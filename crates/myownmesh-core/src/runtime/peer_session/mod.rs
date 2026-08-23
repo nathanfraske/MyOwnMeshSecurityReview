@@ -41,6 +41,7 @@
 //!   acknowledged-delivery wait is resolved by an acknowledgement or by nothing.
 
 mod capabilities;
+mod departure;
 mod reliable;
 mod slot;
 
@@ -82,6 +83,9 @@ impl DedupToken {
     }
 }
 
+pub(crate) use departure::{
+    DepartureAdmissionError, DepartureCarrier, DepartureWaitOutcome, DepartureWaiter,
+};
 pub(crate) use reliable::{InboundOutcome, UnsentFrame};
 pub(crate) use slot::{
     PromotedChannelBinding, PromotedDedupDrain, PromotedDedupSet, PromotedSession,
@@ -109,6 +113,7 @@ pub(crate) struct PeerSessionState {
     peer_advert: capabilities::RetainedAdvert,
     /// Whether this session still owes the peer the local advertisement.
     local_advert: capabilities::LocalAdvertDebt,
+    departure: departure::DepartureState,
 }
 
 /// The logical-session witness is the broker's existing validity lineage.
@@ -177,6 +182,42 @@ impl LogicalSessionOperation<'_> {
     pub(crate) fn validity(&self) -> &LogicalSessionValidityWitness {
         &self.validity
     }
+
+    pub(crate) fn begin_departure(
+        &mut self,
+        correlation: crate::protocol::DepartureCorrelation,
+        carrier: DepartureCarrier,
+    ) -> std::result::Result<DepartureWaiter, DepartureAdmissionError> {
+        self.state
+            .departure
+            .begin_local(correlation, carrier, &self.validity)
+    }
+
+    pub(crate) fn observe_departure(
+        &mut self,
+        correlation: &crate::protocol::DepartureCorrelation,
+    ) -> bool {
+        self.state.departure.observe_local(correlation)
+    }
+
+    pub(crate) fn accept_remote_departure(
+        &mut self,
+        correlation: &crate::protocol::DepartureCorrelation,
+    ) -> bool {
+        self.state.departure.accept_remote(correlation)
+    }
+
+    pub(crate) fn cancel_departure_for_carrier(&mut self, carrier: DepartureCarrier) -> bool {
+        self.state.departure.cancel_for_carrier(carrier)
+    }
+
+    pub(crate) fn cancel_departure_for_shutdown(&mut self) -> bool {
+        self.state.departure.cancel_for_shutdown()
+    }
+
+    pub(crate) fn departure_pending(&self) -> bool {
+        self.state.departure.is_pending()
+    }
 }
 
 impl PeerSessionState {
@@ -190,6 +231,7 @@ impl PeerSessionState {
             rpc: crate::rpc::SessionRpcState::new(),
             peer_advert: capabilities::RetainedAdvert::default(),
             local_advert: capabilities::LocalAdvertDebt::new(),
+            departure: departure::DepartureState::new(),
         }
     }
 

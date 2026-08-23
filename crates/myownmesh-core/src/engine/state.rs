@@ -27,6 +27,7 @@ use crate::transport::webrtc::{
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
+use tokio::task::JoinHandle;
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
@@ -287,7 +288,7 @@ pub enum NetworkCmd {
         /// Per-device custody second factor, if the network requires one on
         /// this device. `None` when no custody lock is enrolled.
         mfa_code: Option<String>,
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<crate::semantic::FactId>>,
     },
     /// Sign an existing pending proposal. Verifies the local user
     /// has authority for the variant + that the proposal hasn't
@@ -296,7 +297,7 @@ pub enum NetworkCmd {
     /// signature satisfies the quorum, the engine ratifies the
     /// transition in the same step.
     SignProposal {
-        proposal_id: String,
+        proposal_id: crate::semantic::FactId,
         /// Per-device custody second factor (see `ProposeTransition`).
         mfa_code: Option<String>,
         reply: oneshot::Sender<Result<()>>,
@@ -305,14 +306,14 @@ pub enum NetworkCmd {
     /// proposal — the engine drops it from pending and broadcasts
     /// the signed deny.
     DenyProposal {
-        proposal_id: String,
+        proposal_id: crate::semantic::FactId,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Withdraw a proposal the local device floated. No
     /// broadcast — peers see the proposal disappear via the
     /// next `NetworkState` snapshot.
     WithdrawProposal {
-        proposal_id: String,
+        proposal_id: crate::semantic::FactId,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Proposer-initiated split fallback. Spawns a derived closed
@@ -320,7 +321,7 @@ pub enum NetworkCmd {
     /// carries the derived `network_id` so the caller can join
     /// the new network straight away.
     SpawnSplit {
-        proposal_id: String,
+        proposal_id: crate::semantic::FactId,
         reply: oneshot::Sender<Result<String>>,
     },
     /// Snapshot of the current governance state. Used by the
@@ -391,12 +392,14 @@ impl ResourceMailboxItem for NetworkCmd {
                 mfa_code,
                 ..
             } => checked_measure_add(
-                strings_measure([proposal_id.as_str()])?,
+                strings_measure([proposal_id.to_string().as_str()])?,
                 strings_measure(mfa_code.iter().map(String::as_str))?,
             )?,
             Self::DenyProposal { proposal_id, .. }
             | Self::WithdrawProposal { proposal_id, .. }
-            | Self::SpawnSplit { proposal_id, .. } => strings_measure([proposal_id.as_str()])?,
+            | Self::SpawnSplit { proposal_id, .. } => {
+                strings_measure([proposal_id.to_string().as_str()])?
+            }
         };
         // Channel/Arc-backed effects are opaque dependency allocations, not OS
         // sockets or handles. The payload walk above counts its own allocations;
@@ -560,14 +563,13 @@ impl SignalingInbound {
 #[derive(Debug, Clone)]
 pub(crate) enum SignalingOutbound {
     Announce,
-    /// Graceful departure broadcast — the dual of [`Announce`]. Tells every
-    /// peer in the room to tear our session down *now* instead of waiting
-    /// out the heartbeat timeout (~90 s). Emitted on a deliberate leave
-    /// (network remove / transport restart / daemon shutdown) so that a
-    /// "reconnect" — which is a leave-then-rejoin — doesn't strand peers
-    /// holding a dead session whose ICE still falsely reports `Connected`.
-    /// Public relays never synthesise a `Leave` for us (only an intelligent
-    /// signaling server does), so the departing peer announces its own.
+    /// Carrier departure observation — the dual of [`Announce`]. This is a
+    /// sender-claimed reachability hint, not an authenticated session terminal
+    /// and not durable participation or authorization. A receiver may use it
+    /// to update carrier availability, cancel speculative work, or trigger
+    /// exact connector/liveness validation; it must not tear down a healthy
+    /// authenticated session solely because this hint names its Device.
+    /// Authenticated departure travels over the exact live session instead.
     Leave,
     Offer {
         device_id: String,
@@ -634,6 +636,10 @@ impl ResourceMailboxItem for SignalingOutbound {
 /// locks and notification points rather than one process-wide state lock.
 pub struct NetworkState {
     pub network_id: String,
+    /// The exact semantic bootstrap accepted before any peer or signaling
+    /// surface is assembled.
+    verified_bootstrap: crate::semantic::VerifiedBootstrap,
+    mesh_context_id: crate::semantic::MeshContextId,
     pub identity: Arc<Identity>,
     pub transport: Transport,
     resource_scope: NetworkInstanceResourceScope,
@@ -669,6 +675,15 @@ pub struct NetworkState {
     /// 0600 on Unix). Loaded once on construction; the engine
     /// persists after every signed transition that lands.
     pub governance_state: Arc<RwLock<crate::network_state::NetworkState>>,
+    /// The one authoritative semantic graph for this joined network.
+    ///
+    /// This is persistent for the lifetime of the shared `NetworkState`: all
+    /// durable-fact ingress paths must borrow this exact graph rather than
+    /// constructing a transient `FactGraph::new()`. Its context and authority
+    /// roots come only from `verified_bootstrap`; pinned peers and
+    /// carrier/session identities are selectors and never become semantic
+    /// authority.
+    pub(crate) fact_graph: Arc<RwLock<crate::semantic::FactGraph>>,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
@@ -700,6 +715,11 @@ pub struct NetworkState {
     /// drain it via [`Self::take_signaling_outbound_rx`] when they
     /// bring up their signaling task.
     signaling_outbound_rx: Mutex<Option<ResourceMailboxReceiver<SignalingOutbound>>>,
+    /// Joinable forwarders created by the in-process signaling bridge. `Some`
+    /// means registration is open; shutdown takes the option under this mutex
+    /// before awaiting the handles, so a concurrent late attach cannot become
+    /// an untracked task.
+    local_signaling_forwarders: Mutex<Option<Vec<JoinHandle<()>>>>,
     /// Controls that do not run an engine driver still need the command
     /// mailbox to be live: session promotion announces on it, and a closed
     /// receiver truthfully means the driver is gone. Parking the receiver in
@@ -835,6 +855,15 @@ pub struct NetworkState {
     #[cfg(test)]
     pub(crate) rpc_handler_start_boundary: RpcSendBoundary,
 
+    /// Controls only: park the next production DepartObserved receipt after
+    /// it has been admitted, so a control can prove the receipt is in flight
+    /// before allowing the exact send/retirement path to continue.
+    ///
+    /// Test and transport-lab observation only. It is absent from ordinary
+    /// production builds and has no effect on receipt admission or custody.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(crate) depart_observed_gate: DepartObservedGate,
+
     /// One action to run inside a handler run's start, between its early
     /// validity read and the fenced commit.
     ///
@@ -915,13 +944,40 @@ impl NetworkState {
     /// already hold the scopes they want this state to live under. Reaching for
     /// the global root inside a constructor was the thing that made it a
     /// convenience rather than a seam.
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(crate) fn new_in_mesh_scope(
         config: NetworkConfig,
         identity: Arc<Identity>,
         transport: Transport,
+        verified_bootstrap: crate::semantic::VerifiedBootstrap,
         mesh_scope: &MeshRuntimeResourceScope,
         local_resources: &LocalApplicationResourceScope,
+    ) -> Result<(
+        Arc<Self>,
+        ResourceMailboxReceiver<EphemeralIngress>,
+        ResourceMailboxReceiver<NetworkCmd>,
+    )> {
+        Self::new_in_mesh_scope_with_instance_root(
+            config,
+            identity,
+            transport,
+            verified_bootstrap,
+            mesh_scope,
+            local_resources,
+            None,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn new_in_mesh_scope_with_instance_root(
+        config: NetworkConfig,
+        identity: Arc<Identity>,
+        transport: Transport,
+        verified_bootstrap: crate::semantic::VerifiedBootstrap,
+        mesh_scope: &MeshRuntimeResourceScope,
+        local_resources: &LocalApplicationResourceScope,
+        instance_root: Option<std::path::PathBuf>,
     ) -> Result<(
         Arc<Self>,
         ResourceMailboxReceiver<EphemeralIngress>,
@@ -933,6 +989,8 @@ impl NetworkState {
             transport,
             mesh_scope.network_instance_scope(),
             local_resources.child()?,
+            verified_bootstrap,
+            instance_root,
         )
     }
 
@@ -943,6 +1001,8 @@ impl NetworkState {
         transport: Transport,
         resource_scope: NetworkInstanceResourceScope,
         local_resources: LocalApplicationResourceScope,
+        verified_bootstrap: crate::semantic::VerifiedBootstrap,
+        instance_root: Option<std::path::PathBuf>,
     ) -> Result<(
         Arc<Self>,
         ResourceMailboxReceiver<EphemeralIngress>,
@@ -951,51 +1011,61 @@ impl NetworkState {
         // Standing dials survive restarts by riding the network config —
         // the daemon re-joins with the same `pinned_peers`, and this seed
         // re-arms them without any runtime re-pinning.
+        verified_bootstrap
+            .validate()
+            .map_err(|error| Error::Network(format!("verified bootstrap rejected: {error}")))?;
+        if verified_bootstrap.context().scope != config.network_id {
+            return Err(Error::Network(format!(
+                "verified bootstrap scope {} does not match network id {}",
+                verified_bootstrap.context().scope,
+                config.network_id
+            )));
+        }
+        let bootstrap_is_closed = matches!(
+            verified_bootstrap.policy(),
+            crate::semantic::VerifiedProjectPolicy::Closed(_)
+        );
+        let config_is_closed = matches!(config.kind, crate::network_state::NetworkKind::Closed);
+        if bootstrap_is_closed != config_is_closed {
+            return Err(Error::Network(format!(
+                "verified bootstrap policy shape does not match configured network kind {:?}",
+                config.kind
+            )));
+        }
+        let mesh_context_id = verified_bootstrap.context_id();
+
         let pinned: std::collections::HashSet<String> =
             config.pinned_peers.iter().cloned().collect();
-        let roster = crate::roster::load(&config.network_id)?;
+        let persistence_root = instance_root.as_deref();
+        let roster = crate::roster::load_at(persistence_root, &config.network_id)?;
         // Load (or initialise) the per-network signed state log. If
         // the config requests Closed kind but the on-disk log says
         // Open (or vice-versa), the on-disk log wins — kind is
         // authoritatively a signed-state property, not a config one.
         // The config field only seeds new networks at first attach.
-        let governance_state = {
-            let mut s = crate::network_state::load(&config.network_id)?;
-            if s.transitions.is_empty() {
-                // A brand-new Closed log must establish its signed founder
-                // basis before the peer registry becomes usable. Deferring
-                // genesis until first ACTIVE is circular: ACTIVE now requires
-                // positive membership in this projection.
-                if s.kind == crate::network_state::NetworkKind::Closed
-                    || config.kind == crate::network_state::NetworkKind::Closed
-                {
-                    // The signed log replays from Open, so genesis is expressed
-                    // as a transition rather than as a pre-mutated kind field.
-                    s.kind = crate::network_state::NetworkKind::Open;
-                    let variant = crate::network_state::TransitionVariant::KindChange {
-                        to: crate::network_state::NetworkKind::Closed,
-                    };
-                    let transition = crate::network_state::Transition {
-                        at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        signatures: vec![crate::network_state::sign_transition(
-                            &config.network_id,
-                            &variant,
-                            identity.signing_key(),
-                        )],
-                        signers: vec![identity.public_id().to_string()],
-                        variant,
-                    };
-                    s = crate::network_state::apply_transition(s, &transition);
-                    crate::network_state::save(&s)?;
-                } else {
-                    s.kind = config.kind;
-                }
-            }
-            s
+        // Keep the legacy projection only as a compatibility mirror for the
+        // current peer-policy compiler. Its policy shape and initial root are
+        // derived from the verified bootstrap, never from config or the local
+        // identity. No local founder transition is minted or persisted here.
+        let mut governance_state =
+            crate::network_state::load_at(persistence_root, &config.network_id)?;
+        governance_state.kind = if bootstrap_is_closed {
+            crate::network_state::NetworkKind::Closed
+        } else if matches!(config.kind, crate::network_state::NetworkKind::Silent) {
+            // Silent is a local transport behavior layered on the verified
+            // Open semantic profile; it is not a second authority shape.
+            crate::network_state::NetworkKind::Silent
+        } else {
+            crate::network_state::NetworkKind::Open
         };
+        governance_state.roles.clear();
+        if let crate::semantic::VerifiedProjectPolicy::Closed(policy) = verified_bootstrap.policy()
+        {
+            governance_state.roles.insert(
+                policy.authority_root().to_string(),
+                crate::network_state::Role::Owner,
+            );
+        }
         // Topology has the same precedence as kind: a ratified
         // `TopologyChange` in the signed log outranks whatever the
         // local config says; the config value only shapes networks
@@ -1023,8 +1093,13 @@ impl NetworkState {
         let session_broker = transport.session_broker();
         let governance_state = Arc::new(RwLock::new(governance_state));
         let local_device_id = identity.public_id().to_string();
+        let fact_graph = Arc::new(RwLock::new(crate::semantic::FactGraph::from_bootstrap(
+            &verified_bootstrap,
+        )));
         let state = Arc::new(Self {
             network_id: config.network_id.clone(),
+            verified_bootstrap,
+            mesh_context_id,
             identity,
             transport,
             resource_scope,
@@ -1035,6 +1110,7 @@ impl NetworkState {
             peers: PeerRegistry::new(Arc::clone(&governance_state), local_device_id),
             roster: RwLock::new(roster),
             governance_state,
+            fact_graph,
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             application_gateway: crate::application_gateway::ApplicationGateway::new(
@@ -1048,6 +1124,7 @@ impl NetworkState {
             speculative_promotion_tx,
             speculative_promotion_rx: Mutex::new(Some(speculative_promotion_rx)),
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            local_signaling_forwarders: Mutex::new(Some(Vec::new())),
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
@@ -1068,6 +1145,8 @@ impl NetworkState {
             rpc_send_boundary: RpcSendBoundary::default(),
             #[cfg(test)]
             rpc_handler_start_boundary: RpcSendBoundary::default(),
+            #[cfg(any(test, feature = "transport-lab"))]
+            depart_observed_gate: DepartObservedGate::default(),
             #[cfg(test)]
             rpc_handler_precommit_action: Mutex::new(None),
             relay_reconnect: Mutex::new(None),
@@ -1087,6 +1166,50 @@ impl NetworkState {
             .peers
             .bind_speculative_promotion_sink(state.speculative_promotion_tx.clone());
         Ok((state, signaling_inbound_rx, cmd_rx))
+    }
+
+    /// The exact semantic identity selected by the verified bootstrap.
+    pub fn mesh_context_id(&self) -> crate::semantic::MeshContextId {
+        self.mesh_context_id
+    }
+
+    /// The canonical, wire-safe spelling of this state's semantic context.
+    ///
+    /// This is derived from the immutable [`crate::semantic::MeshContextId`]
+    /// selected by the
+    /// verified bootstrap; it is never reconstructed from a carrier, peer, or
+    /// mutable network configuration.
+    pub fn mesh_context_id_string(&self) -> String {
+        self.mesh_context_id.to_string()
+    }
+
+    /// The validated bootstrap that owns this network state's semantic policy.
+    pub fn verified_bootstrap(&self) -> &crate::semantic::VerifiedBootstrap {
+        &self.verified_bootstrap
+    }
+
+    /// The sealed policy projected by the validated bootstrap.
+    ///
+    /// Callers may inspect this immutable projection when deciding whether a
+    /// canonical semantic commit can affect a policy-owned path. They cannot
+    /// supply roots or mutate the bootstrap through this reference.
+    pub fn verified_policy(&self) -> &crate::semantic::VerifiedProjectPolicy {
+        self.verified_bootstrap.policy()
+    }
+
+    /// The exact authority root, when this state is backed by a Closed
+    /// bootstrap. Open profiles intentionally have no root authority.
+    pub fn verified_authority_root(&self) -> Option<&str> {
+        match self.verified_policy() {
+            crate::semantic::VerifiedProjectPolicy::Open => None,
+            crate::semantic::VerifiedProjectPolicy::Closed(policy) => Some(policy.authority_root()),
+        }
+    }
+
+    /// The exact persisted bootstrap record, exposed read-only for durable
+    /// handoff and diagnostics without exposing mutable authority state.
+    pub fn verified_bootstrap_record(&self) -> &crate::semantic::BootstrapRecord {
+        self.verified_bootstrap.record()
     }
 
     pub(crate) fn peer_connection_resource_scope(
@@ -1176,6 +1299,13 @@ impl NetworkState {
         self.rpc_handler_start_boundary.reach().await;
     }
 
+    /// Reach the one-shot DepartObserved control gate. In an ordinary build
+    /// this compiles to no behavior because the gate is not part of the state.
+    pub(crate) async fn reach_depart_observed_gate(&self) {
+        #[cfg(any(test, feature = "transport-lab"))]
+        self.depart_observed_gate.reach().await;
+    }
+
     /// The point inside a handler run's start, after its early validity read and
     /// before the fenced commit.
     ///
@@ -1221,6 +1351,60 @@ impl NetworkState {
     #[cfg(test)]
     pub(crate) fn rpc_handler_precommit_action_pending(&self) -> bool {
         self.rpc_handler_precommit_action.lock().is_some()
+    }
+}
+
+/// One-shot control gate for the exact DepartObserved receipt path.
+///
+/// The release future is subscribed before the arm is consumed. That ordering
+/// makes a release concurrent with arrival observable rather than a lost
+/// `Notify` wake. Consuming the arm before announcing entry makes only one
+/// receipt park, even if several receipt tasks reach the hook together.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Default)]
+pub(crate) struct DepartObservedGate {
+    armed: std::sync::atomic::AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "transport-lab"))]
+impl DepartObservedGate {
+    pub(crate) async fn reach(&self) {
+        use std::sync::atomic::Ordering;
+
+        let release = self.release_notify.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.entered_notify.notify_waiters();
+        release.await;
+    }
+
+    /// Arm exactly one future receipt. A second arm before arrival is a
+    /// control mistake rather than a silently displaced observation.
+    pub(crate) fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, std::sync::atomic::Ordering::AcqRel),
+            "a DepartObserved gate was armed twice"
+        );
+    }
+
+    /// Subscribe before causing the receipt so entry cannot be missed.
+    pub(crate) fn entered(&self) -> tokio::sync::futures::Notified<'_> {
+        self.entered_notify.notified()
+    }
+
+    /// Alias matching the other engine controls' arrival terminology.
+    pub(crate) fn arrival(&self) -> tokio::sync::futures::Notified<'_> {
+        self.entered()
+    }
+
+    /// Release the one receipt currently parked at the gate.
+    pub(crate) fn release(&self) {
+        self.release_notify.notify_waiters();
     }
 }
 
@@ -1404,6 +1588,13 @@ impl Drop for RpcRunEpilogue {
 }
 
 impl NetworkState {
+    /// Borrow the single semantic authority graph for this network instance.
+    /// Callers must use this shared graph for admission and projection; a new
+    /// default graph would silently bypass the trusted-root boundary.
+    pub(crate) fn authoritative_fact_graph(&self) -> Arc<RwLock<crate::semantic::FactGraph>> {
+        Arc::clone(&self.fact_graph)
+    }
+
     /// Read observations for this live joined network instance.
     pub fn resource_report(&self) -> ResourceReport {
         self.resource_scope.report()
@@ -1466,6 +1657,35 @@ impl NetworkState {
         self.cmd_tx.close();
         self.speculative_promotion_tx.close();
         self.signaling_inbound_tx.close();
+        self.signaling_tx.close();
+    }
+
+    /// Run one local signaling attach while holding the registration fence.
+    /// The closure must return the exact spawned forwarder; keeping spawn and
+    /// registration in this critical section prevents shutdown from taking the
+    /// registry between those two operations.
+    pub(crate) fn with_local_signaling_forwarder<R>(
+        &self,
+        start: impl FnOnce() -> (R, JoinHandle<()>),
+    ) -> Option<R> {
+        let mut forwarders = self.local_signaling_forwarders.lock();
+        if self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return None;
+        }
+        let handles = forwarders.as_mut()?;
+        let (result, handle) = start();
+        handles.push(handle);
+        Some(result)
+    }
+
+    fn take_local_signaling_forwarders(&self) -> Vec<JoinHandle<()>> {
+        self.local_signaling_forwarders
+            .lock()
+            .take()
+            .unwrap_or_default()
     }
 
     pub(crate) async fn wait_for_shutdown(&self) {
@@ -2499,6 +2719,7 @@ impl NetworkState {
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
     pub(crate) async fn shutdown(&self) {
+        self.request_shutdown();
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is
         // cleared only after this is the last shutdown consumer of it.
@@ -2518,6 +2739,11 @@ impl NetworkState {
         drop(retired);
         drop(runtime);
         self.signaling_runtime.write().take();
+        for forwarder in self.take_local_signaling_forwarders() {
+            if let Err(error) = forwarder.await {
+                tracing::warn!(%error, "local signaling forwarder failed during shutdown");
+            }
+        }
         // Nothing outlives the engine: parked connect waits resolve with the
         // truth instead of hanging.
         //
@@ -2535,13 +2761,12 @@ impl NetworkState {
         self.application_gateway.close();
     }
 
-    /// Broadcast a graceful departure so peers drop our session immediately
-    /// rather than waiting out the ~90 s heartbeat timeout. Fire-and-forget,
-    /// like every other signaling publish: the message is handed to the
-    /// signaling driver and rides the relays best-effort. Callers tearing
-    /// the network down (see [`crate::JoinedNetwork::announce_leave`]) should
-    /// emit this *before* dropping the signaling driver and give it a brief
-    /// moment to reach the relays.
+    /// Publish a carrier departure observation. Fire-and-forget, like every
+    /// other signaling publish: the message is handed to the signaling driver
+    /// and rides the relays best-effort. This does not own or retire any peer
+    /// session; [`crate::JoinedNetwork::announce_leave`] first performs the
+    /// authenticated-session departure protocol, then publishes this hint
+    /// while the signaling driver still exists.
     pub fn announce_departure(&self) {
         if let Err(error) = self.signaling_tx.send(SignalingOutbound::Leave) {
             tracing::warn!(error = %error.into_admission_error(), "departure announcement was refused");

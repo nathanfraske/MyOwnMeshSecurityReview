@@ -97,7 +97,7 @@ pub(crate) async fn submit(
     state.peers.with_live_session_state(
         &owner,
         state.session_broker.as_ref(),
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         |session, record| {
             let (payload, reply) = handoff
                 .take()
@@ -131,7 +131,7 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
             .with_live_session_state(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, record| record.next_unsent(session),
             )
             .flatten();
@@ -165,7 +165,7 @@ pub(super) async fn flush_owner(state: &Arc<NetworkState>, owner: &PeerOwnerToke
         state.peers.with_live_session_state(
             owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, record| record.mark_sent(seq),
         );
         // The copy and the lease that funded it die together, here, once the

@@ -174,6 +174,109 @@ pub(super) enum LogicalSessionTerminal {
     Removed(Arc<PeerConnection>),
 }
 
+/// Exact local-departure custody minted under the registry fence.  The worker
+/// stamp is retained only for the send; the waiter is funded by the logical
+/// session witness and therefore survives carrying-channel replacement.
+pub(super) struct AdmittedLocalDeparture {
+    owner: PeerOwnerToken,
+    witness: crate::runtime::peer_session::LogicalSessionValidityWitness,
+    waiter: crate::runtime::peer_session::DepartureWaiter,
+}
+
+impl AdmittedLocalDeparture {
+    pub(super) fn owner(&self) -> &PeerOwnerToken {
+        &self.owner
+    }
+
+    pub(super) fn witness(&self) -> &crate::runtime::peer_session::LogicalSessionValidityWitness {
+        &self.witness
+    }
+
+    pub(super) fn waiter(&self) -> &crate::runtime::peer_session::DepartureWaiter {
+        &self.waiter
+    }
+}
+
+// A receipt send started on the exact authenticated channel that carried a
+// remote departure. The peer remains current until the receipt has settled so
+// a simultaneous local departure can observe it on its own exact witness.
+// The JSON receipt envelope is well below one correlation's wire bound; two
+// bounds leave finite room for the fixed kind/op/quotes without relying on an
+// unmeasured allocation. The lease below is acquired before the receipt bytes
+// are serialized.
+const MAX_DEPARTURE_RECEIPT_FRAME_BYTES: usize =
+    crate::protocol::MAX_DEPARTURE_CORRELATION_BYTES * 2;
+
+fn remote_departure_receipt_claim() -> std::result::Result<
+    crate::resource::ResourceClaim,
+    crate::resource::ResourceClaimArithmeticError,
+> {
+    let bytes = u64::try_from(
+        std::mem::size_of::<RemoteDepartureReceipt>()
+            .checked_add(MAX_DEPARTURE_RECEIPT_FRAME_BYTES)
+            .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+                dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+            })?,
+    )
+    .map_err(
+        |_| crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let frame = u64::try_from(MAX_DEPARTURE_RECEIPT_FRAME_BYTES).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: crate::resource::ResourceClass::QueuedBytes,
+        }
+    })?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+        (crate::resource::ResourceClass::QueuedBytes, frame),
+        (crate::resource::ResourceClass::ParsingOrCpuWork, frame),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+}
+
+/// The exact carrying-channel send permit and its bounded receipt lease.
+pub(super) struct RemoteDepartureReceipt {
+    send: crate::transport::StartedConnectorSend,
+    /// Explicitly funds the bounded serialized receipt buffer in addition to
+    /// the connector operation permit. Dropping it on send failure/cancel
+    /// returns the exact receipt claim to the logical provider scope.
+    _frame_lease: crate::resource::ResourceLease,
+}
+
+impl RemoteDepartureReceipt {
+    pub(super) async fn send(self, data: bytes::Bytes) -> Result<usize> {
+        if data.len() > MAX_DEPARTURE_RECEIPT_FRAME_BYTES {
+            return Err(Error::Transport(
+                "departure receipt exceeded its funded frame bound".into(),
+            ));
+        }
+        self.send.send(data).await
+    }
+}
+
+pub(super) enum RemoteDepartureAdmission {
+    Stale,
+    Accepted {
+        receipt: Option<Box<RemoteDepartureReceipt>>,
+        operation: LogicalSessionOperation,
+        /// A local departure is already waiting for this receipt. Its existing
+        /// waiter owns the matching retirement edge; retiring here first would
+        /// invalidate that witness before `DepartObserved` can be admitted.
+        defer_retirement: bool,
+    },
+}
+
+fn departure_carrier(
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+) -> Option<crate::runtime::peer_session::DepartureCarrier> {
+    worker
+        .live_connector_incarnation()
+        .cloned()
+        .map(crate::runtime::peer_session::DepartureCarrier::new)
+}
+
 impl Default for PeerRegistry {
     fn default() -> Self {
         Self::new(
@@ -206,9 +309,12 @@ impl PeerRegistry {
         &self,
         runtime: Weak<super::signaling_ingress::SignalingRuntime>,
     ) {
-        *self.signaling_runtime.write() = Some(runtime.clone());
+        *self.signaling_runtime.write() = Some(Weak::clone(&runtime));
         for entry in self.peers.iter() {
-            entry.value().peer.bind_signaling_runtime(runtime.clone());
+            entry
+                .value()
+                .peer
+                .bind_signaling_runtime(Weak::clone(&runtime));
         }
     }
 
@@ -417,7 +523,9 @@ impl PeerRegistry {
     ) -> Option<super::connection::SpeculativeRetirement> {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
-        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
             return None;
         }
         current
@@ -638,6 +746,69 @@ impl PeerRegistry {
             return None;
         }
         Some(effect(&current.value().peer))
+    }
+
+    /// Admit the one durable semantic frame allowed from an authenticated
+    /// endpoint that is still awaiting policy approval.
+    ///
+    /// This is deliberately separate from the application admission helpers:
+    /// it never promotes the peer, lends a session capability, or creates a
+    /// logical application route.  The worker stamp, endpoint-auth task,
+    /// authenticated-channel proof, exact mesh context, and bounded parse
+    /// claim are all decided under the mutation fence.  The returned
+    /// operation is the only value that carries that decision out of the
+    /// fence, and dropping it releases the exact claim on every refusal or
+    /// cancellation path.
+    pub(super) fn admit_pending_semantic_operation(
+        &self,
+        owner: &PeerOwnerToken,
+        mesh_context: &str,
+        bytes: &bytes::Bytes,
+    ) -> Option<AdmittedPendingSemanticOperation> {
+        let classified = crate::protocol::classify_frame(bytes)?;
+        if !matches!(
+            classified.admission,
+            crate::protocol::FrameAdmission::DurableFact
+        ) {
+            return None;
+        }
+
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        let worker = owner.worker()?.clone();
+        if !owner.worker_matches(peer)
+            || peer
+                .current_worker()
+                .is_none_or(|current| !Arc::ptr_eq(&current, &worker))
+        {
+            return None;
+        }
+        {
+            let data = peer.state.read();
+            if !data.authenticated
+                || !matches!(data.status, super::connection::PeerStatus::PendingApproval)
+            {
+                return None;
+            }
+        }
+        let endpoint_auth = peer.endpoint_auth_task_for(Some(&worker))?;
+        if !pending_semantic_endpoint_is_current(peer, &worker, &endpoint_auth, mesh_context) {
+            return None;
+        }
+        let claim =
+            crate::application_gateway::AdmittedApplicationFrame::claim(bytes.len()).ok()?;
+        let work = worker.reserve_attempt_work(claim).ok()?;
+        Some(AdmittedPendingSemanticOperation {
+            owner: owner.clone(),
+            worker,
+            endpoint_auth,
+            mesh_context: mesh_context.to_owned(),
+            work,
+        })
     }
 
     /// Resolve an exact installation without requiring a worker stamp.
@@ -1325,13 +1496,20 @@ impl PeerRegistry {
         replaced
     }
 
-    pub(super) fn remove(&self, device_id: &str) -> Option<Arc<PeerConnection>> {
+    pub(super) fn remove(
+        &self,
+        device_id: &str,
+    ) -> Option<(
+        Arc<PeerConnection>,
+        Option<Arc<crate::transport::WebRtcConnectorWorker>>,
+    )> {
         let _mutation = self.mutation.lock();
         let (_, entry) = self.peers.remove(device_id)?;
         let peer = entry.peer;
+        let worker = peer.current_worker();
         peer.retire_connector();
         self.track_removed_close(Arc::clone(&peer));
-        Some(peer)
+        Some((peer, worker))
     }
 
     #[cfg(test)]
@@ -1389,6 +1567,11 @@ impl PeerRegistry {
         let Some(removed) = peer.retire_authenticated_worker(operation.worker()) else {
             return ChannelTerminal::Stale;
         };
+        if let Some(carrier) = departure_carrier(operation.worker()) {
+            peer.with_logical_session_state(|logical| {
+                logical.cancel_departure_for_carrier(carrier)
+            });
+        }
         if removed.session_empty {
             drop(current);
             let Some((_, entry)) = self.peers.remove(owner.device_id()) else {
@@ -1433,6 +1616,148 @@ impl PeerRegistry {
         peer.retire_connector();
         self.track_removed_close(Arc::clone(&peer));
         LogicalSessionTerminal::Removed(peer)
+    }
+
+    /// Begin one local graceful departure against the exact installed
+    /// logical session and its sole currently usable carrying channel.
+    ///
+    /// Selection and pending-observation admission share this mutation fence,
+    /// so a channel terminal or replacement cannot slip between the two.  The
+    /// returned worker stamp is used only for the departure frame; the waiter
+    /// itself is funded by the logical validity lineage.
+    pub(super) fn begin_local_departure<C: AsRef<str>>(
+        &self,
+        owner: &PeerOwnerToken,
+        correlation: C,
+    ) -> Option<
+        std::result::Result<
+            AdmittedLocalDeparture,
+            crate::runtime::peer_session::DepartureAdmissionError,
+        >,
+    > {
+        let correlation = crate::protocol::DepartureCorrelation::new(correlation.as_ref()).ok()?;
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        let worker = peer.select_unique_usable_channel()?;
+        let carrier = departure_carrier(&worker)?;
+        let witness_and_waiter = peer.with_logical_session_state(|logical| {
+            let witness = logical.validity().clone();
+            logical
+                .begin_departure(correlation, carrier)
+                .map(|waiter| (witness, waiter))
+        })?;
+        Some(
+            witness_and_waiter.map(|(witness, waiter)| AdmittedLocalDeparture {
+                owner: owner.for_worker(worker),
+                witness,
+                waiter,
+            }),
+        )
+    }
+
+    /// Cancel every currently installed logical session's one pending local
+    /// departure. Shutdown calls this before awaiting a departure sweep, so a
+    /// missing remote receipt cannot keep daemon shutdown parked forever. The
+    /// mutation fence preserves exact installation/validity custody while the
+    /// runtime state releases only its own observation lease.
+    pub(super) fn cancel_pending_departures_for_shutdown(&self) -> usize {
+        let _mutation = self.mutation.lock();
+        self.peers
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .peer
+                    .with_logical_session_state(|logical| logical.cancel_departure_for_shutdown())
+            })
+            .filter(|cancelled| *cancelled)
+            .count()
+    }
+
+    /// Read the number of exact logical records currently holding a pending
+    /// departure observation. This is an observation for shutdown controls;
+    /// it does not admit, select, or retain any session.
+    pub(super) fn pending_departure_count(&self) -> usize {
+        let _mutation = self.mutation.lock();
+        self.peers
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .value()
+                    .peer
+                    .with_logical_session_state(|logical| logical.departure_pending())
+            })
+            .filter(|pending| *pending)
+            .count()
+    }
+
+    /// Admit a remote Depart only on the exact authenticated carrying channel
+    /// that delivered it and retain the send permit for its receipt. The exact
+    /// logical retirement is deferred until the receipt has settled outside the
+    /// fence; if a local departure is pending, its matching waiter owns that
+    /// final edge. No await occurs while the fence is held, and a duplicate or
+    /// stale dispatch cannot remove a successor installation.
+    pub(super) fn accept_remote_departure(
+        &self,
+        dispatch: &AdmittedInboundDispatch,
+        correlation: &crate::protocol::DepartureCorrelation,
+    ) -> RemoteDepartureAdmission {
+        let _mutation = self.mutation.lock();
+        let Some(worker) = dispatch.owner.worker().cloned() else {
+            return RemoteDepartureAdmission::Stale;
+        };
+        let Some(current) = self.peers.get(dispatch.owner.device_id()) else {
+            return RemoteDepartureAdmission::Stale;
+        };
+        if !Arc::ptr_eq(&current.value().installation, &dispatch.owner.installation)
+            || !dispatch.witness.is_live()
+            || !dispatch.owner.worker_matches(&current.value().peer)
+        {
+            return RemoteDepartureAdmission::Stale;
+        }
+        let peer = &current.value().peer;
+        // Acquire the exact receipt custody before committing remote-terminal
+        // state. If the logical admission below rejects as stale, this value
+        // drops without publishing a terminal transition or retaining a
+        // provider lease.
+        let receipt = dispatch
+            .witness
+            .reserve_retained(
+                remote_departure_receipt_claim()
+                    .expect("the fixed departure receipt claim is representable"),
+            )
+            .ok()
+            .and_then(|_frame_lease| {
+                worker
+                    .begin_send()
+                    .ok()
+                    .map(|send| Box::new(RemoteDepartureReceipt { send, _frame_lease }))
+            });
+        let Some(defer_retirement) = peer
+            .with_logical_session_state(|logical| {
+                if !dispatch.witness.same_validity(logical.validity())
+                    || !logical.accept_remote_departure(correlation)
+                {
+                    return None;
+                }
+                Some(logical.departure_pending())
+            })
+            .flatten()
+        else {
+            return RemoteDepartureAdmission::Stale;
+        };
+        let defer_retirement = defer_retirement && receipt.is_some();
+        RemoteDepartureAdmission::Accepted {
+            receipt,
+            operation: dispatch.logical_operation(),
+            defer_retirement,
+        }
     }
 
     pub(super) fn remove_if_current_unpromoted(
@@ -1665,6 +1990,100 @@ impl LogicalSessionOperation {
 pub(super) struct ExactChannelOperation {
     logical: LogicalSessionOperation,
     worker: Arc<crate::transport::WebRtcConnectorWorker>,
+}
+
+/// Move-only custody for one authenticated pre-approval durable semantic
+/// frame.  It proves an exact installation and connector, but intentionally
+/// contains no promoted-session or general application authority.
+#[must_use = "dropping an admitted semantic operation releases its exact parse claim"]
+pub(super) struct AdmittedPendingSemanticOperation {
+    owner: PeerOwnerToken,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    endpoint_auth: Arc<crate::endpoint_auth::EndpointAuthTask>,
+    mesh_context: String,
+    work: crate::resource::ResourceLease,
+}
+
+impl AdmittedPendingSemanticOperation {
+    /// Validate the already-funded decode result without lending any session
+    /// or application capability.  Every fact in a bundle must name the exact
+    /// mesh context captured at admission.
+    pub(super) fn accepts_message(&self, message: &crate::protocol::MeshMessage) -> bool {
+        match message {
+            crate::protocol::MeshMessage::Fact(fact) => {
+                fact.content.mesh_context == self.mesh_context
+            }
+            crate::protocol::MeshMessage::FactBundle(bundle) => bundle
+                .facts
+                .iter()
+                .all(|fact| fact.content.mesh_context == self.mesh_context),
+            // Inventory/request are exact-context Application-phase
+            // coordination, never pending durable semantic input.
+            crate::protocol::MeshMessage::FactInventory(_)
+            | crate::protocol::MeshMessage::FactRequest(_) => false,
+            _ => false,
+        }
+    }
+
+    /// Re-prove the exact endpoint after parsing and before reduction.  The
+    /// operation remains usable only for this installation; a replacement,
+    /// worker retirement, endpoint-auth retirement, status change, or context
+    /// change answers false and the caller drops the operation.
+    pub(super) fn is_current(&self, registry: &PeerRegistry) -> bool {
+        registry
+            .with_current(&self.owner, |peer| {
+                pending_semantic_endpoint_is_current(
+                    peer,
+                    &self.worker,
+                    &self.endpoint_auth,
+                    &self.mesh_context,
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Move out the exact witness and provider custody for a reducer that must
+    /// retain the claim across an await.  The returned worker/task are still
+    /// provenance witnesses; they do not grant application authority.
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        PeerOwnerToken,
+        Arc<crate::transport::WebRtcConnectorWorker>,
+        Arc<crate::endpoint_auth::EndpointAuthTask>,
+        String,
+        crate::resource::ResourceLease,
+    ) {
+        (
+            self.owner,
+            self.worker,
+            self.endpoint_auth,
+            self.mesh_context,
+            self.work,
+        )
+    }
+}
+
+fn pending_semantic_endpoint_is_current(
+    peer: &Arc<PeerConnection>,
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    endpoint_auth: &Arc<crate::endpoint_auth::EndpointAuthTask>,
+    mesh_context: &str,
+) -> bool {
+    if peer.registry_retired()
+        || peer
+            .current_worker()
+            .is_none_or(|current| !Arc::ptr_eq(&current, worker))
+        || !peer.has_authenticated_channel()
+        || endpoint_auth.is_retired()
+        || !worker.owns_endpoint_auth(endpoint_auth)
+        || !endpoint_auth
+            .context_matches(mesh_context, crate::signing::pubkey_part(&peer.device_id))
+    {
+        return false;
+    }
+    let data = peer.state.read();
+    data.authenticated && matches!(data.status, super::connection::PeerStatus::PendingApproval)
 }
 
 impl ExactChannelOperation {

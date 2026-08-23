@@ -16,6 +16,7 @@
 //! - [`defaults`] — built-in default relay URLs.
 
 pub mod defaults;
+pub mod delivery;
 pub mod denylist;
 pub mod driver;
 pub mod event;

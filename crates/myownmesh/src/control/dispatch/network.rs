@@ -151,17 +151,26 @@ async fn network_remove_result(
     _owner: &ResponseOwner,
 ) -> std::result::Result<String, String> {
     let key_owned = key.to_string();
-    let ids = if let Some(joined) = state.registry.get(key) {
+    let (ids, removal) = if let Some(joined) = state.registry.get(key) {
         let ids = (
             joined.config_id().to_string(),
             joined.network_id().to_string(),
         );
-        joined.announce_leave().await;
-        Some(ids)
+        // Start the authenticated departure and registry removal together.
+        // A silent peer's DepartObserved waiter is cancelled by teardown;
+        // awaiting the announcement first would deadlock this removal.
+        let departure = joined.announce_leave();
+        let removal = state.registry.remove(key);
+        let (_, removal) = tokio::join!(departure, removal);
+        (Some(ids), Some(removal))
     } else {
-        None
+        (None, None)
     };
-    match state.registry.remove(key).await {
+    let removal = match removal {
+        Some(removal) => removal,
+        None => state.registry.remove(key).await,
+    };
+    match removal {
         RemoveResult::Removed(outcome) => {
             let (config_id, network_id) =
                 ids.unwrap_or_else(|| (key_owned.clone(), key_owned.clone()));
@@ -441,16 +450,16 @@ pub(in crate::control) async fn network_update(
     // recovery surface is a footgun. Then release our Arc clones so the
     // registry can begin its single owned teardown.
     let old_config = net_state.config.read().clone();
-    // Same graceful-departure courtesy as network_remove: peers drop our
-    // session now rather than waiting out the heartbeat timeout, so the
-    // rebuild under the new transport reconnects promptly instead of
-    // racing the stale-session recovery path. Emitted while the signaling
-    // driver is still live (before the registry remove below drops it).
-    joined.announce_leave().await;
+    // Start the authenticated departure and teardown together so teardown can
+    // cancel a silent peer's DepartObserved waiter. The carrier hint remains
+    // part of the departure future.
+    let departure = joined.announce_leave();
+    let removal = state.registry.remove(&config.id);
+    let (_, removal) = tokio::join!(departure, removal);
     drop(net_state);
     drop(joined);
 
-    match state.registry.remove(&config.id).await {
+    match removal {
         RemoveResult::Removed(Ok(())) => {}
         RemoveResult::Removed(Err(error)) => {
             return owner.finish(Err(format!("old runtime teardown failed: {error}")));

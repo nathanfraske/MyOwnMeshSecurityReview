@@ -1,44 +1,36 @@
-//! Regression test for **MOM-01**: closed-network roster membership may
-//! only be expanded by an authority (Controller/Owner).
+//! Regression controls for canonical roster membership authority.
 //!
-//! Before the fix, `governance::on_roster_entries` added any device id a
-//! peer gossiped to the local roster regardless of the network kind or the
-//! sender's authority. Because a rostered peer is auto-approved on every
-//! future connection (`auto = cfg.auto_approve || rostered`), an attacker
-//! who cleared a single approval — or any plain Member — could conscript
-//! arbitrary identities into a *closed* network and have them auto-approved
-//! network-wide.
+//! `RosterEntries` is carrier material, not an authority-bearing fact. The
+//! canonical signed governance projection is the only source that can add a
+//! member to a Closed roster; an unsigned carrier must not do so regardless
+//! of the sender's role. Open networks remain founderless and permissionless
+//! at the policy and local approval boundary, while unsigned roster carriers
+//! remain inert.
 //!
-//! The fix makes closed-network membership owner-**signed**: it rides the
-//! signed transition log (a ratified `RoleGrant`), and the unsigned
-//! roster-entry gossip is never a trust input on a closed network — not even
-//! from a Controller/Owner. Authority over the *messenger* is not authority
-//! over the *data*: the membership data itself must be signed by an authority.
-//! Open networks stay permissionless by design (a member is anyone any current
-//! member has vouched for).
+//! The test uses explicit per-node bootstrap roots and drives the canonical
+//! Closed RoleGrant path before exercising the inert carrier boundary.
 //!
-//! The test drives `on_roster_entries` directly against a closed-network
-//! state set up in-process — no transport/handshake timing — so the
-//! authority gate is exercised deterministically.
-//!
-//! Companion to `roster_gossip.rs` (open-network convergence) and
+//! Companion to `roster_gossip.rs` (transport convergence) and
 //! `closed_network_governance.rs` (signed transitions).
 
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{governance, spawn_network};
+use myownmesh_core::engine::{
+    create_network_in_instance_root, governance, spawn_network_in_instance_root, NetworkState,
+};
 use myownmesh_core::identity::Identity;
+use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
 use myownmesh_core::protocol::governance::{RosterEntriesMessage, RosterEntry};
-use myownmesh_core::{NetworkKind, Role};
+use myownmesh_core::semantic::{ClosedProfileId, VerifiedProjectPolicy};
+use tempfile::TempDir;
 
-fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
+fn fresh_network(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: network_id.to_string(),
         label: id.to_string(),
-        kind: Default::default(),
+        kind,
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
@@ -53,7 +45,7 @@ fn rostered(state: &Arc<NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
 }
 
-/// One gossiped roster entry introducing `id` as a plain member.
+/// One unsigned carrier entry introducing `id` as a plain member.
 fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
     RosterEntriesMessage {
         entries: vec![RosterEntry {
@@ -61,127 +53,153 @@ fn vouch(id: &str, label: &str) -> RosterEntriesMessage {
             label: label.to_string(),
             approved_at: 0,
             role: Role::Member,
-            // Unsigned, attacker-controllable in the wild — the guard keys
-            // off the cryptographically-authenticated *sender's* role, not
-            // this field, so its value is irrelevant to the decision.
             granted_by: String::new(),
         }],
-        // No governance log on this gossip — exercises the membership-only path
-        // without relying on a missing-field compatibility default.
-        transitions: Vec::new(),
-        // No signed member log either — the closed-net guard must still refuse.
-        member_log: Vec::new(),
     }
 }
 
-// Both scenarios share one process (and so one `MYOWNMESH_HOME`); distinct
-// network ids keep their roster files apart. Running them in one test avoids
-// the env-var race two parallel `#[tokio::test]`s in a file would hit.
 #[tokio::test]
 async fn roster_membership_authority_gate() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("MYOWNMESH_HOME", tmp.path());
     let transport = support::test_transport();
+    let closed_root: TempDir = tempfile::tempdir().expect("closed per-node persistence root");
+    let open_root: TempDir = tempfile::tempdir().expect("open per-node persistence root");
 
-    // Identities used across both scenarios.
-    let bob = Arc::new(Identity::ephemeral()); // a plain Member
-    let carol = Arc::new(Identity::ephemeral()); // a Controller
-    let mallory = Arc::new(Identity::ephemeral()); // attacker-introduced id
-    let dave = Arc::new(Identity::ephemeral()); // legitimately vouched by Carol
-    let eve = Arc::new(Identity::ephemeral()); // vouched on the open network
+    // Bob and Carol become canonical Closed roles. The remaining identities
+    // are fresh targets for the four non-authoritative carrier attempts.
+    let bob = Arc::new(Identity::ephemeral());
+    let carol = Arc::new(Identity::ephemeral());
+    let mallory = Arc::new(Identity::ephemeral());
+    let dave = Arc::new(Identity::ephemeral());
+    let eve = Arc::new(Identity::ephemeral());
+    let frank = Arc::new(Identity::ephemeral());
 
-    // ---- Scenario 1: CLOSED network — only authorities may admit --------
+    // ---- Scenario 1: CLOSED network — only canonical authority may admit.
     let alice_id = Arc::new(Identity::ephemeral());
-    let (alice, _alice_driver) = spawn_network(
-        fresh_network("alice", "closed-roster-guard"),
+    let (alice, alice_driver) = create_network_in_instance_root(
+        fresh_network("alice", "closed-roster-guard", NetworkKind::Closed),
         alice_id.clone(),
         transport.clone(),
+        closed_root.path().to_path_buf(),
+        [0x71; 32],
     )
     .await
-    .expect("spawn alice (closed)");
-
-    // Seed the ordinary roster while the fixture is still Open. Production
-    // correctly refuses manufacturing unknown Closed members through this API;
-    // moving these fixture approvals earlier keeps that policy intact.
-    alice
-        .approve_roster(bob.public_id(), "bob")
-        .await
-        .expect("seed bob while open");
-    alice
-        .approve_roster(carol.public_id(), "carol")
-        .await
-        .expect("seed carol while open");
-    assert!(
-        rostered(&alice, bob.public_id()) && rostered(&alice, carol.public_id()),
-        "the unsigned Open roster seeds are genuinely present before the Closed authority gate"
+    .expect("create explicit Closed root");
+    assert!(matches!(
+        alice.verified_policy(),
+        VerifiedProjectPolicy::Closed(policy)
+            if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
+    ));
+    assert_eq!(
+        alice.verified_bootstrap().context().scope,
+        "closed-roster-guard"
+    );
+    assert_eq!(
+        alice
+            .governance_state
+            .read()
+            .roles
+            .get(alice_id.public_id()),
+        Some(&Role::Owner),
+        "the explicit Closed creator is the canonical root owner"
     );
 
-    // Stand the network up as `closed` with Bob=Member, Carol=Controller.
-    // (In production this state is reached via the signed open→closed
-    // transition + role grants; here we set it directly to isolate the
-    // gate under test.)
+    let bob_fact = governance::propose(
+        &alice,
+        TransitionVariant::RoleGrant {
+            target: bob.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("root signs Bob's canonical Member grant");
+    let carol_fact = governance::propose(
+        &alice,
+        TransitionVariant::RoleGrant {
+            target: carol.public_id().to_string(),
+            role: Role::Controller,
+        },
+        None,
+    )
+    .await
+    .expect("root signs Carol's canonical Controller grant");
+    assert_ne!(
+        bob_fact, carol_fact,
+        "each RoleGrant is a distinct canonical fact"
+    );
     {
-        let mut gov = alice.governance_state.write();
-        gov.kind = NetworkKind::Closed;
-        gov.roles.insert(bob.public_id().to_string(), Role::Member);
-        gov.roles
-            .insert(carol.public_id().to_string(), Role::Controller);
+        let gov = alice.governance_state.read();
+        assert_eq!(gov.roles.get(bob.public_id()), Some(&Role::Member));
+        assert_eq!(gov.roles.get(carol.public_id()), Some(&Role::Controller));
     }
+    assert!(
+        rostered(&alice, bob.public_id()) && rostered(&alice, carol.public_id()),
+        "canonical RoleGrants must project into the compatibility roster"
+    );
 
-    // (a) A MEMBER (Bob) gossips a brand-new id → MUST be refused.
+    // A MEMBER carries a brand-new id — it must be ignored.
     governance::on_roster_entries(
         &alice,
         bob.public_id(),
         vouch(mallory.public_id(), "mallory"),
     )
     .await;
-    assert!(
-        !rostered(&alice, mallory.public_id()),
-        "MOM-01: a Member's gossip conscripted a new member into a closed network"
-    );
+    assert!(!rostered(&alice, mallory.public_id()));
 
-    // (b) An UNKNOWN sender (role defaults to Member) gossips → MUST be refused.
+    // An unknown sender carries another new id — it must be ignored.
+    governance::on_roster_entries(&alice, mallory.public_id(), vouch(dave.public_id(), "dave"))
+        .await;
+    assert!(!rostered(&alice, dave.public_id()));
+
+    // A CONTROLLER's unsigned carrier is not a membership fact.
+    governance::on_roster_entries(&alice, carol.public_id(), vouch(eve.public_id(), "eve")).await;
+    assert!(!rostered(&alice, eve.public_id()));
+
+    // Neither is the verified root's unsigned carrier.
     governance::on_roster_entries(
         &alice,
-        mallory.public_id(),
+        alice_id.public_id(),
+        vouch(frank.public_id(), "frank"),
+    )
+    .await;
+    assert!(!rostered(&alice, frank.public_id()));
+
+    // ---- Scenario 2: OPEN is founderless, but carriers stay inert --------
+    let alice2_id = Arc::new(Identity::ephemeral());
+    let (alice2, alice2_driver) = spawn_network_in_instance_root(
+        fresh_network("alice-open", "open-roster-guard", NetworkKind::Open),
+        alice2_id.clone(),
+        transport,
+        open_root.path().to_path_buf(),
+    )
+    .await
+    .expect("spawn founderless Open network");
+    assert!(matches!(
+        alice2.verified_policy(),
+        VerifiedProjectPolicy::Open
+    ));
+    assert!(alice2.verified_authority_root().is_none());
+    alice2
+        .approve_roster(eve.public_id(), "eve")
+        .await
+        .expect("Open local roster approval remains permissionless");
+    assert!(rostered(&alice2, eve.public_id()));
+
+    governance::on_roster_entries(
+        &alice2,
+        alice2_id.public_id(),
         vouch(mallory.public_id(), "mallory"),
     )
     .await;
     assert!(
-        !rostered(&alice, mallory.public_id()),
-        "MOM-01: an unrostered stranger's gossip added a member to a closed network"
+        !rostered(&alice2, mallory.public_id()),
+        "unsigned roster carriers must not mutate a founderless Open roster"
     );
 
-    // (c) Even a CONTROLLER's *unsigned* gossip is now ignored on a closed
-    //     network. Membership is owner-**signed**: it rides the signed
-    //     transition log (a ratified RoleGrant), never the unsigned roster-entry
-    //     gossip. Authority over the *messenger* is no longer authority over the
-    //     *data* — the strong form of MOM-01. A Controller admits members by
-    //     authoring a ratified RoleGrant (the signed path is exercised in
-    //     `closed_network_governance.rs`).
-    governance::on_roster_entries(&alice, carol.public_id(), vouch(dave.public_id(), "dave")).await;
-    assert!(
-        !rostered(&alice, dave.public_id()),
-        "closed-network membership must be owner-signed: even a Controller's \
-         unsigned roster gossip must not admit a member"
-    );
-
-    // ---- Scenario 2: OPEN network stays permissionless ------------------
-    let alice2_id = Arc::new(Identity::ephemeral());
-    let (alice2, _alice2_driver) = spawn_network(
-        fresh_network("alice-open", "open-roster-guard"),
-        alice2_id.clone(),
-        transport.clone(),
-    )
-    .await
-    .expect("spawn alice (open)");
-
-    // Default kind is `open`. A plain Member (Bob) vouching for Eve is
-    // accepted — the documented open-network membership model, unchanged.
-    governance::on_roster_entries(&alice2, bob.public_id(), vouch(eve.public_id(), "eve")).await;
-    assert!(
-        rostered(&alice2, eve.public_id()),
-        "open-network roster gossip must remain permissionless (member-vouching)"
-    );
+    alice.request_shutdown();
+    alice2.request_shutdown();
+    let _ = alice_driver.await;
+    let _ = alice2_driver.await;
 }
+
 mod support;

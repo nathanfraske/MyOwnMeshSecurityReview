@@ -68,20 +68,20 @@
 //! "Not a durable exchange" is not an error — it is the ordinary case, and the
 //! frame comes back whole for the engine to dispatch. A `Result` would have said
 //! the opposite, and it would also have put a `MeshMessage` in an `Err`, which is
-//! large: every non-durable live frame would pay for the widest variant on its
-//! way past. Boxing it would have traded that for an allocation on every such
-//! frame, which is worse — this classifier sits in front of the entire inbound
-//! path. [`SemanticAdmission`] is two named outcomes, moves the frame, and
-//! allocates nothing.
+//! large: boxing the non-durable frame keeps the enum layout bounded by the
+//! durable exchange arm while the classifier still moves that frame exactly
+//! once.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tracing::trace;
 
 use crate::protocol::{
-    MeshMessage, NetworkStateAckMessage, NetworkStateBroadcast, NetworkStateProposeMessage,
-    NetworkStateSplitMessage, RosterEntriesMessage, RosterRequestMessage, RosterSummaryMessage,
+    FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
+    RosterRequestMessage, RosterSummaryMessage,
 };
+use crate::semantic::{Admission, SignedFact};
 
 use super::governance;
 use super::peer_registry::LogicalSessionOperation;
@@ -124,22 +124,17 @@ enum Exchange {
     /// Verified by [`super::governance`] against the embedded signature over a
     /// canonical payload that names this network and the state signing domain.
     /// Nothing about the delivery is consulted.
-    SignedFact(SignedFact),
+    SignedFact(Box<SignedFact>),
     /// A bundle of facts: the signed governance and member transition logs.
     ///
     /// Self-authenticating the same way, in bulk — `verify_log` and
     /// `verify_member_log` walk it from genesis, and a fork or a bad signature
     /// rejects the whole bundle rather than part of it.
     ///
-    /// **One honest impurity, named rather than hidden.** The same message also
-    /// carries an unsigned `entries` list. On a closed network it is not a trust
-    /// input at all and is ignored. On an open or silent network — where
-    /// membership is permissionless by design and no per-entry signature exists
-    /// on the wire to verify — it is merged additively as a hint: never stored
-    /// as a fact, never compacted, and unable to rewrite an entry this node
-    /// already holds or its own. Giving it a signature is a wire and product
-    /// change, and inventing one here would have been the dishonest option.
-    FactBundle(RosterEntriesMessage),
+    /// The unsigned `entries` list is carrier material only, not an
+    /// authority-bearing membership fact. Signed governance/member logs are
+    /// the canonical state source; inventories and requests remain exchanges.
+    FactBundle(FactBundleMessage),
     /// A summary of what the sender has, so the two sides can find a difference.
     ///
     /// Counts and digests. Nothing here is stored or projected; its whole use is
@@ -155,28 +150,24 @@ enum Exchange {
     DependencyRequest(DependencyRequest),
 }
 
-/// A single self-authenticating fact.
-enum SignedFact {
-    /// A proposed transition, awaiting acknowledgement.
-    Propose(NetworkStateProposeMessage),
-    /// An acknowledgement of one.
-    Ack(NetworkStateAckMessage),
-    /// A divergence report between two views of the log.
-    Split(NetworkStateSplitMessage),
-}
-
 /// A summary of the sender's state, for comparison.
 enum Inventory {
     /// The sender's view of governance: kind, counts, membership root.
     NetworkState(NetworkStateBroadcast),
     /// A digest of the sender's roster.
     Roster(RosterSummaryMessage),
+    /// Exact-context FactIds known by the sender. This is coordination only;
+    /// it carries no signed body and therefore cannot authorize anything.
+    Facts(FactInventory),
 }
 
 /// A request for rows the sender is missing.
 enum DependencyRequest {
     /// The full roster and the signed logs behind it.
     Roster(RosterRequestMessage),
+    /// Exact-context FactIds whose signed bodies the sender requests. The
+    /// response is a FactBundle; this request cannot install a fact.
+    Facts(FactRequest),
 }
 
 /// What one decoded frame turned out to be.
@@ -187,7 +178,7 @@ pub(crate) enum SemanticAdmission {
     /// A durable semantic exchange, for [`reduce`].
     Durable(DurableSemanticExchange),
     /// Not this module's, handed back whole and unmodified.
-    NotDurable(MeshMessage),
+    NotDurable(Box<MeshMessage>),
 }
 
 /// Admit a decoded frame as a durable semantic exchange, or hand it straight
@@ -199,13 +190,16 @@ pub(crate) enum SemanticAdmission {
 /// classes, classified into the right one rather than into a single bucket.
 pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
     let exchange = match message {
-        MeshMessage::NetworkStatePropose(m) => Exchange::SignedFact(SignedFact::Propose(m)),
-        MeshMessage::NetworkStateAck(m) => Exchange::SignedFact(SignedFact::Ack(m)),
-        MeshMessage::NetworkStateSplit(m) => Exchange::SignedFact(SignedFact::Split(m)),
-        MeshMessage::RosterEntries(m) => Exchange::FactBundle(m),
+        MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
+        MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
+        other @ MeshMessage::RosterEntries(_) => {
+            return SemanticAdmission::NotDurable(Box::new(other));
+        }
         MeshMessage::NetworkState(m) => Exchange::Inventory(Inventory::NetworkState(m)),
         MeshMessage::RosterSummary(m) => Exchange::Inventory(Inventory::Roster(m)),
+        MeshMessage::FactInventory(m) => Exchange::Inventory(Inventory::Facts(m)),
         MeshMessage::RosterRequest(m) => Exchange::DependencyRequest(DependencyRequest::Roster(m)),
+        MeshMessage::FactRequest(m) => Exchange::DependencyRequest(DependencyRequest::Facts(m)),
         other @ (MeshMessage::Ping(_)
         | MeshMessage::Pong(_)
         | MeshMessage::Hello(_)
@@ -222,7 +216,9 @@ pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
         | MeshMessage::RpcStreamEnd(_)
         | MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
-        | MeshMessage::ChannelAck { .. }) => return SemanticAdmission::NotDurable(other),
+        | MeshMessage::ChannelAck { .. }) => {
+            return SemanticAdmission::NotDurable(Box::new(other));
+        }
     };
     SemanticAdmission::Durable(DurableSemanticExchange { exchange })
 }
@@ -238,13 +234,13 @@ impl DurableSemanticExchange {
     /// content.
     pub(crate) fn kind_name(&self) -> &'static str {
         match self.exchange {
-            Exchange::SignedFact(SignedFact::Propose(_)) => "propose",
-            Exchange::SignedFact(SignedFact::Ack(_)) => "ack",
-            Exchange::SignedFact(SignedFact::Split(_)) => "split",
+            Exchange::SignedFact(_) => "signed_fact",
             Exchange::FactBundle(_) => "fact_bundle",
             Exchange::Inventory(Inventory::NetworkState(_)) => "state_inventory",
             Exchange::Inventory(Inventory::Roster(_)) => "roster_inventory",
+            Exchange::Inventory(Inventory::Facts(_)) => "fact_inventory",
             Exchange::DependencyRequest(DependencyRequest::Roster(_)) => "roster_request",
+            Exchange::DependencyRequest(DependencyRequest::Facts(_)) => "fact_request",
         }
     }
 }
@@ -293,18 +289,15 @@ pub(super) async fn reduce(
         // Signed facts. No route, by construction — these three arms cannot
         // name `reply`, so the compiler is what keeps a courier out of the
         // decision.
-        Exchange::SignedFact(SignedFact::Propose(m)) => governance::on_propose(state, m).await,
-        Exchange::SignedFact(SignedFact::Ack(m)) => governance::on_ack(state, m).await,
-        Exchange::SignedFact(SignedFact::Split(m)) => governance::on_split(state, m).await,
+        Exchange::SignedFact(m) => reduce_signed_fact(state, *m).await,
         // The bundle does see a device id off the route — as a label for the
         // trace and the log, scoped to this session, and never as a reason to
         // accept or reject anything. `on_roster_entries` verifies the logs from
         // genesis; `source` does not appear in that decision.
         Exchange::FactBundle(m) => {
-            let source = reply
-                .map(|route| route.owner().device_id())
-                .unwrap_or(NO_SESSION);
-            governance::on_roster_entries(state, source, m).await
+            for fact in m.facts {
+                reduce_signed_fact(state, fact).await;
+            }
         }
         // Comparisons and questions. These are the ones with somebody to answer.
         Exchange::Inventory(inventory) => {
@@ -318,14 +311,76 @@ pub(super) async fn reduce(
             match inventory {
                 Inventory::NetworkState(m) => governance::on_state_broadcast(state, route, m).await,
                 Inventory::Roster(m) => governance::on_roster_summary(state, route, m).await,
+                Inventory::Facts(m) => {
+                    if m.context_id() != state.mesh_context_id() {
+                        trace!(kind, "discarding fact inventory for a foreign mesh context");
+                        return;
+                    }
+                    governance::on_fact_inventory(state, route, m).await;
+                }
             }
         }
-        Exchange::DependencyRequest(DependencyRequest::Roster(m)) => {
+        Exchange::DependencyRequest(request) => {
             let Some(route) = reply else {
                 trace!(kind, "request with no route back; nothing to answer");
                 return;
             };
-            governance::on_roster_request(state, route, m).await
+            match request {
+                DependencyRequest::Roster(m) => {
+                    governance::on_roster_request(state, route, m).await
+                }
+                DependencyRequest::Facts(m) => {
+                    if m.context_id() != state.mesh_context_id() {
+                        trace!(kind, "discarding fact request for a foreign mesh context");
+                        return;
+                    }
+                    governance::on_fact_request(state, route, m).await;
+                }
+            }
+        }
+    }
+}
+
+/// Admit a fact and, when it supplies a missing parent, move every fact that
+/// becomes ready out of quarantine in the same graph write section. The graph
+/// lock is released before any semantic reducer runs; `AlreadyPresent` never
+/// returns a fact to reduce, so replaying a wire frame cannot apply it twice.
+fn admit_with_quarantine_retry(
+    state: &Arc<NetworkState>,
+    fact: SignedFact,
+) -> Result<(Admission, Vec<SignedFact>), crate::semantic::SemanticError> {
+    let graph = state.authoritative_fact_graph();
+    let mut graph = graph.write();
+    let before: BTreeSet<_> = graph.ids().cloned().collect();
+    let fact_id = fact.id;
+    let admission = graph.admit(fact)?;
+    if !matches!(admission, Admission::Inserted) {
+        return Ok((admission, Vec::new()));
+    }
+
+    // A malformed quarantined fact must not prevent the successfully inserted
+    // parent (or any earlier successful retries) from being reduced. The
+    // post-attempt graph diff still captures every fact that did get inserted
+    // before such an error was returned.
+    let _ = graph.retry_quarantined();
+    let mut newly_inserted: Vec<_> = graph
+        .ids()
+        .filter(|id| !before.contains(*id))
+        .filter_map(|id| graph.get(id).cloned())
+        .collect();
+    if let Some(parent) = newly_inserted
+        .iter()
+        .position(|inserted| inserted.id == fact_id)
+    {
+        newly_inserted.swap(0, parent);
+    }
+    Ok((admission, newly_inserted))
+}
+
+async fn reduce_signed_fact(state: &Arc<NetworkState>, fact: SignedFact) {
+    if let Ok((Admission::Inserted, newly_inserted)) = admit_with_quarantine_retry(state, fact) {
+        for fact in newly_inserted {
+            governance::on_fact(state, fact).await;
         }
     }
 }
@@ -364,52 +419,20 @@ mod tests {
     fn the_durable_set_is_classified_by_what_authenticates_each_message() {
         let expected = [
             (
-                "signed_fact",
-                MeshMessage::NetworkStatePropose(NetworkStateProposeMessage {
-                    proposal_id: String::new(),
-                    variant: crate::network_state::TransitionVariant::KindChange {
-                        to: crate::network_state::NetworkKind::Closed,
-                    },
-                    proposer: String::new(),
-                    created_at: 0,
-                    signature: String::new(),
-                }),
-            ),
-            (
-                "signed_fact",
-                MeshMessage::NetworkStateAck(NetworkStateAckMessage {
-                    proposal_id: String::new(),
-                    signer: String::new(),
-                    decision: crate::protocol::AckDecision::Sign,
-                    at: 0,
-                    signature: String::new(),
-                }),
-            ),
-            (
-                "signed_fact",
-                MeshMessage::NetworkStateSplit(NetworkStateSplitMessage {
-                    parent_proposal_id: String::new(),
-                    new_network_id: String::new(),
-                    members: Vec::new(),
-                    proposer: String::new(),
-                    at: 0,
-                    signature: String::new(),
-                }),
-            ),
-            (
                 "fact_bundle",
-                MeshMessage::RosterEntries(RosterEntriesMessage {
+                MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() }),
+            ),
+            (
+                "not_durable",
+                MeshMessage::RosterEntries(crate::protocol::RosterEntriesMessage {
                     entries: Vec::new(),
-                    transitions: Vec::new(),
-                    member_log: Vec::new(),
                 }),
             ),
             (
                 "inventory",
                 MeshMessage::NetworkState(NetworkStateBroadcast {
                     kind: crate::network_state::NetworkKind::Closed,
-                    transitions_count: 0,
-                    member_log_count: 0,
+                    fact_heads_count: 0,
                     roster_root: String::new(),
                 }),
             ),
@@ -439,7 +462,10 @@ mod tests {
         // exchange, and both must come back untouched for the engine's own match.
         assert_eq!(
             class(MeshMessage::SessionControl(
-                crate::protocol::SessionControl::Depart
+                crate::protocol::SessionControl::Depart {
+                    correlation: crate::protocol::DepartureCorrelation::new("test-departure")
+                        .expect("test departure correlation is bounded"),
+                }
             )),
             "not_durable",
             "a session-lifecycle control is the Peer Session owner's, not the \

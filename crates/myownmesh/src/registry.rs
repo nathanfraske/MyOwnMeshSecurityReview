@@ -1427,6 +1427,20 @@ impl NetworkRegistry {
         }
     }
 
+    /// Supervise authenticated departures alongside registry teardown.
+    ///
+    /// A departure waits for an authenticated observation, so awaiting all
+    /// departures before requesting shutdown can deadlock on a silent peer.
+    /// Starting both futures preserves the carrier hint path while letting the
+    /// existing shutdown lifecycle cancel the departure waiter. No timeout,
+    /// grace period, retry, or alternate acknowledgement mechanism is added.
+    pub async fn shutdown_all_with_departures(&self) -> Vec<Result<(), String>> {
+        let departures = self.announce_all_departures();
+        let shutdown = self.shutdown_all();
+        let (_, outcomes) = tokio::join!(departures, shutdown);
+        outcomes
+    }
+
     /// Tear down every distinct network, in the same order and through the same
     /// path as a single removal.
     ///

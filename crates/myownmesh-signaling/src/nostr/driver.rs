@@ -20,14 +20,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
+use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
 
+use super::delivery::{
+    DeliveryProvider, DeliveryStore, DeliveryTerminal, RelaySessionId, UnmeteredDeliveryProvider,
+};
 use super::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
 };
@@ -35,45 +38,8 @@ use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
 use crate::{
-    CarrierAttribution, ErasedOwner, ErasedSource, InboundSink, OutboundSource, OwnedSignal,
-    SignalingMessage,
+    CarrierAttribution, ErasedOwner, ErasedSource, InboundSink, OutboundSource, SignalingMessage,
 };
-
-/// One event on the publish bus, and what pays for it.
-///
-/// # Why this is two cases and not one
-///
-/// Nearly everything published here was derived from a value the engine
-/// admitted: the driver serialized it, wrapped it in an `Arc`, fanned that to
-/// every relay task and possibly kept it in the replay buffer. Each of those is
-/// an allocation the producer paid for, and the [`OwnedSignal`] is what keeps
-/// the payer alive for as long as any of them exist. The `Arc` is the mechanism:
-/// every clone shares one owner, dropping clones one at a time releases nothing,
-/// and the last one out — the final relay subscriber, a replay eviction, a stale
-/// drain — is what returns the funding.
-///
-/// The periodic presence beacon is genuinely different. The driver mints it on
-/// its own timer; nothing external asked for it and nothing external is paying
-/// for it, so there is no owner to carry and pretending otherwise would be a
-/// fiction in the type. Saying so in a second variant is the honest option, and
-/// it keeps the announce off the replay path by construction.
-enum Published {
-    /// Derived from an engine value; carries the owner that admitted it.
-    FromEngine(OwnedSignal<NostrEvent, ErasedOwner>),
-    /// The driver's own presence beacon. No external owner exists.
-    Announce(NostrEvent),
-}
-
-impl Published {
-    /// The event to serialize onto a socket. Borrow only — a relay task never
-    /// takes the event out from under its owner.
-    fn event(&self) -> &NostrEvent {
-        match self {
-            Self::FromEngine(owned) => owned.value(),
-            Self::Announce(event) => event,
-        }
-    }
-}
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -160,6 +126,25 @@ where
     S: OutboundSource<NostrOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
 {
+    start_with_delivery_provider(
+        config,
+        outbound,
+        inbound_tx,
+        Arc::new(UnmeteredDeliveryProvider),
+    )
+}
+
+/// Start with the provider that funds each exact relay-session delivery.
+pub fn start_with_delivery_provider<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound_tx: InboundSink<NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+) -> NostrDriverHandle
+where
+    S: OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
     let identity = NostrIdentity::generate();
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
     info!(
@@ -201,9 +186,8 @@ where
         Vec::new()
     };
 
-    // Fan-out channel for outbound events. Capacity is generous
-    // so a slow relay can't backpressure the publish side.
-    let (publish_tx, _) = broadcast::channel::<Arc<Published>>(64);
+    let delivery = DeliveryStore::new(provider);
+    let (presence_tx, _) = watch::channel::<Option<Arc<NostrEvent>>>(None);
     // Force-reconnect signal. A bumped generation tells every relay
     // task to drop its current socket and redial *now*, skipping the
     // backoff wait — see `run_relay` / `run_relay_session`. The engine
@@ -224,16 +208,14 @@ where
         device_id: config.device_id.clone(),
         relays: Mutex::new(Vec::new()),
         // Erased once, here, at the only place that knows the producer's owner
-        // type. Everything downstream — the shared state, the publish bus, the
-        // replay buffer — stays concrete, and the owner still travels with the
-        // value it funded because erasure consumes the pair rather than
-        // splitting it.
+        // type. Everything downstream stays concrete, and the owner remains
+        // paired with the value it funded.
         outbound: tokio::sync::Mutex::new(Some(Box::new(ErasedSource::new(outbound))
             as Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>)),
-        publish_tx,
+        delivery: delivery.clone(),
+        presence_tx,
         force_reconnect: force_reconnect.clone(),
         relay_connected: relay_connected.clone(),
-        outbound_replay: Mutex::new(std::collections::VecDeque::new()),
     });
     {
         let mut relays = shared.relays.lock();
@@ -291,11 +273,11 @@ where
     let cancel_token_for_task = cancel_token.clone();
     cancellers.push(cancel_token);
     tokio::spawn(async move {
-        run_outbound_pump(shared_for_outbound, cancel_token_for_task).await;
+        run_outbound_pump_v2(shared_for_outbound, cancel_token_for_task).await;
     });
 
     // Spawn the global announce task. Single ticker per driver
-    // instance (NOT per relay) — fans out via `publish_tx`. See
+    // instance (NOT per relay) — updates the driver-owned presence watch.
     // `upstream.rs` item 7 for the schedule rationale and the
     // earlier "N-relay = N-publish" bug it fixes.
     let shared_for_announce = shared.clone();
@@ -310,6 +292,7 @@ where
         cancellers,
         force_reconnect,
         relay_connected,
+        delivery,
     }
 }
 
@@ -319,10 +302,17 @@ pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
     force_reconnect: Arc<watch::Sender<u64>>,
     relay_connected: Arc<watch::Sender<u64>>,
+    delivery: Arc<DeliveryStore>,
 }
 
 impl NostrDriverHandle {
+    /// Finish all live emissions carrying one existing attempt correlation.
+    pub fn finish_attempt(&self, attempt: &str, terminal: DeliveryTerminal) -> usize {
+        self.delivery.finish_attempt(attempt, terminal)
+    }
+
     pub fn stop(self) {
+        self.delivery.shutdown();
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -348,6 +338,7 @@ impl NostrDriverHandle {
 
 impl Drop for NostrDriverHandle {
     fn drop(&mut self) {
+        self.delivery.shutdown();
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -361,7 +352,8 @@ struct DriverShared {
     relays: Mutex<Vec<RelayHandle>>,
     outbound:
         tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>>>,
-    publish_tx: broadcast::Sender<Arc<Published>>,
+    delivery: Arc<DeliveryStore>,
+    presence_tx: watch::Sender<Option<Arc<NostrEvent>>>,
     /// Generation counter for forced reconnects. Bumping it wakes
     /// every relay task's `watch::Receiver` so it drops its socket
     /// and redials without waiting out the backoff. See the comment
@@ -374,22 +366,13 @@ struct DriverShared {
     /// offers/candidates would reach nobody (the "0 remote candidates
     /// arrived" stall). See `engine::network_watch::on_network_change`.
     relay_connected: Arc<watch::Sender<u64>>,
-    /// Outbound *directed* events (offers / answers / candidates) buffered
-    /// while every relay socket was mid-reconnect, when `publish_tx` has no
-    /// subscribers and a plain send would be dropped. This is the
-    /// network-change race: the engine fires its ICE-restart offers the
-    /// same instant the relay redials (both triggered by the IP change),
-    /// so without buffering the restart offers vanish into the ~1 s
-    /// reconnect window — the peer never hears them and the Offerer side
-    /// never recovers (observed directly in the field). The next relay to
-    /// (re)connect drains and replays these; see `run_outbound_pump` and
-    /// the relay session's subscribe path. Bounded ([`OUTBOUND_REPLAY_CAP`])
-    /// and TTL'd ([`OUTBOUND_REPLAY_TTL_MS`]) so a long outage can't grow it
-    /// unboundedly or replay an offer the negotiation has moved past.
-    /// Every entry holds its [`Published`], so a buffered directed event keeps
-    /// its owner alive for exactly as long as it is replayable. Eviction at the
-    /// cap and the stale drain are both release points.
-    outbound_replay: Mutex<std::collections::VecDeque<(std::time::Instant, Arc<Published>)>>,
+    // Outbound *directed* events (offers / answers / candidates) removed;
+    // while every relay socket was mid-reconnect; DeliveryStore owns live attempts.
+    // A reconnecting session registers fresh per-relay custody entries.
+    // DeliveryStore retains them for the next live relay session.
+    // DeliveryStore owns live directed attempts and registers fresh custody
+    // entries for each reconnecting relay session. The source owner remains in
+    // the exact attempt record until its terminal outcome.
 }
 
 /// The NIP-01 filter set for our room subscription:
@@ -530,9 +513,28 @@ async fn run_relay(
                 if let Some(c) = &live {
                     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
-                let outcome =
-                    run_relay_session(&url, stream, &shared, &inbound_tx, &cancel, &mut force_rx)
-                        .await;
+                let (session, refused) = shared.delivery.open_session();
+                for (event_id, error) in refused {
+                    warn!(
+                        relay = %short(&url),
+                        %event_id,
+                        ?error,
+                        "relay-session delivery refused by provider"
+                    );
+                }
+                let outcome = run_relay_session(
+                    &url,
+                    stream,
+                    &shared,
+                    &inbound_tx,
+                    &cancel,
+                    &mut force_rx,
+                    &session,
+                )
+                .await;
+                shared
+                    .delivery
+                    .close_session(session, DeliveryTerminal::Cancelled);
                 if let Some(c) = &live {
                     c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -709,6 +711,35 @@ enum RelaySessionOutcome {
 /// promptly rather than waiting on its own connection timeout.
 const RELAY_CANCEL_POLL_MS: u64 = 250;
 
+async fn send_pending_deliveries<S>(
+    url: &str,
+    write: &mut S,
+    delivery: &Arc<DeliveryStore>,
+    session: &RelaySessionId,
+) -> Result<(), String>
+where
+    S: Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    for event_id in delivery.pending(session) {
+        let Some(frame) = delivery.with_event(&event_id, |event| {
+            serde_json::json!(["EVENT", event]).to_string()
+        }) else {
+            continue;
+        };
+        if let Err(error) = write.send(WsMessage::Text(frame)).await {
+            delivery.settle(
+                session,
+                &event_id,
+                DeliveryTerminal::TypedRefused(format!("local write: {error}")),
+            );
+            return Err(format!("send publish: {error}"));
+        }
+    }
+    let _ = url;
+    Ok(())
+}
+
 async fn run_relay_session(
     url: &str,
     stream: tokio_tungstenite::WebSocketStream<
@@ -718,6 +749,7 @@ async fn run_relay_session(
     inbound_tx: &InboundSink<NostrInbound>,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     force_rx: &mut watch::Receiver<u64>,
+    session: &RelaySessionId,
 ) -> RelaySessionOutcome {
     let (mut write, mut read) = stream.split();
 
@@ -738,36 +770,19 @@ async fn run_relay_session(
         return RelaySessionOutcome::Error(format!("send REQ: {e}"));
     }
 
-    // Subscribe to the broadcast so outbound events fan to this socket.
+    // Subscribe to the driver-owned presence watch for this socket.
     // Announce ticking lives in `run_announcer` — one shared task
     // per driver instance, not one per relay — so the per-cycle
     // publish rate doesn't scale with relay count.
-    let mut publish_rx = shared.publish_tx.subscribe();
+    let mut presence_rx = shared.presence_tx.subscribe();
+    if let Err(error) = send_pending_deliveries(url, &mut write, &shared.delivery, session).await {
+        return RelaySessionOutcome::Error(error);
+    }
 
     // Replay any directed events buffered while every relay was
     // mid-reconnect (the network-change race — see
-    // `DriverShared::outbound_replay`). Now that this socket is subscribed,
-    // re-publish them so they fan out to every connected relay and reach
-    // the peer; draining means only the first relay back replays. This is
-    // what lets the Offerer side's ICE-restart offers survive the relay
-    // redial instead of being dropped.
-    {
-        let fresh = {
-            let mut buf = shared.outbound_replay.lock();
-            drain_fresh_outbound(&mut buf, std::time::Instant::now())
-        };
-        if !fresh.is_empty() {
-            debug!(
-                relay = %short(url),
-                count = fresh.len(),
-                "replaying buffered outbound events after relay reconnect"
-            );
-            for event in fresh {
-                let _ = shared.publish_tx.send(event);
-            }
-        }
-    }
-
+    // Live negotiation entries are registered by DeliveryStore for this
+    // fresh session and are drained below after provider admission.
     // One-shot "hello, I'm on this relay" publish so a freshly
     // (re)connected relay immediately learns we're here, rather
     // than waiting up to ANNOUNCE_STEADY_MS for the next global
@@ -803,23 +818,26 @@ async fn run_relay_session(
                     Ok(_) => continue,
                     Err(e) => return RelaySessionOutcome::Error(format!("ws read: {e}")),
                 };
-                if let Err(e) = handle_inbound_frame(url, &frame, shared, inbound_tx) {
+                if let Err(e) = handle_inbound_frame(url, &frame, shared, inbound_tx, session.clone()) {
                     trace!(relay = %short(url), "inbound frame parse: {e}");
                 }
             }
-            publish = publish_rx.recv() => {
-                match publish {
-                    Ok(event) => {
-                        let frame = serde_json::json!(["EVENT", event.event()]).to_string();
-                        if let Err(e) = write.send(WsMessage::Text(frame)).await {
-                            return RelaySessionOutcome::Error(format!("send publish: {e}"));
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        return RelaySessionOutcome::Cancelled;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(relay = %short(url), "publish bus lagged {n} events");
+            _ = shared.delivery.notification().notified() => {
+                if let Err(error) =
+                    send_pending_deliveries(url, &mut write, &shared.delivery, session).await
+                {
+                    return RelaySessionOutcome::Error(error);
+                }
+            }
+            changed = presence_rx.changed() => {
+                if changed.is_err() {
+                    return RelaySessionOutcome::Cancelled;
+                }
+                let event = presence_rx.borrow().clone();
+                if let Some(event) = event {
+                    let frame = serde_json::json!(["EVENT", event.as_ref()]).to_string();
+                    if let Err(e) = write.send(WsMessage::Text(frame)).await {
+                        return RelaySessionOutcome::Error(format!("send presence: {e}"));
                     }
                 }
             }
@@ -845,7 +863,7 @@ async fn run_relay_session(
 }
 
 /// Global announce ticker. One instance per driver; publishes
-/// presence events via `publish_tx` on the schedule defined by
+/// presence events via the driver-owned watch on the schedule defined by
 /// [`ANNOUNCE_BACKOFF_MS`] / [`ANNOUNCE_STEADY_MS`].
 ///
 /// The first announce fires immediately on driver start (a fresh
@@ -859,12 +877,9 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
             return;
         }
         let event = build_announce_event(&shared);
-        // `publish_tx` is a broadcast — every connected relay's
-        // run_relay loop receives this on its `publish_rx` and
-        // writes it to its own socket. One tick → one publish →
-        // N writes (one per relay), independent of how many
-        // relays are currently connected.
-        let _ = shared.publish_tx.send(Arc::new(Published::Announce(event)));
+        // Each connected relay observes this latest best-effort presence
+        // value independently; negotiation never enters this path.
+        let _ = shared.presence_tx.send(Some(Arc::new(event)));
 
         let base_ms = ANNOUNCE_BACKOFF_MS
             .get(count)
@@ -904,6 +919,7 @@ fn handle_inbound_frame(
     frame: &str,
     shared: &Arc<DriverShared>,
     inbound_tx: &InboundSink<NostrInbound>,
+    session: RelaySessionId,
 ) -> Result<(), String> {
     let value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
     let arr = value.as_array().ok_or_else(|| "not an array".to_string())?;
@@ -1016,6 +1032,28 @@ fn handle_inbound_frame(
                 }
             }
         }
+        "OK" => {
+            let event_id = arr
+                .get(1)
+                .and_then(Value::as_str)
+                .ok_or_else(|| "OK missing event id".to_string())?;
+            let accepted = arr
+                .get(2)
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "OK missing acceptance".to_string())?;
+            let reason = arr
+                .get(3)
+                .and_then(Value::as_str)
+                .unwrap_or("relay refused event");
+            let terminal = if accepted {
+                DeliveryTerminal::Accepted
+            } else {
+                DeliveryTerminal::TypedRefused(reason.to_string())
+            };
+            if !shared.delivery.settle(&session, event_id, terminal) {
+                trace!(relay = %short(url), %event_id, "stale relay OK ignored");
+            }
+        }
         "EOSE" => {
             trace!(relay = %short(url), "EOSE");
         }
@@ -1061,48 +1099,10 @@ fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     )
 }
 
-/// Cap on the outbound replay buffer — see [`DriverShared::outbound_replay`].
-/// A network change produces a handful of offers plus a candidate trickle
-/// per peer; 256 covers a large mesh's burst with headroom while bounding
-/// memory if every relay stays down.
-const OUTBOUND_REPLAY_CAP: usize = 256;
-
-/// Buffered outbound events older than this are stale — the ICE
-/// negotiation they belonged to has moved on — and are dropped rather than
-/// replayed. Comfortably longer than a relay reconnect (sub-second to
-/// ~2 s), shorter than the engine's checking-timeout, so a replay always
-/// lands inside the attempt it was meant for.
-const OUTBOUND_REPLAY_TTL_MS: u64 = 10_000;
-
-/// Push an outbound event onto the replay buffer, evicting the oldest if
-/// it would exceed [`OUTBOUND_REPLAY_CAP`].
-fn push_outbound_replay(
-    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<Published>)>,
-    now: std::time::Instant,
-    event: Arc<Published>,
+async fn run_outbound_pump_v2(
+    shared: Arc<DriverShared>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    buf.push_back((now, event));
-    while buf.len() > OUTBOUND_REPLAY_CAP {
-        buf.pop_front();
-    }
-}
-
-/// Drain the replay buffer, returning the events still within
-/// [`OUTBOUND_REPLAY_TTL_MS`] in order. Stale entries are discarded; the
-/// buffer is emptied either way, so the first relay back replays and the
-/// rest see nothing.
-fn drain_fresh_outbound(
-    buf: &mut std::collections::VecDeque<(std::time::Instant, Arc<Published>)>,
-    now: std::time::Instant,
-) -> Vec<Arc<Published>> {
-    let ttl = Duration::from_millis(OUTBOUND_REPLAY_TTL_MS);
-    buf.drain(..)
-        .filter(|(t, _)| now.duration_since(*t) <= ttl)
-        .map(|(_, e)| e)
-        .collect()
-}
-
-async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut rx_guard = shared.outbound.lock().await;
     let Some(mut rx) = rx_guard.take() else {
         return;
@@ -1110,107 +1110,90 @@ async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::ato
     drop(rx_guard);
     while let Some(outbound) = rx.recv().await {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
+            break;
         }
-        // Presence rides the stored kind; directed negotiation rides
-        // the ephemeral kind so it's never replayed onto a future
-        // session. The kind is chosen by message class, not content —
-        // and it is chosen on a *borrow*, before anything is built.
-        let kind = match outbound.value() {
-            NostrOutbound::Announce => SIGNALING_EVENT_KIND,
-            NostrOutbound::Leave | NostrOutbound::DirectedToPeer { .. } => SIGNALING_EPHEMERAL_KIND,
-        };
-        // The event is created *inside* `map`, so the serialized
-        // `NostrEvent` — and every `Arc` clone of it that the broadcast
-        // bus, the relay subscribers and the replay buffer go on to hold —
-        // is born already carrying the owner that admitted the value it
-        // came from. There is no window in which the encoded form exists
-        // beside its funding rather than inside it.
+        let attempt = outbound_attempt(outbound.value()).map(str::to_owned);
         let shared_for_event = Arc::clone(&shared);
-        let event = Arc::new(Published::FromEngine(outbound.map(move |outbound| {
-            let shared = shared_for_event;
-            match outbound {
-                // Same builder as the ticker and the open-announce — one
-                // announce shape, one place to change it.
-                NostrOutbound::Announce => build_announce_event(&shared),
-                // A departure is a broadcast (no `to`) on the ephemeral kind —
-                // same envelope shape an intelligent signaling server synthesises
-                // on a socket close (see `server::build_leave_event`), so
-                // receivers handle a self-announced leave identically.
-                NostrOutbound::Leave => {
-                    let envelope = SignalingEnvelope {
-                        from: shared.device_id.clone(),
-                        to: None,
-                        msg: SignalingMessage::Leave {
-                            peer_id: shared.device_id.clone(),
-                        },
-                    };
-                    // Broadcast ephemerals are "addressed to the room": the
-                    // `["p", room_handle]` tag is what keeps a departure
-                    // visible to peers whose subscription has narrowed to
-                    // recipient-tagged events only (see `desired_filters`).
-                    make_event(
-                        &shared.identity,
-                        SIGNALING_EPHEMERAL_KIND,
-                        vec![
-                            vec!["r".into(), shared.room_handle.clone()],
-                            vec!["p".into(), shared.room_handle.clone()],
-                        ],
-                        serde_json::to_string(&envelope).expect("serialize ok"),
-                        now_secs(),
-                    )
-                }
-                // Directed negotiation carries its recipient both in the
-                // envelope (`to`, the receive-side check) and as a `["p", …]`
-                // tag — the tag is what lets subscribers ask the relay only for
-                // "directed to me", so pairwise negotiation is never fanned to
-                // the whole room.
-                NostrOutbound::DirectedToPeer { to, msg } => {
-                    let envelope = SignalingEnvelope {
-                        from: shared.device_id.clone(),
-                        to: Some(to.clone()),
-                        msg,
-                    };
-                    make_event(
-                        &shared.identity,
-                        SIGNALING_EPHEMERAL_KIND,
-                        vec![
-                            vec!["r".into(), shared.room_handle.clone()],
-                            vec!["p".into(), to],
-                        ],
-                        serde_json::to_string(&envelope).expect("serialize ok"),
-                        now_secs(),
-                    )
-                }
-            }
-        })));
-        // Fan out to every connected relay session via the
-        // broadcast bus. Sessions that aren't subscribed yet
-        // (still connecting / reconnecting) will pick up the
-        // next event after their subscribe — for the
-        // active-handshake path that's the periodic announce
-        // running on each relay's own timer.
-        if shared.publish_tx.receiver_count() == 0 {
-            // Every relay is mid-reconnect. Buffer directed negotiation
-            // (offers / answers / candidates, on the ephemeral kind) so the
-            // next relay up replays it — without this the network-change
-            // ICE-restart offers are lost to the reconnect window and the
-            // Offerer side never recovers. Announce rides the stored kind
-            // and is self-healing (the periodic tick + each relay's
-            // open-announce re-send it), so buffering it would only add a
-            // redundant publish.
-            if kind == SIGNALING_EPHEMERAL_KIND {
-                let mut buf = shared.outbound_replay.lock();
-                push_outbound_replay(&mut buf, std::time::Instant::now(), event);
-                debug!(
-                    "no relay subscribers ready; buffered directed event for replay on reconnect"
+        let owned =
+            outbound.map(move |outbound| translate_outbound_event(&shared_for_event, outbound));
+        if let Some(attempt) = attempt {
+            let report = shared.delivery.admit(attempt.clone(), owned);
+            if let Some(refusal) = report.attempt_refusal {
+                warn!(
+                    %attempt,
+                    event_id = %report.event_id,
+                    ?refusal,
+                    "negotiation attempt refused before relay admission"
                 );
-            } else {
-                debug!("no relay subscribers ready; announce dropped (re-ticks on reconnect)");
             }
-            continue;
+            for (session, error) in &report.refused {
+                warn!(
+                    ?session,
+                    ?error,
+                    event_id = %report.event_id,
+                    "negotiation delivery refused before frame allocation"
+                );
+            }
+        } else {
+            let _ = shared
+                .presence_tx
+                .send(Some(Arc::new(owned.value().clone())));
         }
-        let _ = shared.publish_tx.send(event);
+    }
+    shared.delivery.shutdown();
+}
+
+fn outbound_attempt(outbound: &NostrOutbound) -> Option<&str> {
+    let NostrOutbound::DirectedToPeer { msg, .. } = outbound else {
+        return None;
+    };
+    match msg {
+        SignalingMessage::Offer { offer_id, .. }
+        | SignalingMessage::Answer { offer_id, .. }
+        | SignalingMessage::Candidate { offer_id, .. } => Some(offer_id),
+        _ => None,
+    }
+}
+
+fn translate_outbound_event(shared: &DriverShared, outbound: NostrOutbound) -> NostrEvent {
+    match outbound {
+        NostrOutbound::Announce => build_announce_event(shared),
+        NostrOutbound::Leave => {
+            let envelope = SignalingEnvelope {
+                from: shared.device_id.clone(),
+                to: None,
+                msg: SignalingMessage::Leave {
+                    peer_id: shared.device_id.clone(),
+                },
+            };
+            make_event(
+                &shared.identity,
+                SIGNALING_EPHEMERAL_KIND,
+                vec![
+                    vec!["r".into(), shared.room_handle.clone()],
+                    vec!["p".into(), shared.room_handle.clone()],
+                ],
+                serde_json::to_string(&envelope).expect("serialize ok"),
+                now_secs(),
+            )
+        }
+        NostrOutbound::DirectedToPeer { to, msg } => {
+            let envelope = SignalingEnvelope {
+                from: shared.device_id.clone(),
+                to: Some(to.clone()),
+                msg,
+            };
+            make_event(
+                &shared.identity,
+                SIGNALING_EPHEMERAL_KIND,
+                vec![
+                    vec!["r".into(), shared.room_handle.clone()],
+                    vec!["p".into(), to],
+                ],
+                serde_json::to_string(&envelope).expect("serialize ok"),
+                now_secs(),
+            )
+        }
     }
 }
 
@@ -1269,118 +1252,8 @@ mod tests {
         assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
     }
 
-    fn test_nostr_event(signer: &NostrIdentity, n: u8) -> NostrEvent {
-        let envelope = SignalingEnvelope {
-            from: "peer".into(),
-            to: Some("self-device".into()),
-            msg: SignalingMessage::Announce {
-                peer_id: format!("p{n}"),
-            },
-        };
-        crate::nostr::event::make_event(
-            signer,
-            SIGNALING_EPHEMERAL_KIND,
-            vec![vec!["r".into(), "test-room".into()]],
-            serde_json::to_string(&envelope).unwrap(),
-            1_700_000_000,
-        )
-    }
-
-    /// A published value with a unit owner — enough for the buffer mechanics,
-    /// which never look inside one.
-    fn test_event(signer: &NostrIdentity, n: u8) -> Arc<Published> {
-        Arc::new(Published::FromEngine(OwnedSignal::new(
-            test_nostr_event(signer, n),
-            Box::new(()) as ErasedOwner,
-        )))
-    }
-
-    /// An owner that records its own release.
-    ///
-    /// The point of the owner type is *when* the funding goes back, and no
-    /// assertion about a type can observe that. This can: it fires exactly once,
-    /// in `Drop`, so a control can distinguish "the buffer let go" from "the last
-    /// copy that could still be written to a socket let go".
-    struct ReleaseFlag(Arc<std::sync::atomic::AtomicBool>);
-
-    impl Drop for ReleaseFlag {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[test]
-    fn the_owner_outlives_every_shared_copy_of_what_it_funded() {
-        use std::collections::VecDeque;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let id = NostrIdentity::generate();
-        let released = Arc::new(AtomicBool::new(false));
-        let event = Arc::new(Published::FromEngine(OwnedSignal::new(
-            test_nostr_event(&id, 9),
-            Box::new(ReleaseFlag(Arc::clone(&released))) as ErasedOwner,
-        )));
-        // One relay subscriber holds its own clone — what `publish_tx` hands
-        // every live session — while the replay buffer holds another.
-        let subscriber = Arc::clone(&event);
-        let base = std::time::Instant::now();
-        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
-        push_outbound_replay(&mut buf, base, event);
-        // Stale, so the drain discards the buffer's copy.
-        let now = base + Duration::from_secs(60);
-        assert!(drain_fresh_outbound(&mut buf, now).is_empty());
-        assert!(
-            !released.load(Ordering::SeqCst),
-            "the buffer let go, but a subscriber can still write this event to a \
-             socket — the funding must not be back yet"
-        );
-        drop(subscriber);
-        assert!(
-            released.load(Ordering::SeqCst),
-            "the last copy is gone, so nothing derived from the admitted value \
-             remains and the owner is released"
-        );
-    }
-
-    #[test]
-    fn outbound_replay_caps_at_limit_evicting_oldest() {
-        use std::collections::VecDeque;
-        let id = NostrIdentity::generate();
-        let now = std::time::Instant::now();
-        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
-        for n in 0..(OUTBOUND_REPLAY_CAP as u32 + 50) {
-            push_outbound_replay(&mut buf, now, test_event(&id, n as u8));
-        }
-        assert_eq!(
-            buf.len(),
-            OUTBOUND_REPLAY_CAP,
-            "buffer must not grow past the cap"
-        );
-    }
-
-    #[test]
-    fn drain_fresh_outbound_keeps_recent_drops_stale_and_empties() {
-        use std::collections::VecDeque;
-        let id = NostrIdentity::generate();
-        // Use Add (not Sub) to build a reference "now" 60 s ahead of the
-        // stale timestamp — avoids any Instant underflow on a freshly
-        // booted host while still putting the first event well past the TTL.
-        let base = std::time::Instant::now();
-        let now = base + Duration::from_secs(60);
-        let mut buf: VecDeque<(std::time::Instant, Arc<Published>)> = VecDeque::new();
-        push_outbound_replay(&mut buf, base, test_event(&id, 1)); // 60 s old → stale
-        push_outbound_replay(&mut buf, now, test_event(&id, 2)); // fresh
-        push_outbound_replay(&mut buf, now, test_event(&id, 3)); // fresh
-        let fresh = drain_fresh_outbound(&mut buf, now);
-        assert_eq!(fresh.len(), 2, "only the two fresh events should replay");
-        assert!(
-            buf.is_empty(),
-            "drain empties the buffer regardless of which entries were stale"
-        );
-    }
-
     fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();
-        let (publish_tx, _) = broadcast::channel::<Arc<Published>>(16);
         let (_out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
         // The standalone shape: an unbounded source has no accountant, so its
         // owner is `()`, and erasing that is what lets the fixture hand the
@@ -1394,10 +1267,10 @@ mod tests {
             device_id: "self-device".into(),
             relays: Mutex::new(Vec::new()),
             outbound: tokio::sync::Mutex::new(Some(out_rx)),
-            publish_tx,
+            delivery: DeliveryStore::new(Arc::new(UnmeteredDeliveryProvider)),
+            presence_tx: watch::channel(None).0,
             force_reconnect: Arc::new(watch::channel(0u64).0),
             relay_connected: Arc::new(watch::channel(0u64).0),
-            outbound_replay: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -1464,9 +1337,30 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
 
-        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
-        handle_inbound_frame("wss://relay-b", &frame, &shared, &tx).expect("dup parses");
-        handle_inbound_frame("wss://relay-c", &frame, &shared, &tx).expect("dup parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame parses");
+        handle_inbound_frame(
+            "wss://relay-b",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("dup parses");
+        handle_inbound_frame(
+            "wss://relay-c",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("dup parses");
 
         for relay in ["a", "b", "c"] {
             match rx.try_recv() {
@@ -1523,8 +1417,22 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
-        handle_inbound_frame("wss://relay-a", &frame1, &shared, &tx).expect("frame 1 parses");
-        handle_inbound_frame("wss://relay-a", &frame2, &shared, &tx).expect("frame 2 parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame1,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame 1 parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame2,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame 2 parses");
 
         assert!(matches!(
             rx.try_recv().expect("first announce"),
@@ -1575,7 +1483,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
 
-        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame parses");
 
         match rx.try_recv().expect("offer delivered") {
             NostrInbound::Message { from, msg } => {
@@ -1599,7 +1514,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
 
-        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame parses");
 
         assert!(
             rx.try_recv().is_err(),
@@ -1633,7 +1555,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
         let tx = InboundSink::from_unbounded(tx);
 
-        handle_inbound_frame("wss://relay-a", &frame, &shared, &tx).expect("frame parses");
+        handle_inbound_frame(
+            "wss://relay-a",
+            &frame,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect("frame parses");
 
         assert!(
             rx.try_recv().is_err(),

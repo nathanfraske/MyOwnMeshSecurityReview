@@ -94,12 +94,15 @@ impl LocalBroker {
         // being visible at the call site is the point.
         let outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
             Box::new(crate::UnboundedSource::new(out_rx));
-        self.join_with_sink(
+        // The convenience API deliberately detaches the broker task: callers
+        // that need lifecycle custody use `join_with_sink` and retain its
+        // returned handle instead.
+        drop(self.join_with_sink(
             room,
             device_id,
             outbound,
             InboundSink::from_unbounded(in_tx),
-        );
+        ));
         (out_tx, in_rx)
     }
 
@@ -120,13 +123,17 @@ impl LocalBroker {
     /// a value is all a sink is for, and the consumers here do exactly that; the
     /// alternative — copying the peer list out and offering afterwards — would
     /// let a peer that left in between be delivered to.
+    ///
+    /// Returns the exact outbound forwarder task. Dropping the handle detaches
+    /// it, which is the behavior of [`Self::join`]; lifecycle owners should
+    /// retain and await it.
     pub fn join_with_sink<O: Send + 'static>(
         &self,
         room: &str,
         device_id: &str,
         mut outbound: Box<dyn OutboundSource<LocalOutbound, Owner = O>>,
         inbound: InboundSink<LocalInbound>,
-    ) {
+    ) -> tokio::task::JoinHandle<()> {
         // Register and announce to existing peers.
         {
             let mut inner = self.inner.lock();
@@ -181,7 +188,7 @@ impl LocalBroker {
                     guard.rooms.remove(&room);
                 }
             }
-        });
+        })
     }
 }
 
@@ -284,7 +291,7 @@ mod tests {
         let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
         let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
             Box::new(crate::UnboundedSource::new(bob_rx));
-        broker.join_with_sink(
+        let _ = broker.join_with_sink(
             "room1",
             "bob",
             bob_outbound,
@@ -313,7 +320,8 @@ mod tests {
         ));
         let alice_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ReleaseFlag>> =
             Box::new(ScriptedSource(script));
-        broker.join_with_sink("room1", "alice", alice_outbound, InboundSink::new(|_| true));
+        let alice_task =
+            broker.join_with_sink("room1", "alice", alice_outbound, InboundSink::new(|_| true));
 
         assert_eq!(
             probe_rx.recv().await,
@@ -327,6 +335,9 @@ mod tests {
             "the broker pulled a second value while still holding the first — \
              that is a queue, and the broker is not supposed to be one"
         );
+        alice_task
+            .await
+            .expect("finite outbound source forwarder joined");
     }
 
     #[tokio::test]

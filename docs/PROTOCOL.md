@@ -26,6 +26,78 @@ it is a compatibility precondition, not optional-frame negotiation.
 Each variant below lists its discriminator and the fields it carries.
 All field names are snake_case.
 
+The governance semantic profile is the hard-alpha V4 cut described below. It
+does not accept v1/v2 fact envelopes or mixed-version fallbacks. The transport
+version shown above remains the closed JSON frame-profile version; the fact
+schema carries its own `version: 4` domain-separated field.
+
+---
+
+## Authenticated session departure
+
+`session_control` is authenticated by, and applies only to, the exact session
+that carries it. It never contains a target Device ID. A deliberate leave is
+one correlated pair:
+
+```jsonc
+{
+  "kind": "session_control",
+  "op": "depart",
+  "correlation": "opaque-local-value"
+}
+```
+
+The receiver sends the matching receipt on that same authenticated session:
+
+```jsonc
+{
+  "kind": "session_control",
+  "op": "depart_observed",
+  "correlation": "opaque-local-value"
+}
+```
+
+`correlation` is non-empty UTF-8 and at most 128 bytes. It is routing metadata
+for this one observation only: it is not a session identity, generation,
+retry/ack token, timer key, or durable authority. Duplicate matching frames
+are idempotent. There is no retry, grace period, or compatibility departure
+shape; ordinary connector closure/lifecycle cancellation resolves a lost
+departure.
+
+---
+
+## Canonical V4 facts
+
+Authority is carried only by signed, content-addressed `fact` frames or their
+`fact_bundle` grouping. A bundle is not authority by itself: each fact must
+verify independently before reduction.
+
+The semantic owner defines the canonical `FactContent` tuple:
+
+```text
+domain = governance | participation | checkpoint | eviction_proof
+mesh_context
+typed FactBody
+author
+sorted causal parent FactIds
+```
+
+The FactId is the semantic owner's 32-byte SHA-256 digest of its explicit
+length-delimited canonical encoding, domain-separated by `myownmesh-semantic-v4`
+and schema 4. The typed `FactBody` encoding includes governance changes,
+participation, checkpoints, eviction proofs, topology, and explicit conflict
+resolution. Parent ordering is canonicalized by the semantic owner. The
+signature covers the exact FactId, and verification recomputes the semantic
+content digest before checking the author's signature. Any change to context,
+author, body, domain, or causal parent set therefore produces a different
+FactId and cannot retain the old signature.
+
+`roster_summary`, `roster_request`, and `roster_entries` remain discovery and
+dependency exchanges. `roster_entries` is unsigned exchange data and is never
+an authoritative fact bundle; membership or role changes must arrive as signed
+V4 facts. There are no unsigned transition/member-log fields in that exchange
+frame. Inventory/request traffic is not silently promoted into authority.
+
 ---
 
 ## Handshake
@@ -35,7 +107,7 @@ First frame on a fresh data channel from each side.
 
 | Field | Type | Notes |
 |---|---|---|
-| `protocol` | u32 | Wire-protocol version. v1 today. |
+| `protocol` | u32 | Current closed wire-profile version; older profiles are not accepted. |
 | `device_id` | string | Bare-pubkey Device ID (base32-lowercase, 52 chars). |
 | `label` | string | Self-reported human label. Cosmetic. |
 | `nonce` | string | Random 32-byte challenge, base32-lowercase. |

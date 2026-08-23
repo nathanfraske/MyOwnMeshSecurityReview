@@ -39,6 +39,10 @@ use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
 };
+use myownmesh_signaling::nostr::delivery::{
+    DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryTerminal,
+    RelaySessionId,
+};
 use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
 };
@@ -155,6 +159,70 @@ enum CoreOutboundOwner {
     },
     /// The broker join announce: no delivery, because the engine never sent it.
     First { _derived: ResourceLease },
+}
+
+/// Provider adapter for Church's attempt-owned Nostr delivery store.
+///
+/// The store owns the admitted `OwnedSignal` and calls this adapter once for
+/// each exact `(attempt, relay-session)` entry.  Admission first measures the
+/// driver's compact `EVENT` envelope without constructing its frame, then
+/// acquires the exact encoded-byte and one-entry structural claims.  The
+/// driver's later frame allocation is therefore covered by the lease that is
+/// settled for this exact relay/session terminal.
+pub(crate) struct CoreNostrDeliveryProvider {
+    scope: LocalApplicationResourceScope,
+}
+
+struct CoreNostrDeliveryLease {
+    _lease: ResourceLease,
+}
+
+impl DeliveryLease for CoreNostrDeliveryLease {
+    fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
+        // Dropping the exact lease is the settlement.  The terminal is
+        // intentionally observational here; attempt/session identity is
+        // enforced by DeliveryStore before it calls this method.
+    }
+}
+
+impl DeliveryProvider for CoreNostrDeliveryProvider {
+    fn reserve(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let encoded_bytes = retention
+            .encoded_event_bytes
+            .checked_add(retention.structural_entry_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or_else(|| DeliveryRefusal::Provider("EVENT retention overflow".to_string()))?;
+        let claim = ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                encoded_bytes,
+            ),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
+        let lease = self
+            .scope
+            .acquire(claim)
+            .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
+        Ok(Box::new(CoreNostrDeliveryLease { _lease: lease }))
+    }
+}
+
+/// Construct the exact provider adapter passed to the Nostr attempt store.
+///
+/// Kept crate-visible so the Nostr driver integration can pass the provider
+/// without giving the signaling crate a core-resource constructor or a global
+/// ledger.
+pub(crate) fn nostr_delivery_provider(
+    scope: LocalApplicationResourceScope,
+) -> Arc<dyn DeliveryProvider> {
+    Arc::new(CoreNostrDeliveryProvider { scope })
 }
 
 /// What one translated outbound value and its downstream copies cost.
@@ -378,12 +446,15 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 },
             }),
         });
-    broker.join_with_sink(
-        &room,
-        &device_id,
-        outbound,
-        carrier_sink(SignalingRuntime::attach(&runtime, SignalingCarrier::Local)),
-    );
+    let _ = state.with_local_signaling_forwarder(|| {
+        let forwarder = broker.join_with_sink(
+            &room,
+            &device_id,
+            outbound,
+            carrier_sink(SignalingRuntime::attach(&runtime, SignalingCarrier::Local)),
+        );
+        ((), forwarder)
+    });
 }
 
 /// The engine's admission, as the thing a driver hands each report to.
@@ -592,6 +663,7 @@ fn attach_nostr_with(
     // benefit.
     let device_id_for_out = device_id.clone();
     let scope = local_scope(state, "nostr")?;
+    let provider = nostr_delivery_provider(scope.clone());
     let outbound: Box<dyn OutboundSource<NostrOutbound, Owner = CoreOutboundOwner>> =
         Box::new(TranslatedOutbound {
             first: None,
@@ -644,7 +716,12 @@ fn attach_nostr_with(
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
     // through this carrier's attach on the shared runtime.
-    let handle = nostr_driver::start(nostr_cfg, outbound, carrier_sink(attach));
+    let handle = nostr_driver::start_with_delivery_provider(
+        nostr_cfg,
+        outbound,
+        carrier_sink(attach),
+        provider,
+    );
     // Hand the engine the force-reconnect signal so resume-from-sleep
     // (and any other recovery path) can make every relay redial at
     // once instead of waiting out a zombie socket. See
@@ -787,6 +864,35 @@ impl SignalingDrivers {
             (None, Some(_)) => "mdns".into(),
             (None, None) => "none".into(),
         }
+    }
+
+    /// Settle every live Nostr relay entry for one exact attempt correlation.
+    ///
+    /// The engine's authoritative attempt owner calls this at completion,
+    /// replacement, or cancellation.  mDNS has no Nostr delivery store, so
+    /// the result is zero when this network has no Nostr driver.  Shutdown is
+    /// owned by [`Drop`] on the exact driver handle and therefore needs no
+    /// second registry or callback here.
+    pub fn finish_attempt(&self, attempt: &str, terminal: DeliveryTerminal) -> usize {
+        self.nostr
+            .as_ref()
+            .map(|handle| handle.finish_attempt(attempt, terminal))
+            .unwrap_or(0)
+    }
+
+    /// Settle a successfully completed attempt on every Nostr relay session.
+    pub fn complete_attempt(&self, attempt: &str) -> usize {
+        self.finish_attempt(attempt, DeliveryTerminal::AttemptCompleted)
+    }
+
+    /// Settle an attempt displaced by an exact replacement.
+    pub fn replace_attempt(&self, attempt: &str) -> usize {
+        self.finish_attempt(attempt, DeliveryTerminal::AttemptReplaced)
+    }
+
+    /// Settle an attempt cancelled by its authoritative owner.
+    pub fn cancel_attempt(&self, attempt: &str) -> usize {
+        self.finish_attempt(attempt, DeliveryTerminal::Cancelled)
     }
 }
 

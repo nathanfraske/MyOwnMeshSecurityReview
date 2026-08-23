@@ -21,12 +21,13 @@
 //! are convenience, not security — the wire is the security
 //! boundary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::semantic::{ClosedProfileId, MeshContextId, VerifiedBootstrap};
 
 /// Domain-separation tag prefixed to every signed state-transition
 /// payload. Distinct from the endpoint-auth transcript domain so a signature
@@ -340,6 +341,12 @@ pub struct NetworkState {
     /// `kind` has); `None` means no topology transition has ever been
     /// ratified and the local config rules.
     pub topology: Option<crate::config::TopologyMode>,
+    /// Instance-owned persistence root. It is deliberately not serialized:
+    /// the wire-level network id remains the sole signed identity, while a
+    /// simulated node may keep its local projection separate from another
+    /// node carrying the same id.
+    #[serde(skip)]
+    persistence_root: Option<PathBuf>,
 }
 
 impl Default for NetworkState {
@@ -360,7 +367,13 @@ impl NetworkState {
             pending: Vec::new(),
             splits: Vec::new(),
             topology: None,
+            persistence_root: None,
         }
+    }
+
+    fn with_persistence_root(mut self, root: Option<&Path>) -> Self {
+        self.persistence_root = root.map(Path::to_path_buf);
+        self
     }
 
     /// Role for a peer in this network. Returns [`Role::Member`]
@@ -764,15 +777,70 @@ pub fn verify_log(network_id: &str, transitions: &[Transition]) -> Result<Networ
     Ok(state)
 }
 
+/// Replay the legacy governance/member-log representation against an exact
+/// semantic Closed bootstrap. The bootstrap supplies the one verified root as
+/// an initial owner in memory; no synthetic `KindChange` is appended or
+/// persisted. This keeps the old projection and idempotent/eviction callers
+/// usable while removing founder self-election from the import path.
+pub(crate) fn verify_seeded_logs(
+    bootstrap: &VerifiedBootstrap,
+    expected_context_id: &MeshContextId,
+    network_id: &str,
+    transitions: &[Transition],
+    member_log: &[Transition],
+) -> Result<NetworkState> {
+    if bootstrap.profile() != Some(ClosedProfileId::SingleRootSignedMemberLogV1) {
+        return Err(Error::Protocol(
+            "seeded legacy logs require the SingleRootSignedMemberLogV1 profile".into(),
+        ));
+    }
+    if bootstrap.context_id() != *expected_context_id {
+        return Err(Error::Protocol(
+            "seeded legacy logs do not match the authenticated bootstrap context".into(),
+        ));
+    }
+    if bootstrap.context().scope != network_id {
+        return Err(Error::Protocol(
+            "seeded legacy logs do not match the bootstrap context scope".into(),
+        ));
+    }
+    let root = bootstrap
+        .authority_roots()
+        .iter()
+        .next()
+        .cloned()
+        .ok_or_else(|| Error::Protocol("Closed bootstrap has no authority root".into()))?;
+
+    let mut state = NetworkState::empty_for(network_id);
+    state.kind = NetworkKind::Closed;
+    state.roles.insert(root, Role::Owner);
+    for transition in transitions.iter().chain(member_log.iter()) {
+        if matches!(transition.variant, TransitionVariant::KindChange { .. }) {
+            return Err(Error::Protocol(
+                "seeded legacy logs cannot contain a synthetic kind transition".into(),
+            ));
+        }
+    }
+    for transition in transitions {
+        verify_transition_signatures(network_id, transition)?;
+        verify_quorum(&state, transition)?;
+        state = apply_transition(state, transition);
+    }
+    state.member_log = member_log.to_vec();
+    Ok(state)
+}
+
 // ---- member tier (multi-writer leaf of the cert chain) --------------
 
 /// Stable, collision-resistant identity for a ratified member-tier entry: its
-/// timestamp, canonical signed variant, and exact signer/signature set. Two
+/// canonical signed variant and exact signer/signature set. The legacy wall
+/// clock field is excluded, so arrival time cannot create a second authority.
+/// Two
 /// byte-identical entries share a key (so a union-merge dedupes them); any
 /// difference yields a distinct key. Used for both dedup and a deterministic
 /// sort tiebreak, so every peer derives the same membership from the same set.
 fn member_entry_key(t: &Transition) -> String {
-    serde_json::to_string(t).unwrap_or_default()
+    serde_json::to_string(&(&t.variant, &t.signers, &t.signatures)).unwrap_or_default()
 }
 
 /// Project the member-tier log against the governance state, returning the set
@@ -781,11 +849,11 @@ fn member_entry_key(t: &Transition) -> String {
 /// The member tier is **multi-writer**: any current owner or manager
 /// (controller) may author an admit (`RoleGrant{Member}`) or a removal
 /// (`RoleRevoke`/`Evict`) of a member, each entry individually signed by its
-/// author. Entries from every author merge by union; for a given device the
-/// latest entry (by `at`, then [`member_entry_key`]) wins, so an admit and a
-/// later removal converge to "removed" regardless of the order two peers
-/// received them — the property a strict-prefix log can't give concurrent
-/// writers.
+/// author. Entries from every author merge by union. Because this legacy log
+/// carries no causal parents, a valid removal dominates every incomparable
+/// member grant for the same device. Re-admission after removal therefore
+/// requires the canonical fact graph's explicit causal resolution rather than
+/// a wall clock, arrival order, or signed-content accident.
 ///
 /// Authority is evaluated against the *current* governance roles: an entry
 /// counts only if at least one of its signers is presently an owner or manager,
@@ -826,9 +894,9 @@ pub fn member_log_removed(
 
 /// The member-tier verdict: device → currently a member (`true`) or explicitly
 /// removed (`false`). Only entries that verify and are authored by a current
-/// owner/manager count; for each device the latest such entry (by `at`, then a
-/// stable key) wins. A device with no authorised member-tier entry does not
-/// appear at all.
+/// owner/manager count. A valid removal dominates every legacy grant for the
+/// same device; a device with no authorised member-tier entry does not appear
+/// at all.
 fn member_log_verdict(
     gov: &NetworkState,
     member_log: &[Transition],
@@ -842,29 +910,8 @@ fn member_log_verdict(
         .map(|(k, _)| k.as_str())
         .collect();
 
-    // Deterministic order: by timestamp, then tombstones *before* grants,
-    // then a stable per-entry key. The fold below is last-writer-wins, so an
-    // equal-stamp grant survives. Live authoring stamps every member-tier
-    // entry strictly past the newest existing entry; the tie-break is only the
-    // total-order rule for externally supplied logs whose timestamps collide.
-    let is_member_grant = |t: &&Transition| {
-        matches!(
-            t.variant,
-            TransitionVariant::RoleGrant {
-                role: Role::Member,
-                ..
-            }
-        )
-    };
-    let mut ordered: Vec<&Transition> = member_log.iter().collect();
-    ordered.sort_by(|a, b| {
-        a.at.cmp(&b.at)
-            .then_with(|| is_member_grant(a).cmp(&is_member_grant(b)))
-            .then_with(|| member_entry_key(a).cmp(&member_entry_key(b)))
-    });
-
     let mut present: BTreeMap<String, bool> = BTreeMap::new();
-    for t in ordered {
+    for t in member_log {
         // Skip anything that doesn't cleanly verify — fail-safe, never fatal.
         if verify_transition_signatures(network_id, t).is_err() {
             continue;
@@ -877,7 +924,10 @@ fn member_log_verdict(
                 target,
                 role: Role::Member,
             } => {
-                present.insert(target.clone(), true);
+                // A legacy grant cannot prove that it causally follows an
+                // existing tombstone, so it may establish membership only
+                // while no valid removal has been observed.
+                present.entry(target.clone()).or_insert(true);
             }
             TransitionVariant::RoleRevoke { target } | TransitionVariant::Evict { target } => {
                 present.insert(target.clone(), false);
@@ -907,8 +957,12 @@ pub fn merge_member_logs(local: &[Transition], incoming: &[Transition]) -> Vec<T
 
 // ---- on-disk persistence -------------------------------------------
 
-fn state_path(network_id: &str) -> Result<PathBuf> {
-    Ok(crate::dirs::states_dir()?.join(format!("{network_id}.json")))
+fn state_path(root: Option<&Path>, network_id: &str) -> Result<PathBuf> {
+    let states_dir = match root {
+        Some(root) => root.join("states"),
+        None => crate::dirs::states_dir()?,
+    };
+    Ok(states_dir.join(format!("{network_id}.json")))
 }
 
 fn require_current_version(state: NetworkState) -> Result<NetworkState> {
@@ -925,9 +979,16 @@ fn require_current_version(state: NetworkState) -> Result<NetworkState> {
 /// file → fresh empty open state. Schema mismatch → error, so a
 /// future revision can't silently parse the new shape into the old.
 pub fn load(network_id: &str) -> Result<NetworkState> {
-    let path = state_path(network_id)?;
+    load_at(None, network_id)
+}
+
+/// Load state from an instance-owned persistence root. The root contains the
+/// normal `states/{network_id}.json` layout; `None` preserves the production
+/// user-data default used by [`load`].
+pub fn load_at(root: Option<&Path>, network_id: &str) -> Result<NetworkState> {
+    let path = state_path(root, network_id)?;
     if !path.exists() {
-        return Ok(NetworkState::empty_for(network_id));
+        return Ok(NetworkState::empty_for(network_id).with_persistence_root(root));
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Other(format!("read network_state at {}: {e}", path.display())))?;
@@ -948,19 +1009,19 @@ pub fn load(network_id: &str) -> Result<NetworkState> {
                  governance re-converges from the network's signed \
                  transitions"
             );
-            return Ok(NetworkState::empty_for(network_id));
+            return Ok(NetworkState::empty_for(network_id).with_persistence_root(root));
         }
     };
     let state = require_current_version(state)?;
     if state.network_id != network_id {
         // Filename is the index of truth; on mismatch, start fresh.
-        return Ok(NetworkState::empty_for(network_id));
+        return Ok(NetworkState::empty_for(network_id).with_persistence_root(root));
     }
-    Ok(state)
+    Ok(state.with_persistence_root(root))
 }
 
 pub fn save(state: &NetworkState) -> Result<()> {
-    let path = state_path(&state.network_id)?;
+    let path = state_path(state.persistence_root.as_deref(), &state.network_id)?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::Other(format!("state path has no parent: {}", path.display())))?;
@@ -976,7 +1037,7 @@ pub fn save(state: &NetworkState) -> Result<()> {
 /// Remove the per-network state file. Used by the "forget network"
 /// path so removed networks don't leak governance state on disk.
 pub fn delete(network_id: &str) -> Result<()> {
-    let path = state_path(network_id)?;
+    let path = state_path(None, network_id)?;
     if path.exists() {
         std::fs::remove_file(&path).map_err(|e| {
             Error::Other(format!("remove network_state at {}: {e}", path.display()))
@@ -1320,10 +1381,10 @@ mod tests {
     }
 
     #[test]
-    fn equal_stamp_grant_wins_the_total_order() {
-        // Externally supplied logs can contain equal timestamps. The declared
-        // total order applies the tombstone first and the grant second, so
-        // every peer derives membership from the same pair in the same way.
+    fn member_projection_fails_closed_without_causal_readmission() {
+        // Legacy entries carry no causal parents. An admit and removal for the
+        // same device are therefore incomparable, and the projection fails
+        // closed to removal regardless of their timestamps or arrival order.
         let (owner_sk, owner) = fixture_key(1);
         let (_, m) = fixture_key(2);
         let net = "tie-net";
@@ -1340,7 +1401,7 @@ mod tests {
                 variant,
             }
         };
-        // Admitted at 1, evicted at 5, re-admitted in the same second.
+        // Admitted at 1, evicted at 5, and granted again in the same second.
         let member_log = vec![
             signed(
                 TransitionVariant::RoleGrant {
@@ -1362,18 +1423,18 @@ mod tests {
         let present = verify_member_log(&gov, &member_log, net);
         let removed = member_log_removed(&gov, &member_log, net);
         assert!(
-            present.contains(&m),
-            "an equal-stamp evict/re-admit pair resolves to membership"
+            !present.contains(&m),
+            "an incomparable legacy grant cannot override a valid tombstone"
         );
         assert!(
-            removed.is_empty(),
-            "a re-admitted device is never handed to the roster mirror for deletion"
+            removed.contains(&m),
+            "the projection fails closed until a canonical causal resolution"
         );
-        // A *strictly later* evict still wins — deliberate removals stand.
-        let mut evicted_later = member_log;
-        evicted_later.push(signed(TransitionVariant::Evict { target: m.clone() }, 6));
-        assert!(!verify_member_log(&gov, &evicted_later, net).contains(&m));
-        assert!(member_log_removed(&gov, &evicted_later, net).contains(&m));
+        // A numerically later legacy timestamp does not create authority.
+        let mut timestamp_only_variant = member_log;
+        timestamp_only_variant.push(signed(TransitionVariant::Evict { target: m.clone() }, 6));
+        assert!(!verify_member_log(&gov, &timestamp_only_variant, net).contains(&m));
+        assert!(member_log_removed(&gov, &timestamp_only_variant, net).contains(&m));
     }
 
     #[test]

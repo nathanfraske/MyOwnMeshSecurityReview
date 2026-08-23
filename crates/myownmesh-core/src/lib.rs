@@ -133,6 +133,10 @@ pub mod resource;
 pub mod roster;
 pub mod rpc;
 pub mod runtime;
+/// Canonical V4 durable semantic facts.  This is the authority-bearing
+/// surface; legacy governance/roster values are adapters and must not mint a
+/// second fact identity.
+pub mod semantic;
 pub mod services;
 pub mod signing;
 pub mod topology;
@@ -158,10 +162,6 @@ pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 pub use handle::TransportLabPromotedPeer;
 pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
 pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
-pub use network_state::{
-    NetworkKind, NetworkState, Proposal, Role, SplitRecord, Transition, TransitionVariant,
-    SIGN_DOMAIN_TAG_STATE,
-};
 pub use protocol::CapabilityAdvert;
 pub use resource::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim,
@@ -185,6 +185,11 @@ pub use runtime::attempt::{
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
 pub use runtime::session_broker::session_reservation_planning_claim;
+pub use semantic::{
+    CanonicalFact, CellProjection, DurableCheckpoint, EvictionProofReference, ExclusiveCell,
+    FactBody, FactContent, FactDomain, FactGraph, FactId, GovernanceKind, Projection,
+    Role as SemanticRole, SemanticError, SignedFact, Topology as SemanticTopology,
+};
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]

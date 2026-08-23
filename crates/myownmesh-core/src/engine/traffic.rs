@@ -44,9 +44,10 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::SessionControl(_)
         | MeshMessage::CapabilitiesUpdate(_) => FrameClass::Control,
         MeshMessage::NetworkState(_)
-        | MeshMessage::NetworkStatePropose(_)
-        | MeshMessage::NetworkStateAck(_)
-        | MeshMessage::NetworkStateSplit(_)
+        | MeshMessage::Fact(_)
+        | MeshMessage::FactBundle(_)
+        | MeshMessage::FactInventory(_)
+        | MeshMessage::FactRequest(_)
         | MeshMessage::RosterSummary(_)
         | MeshMessage::RosterRequest(_)
         | MeshMessage::RosterEntries(_) => FrameClass::Gossip,

@@ -11,7 +11,8 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
-use myownmesh_core::{MeshEvent, NetworkKind, PeerEvent};
+use myownmesh_core::network_state::NetworkKind;
+use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 

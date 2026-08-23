@@ -52,6 +52,10 @@ pub struct Roster {
     /// network_id triggers a wipe on next load.
     pub network_id: String,
     pub authorized_devices: Vec<AuthorizedPeer>,
+    /// Instance-owned persistence root. This is local custody, not wire or
+    /// roster identity, so it is intentionally omitted from serialization.
+    #[serde(skip)]
+    persistence_root: Option<PathBuf>,
 }
 
 /// Per-network roster filename. We use the canonical network_id
@@ -61,6 +65,13 @@ pub struct Roster {
 /// here without bypassing the normalizer.
 fn roster_path(network_id: &str) -> Result<PathBuf> {
     Ok(crate::dirs::rosters_dir()?.join(format!("{network_id}.json")))
+}
+
+fn roster_path_at(root: Option<&Path>, network_id: &str) -> Result<PathBuf> {
+    match root {
+        Some(root) => Ok(root.join("rosters").join(format!("{network_id}.json"))),
+        None => roster_path(network_id),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -82,7 +93,13 @@ pub fn empty_for(network_id: &str) -> Roster {
         version: ROSTER_VERSION,
         network_id: network_id.to_string(),
         authorized_devices: Vec::new(),
+        persistence_root: None,
     }
+}
+
+fn with_persistence_root(mut roster: Roster, root: Option<&Path>) -> Roster {
+    roster.persistence_root = root.map(Path::to_path_buf);
+    roster
 }
 
 /// Add or refresh a peer in the roster. Idempotent — re-approving an
@@ -143,10 +160,8 @@ pub fn is_authorized(roster: &Roster, device_id: &str) -> bool {
         .any(|p| p.device_id == pubkey)
 }
 
-/// Most-recent `approved_at` across every entry. Used as the
-/// tie-breaker in [`crate::protocol::RosterSummaryMessage`] when
-/// roots disagree but neither side knows which is ahead. Returns 0
-/// for an empty roster.
+/// Legacy diagnostic only. It is not an ordering or convergence authority;
+/// roster summaries carry a fixed zero for the old wire field.
 pub fn last_edit_ts(roster: &Roster) -> u64 {
     roster
         .authorized_devices
@@ -197,8 +212,6 @@ fn leaf_hash(entry: &AuthorizedPeer) -> [u8; 32] {
     h.update(entry.device_id.as_bytes());
     h.update(b"|");
     h.update(entry.label.as_bytes());
-    h.update(b"|");
-    h.update(entry.approved_at.to_string().as_bytes());
     h.update(b"|");
     h.update(role_tag(entry.role).as_bytes());
     h.finalize().into()
@@ -267,7 +280,9 @@ pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
     crate::protocol::RosterSummaryMessage {
         root: membership_root(roster),
         count: roster.authorized_devices.len() as u32,
-        last_edit_ts: last_edit_ts(roster),
+        // Preserve the current wire field without allowing a local clock to
+        // order or authorize roster state.
+        last_edit_ts: 0,
     }
 }
 
@@ -290,9 +305,15 @@ pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
 /// broadcast), so starting empty is always recoverable; the corrupt
 /// bytes are kept for forensics.
 pub fn load(current_network_id: &str) -> Result<Roster> {
-    let path = roster_path(current_network_id)?;
+    load_at(None, current_network_id)
+}
+
+/// Load a roster from an instance-owned root. The root contains the normal
+/// `rosters/{network_id}.json` layout; `None` keeps the production default.
+pub fn load_at(root: Option<&Path>, current_network_id: &str) -> Result<Roster> {
+    let path = roster_path_at(root, current_network_id)?;
     if !path.exists() {
-        return Ok(empty_for(current_network_id));
+        return Ok(with_persistence_root(empty_for(current_network_id), root));
     }
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Error::Roster(format!("read roster at {}: {e}", path.display())))?;
@@ -308,7 +329,7 @@ pub fn load(current_network_id: &str) -> Result<Roster> {
                  roster fresh; it re-converges from approvals / the \
                  owner's signed roster"
             );
-            return Ok(empty_for(current_network_id));
+            return Ok(with_persistence_root(empty_for(current_network_id), root));
         }
     };
     if roster.version != ROSTER_VERSION {
@@ -321,13 +342,13 @@ pub fn load(current_network_id: &str) -> Result<Roster> {
         // Defensive: a per-network file should always match its
         // filename. If it doesn't (manual edit, mid-rename crash,
         // etc.) trust the filename — it's the index we're keyed on.
-        return Ok(empty_for(current_network_id));
+        return Ok(with_persistence_root(empty_for(current_network_id), root));
     }
-    Ok(roster)
+    Ok(with_persistence_root(roster, root))
 }
 
 pub fn save(roster: &Roster) -> Result<()> {
-    let path = roster_path(&roster.network_id)?;
+    let path = roster_path_at(roster.persistence_root.as_deref(), &roster.network_id)?;
     let parent = path
         .parent()
         .ok_or_else(|| Error::Roster(format!("roster path has no parent: {}", path.display())))?;
@@ -574,7 +595,7 @@ mod tests {
         b.authorized_devices[1].approved_at = 1;
 
         assert_eq!(membership_root(&a), membership_root(&b));
-        // ...while the full merkle root, which DOES hash those fields,
+        // ...while the full merkle root, which hashes display/role fields,
         // diverges — confirming the two roots capture different things.
         assert_ne!(merkle_root(&a), merkle_root(&b));
     }
@@ -642,7 +663,7 @@ mod tests {
             crate::protocol::MeshMessage::RosterSummary(b) => {
                 assert_eq!(b.root, s.root);
                 assert_eq!(b.count, 1);
-                assert_eq!(b.last_edit_ts, 100);
+                assert_eq!(b.last_edit_ts, 0);
             }
             _ => panic!("did not round-trip as RosterSummary"),
         }

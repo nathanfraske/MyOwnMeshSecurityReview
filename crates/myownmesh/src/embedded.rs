@@ -118,16 +118,11 @@ impl EmbeddedDaemon {
         }
         // Stop hosted services before tearing down networks.
         self.service_manager.shutdown().await;
-        // Say goodbye before we go: a graceful `leave` per network so peers
-        // drop our sessions immediately rather than waiting out a heartbeat.
-        self.registry.announce_all_departures().await;
-        // Every distinct network, through the registry's own teardown. It used
-        // to hand back only the networks it could take sole ownership of, so a
-        // network held by one in-flight request at shutdown was silently left
-        // running and its peers waited out a heartbeat instead of seeing a
-        // leave. Nothing is skipped now, and a failed teardown is reported
-        // rather than assumed clean.
-        for outcome in self.registry.shutdown_all().await {
+        // Supervise authenticated departures with teardown. A silent peer can
+        // otherwise hold departure forever before shutdown gets to cancel its
+        // waiter; the carrier hint remains in the departure future. Nothing is
+        // skipped, and failed teardown is reported rather than assumed clean.
+        for outcome in self.registry.shutdown_all_with_departures().await {
             if let Err(e) = outcome {
                 warn!("network shutdown failed: {e}");
             }

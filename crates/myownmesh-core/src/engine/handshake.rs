@@ -495,7 +495,8 @@ pub async fn on_auth_response(
     // the same canonical form the context stored rather than a display spelling.
     // Fail closed with no fallback: a task whose context does not match cannot
     // be corrected here, only refused.
-    if !auth_task.context_matches(&state.network_id, crate::signing::pubkey_part(device_id)) {
+    let mesh_context = state.mesh_context_id().to_string();
+    if !auth_task.context_matches(&mesh_context, crate::signing::pubkey_part(device_id)) {
         warn!(peer = %device_id, "endpoint-auth task authenticates a different mesh or peer — dropping");
         super::drop_peer_if_current(state, owner, DropReason::AuthFailed).await;
         return;
@@ -603,11 +604,7 @@ pub async fn on_auth_response(
     // policy write two separate atoms for no benefit — neither read depends on
     // this peer's state.
     let rostered = state.is_rostered(device_id);
-    let policy_admits = super::governance::current_policy_admits(
-        &state.governance_state.read(),
-        state.identity.public_id(),
-        device_id,
-    );
+    let policy_admits = canonical_policy_admits_both(state, device_id);
     let auto_approve = policy_admits && (state.config.read().auto_approve || rostered);
     // The write itself linearizes against registry replacement rather than
     // merely observing that the owner was current a moment ago. It is
@@ -670,6 +667,104 @@ pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
     maybe_activate(state, owner).await;
 }
 
+/// Re-evaluate one exact authenticated peer after a canonical RoleGrant has
+/// become visible. The caller supplies the owner it already holds; this hook
+/// never resolves a peer by Device ID or manufactures approval observations.
+///
+/// A newly admitted peer may auto-approve only under the same ordinary
+/// roster/configuration rule used at authentication. Activation itself still
+/// requires both approval observations and the canonical projection below.
+pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
+    let Some(should_reevaluate) = state.peers.with_current(owner, |peer| {
+        let data = peer.state.read();
+        data.authenticated && matches!(data.status, PeerStatus::PendingApproval)
+    }) else {
+        return;
+    };
+    if !should_reevaluate || !canonical_policy_admits_both(state, owner.device_id()) {
+        return;
+    }
+    let rostered = state.is_rostered(owner.device_id());
+    let auto_approve = state.config.read().auto_approve || rostered;
+    if auto_approve {
+        send_local_approve_owner(state, owner).await;
+    } else {
+        maybe_activate(state, owner).await;
+    }
+}
+
+/// Whether the exact local/remote pair is admitted by the canonical semantic
+/// projection. Closed bootstrap roots are the initial owner authority; every
+/// later member/controller/owner must be the selected, non-conflicting role
+/// fact for that device. An Evict membership cell remains a refusal even if a
+/// stale role grant is present, and stand-down is always fail-closed.
+fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &str) -> bool {
+    if !matches!(
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Closed(_)
+    ) {
+        return true;
+    }
+
+    let local_device_id = crate::signing::pubkey_part(state.identity.public_id()).to_string();
+    let remote_device_id = crate::signing::pubkey_part(remote_device_id).to_string();
+    let roots = state.verified_bootstrap().authority_roots();
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let projection = graph.projection();
+
+    let role_admits = |device_id: &str| {
+        if projection.is_stood_down(device_id) {
+            return false;
+        }
+        if !roots
+            .iter()
+            .any(|root| crate::signing::pubkey_part(root) == device_id)
+        {
+            let role_cell = crate::semantic::ExclusiveCell::new(device_id, "role");
+            let Some(role_id) = projection.value(&role_cell) else {
+                return false;
+            };
+            let Some(role_fact) = graph.get(&role_id) else {
+                return false;
+            };
+            if !matches!(
+                &role_fact.content.body,
+                crate::semantic::FactBody::RoleGrant { target, role }
+                    if crate::signing::pubkey_part(target) == device_id
+                        && matches!(
+                            role,
+                            crate::semantic::Role::Member
+                                | crate::semantic::Role::Controller
+                                | crate::semantic::Role::Owner
+                        )
+            ) {
+                return false;
+            }
+        }
+
+        let membership_cell = crate::semantic::ExclusiveCell::new(device_id, "membership");
+        if projection.is_conflicted(&membership_cell) {
+            return false;
+        }
+        if let Some(membership_id) = projection.value(&membership_cell) {
+            let Some(membership_fact) = graph.get(&membership_id) else {
+                return false;
+            };
+            if matches!(
+                &membership_fact.content.body,
+                crate::semantic::FactBody::Evict { target }
+                    if crate::signing::pubkey_part(target) == device_id
+            ) {
+                return false;
+            }
+        }
+        true
+    };
+
+    role_admits(&local_device_id) && role_admits(&remote_device_id)
+}
+
 /// Complete the Active edge from facts already established on the exact peer.
 /// Only [`on_approve`] may latch remote approval. Re-evaluating after a local
 /// send must never manufacture peer consent.
@@ -700,6 +795,10 @@ async fn maybe_activate_after_check(
     }
 
     before_commit();
+    let policy_admits = canonical_policy_admits_both(state, device_id);
+    if !policy_admits {
+        return;
+    }
 
     let Some(Some(roster_result)) = state.peers.with_current(owner, |peer| {
         let mut data = peer.state.write();
@@ -718,11 +817,7 @@ async fn maybe_activate_after_check(
         let active = data.authenticated
             && data.local_approve_sent
             && data.remote_approve_seen
-            && super::governance::current_policy_admits(
-                &state.governance_state.read(),
-                state.identity.public_id(),
-                device_id,
-            );
+            && policy_admits;
         if !active || was_active {
             return None;
         }
@@ -797,6 +892,10 @@ async fn maybe_activate_after_check(
 
     if super::governance::broadcast_roster_summary_for_owner(state, owner).await {
         let _ = super::governance::broadcast_state_for_owner(state, owner).await;
+        if state.peers.get_if_current(owner).is_none() {
+            return;
+        }
+        let _ = super::governance::broadcast_fact_inventory_for_owner(state, owner).await;
     }
 }
 
@@ -808,17 +907,16 @@ pub async fn on_deny(state: &Arc<NetworkState>, owner: &PeerOwnerToken, deny: De
         format!("peer denied us: {device_id} (reason: {:?})", deny.reason),
         serde_json::json!({ "peer": device_id, "reason": format!("{:?}", deny.reason) }),
     );
-    // An eviction denial carries the network's signed logs as proof.
+    // Deny carries no governance proof.
     // Nothing about the DENIER is trusted: the logs go through the same
     // strict-extension verification every adoption takes, so a forged or
     // foreign log changes nothing — but a genuine one finally teaches a
     // device that was evicted while offline that it is out, flipping it
     // to stood-down (and letting the embedding app clear its fleet
     // state) instead of redialing into denials forever.
-    if !deny.transitions.is_empty() || !deny.member_log.is_empty() {
-        super::governance::adopt_deny_proof(state, device_id, &deny.transitions, &deny.member_log)
-            .await;
-    }
+    // Deny is a channel/session outcome only. Legacy transition/member-log
+    // proof is intentionally absent from the wire message; no governance
+    // state is adopted from an unauthenticated denial.
     super::drop_peer_if_current(state, owner, DropReason::Denied).await;
 }
 
@@ -879,9 +977,9 @@ mod tests {
     /// A registry peer whose endpoint-auth task has promoted and whose
     /// capability was **not** installed.
     ///
-    /// Built against `state.network_id` and the peer's own Device ID, so the
-    /// handler's context check passes and the control reaches the outcome under
-    /// test rather than stopping at an earlier refusal. The capability the
+    /// Built against the state's exact `MeshContextId` and the peer's own
+    /// Device ID, so the handler's context check passes and the control reaches
+    /// the outcome under test rather than stopping at an earlier refusal. The capability the
     /// promotion issues is deliberately dropped: that is the whole scenario —
     /// a caller that won promotion, moved the channel out, and then failed to
     /// install what it was handed.
@@ -902,7 +1000,7 @@ mod tests {
         let peer_key = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
         let remote_id = device_id(&peer_key);
         let context = crate::endpoint_auth::EndpointAuthContext::new(
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             &device_id(&local_key),
             &remote_id,
             crate::connector::EndpointAuthBinding::webrtc_certificate_fingerprints(
@@ -1438,7 +1536,10 @@ mod tests {
         );
         let owner = state.peers.owner("peer").expect("installed peer owner");
         assert!(
-            !task.context_matches(&state.network_id, crate::signing::pubkey_part("peer")),
+            !task.context_matches(
+                &state.mesh_context_id().to_string(),
+                crate::signing::pubkey_part("peer"),
+            ),
             "non-vacuity: the fixture task really does authenticate another mesh and peer"
         );
 

@@ -550,118 +550,6 @@ impl JoinedNetwork {
         self.rpc.advertise(caps)
     }
 
-    // ---- governance (closed networks) ---------------------------------
-    //
-    // These wrap the engine's `NetworkCmd::*` variants for the
-    // proposal lifecycle. Every method except `governance_state()`
-    // round-trips through the driver loop so mutations stay serialised
-    // with the rest of the engine's per-network operations.
-
-    /// Snapshot the current signed governance state — kind + role
-    /// assignments + the append-only transition log + pending
-    /// proposals + spawned splits. Read-only.
-    pub async fn governance_state(&self) -> Result<crate::network_state::NetworkState> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::GovernanceSnapshot { reply })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped snapshot reply".into()))
-    }
-
-    /// Float a new signed transition. Returns the new proposal id
-    /// so the caller can correlate with subsequent acks. The engine
-    /// signs the canonical payload with the local identity,
-    /// persists to pending, and broadcasts to active peers in one
-    /// step; if the local signer set already satisfies the variant's
-    /// quorum (e.g. founder self-election), the proposal ratifies
-    /// before this call returns.
-    pub async fn propose_transition(
-        &self,
-        variant: crate::network_state::TransitionVariant,
-        mfa_code: Option<String>,
-    ) -> Result<String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::ProposeTransition {
-                variant,
-                mfa_code,
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped propose reply".into()))?
-    }
-
-    /// Sign a pending proposal floated by another peer (or by this
-    /// device). The engine broadcasts the signed ack and attempts
-    /// ratification atomically.
-    pub async fn sign_proposal(&self, proposal_id: &str, mfa_code: Option<String>) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::SignProposal {
-                proposal_id: proposal_id.to_string(),
-                mfa_code,
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped sign reply".into()))?
-    }
-
-    /// Deny a pending proposal. A single deny invalidates the
-    /// proposal across the whole network; the engine signs the deny
-    /// + broadcasts so other peers see the kill switch fire.
-    pub async fn deny_proposal(&self, proposal_id: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::DenyProposal {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped deny reply".into()))?
-    }
-
-    /// Withdraw a proposal the local device floated. Engine drops
-    /// from pending without broadcasting a deny; peers see the
-    /// proposal disappear via the next state snapshot.
-    pub async fn withdraw_proposal(&self, proposal_id: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::WithdrawProposal {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped withdraw reply".into()))?
-    }
-
-    /// Fire the proposer-initiated split fallback for a stuck close.
-    /// Returns the deterministically-derived network id of the new
-    /// closed network; the caller typically `join`s it straight
-    /// away. Only callable by the proposer of the original
-    /// open→closed proposal.
-    pub async fn spawn_split(&self, proposal_id: &str) -> Result<String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::SpawnSplit {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped split reply".into()))?
-    }
-
     /// Leave deliberately: depart every authenticated session, then drop the
     /// carrier hint on the way out.
     ///
@@ -722,7 +610,7 @@ impl JoinedNetwork {
 
     /// Deliberately dial exactly one signaling-discovered peer by device id,
     /// opening the WebRTC session on demand. This is the manual-connect
-    /// primitive a [`Silent`](crate::NetworkKind::Silent) network needs: on a
+    /// primitive a [`Silent`](crate::network_state::NetworkKind::Silent) network needs: on a
     /// Silent mesh the engine never dials just because a peer announced (a
     /// co-present peer surfaces as [`crate::PeerEvent::Sighted`] / in
     /// [`Self::peers`] with no session), so a connection is initiated only
@@ -827,12 +715,17 @@ impl JoinedNetwork {
     /// retirement before it returns.
     pub async fn shutdown(&self) -> Result<()> {
         self.state.request_shutdown();
+        // Cancel the mesh-wide event fan-out before waiting for the driver.
+        // A departure or terminal peer event can otherwise keep this
+        // lifecycle task retaining the network state while the driver waits
+        // for its final peer cleanup, which is a shutdown-only deadlock for a
+        // silently connected peer.
+        if let Some(fanout) = self.lifecycle.fanout.lock().take() {
+            fanout.abort();
+        }
         let mut driver = self.lifecycle.driver.lock().await;
         if let Some(driver) = driver.take() {
             let _ = driver.await;
-        }
-        if let Some(fanout) = self.lifecycle.fanout.lock().take() {
-            fanout.abort();
         }
         Ok(())
     }

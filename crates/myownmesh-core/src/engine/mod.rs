@@ -71,6 +71,7 @@ const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 /// peers converge inside a handful of seconds.
 const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -90,10 +91,14 @@ use crate::protocol::{
         RpcStreamEndMessage,
     },
     topology::ShelveMessage,
-    CapabilityAdvert, MeshMessage,
+    CapabilityAdvert, DepartureCorrelation, MeshMessage,
 };
 use crate::resource::{
     LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
+};
+use crate::semantic::{
+    BootstrapRecord, ClosedProfileId, ExpectedMeshContext, MeshContextId, VerifiedBootstrap,
+    VerifiedProjectPolicy,
 };
 use crate::transport::{
     DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
@@ -222,6 +227,14 @@ fn record_b2_stage(state: &Arc<NetworkState>, correlation: &str, stage: B2Stage)
     }
 }
 
+#[cfg(test)]
+fn test_departure_control() -> crate::protocol::SessionControl {
+    crate::protocol::SessionControl::Depart {
+        correlation: DepartureCorrelation::new("test-departure")
+            .expect("the test departure correlation is valid"),
+    }
+}
+
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
 /// driver task (waitable for clean shutdown).
@@ -230,9 +243,108 @@ pub async fn spawn_network(
     identity: Arc<Identity>,
     transport: Transport,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = bootstrap_for_spawn(&config, None)?;
     let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
     let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
-    spawn_network_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources).await
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        &mesh_scope,
+        &local_resources,
+        bootstrap,
+        None,
+    )
+    .await
+}
+
+/// Create and durably install the local Closed bootstrap before exposing an
+/// engine for it. The creation id is caller-owned semantic input; the local
+/// signing key is the only authority root accepted by this profile.
+pub async fn create_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    creation_id: [u8; 32],
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = create_local_bootstrap(&config, &identity, None, creation_id)?;
+    spawn_network_with_verified_bootstrap(config, identity, transport, None, bootstrap).await
+}
+
+/// Transport-lab variant of [`create_network`] with instance-owned bootstrap
+/// persistence. The record is verified and durably installed before the
+/// engine becomes observable, so a second node can import the exact same
+/// semantic context into a distinct root.
+#[cfg(feature = "transport-lab")]
+pub async fn create_network_in_instance_root(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    root: PathBuf,
+    creation_id: [u8; 32],
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = create_local_bootstrap(&config, &identity, Some(root.as_path()), creation_id)?;
+    spawn_network_with_verified_bootstrap(config, identity, transport, Some(root), bootstrap).await
+}
+
+/// Import and durably install a caller-provided bootstrap only after it has
+/// matched the locally expected semantic context. The expected context id is
+/// an import constraint, never a replacement for record verification.
+pub async fn import_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = import_local_bootstrap(&config, None, expected_context_id, record)?;
+    spawn_network_with_verified_bootstrap(config, identity, transport, None, bootstrap).await
+}
+
+/// Transport-lab variant of [`import_network`] that verifies and persists the
+/// supplied record below one explicit instance root before exposing the
+/// imported engine.
+#[cfg(feature = "transport-lab")]
+pub async fn import_network_in_instance_root(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    root: PathBuf,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap =
+        import_local_bootstrap(&config, Some(root.as_path()), expected_context_id, record)?;
+    spawn_network_with_verified_bootstrap(config, identity, transport, Some(root), bootstrap).await
+}
+
+/// Spawn a transport-lab node with instance-owned on-disk projections.
+///
+/// The supplied root is local custody only: the config's wire-level
+/// `network_id` is preserved exactly. The root is passed through a private
+/// constructor seam, which derives the normal `states/` and `rosters/`
+/// layouts. Ordinary production callers continue through [`spawn_network`]
+/// and retain the default root.
+#[cfg(feature = "transport-lab")]
+pub async fn spawn_network_in_instance_root(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    root: std::path::PathBuf,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = bootstrap_for_spawn(&config, Some(root.as_path()))?;
+    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        &mesh_scope,
+        &local_resources,
+        bootstrap,
+        Some(root),
+    )
+    .await
 }
 
 pub(crate) async fn spawn_network_in_mesh_scope(
@@ -242,13 +354,188 @@ pub(crate) async fn spawn_network_in_mesh_scope(
     mesh_scope: &MeshRuntimeResourceScope,
     local_resources: &LocalApplicationResourceScope,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let (state, signaling_inbound_rx, cmd_rx) =
-        NetworkState::new_in_mesh_scope(config, identity, transport, mesh_scope, local_resources)?;
+    let bootstrap = bootstrap_for_spawn(&config, None)?;
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        mesh_scope,
+        local_resources,
+        bootstrap,
+        None,
+    )
+    .await
+}
+
+async fn spawn_network_with_verified_bootstrap(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    instance_root: Option<PathBuf>,
+    bootstrap: VerifiedBootstrap,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
+    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        &mesh_scope,
+        &local_resources,
+        bootstrap,
+        instance_root,
+    )
+    .await
+}
+
+async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    mesh_scope: &MeshRuntimeResourceScope,
+    local_resources: &LocalApplicationResourceScope,
+    bootstrap: VerifiedBootstrap,
+    instance_root: Option<std::path::PathBuf>,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let (state, signaling_inbound_rx, cmd_rx) = NetworkState::new_in_mesh_scope_with_instance_root(
+        config,
+        identity,
+        transport,
+        bootstrap,
+        mesh_scope,
+        local_resources,
+        instance_root,
+    )?;
     let driver_state = state.clone();
     let handle = tokio::spawn(async move {
         run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;
     });
     Ok((state, handle))
+}
+
+fn bootstrap_root(instance_root: Option<&Path>) -> Result<PathBuf> {
+    match instance_root {
+        Some(root) => Ok(root.to_path_buf()),
+        None => Ok(crate::dirs::data_dir()?.join("mesh")),
+    }
+}
+
+fn bootstrap_store(
+    config: &NetworkConfig,
+    instance_root: Option<&Path>,
+) -> Result<crate::semantic::store::BootstrapStore> {
+    Ok(crate::semantic::store::BootstrapStore::new(
+        bootstrap_root(instance_root)?,
+        &config.id,
+    ))
+}
+
+fn local_bootstrap_principal() -> crate::application_gateway::LocalPrincipalCapability {
+    crate::application_gateway::LocalPrincipalCapability::for_local_process(
+        crate::runtime::RuntimeIncarnation::new(),
+    )
+}
+
+fn bootstrap_error(action: &str, error: impl std::fmt::Display) -> Error {
+    Error::Other(format!("{action} bootstrap: {error}"))
+}
+
+fn ensure_bootstrap_for_config(
+    config: &NetworkConfig,
+    bootstrap: VerifiedBootstrap,
+) -> Result<VerifiedBootstrap> {
+    if bootstrap.context().scope != config.network_id {
+        return Err(bootstrap_error(
+            "rejecting",
+            format!(
+                "semantic scope {} does not match network_id {}",
+                bootstrap.context().scope,
+                config.network_id
+            ),
+        ));
+    }
+
+    let valid_shape = match config.kind {
+        crate::network_state::NetworkKind::Closed => matches!(
+            bootstrap.policy(),
+            VerifiedProjectPolicy::Closed(policy)
+                if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
+        ),
+        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
+            matches!(bootstrap.policy(), VerifiedProjectPolicy::Open)
+        }
+    };
+    if !valid_shape {
+        return Err(bootstrap_error(
+            "rejecting",
+            format!(
+                "bootstrap policy does not match configured kind {:?}",
+                config.kind
+            ),
+        ));
+    }
+    Ok(bootstrap)
+}
+
+fn bootstrap_for_spawn(
+    config: &NetworkConfig,
+    instance_root: Option<&Path>,
+) -> Result<VerifiedBootstrap> {
+    let bootstrap = match config.kind {
+        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
+            VerifiedBootstrap::open(config.network_id.clone())
+                .map_err(|error| bootstrap_error("creating founderless", error))?
+        }
+        crate::network_state::NetworkKind::Closed => bootstrap_store(config, instance_root)?
+            .restore()
+            .map_err(|error| bootstrap_error("restoring Closed", error))?,
+    };
+    ensure_bootstrap_for_config(config, bootstrap)
+}
+
+fn create_local_bootstrap(
+    config: &NetworkConfig,
+    identity: &Identity,
+    instance_root: Option<&Path>,
+    creation_id: [u8; 32],
+) -> Result<VerifiedBootstrap> {
+    if config.kind != crate::network_state::NetworkKind::Closed {
+        return Err(bootstrap_error(
+            "creating",
+            "explicit local creation requires Closed network kind",
+        ));
+    }
+    let bootstrap = VerifiedBootstrap::create_closed(
+        config.network_id.clone(),
+        [identity.signing_key()],
+        creation_id,
+    )
+    .map_err(|error| bootstrap_error("creating", error))?;
+    let principal = local_bootstrap_principal();
+    let stored = bootstrap_store(config, instance_root)?
+        .persist_new(&principal, bootstrap.record())
+        .map_err(|error| bootstrap_error("persisting created", error))?;
+    ensure_bootstrap_for_config(config, stored)
+}
+
+fn import_local_bootstrap(
+    config: &NetworkConfig,
+    instance_root: Option<&Path>,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<VerifiedBootstrap> {
+    if config.kind != crate::network_state::NetworkKind::Closed {
+        return Err(bootstrap_error(
+            "importing",
+            "explicit bootstrap import requires Closed network kind",
+        ));
+    }
+    let principal = local_bootstrap_principal();
+    let expected = ExpectedMeshContext::for_local_import(&principal, expected_context_id);
+    let imported = bootstrap_store(config, instance_root)?
+        .import_expected(&expected, record)
+        .map_err(|error| bootstrap_error("importing", error))?;
+    ensure_bootstrap_for_config(config, imported)
 }
 
 /// The engine's main loop. Owns the per-network state and the
@@ -316,6 +603,7 @@ pub(crate) async fn run_driver(
     let mut tick_registry = tick::TickRegistry::new()
         .register(tick::IceWatchdogTicker)
         .register(tick::NetworkWatchTicker::new().await)
+        .register(tick::FactInventoryTicker)
         .register(tick::ReconnectSupervisor)
         .register(tick::ReliableSendTicker)
         .register(tick::TopologyShapeTicker)
@@ -419,6 +707,11 @@ pub(crate) async fn run_driver(
         format!("driver stopping ({stop_reason})"),
         serde_json::json!({ "reason": stop_reason }),
     );
+    // Resolve exact departure waiters before peer teardown.  A connected but
+    // silent remote cannot be allowed to keep shutdown behind an observation
+    // that will never arrive; the peer-session cancellation edge is the
+    // authority that settles the waiter, not a timer or a synthetic receipt.
+    state.peers.cancel_pending_departures_for_shutdown();
     state.shutdown().await;
 }
 
@@ -534,19 +827,21 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             mfa_code,
             reply,
         } => {
-            let result = governance::sign_proposal(state, &proposal_id, mfa_code.as_deref()).await;
+            let result =
+                governance::sign_proposal(state, &proposal_id.to_string(), mfa_code.as_deref())
+                    .await;
             let _ = reply.send(result);
         }
         NetworkCmd::DenyProposal { proposal_id, reply } => {
-            let result = governance::deny_proposal(state, &proposal_id).await;
+            let result = governance::deny_proposal(state, &proposal_id.to_string()).await;
             let _ = reply.send(result);
         }
         NetworkCmd::WithdrawProposal { proposal_id, reply } => {
-            let result = governance::withdraw_proposal(state, &proposal_id).await;
+            let result = governance::withdraw_proposal(state, &proposal_id.to_string()).await;
             let _ = reply.send(result);
         }
         NetworkCmd::SpawnSplit { proposal_id, reply } => {
-            let result = governance::spawn_split(state, &proposal_id).await;
+            let result = governance::spawn_split(state, &proposal_id.to_string()).await;
             let _ = reply.send(result);
         }
         NetworkCmd::GovernanceSnapshot { reply } => {
@@ -570,7 +865,7 @@ async fn handle_speculative_promotion(
             &candidate,
             &correlation,
             broker,
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
         ) {
             if let Some(displaced) = promotion.displaced_attempt {
                 forget_displacement(state, displaced);
@@ -1634,8 +1929,9 @@ pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
 }
 
 /// Re-offer to a peer we hold a reconnect intent for, when conditions allow:
-/// we're online, we're the deterministic offerer, and no session is already
-/// in flight. Best-effort — a no-op while offline (the relay-reconnect flush
+/// we're online, we're the deterministic offerer (or have an exact recorded
+/// intent/sticky admission), and no session is already in flight. Best-effort
+/// — a no-op while offline (the relay-reconnect flush
 /// and the tick pick it up once we're back) or when a session already exists
 /// (its own lifecycle carries it). Nudges discovery first so the remote
 /// answerer learns we're trying and reflects an announce, giving its side a
@@ -1648,12 +1944,13 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
     if state.peers.contains_key(device_id) {
         return;
     }
-    // Only the deterministic offerer (lex-lower id) re-offers; the answerer
-    // waits for that offer rather than sending a competing one. A sticky
-    // (pinned) peer bypasses the gate: the pin lives on exactly one side —
-    // the dialing side — and on a Silent network the other end will never
-    // initiate, lex order or not.
-    if state.identity.public_id() >= device_id && !state.is_sticky(device_id) {
+    // Manual/no-intent recovery keeps the deterministic offerer gate. A
+    // recorded intent is a prior exact-worker role decision and is sufficient
+    // to bypass stale device-id ordering after that worker has closed. Sticky
+    // peers retain their existing explicit bypass.
+    let sticky = state.is_sticky(device_id);
+    let reconnect_intent = state.has_reconnect_intent(device_id);
+    if state.identity.public_id() >= device_id && !sticky && !reconnect_intent {
         return;
     }
     maybe_reactive_announce(state);
@@ -1704,7 +2001,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(renegotiation) = state.peers.claim_renegotiation(
             &owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
         ) else {
             continue;
         };
@@ -2477,6 +2774,7 @@ async fn retire_speculative_terminal(
             }
         }
         Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+            let opened_as = Some(OpenedAs::of(&removed.worker));
             if removed.session_empty {
                 state.peers.track_removed_close(Arc::clone(&peer));
                 peer.retire_connector();
@@ -2494,7 +2792,14 @@ async fn retire_speculative_terminal(
                 let state = Arc::clone(state);
                 let device_id = owner.device_id().to_string();
                 tokio::spawn(async move {
-                    finish_drop_peer_started(&state, &device_id, DropReason::IceFailed, peer).await;
+                    finish_drop_peer_started(
+                        &state,
+                        &device_id,
+                        DropReason::IceFailed,
+                        peer,
+                        opened_as,
+                    )
+                    .await;
                 });
             }
         }
@@ -2721,7 +3026,7 @@ async fn begin_speculative_endpoint_auth(
     };
     let remote = crate::signing::pubkey_part(owner.device_id()).to_string();
     let Ok(context) = crate::endpoint_auth::EndpointAuthContext::new(
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         state.identity.public_id(),
         &remote,
         binding,
@@ -2784,7 +3089,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
         ),
     )
     .await;
-    let (session, mut rx) = match construction {
+    let (session, rx) = match construction {
         Ok(Ok(peer)) => peer,
         Ok(Err(e)) => {
             state.log_diag_with(
@@ -2827,7 +3132,15 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // displaced can never legitimately be heard from again: release its keys.
     // Doing this is what keeps the ring from accumulating a record of every
     // attempt a long-lived reconnecting peer ever made.
-    if let Some(replaced) = install_peer(&state.peers, peer.clone()) {
+    let replaced = install_peer(&state.peers, peer.clone());
+    // Capture the installation fence before offer construction can await. A
+    // replacement may arrive while that offer is building; resolving by
+    // device id after the await would stamp the successor with this worker.
+    let pump_owner = state
+        .peers
+        .owner(device_id)
+        .map(|owner| owner.for_worker(Arc::clone(&session)));
+    if let Some(replaced) = replaced {
         forget_displacement(state, replaced);
     }
 
@@ -2902,27 +3215,53 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // worker's bounded mailbox. Connector events never enter the unbounded
     // general command queue. The receiver stamps each value with the exact
     // connector worker identity that owns its callback source.
-    let connector_state = Arc::clone(state);
-    // Owned, because the pump outlives this call: it is spawned, so it cannot
-    // borrow the caller's id.
-    let peer_id_for_pump = device_id.to_string();
-    let task_observation = session.observe_owned_task();
-    let pump_session = Arc::clone(&session);
+    spawn_peer_event_pump(
+        Arc::clone(state),
+        device_id.to_string(),
+        Arc::clone(&session),
+        rx,
+        pump_owner,
+    );
+}
+
+/// Spawn the production per-peer receiver pump with its exact installation
+/// fence. The owner is captured by the caller before any offer/await can let a
+/// successor replace the registry entry; EOF consequently retires only the
+/// worker that owned this receiver.
+fn spawn_peer_event_pump(
+    connector_state: Arc<NetworkState>,
+    peer_id: String,
+    pump_session: Arc<crate::transport::WebRtcConnectorWorker>,
+    mut rx: crate::transport::webrtc::WebRtcConnectorEventReceiver,
+    pump_owner: Option<peer_registry::PeerOwnerToken>,
+) -> tokio::task::JoinHandle<()> {
+    let task_observation = pump_session.observe_owned_task();
     tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(ev) = rx.recv().await {
-            if handle_transport_event_from_worker(
+            let handled = handle_transport_event_from_worker(
                 &connector_state,
-                peer_id_for_pump.clone(),
+                peer_id.clone(),
                 &pump_session,
                 ev,
             )
-            .await
-            {
+            .await;
+            if handled {
                 rx.commit_data_channel_open();
             }
         }
-    });
+        if let Some(owner) = pump_owner.as_ref() {
+            handle_exact_promoted_terminal(
+                &connector_state,
+                owner,
+                &pump_session,
+                DropReason::TransportError {
+                    message: "transport event stream ended".to_string(),
+                },
+            )
+            .await;
+        }
+    })
 }
 
 async fn apply_remote_sdp(
@@ -3355,7 +3694,7 @@ async fn handle_transport_event_from_worker(
             // selects no profile semantics.
             let remote_device_id = crate::signing::pubkey_part(&device_id).to_string();
             let Ok(context) = crate::endpoint_auth::EndpointAuthContext::new(
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 state.identity.public_id(),
                 &remote_device_id,
                 binding,
@@ -3894,6 +4233,50 @@ fn message_admission(msg: &MeshMessage) -> Admission {
     }
 }
 
+fn is_pending_approval_peer(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+) -> bool {
+    state
+        .peers
+        .with_current(owner, |peer| {
+            matches!(peer.state.read().status, PeerStatus::PendingApproval)
+        })
+        .unwrap_or(false)
+}
+
+/// Process the only durable traffic allowed before approval.  The provider
+/// lease is acquired before deserialization and held through reduction.  The
+/// semantic reducer owns the authoritative FactGraph/context check; every
+/// other decoded message is refused rather than handed to an application or
+/// control-plane handler.
+async fn handle_pending_semantic_frame(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    bytes: Bytes,
+) {
+    let mesh_context = state.mesh_context_id().to_string();
+    let Some(operation) =
+        state
+            .peers
+            .admit_pending_semantic_operation(owner, &mesh_context, &bytes)
+    else {
+        return;
+    };
+    let Ok(msg) = serde_json::from_slice::<MeshMessage>(&bytes) else {
+        return;
+    };
+    if !operation.accepts_message(&msg) || !operation.is_current(&state.peers) {
+        return;
+    }
+    let semantic_ingress::SemanticAdmission::Durable(durable) = semantic_ingress::admit(msg) else {
+        return;
+    };
+    let (_owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
+    semantic_ingress::reduce(state, durable, None).await;
+    drop(work);
+}
+
 #[cfg(test)]
 async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes: Bytes) {
     let Some(owner) = state.peers.owner(device_id) else {
@@ -3926,9 +4309,17 @@ async fn handle_inbound_frame_from(
     // `handshake::on_approve`). This check is synchronous, not swept: a
     // never-admitted peer must get *zero* application processing, so there is
     // no grace window a periodic revalidation could open.
+    let pending_semantic = matches!(
+        class.admission,
+        crate::protocol::FrameAdmission::DurableFact
+    ) && is_pending_approval_peer(state, owner);
+    if pending_semantic {
+        handle_pending_semantic_frame(state, owner, bytes).await;
+        return;
+    }
     let application = matches!(
         class.admission,
-        crate::protocol::FrameAdmission::Application
+        crate::protocol::FrameAdmission::Application | crate::protocol::FrameAdmission::DurableFact
     );
     // The liveness commit for an inbound frame. Protocol frames take the plain
     // owner fence, because they are what *establishes* admission and must not
@@ -4044,7 +4435,7 @@ async fn handle_inbound_frame_from(
         .with_admitted_current_or_refused(
             owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |admitted| {
                 admitted.record_inbound(commit);
                 // Admitted and *funded* here, decoded below. `admit` measures
@@ -4263,7 +4654,7 @@ async fn handle_inbound_frame_from(
             state.rpc_send_boundary.mark_semantic_finished();
             return reduced;
         }
-        semantic_ingress::SemanticAdmission::NotDurable(other) => other,
+        semantic_ingress::SemanticAdmission::NotDurable(other) => *other,
     };
     match msg {
         MeshMessage::Ping(p) => heartbeat::on_ping(state, &dispatch, p).await,
@@ -4330,18 +4721,21 @@ async fn handle_inbound_frame_from(
         // The four protocol frames: `message_admission` classifies exactly these
         // as `Protocol`, and the protocol branch above returns before this match.
         //
-        // The seven durable frames: `semantic_ingress::admit` took them
-        // above and this function already returned. They cannot be handled here
-        // *and* there without two owners for one fact, which is the arrangement
-        // the semantic ingress exists to end.
+        // The semantic exchange frames: `semantic_ingress::admit` took the
+        // durable subset above and this function already returned; inventory
+        // and request frames remain coordination traffic at this boundary.
+        // They cannot be handled here *and* there without two owners for one
+        // exchange, which is the arrangement the semantic ingress exists to
+        // end.
         MeshMessage::Hello(_)
         | MeshMessage::AuthResponse(_)
         | MeshMessage::Approve(_)
         | MeshMessage::Deny(_)
         | MeshMessage::NetworkState(_)
-        | MeshMessage::NetworkStatePropose(_)
-        | MeshMessage::NetworkStateAck(_)
-        | MeshMessage::NetworkStateSplit(_)
+        | MeshMessage::Fact(_)
+        | MeshMessage::FactBundle(_)
+        | MeshMessage::FactInventory(_)
+        | MeshMessage::FactRequest(_)
         | MeshMessage::RosterSummary(_)
         | MeshMessage::RosterRequest(_)
         | MeshMessage::RosterEntries(_) => {
@@ -4390,18 +4784,19 @@ async fn retire_admitted_logical_session(
     state: &Arc<NetworkState>,
     dispatch: &peer_registry::AdmittedInboundDispatch,
 ) {
-    let operation = dispatch.logical_operation();
+    finish_exact_logical_retirement(state, dispatch.logical_operation()).await;
+}
+
+async fn finish_exact_logical_retirement(
+    state: &Arc<NetworkState>,
+    operation: peer_registry::LogicalSessionOperation,
+) {
+    let device_id = operation.owner().device_id().to_string();
     if let peer_registry::LogicalSessionTerminal::Removed(peer) = state
         .peers
         .remove_current_logical_session_for_terminal(operation)
     {
-        finish_drop_peer(
-            state,
-            dispatch.owner().device_id(),
-            DropReason::UserLeft,
-            Some(peer),
-        )
-        .await;
+        finish_drop_peer(state, &device_id, DropReason::UserLeft, Some(peer)).await;
     }
 }
 
@@ -4424,16 +4819,17 @@ async fn retire_admitted_logical_session(
 /// idempotent for the same reason: the second one finds nothing current to
 /// retire.
 ///
-/// Nothing is acknowledged, retried, or timed. A departure that never arrives
-/// leaves the session to end the way every other unannounced loss ends it,
-/// through connector closure and failure detection.
+/// A remote departure is answered once on its exact carrying channel before
+/// the logical session is retired. A local departure waits on the logical
+/// session's exact observation or cancellation; no device-id lookup or
+/// successor can satisfy that wait.
 async fn on_session_control(
     state: &Arc<NetworkState>,
     dispatch: &peer_registry::AdmittedInboundDispatch,
     control: crate::protocol::SessionControl,
 ) {
     match control {
-        crate::protocol::SessionControl::Depart => {
+        crate::protocol::SessionControl::Depart { correlation } => {
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
                 "peer",
@@ -4443,7 +4839,45 @@ async fn on_session_control(
                 ),
                 serde_json::json!({ "peer": dispatch.owner().device_id() }),
             );
-            retire_admitted_logical_session(state, dispatch).await;
+            match state.peers.accept_remote_departure(dispatch, &correlation) {
+                peer_registry::RemoteDepartureAdmission::Accepted {
+                    receipt,
+                    operation,
+                    defer_retirement,
+                } => {
+                    let mut receipt_sent = false;
+                    if let Some(receipt) = receipt {
+                        state.reach_depart_observed_gate().await;
+                        let observed = MeshMessage::SessionControl(
+                            crate::protocol::SessionControl::DepartObserved { correlation },
+                        );
+                        match serde_json::to_vec(&observed) {
+                            Ok(bytes) => {
+                                receipt_sent = receipt.send(Bytes::from(bytes)).await.is_ok();
+                            }
+                            Err(error) => {
+                                warn!(%error, "departure observation did not serialize");
+                            }
+                        }
+                    }
+                    // A simultaneous local departure owns retirement after
+                    // its exact waiter observes this receipt. If no such
+                    // waiter exists, or receipt funding/send/serialization
+                    // failed, retire now so no pending state is stranded.
+                    if !defer_retirement || !receipt_sent {
+                        finish_exact_logical_retirement(state, operation).await;
+                    }
+                }
+                peer_registry::RemoteDepartureAdmission::Stale => {}
+            }
+        }
+        crate::protocol::SessionControl::DepartObserved { correlation } => {
+            let _ = dispatch.with_captured_logical_state(
+                &state.peers,
+                |operation: &mut crate::runtime::peer_session::LogicalSessionOperation<'_>| {
+                    operation.observe_departure(&correlation)
+                },
+            );
         }
         crate::protocol::SessionControl::RenegotiateRequest => {
             let Some(worker) = dispatch.owner().worker().cloned() else {
@@ -5828,13 +6262,28 @@ enum ChannelDisposition {
 /// the channel down, which is the job the old fixed 250 ms sleep was doing
 /// blindly for every network whether or not it had anything to say.
 ///
-/// **Settling is not delivery, and nothing here pretends otherwise.** There is
-/// no acknowledgement, no retry, no timer and no grace period. A send that
-/// fails, or that succeeds into a channel that dies before the bytes land,
-/// leaves the far side to notice the ordinary way: connector closure, or the
-/// heartbeat. The local retirement happens either way, because this side has
-/// decided to leave.
-pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
+/// **Settling is not delivery, and nothing here pretends otherwise.** A send is
+/// followed by the exact logical wait for `DepartObserved` or session
+/// cancellation; there is no retry or timer. The witness makes a stale receipt
+/// unable to satisfy a replacement session.
+#[cfg(any(test, feature = "transport-lab"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DepartureRunOutcome {
+    pub observed: usize,
+    pub cancelled: usize,
+}
+
+#[cfg(not(any(test, feature = "transport-lab")))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DepartureRunOutcome {
+    pub(crate) observed: usize,
+    pub(crate) cancelled: usize,
+}
+
+pub(crate) async fn depart_authenticated_sessions(
+    state: &Arc<NetworkState>,
+) -> DepartureRunOutcome {
+    let mut outcome = DepartureRunOutcome::default();
     // Selection yields owner tokens, and nothing after this line looks a device
     // id up again. Selecting by id and re-resolving it at the send, or at the
     // retirement, is what let a replacement receive its predecessor's goodbye
@@ -5848,24 +6297,49 @@ pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
         .peers
         .owners_snapshot(|peer| peer.holds_promoted_session());
     for owner in departing {
-        let sent = send_to_peer_owner(
-            state,
-            &owner,
-            &MeshMessage::SessionControl(crate::protocol::SessionControl::Depart),
-        )
-        .await;
-        if let Err(error) = sent {
+        let mut raw = [0u8; 16];
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut raw);
+        let correlation =
+            DepartureCorrelation::new(data_encoding::BASE32_NOPAD.encode(&raw).to_lowercase())
+                .expect("generated departure correlation is bounded and non-empty");
+        let Some(admitted) = state.peers.begin_local_departure(&owner, &correlation) else {
+            continue;
+        };
+        let Ok(admitted) = admitted else {
+            continue;
+        };
+        let depart = MeshMessage::SessionControl(crate::protocol::SessionControl::Depart {
+            correlation: correlation.clone(),
+        });
+        if let Err(error) = send_to_peer_owner(state, admitted.owner(), &depart).await {
+            outcome.cancelled += 1;
             debug!(
                 peer = %owner.device_id(),
                 %error,
-                "departure send did not settle; leaving anyway"
+                "departure send did not settle; retiring the exact session"
             );
+        } else {
+            tokio::select! {
+                result = admitted.waiter().wait(admitted.witness()) => {
+                    match result {
+                        crate::runtime::peer_session::DepartureWaitOutcome::Observed => outcome.observed += 1,
+                        crate::runtime::peer_session::DepartureWaitOutcome::Cancelled => outcome.cancelled += 1,
+                    }
+                }
+                _ = state.wait_for_shutdown() => {
+                    state.peers.cancel_pending_departures_for_shutdown();
+                    outcome.cancelled += 1;
+                }
+            }
         }
-        // The same token that was selected and sent over. A successor installed
-        // before the send, during the awaited send, or after it, is not this
-        // token's installation, so `drop_peer_if_current` leaves it alone.
-        drop_peer_if_current(state, &owner, DropReason::UserLeft).await;
+        if let Some(dispatch) =
+            admit_logical_terminal_dispatch_for_witness(state, admitted.owner(), admitted.witness())
+        {
+            finish_exact_logical_retirement(state, dispatch.logical_operation()).await;
+        }
     }
+    outcome
 }
 
 /// `transport-lab` seam: drive [`depart_authenticated_sessions`] from an
@@ -5882,8 +6356,40 @@ pub(crate) async fn depart_authenticated_sessions(state: &Arc<NetworkState>) {
 /// only where `transport-lab` is on, so an ordinary build has no such public
 /// item.
 #[cfg(feature = "transport-lab")]
-pub async fn depart_for_lab(state: &Arc<NetworkState>) {
-    depart_authenticated_sessions(state).await;
+pub async fn depart_for_lab(state: &Arc<NetworkState>) -> DepartureRunOutcome {
+    depart_authenticated_sessions(state).await
+}
+
+/// Arm the one-shot remote departure receipt hold for a transport-lab control.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn install_departure_receipt_gate_for_lab(state: &NetworkState) {
+    state.depart_observed_gate.arm();
+}
+
+/// Subscribe to the next remote departure receipt entering the lab hold.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn departure_receipt_gate_arrival_for_lab(
+    state: &NetworkState,
+) -> tokio::sync::futures::Notified<'_> {
+    state.depart_observed_gate.arrival()
+}
+
+/// Wait until the next remote departure receipt has entered the lab hold.
+#[cfg(any(test, feature = "transport-lab"))]
+pub async fn wait_departure_receipt_gate_for_lab(state: &NetworkState) {
+    state.depart_observed_gate.entered().await;
+}
+
+/// Release the remote departure receipt currently held by the lab gate.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn release_departure_receipt_gate_for_lab(state: &NetworkState) {
+    state.depart_observed_gate.release();
+}
+
+/// Observe exact logical sessions with a pending departure receipt.
+#[cfg(any(test, feature = "transport-lab"))]
+pub fn pending_departure_count_for_lab(state: &NetworkState) -> usize {
+    state.peers.pending_departure_count()
 }
 
 pub(crate) async fn send_to_peer(
@@ -6013,7 +6519,11 @@ pub(crate) async fn send_application_bytes(
     let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
     let sent = state
         .peers
-        .admit_application_operation(owner, state.session_broker.as_ref(), &state.network_id)
+        .admit_application_operation(
+            owner,
+            state.session_broker.as_ref(),
+            &state.mesh_context_id().to_string(),
+        )
         .ok_or_else(|| {
             Error::Network(format!(
                 "peer owner has no live promoted session for application traffic: {}",
@@ -6142,7 +6652,7 @@ async fn send_capabilities_to_owner(
         .with_live_session(
             owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session| (),
         )
         .is_none()
@@ -6207,7 +6717,7 @@ async fn replay_local_capabilities_to_owner(
     let owed = state.peers.with_live_session_state(
         owner,
         state.session_broker.as_ref(),
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         |_session, session_state| session_state.local_advert_owed(),
     );
     if owed != Some(true) {
@@ -6224,7 +6734,7 @@ async fn replay_local_capabilities_to_owner(
     let _ = state.peers.with_live_session_state(
         owner,
         state.session_broker.as_ref(),
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         |_session, session_state| session_state.clear_local_advert_debt(),
     );
 }
@@ -6490,7 +7000,10 @@ async fn finish_drop_peer(
     reason: DropReason,
     removed: Option<Arc<PeerConnection>>,
 ) {
-    finish_drop_peer_inner(state, device_id, reason, removed, false).await;
+    let opened_as = removed
+        .as_ref()
+        .and_then(|peer| opened_as_for_peer(peer.as_ref()));
+    finish_drop_peer_inner(state, device_id, reason, removed, opened_as, false).await;
 }
 
 async fn finish_drop_peer_started(
@@ -6498,8 +7011,13 @@ async fn finish_drop_peer_started(
     device_id: &str,
     reason: DropReason,
     removed: Arc<PeerConnection>,
+    opened_as: Option<OpenedAs>,
 ) {
-    finish_drop_peer_inner(state, device_id, reason, Some(removed), true).await;
+    finish_drop_peer_inner(state, device_id, reason, Some(removed), opened_as, true).await;
+}
+
+fn opened_as_for_peer(peer: &PeerConnection) -> Option<OpenedAs> {
+    peer.current_worker().map(|worker| OpenedAs::of(&worker))
 }
 
 async fn finish_drop_peer_inner(
@@ -6507,9 +7025,31 @@ async fn finish_drop_peer_inner(
     device_id: &str,
     reason: DropReason,
     removed: Option<Arc<PeerConnection>>,
+    opened_as: Option<OpenedAs>,
     already_started: bool,
 ) {
     if let Some(peer) = removed {
+        let sticky = state.is_sticky(device_id);
+        let evicted = governance::log_evicted(state, device_id);
+        let recoverable = !evicted
+            && matches!(
+                reason,
+                DropReason::IceFailed
+                    | DropReason::HeartbeatTimeout
+                    | DropReason::TransportError { .. }
+            );
+        if recoverable {
+            if opened_as.is_some_and(OpenedAs::is_offerer) || sticky {
+                state.record_reconnect_intent(device_id, sticky);
+            } else {
+                state.clear_reconnect_intent(device_id);
+            }
+        } else {
+            state.clear_reconnect_intent(device_id);
+            let why = format!("{reason:?}");
+            state.resolve_connect_waiters(device_id, Some(&why));
+        }
+
         if !already_started {
             state.peers.track_removed_close(Arc::clone(&peer));
             // Retire synchronously to move every exact channel/candidate into
@@ -6535,57 +7075,9 @@ async fn finish_drop_peer_inner(
             serde_json::json!({ "peer": device_id, "reason": format!("{reason:?}") }),
         );
 
-        // Self-drive the reconnect for any peer we are the *offerer* for that
-        // we lost to a recoverable transport failure — whether it was fully
-        // connected (a network shift tore it down) or never completed its
-        // first connect (a signaling race delivered zero remote candidates).
-        // Either way the *answerer* side waits for our offer and won't
-        // re-initiate, so without this an offerer-role peer only comes back on
-        // its slow (~120 s) steady-state announce. Events drive the actual
-        // re-offer (a relay reconnect flushes intents, an inbound announce
-        // rebuilds); the reconnect-supervisor ticker is the backstop. The
-        // intent is bounded by the reconnecting grace and is NOT extended by
-        // repeated failed rebuilds (see `record_reconnect_intent`), so a peer
-        // that genuinely went away ages out instead of spinning. Intentional
-        // teardown (UserLeft / Denied / AuthFailed) must never be retried.
-        let we_offer = state.identity.public_id() < device_id;
-        let sticky = state.is_sticky(device_id);
-        // A peer our own signed state has evicted is never reconnected back,
-        // whatever the drop reason: the deny-with-proof exchange is a one-shot
-        // handoff, not a session to keep alive. Its post-deny channel close
-        // arrives as a "recoverable" IceFailed, and because we hold the
-        // lex-lower id (so `we_offer`) that would re-arm a reconnect intent —
-        // the 2 s connect/deny/drop/redial hot loop that never converges. Fold
-        // eviction into the intentional-teardown bucket so we stop self-driving
-        // the dial; the evicted device's own periodic announce is still
-        // answered and re-denied with proof, so convergence keeps its channel
-        // without the spin. Mirror of the `self_evicted` announce gate, which
-        // already stands a stood-down engine down from dialing.
-        let evicted = governance::log_evicted(state, device_id);
-        let recoverable = !evicted
-            && matches!(
-                reason,
-                DropReason::IceFailed
-                    | DropReason::HeartbeatTimeout
-                    | DropReason::TransportError { .. }
-            );
-        // Retained frames need no arm here, on either branch. They belonged to
-        // the session this drop ended, and that session's own drop has already
-        // released them and told each waiting caller the frame was not
-        // delivered. Whether the peer is worth reconnecting to decides what
-        // happens next, not what happens to a frame the ended session was
-        // holding.
-        if recoverable {
-            if we_offer || sticky {
-                state.record_reconnect_intent(device_id, sticky);
-            }
-        } else {
-            // Intentional removal / leave / auth failure — stop retrying, and
-            // tell every parked caller the truth.
-            state.clear_reconnect_intent(device_id);
-            let why = format!("{reason:?}");
-            state.resolve_connect_waiters(device_id, Some(&why));
-        }
+        // Reconnect disposition was recorded from the exact removed worker
+        // before native close; completion below only publishes the terminal
+        // event and reevaluates topology.
     }
     phase::recompute(state);
     ladder::reevaluate_topology(state).await;
@@ -6655,8 +7147,12 @@ fn attempt_is_current(state: &Arc<NetworkState>, device_id: &str, attempt: &str)
 }
 
 pub(crate) async fn drop_peer(state: &Arc<NetworkState>, device_id: &str, reason: DropReason) {
-    let removed = remove_peer(&state.peers, device_id);
-    finish_drop_peer(state, device_id, reason, removed).await;
+    match remove_peer(&state.peers, device_id) {
+        Some((peer, opened_as)) => {
+            finish_drop_peer_inner(state, device_id, reason, Some(peer), opened_as, false).await;
+        }
+        None => finish_drop_peer(state, device_id, reason, None).await,
+    }
 }
 
 pub(crate) async fn drop_peer_if_current(
@@ -6689,6 +7185,7 @@ pub(crate) async fn drop_peer_if_current(
                     return;
                 }
                 peer_registry::ChannelTerminal::Peer { peer, channel } => {
+                    let opened_as = Some(OpenedAs::of(&channel.worker));
                     state.peers.track_removed_close(Arc::clone(&peer));
                     peer.retire_connector();
                     let started = owner.connection().start_exact_retired_worker(
@@ -6703,7 +7200,7 @@ pub(crate) async fn drop_peer_if_current(
                     let state = Arc::clone(state);
                     let device_id = owner.device_id().to_string();
                     tokio::spawn(async move {
-                        finish_drop_peer_started(&state, &device_id, reason, peer).await;
+                        finish_drop_peer_started(&state, &device_id, reason, peer, opened_as).await;
                     });
                     return;
                 }
@@ -6725,6 +7222,7 @@ pub(crate) async fn drop_peer_if_current(
                 }
             }
             Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+                let opened_as = Some(OpenedAs::of(&removed.worker));
                 if removed.session_empty {
                     state.peers.track_removed_close(Arc::clone(&peer));
                     peer.retire_connector();
@@ -6742,7 +7240,7 @@ pub(crate) async fn drop_peer_if_current(
                     let state = Arc::clone(state);
                     let device_id = owner.device_id().to_string();
                     tokio::spawn(async move {
-                        finish_drop_peer_started(&state, &device_id, reason, peer).await;
+                        finish_drop_peer_started(&state, &device_id, reason, peer, opened_as).await;
                     });
                 }
             }
@@ -6779,7 +7277,7 @@ fn admit_logical_terminal_dispatch(
         .with_admitted_current_or_refused(
             owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |admitted| {
                 let frame = admitted
                     .with_session_state(|session, _record| {
@@ -6840,8 +7338,11 @@ fn install_peer(
 fn remove_peer(
     peers: &peer_registry::PeerRegistry,
     device_id: &str,
-) -> Option<Arc<PeerConnection>> {
-    peers.remove(device_id)
+) -> Option<(Arc<PeerConnection>, Option<OpenedAs>)> {
+    peers.remove(device_id).map(|(peer, worker)| {
+        let opened_as = worker.as_ref().map(|worker| OpenedAs::of(worker.as_ref()));
+        (peer, opened_as)
+    })
 }
 
 /// Build a minimal `NetworkState` for unit tests. One process-wide
@@ -6851,6 +7352,26 @@ fn remove_peer(
 #[cfg(test)]
 pub(crate) fn build_test_state(network_id_suffix: &str) -> Arc<NetworkState> {
     let (state, cmd_rx) = build_test_state_parts(network_id_suffix);
+    state.park_command_receiver_for_test(cmd_rx);
+    state
+}
+
+/// Build a test state from an explicit local Closed bootstrap root.  The
+/// creation id belongs to the caller so repeated controls cannot accidentally
+/// reuse persisted semantic identity.
+#[cfg(test)]
+pub(crate) fn build_test_closed_state(
+    network_id_suffix: &str,
+    creation_id: [u8; 32],
+) -> Arc<NetworkState> {
+    let (state, _signaling_in_rx, cmd_rx, _provider, _grant) =
+        build_test_state_parts_metered_with_creation(
+            network_id_suffix,
+            None,
+            FIXTURE_CONNECTOR_SLOTS,
+            None,
+            Some(creation_id),
+        );
     state.park_command_receiver_for_test(cmd_rx);
     state
 }
@@ -6923,6 +7444,29 @@ fn build_test_state_parts_metered(
     crate::resource::FiniteResourceProvider,
     crate::resource::ResourceClaim,
 ) {
+    build_test_state_parts_metered_with_creation(
+        network_id_suffix,
+        profile_override,
+        connector_slots,
+        retained,
+        None,
+    )
+}
+
+#[cfg(test)]
+fn build_test_state_parts_metered_with_creation(
+    network_id_suffix: &str,
+    profile_override: Option<crate::WebRtcConnectorProfile>,
+    connector_slots: usize,
+    retained: Option<crate::resource::ResourceClaim>,
+    closed_creation_id: Option<[u8; 32]>,
+) -> (
+    Arc<NetworkState>,
+    crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
+    crate::resource::ResourceMailboxReceiver<NetworkCmd>,
+    crate::resource::FiniteResourceProvider,
+    crate::resource::ResourceClaim,
+) {
     use std::sync::OnceLock;
     static HOME: OnceLock<tempfile::TempDir> = OnceLock::new();
     let _ = HOME.get_or_init(|| {
@@ -6936,7 +7480,11 @@ fn build_test_state_parts_metered(
         id: network_id.clone(),
         network_id,
         label: "test".into(),
-        kind: Default::default(),
+        kind: if closed_creation_id.is_some() {
+            crate::network_state::NetworkKind::Closed
+        } else {
+            Default::default()
+        },
         topology: crate::config::TopologyMode::FullMesh,
         signaling: crate::config::SignalingConfig::default(),
         stun_servers: Vec::new(),
@@ -7242,9 +7790,25 @@ fn build_test_state_parts_metered(
     let local_resources = process
         .issue_local_application_scope()
         .expect("engine fixture issues local application authority");
-    let (state, signaling_in_rx, cmd_rx) =
-        NetworkState::new_in_mesh_scope(config, identity, transport, &mesh_scope, &local_resources)
-            .expect("network state");
+    let bootstrap = match closed_creation_id {
+        Some(creation_id) => VerifiedBootstrap::create_closed(
+            config.network_id.clone(),
+            std::iter::once(identity.signing_key()),
+            creation_id,
+        )
+        .expect("engine fixture creates a root-signed Closed bootstrap"),
+        None => VerifiedBootstrap::open(config.network_id.clone())
+            .expect("engine fixture creates founderless semantic bootstrap"),
+    };
+    let (state, signaling_in_rx, cmd_rx) = NetworkState::new_in_mesh_scope(
+        config,
+        identity,
+        transport,
+        bootstrap,
+        &mesh_scope,
+        &local_resources,
+    )
+    .expect("network state");
     (state, signaling_in_rx, cmd_rx, metered, grant)
 }
 
@@ -7323,7 +7887,7 @@ impl RetainedCapacityMeter {
             .with_live_session(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |_session| (),
             )
             .expect("the peer promotes a session to seal capacity against");
@@ -7345,7 +7909,7 @@ impl RetainedCapacityMeter {
             .with_live_session(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session| session.reserve_retained(seal),
             )
             .expect("the session that was promoted a moment ago is still current")
@@ -7759,7 +8323,7 @@ async fn insert_promoted_peer(state: &Arc<NetworkState>, device_id: &str) -> Pro
         handoff
             .into_generic()
             .expect("a fresh handoff still carries its capability"),
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         state.identity.public_id(),
     );
     install_peer(&state.peers, Arc::clone(&peer));
@@ -7859,7 +8423,7 @@ pub(crate) async fn install_promoted_session_over_real_link(
     }
     far_peer.install_authenticated_channel_over_for_test(
         handoff,
-        &far_state.network_id,
+        &far_state.mesh_context_id().to_string(),
         far_state.identity.public_id(),
     );
     install_peer(&far_state.peers, Arc::clone(&far_peer));
@@ -7874,7 +8438,7 @@ pub(crate) async fn install_promoted_session_over_real_link(
         // No deadline: this loop's termination is an observation, not a
         // timeout. It ends when the native close ends the event stream.
         while let Some(event) = events.recv().await {
-            let _acted = handle_transport_event(&pumping, near_device_id.clone(), event).await;
+            let _ = handle_transport_event(&pumping, near_device_id.clone(), event).await;
         }
     });
 
@@ -7981,7 +8545,7 @@ pub(crate) async fn insert_promoted_peer_over_real_link(
     }
     peer.install_authenticated_channel_over_for_test(
         handoff,
-        &state.network_id,
+        &state.mesh_context_id().to_string(),
         state.identity.public_id(),
     );
     install_peer(&state.peers, Arc::clone(&peer));
@@ -9169,7 +9733,7 @@ mod tests {
             .with_admitted_current(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |_| (),
             )
             .is_some()
@@ -9313,7 +9877,7 @@ mod tests {
                 .with_admitted_current(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |admitted| admitted.device_id().to_string()
                 )
                 .is_none(),
@@ -9367,23 +9931,31 @@ mod tests {
         let grant = signed(
             TransitionVariant::RoleGrant {
                 target: target.into(),
-                role: crate::Role::Member,
+                role: crate::network_state::Role::Member,
             },
             1,
         );
         state.peers.with_governance_commit(|gov| {
-            gov.kind = crate::NetworkKind::Closed;
+            gov.kind = crate::network_state::NetworkKind::Closed;
+            gov.roles.insert(
+                state.identity.public_id().to_string(),
+                crate::network_state::Role::Owner,
+            );
             gov.roles
-                .insert(state.identity.public_id().to_string(), crate::Role::Owner);
-            gov.roles.insert(authority_id.clone(), crate::Role::Owner);
-            gov.roles.insert(target.into(), crate::Role::Member);
+                .insert(authority_id.clone(), crate::network_state::Role::Owner);
+            gov.roles
+                .insert(target.into(), crate::network_state::Role::Member);
             gov.member_log = vec![grant.clone()];
         });
         let fixture = insert_promoted_peer(&state, target).await;
         let owner = state.peers.owner(target).expect("promoted peer owner");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string()
+            )
             .is_some());
 
         let evict = signed(
@@ -9396,7 +9968,11 @@ mod tests {
 
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string()
+            )
             .is_none());
         assert!(
             !fixture.peer.holds_promoted_session(),
@@ -9452,7 +10028,7 @@ mod tests {
                 .admit_application_operation(
                     &closed_owner,
                     closed_state.session_broker.as_ref(),
-                    &closed_state.network_id,
+                    &closed_state.mesh_context_id().to_string(),
                 )
                 .expect("non-vacuity: policy admits the owned send while everything is live");
 
@@ -9476,7 +10052,7 @@ mod tests {
                 .claim_renegotiation(
                     &closed_owner,
                     closed_state.session_broker.as_ref(),
-                    &closed_state.network_id,
+                    &closed_state.mesh_context_id().to_string(),
                 )
                 .expect("non-vacuity: the live session claims renegotiation on its own connector");
             renegotiation.session().begin_close_for_test();
@@ -9511,7 +10087,7 @@ mod tests {
                     .admit_application_operation(
                         &closed_owner,
                         closed_state.session_broker.as_ref(),
-                        &closed_state.network_id
+                        &closed_state.mesh_context_id().to_string()
                     )
                     .is_some(),
                 "and the current owner and its session validity still admit the next operation"
@@ -9581,7 +10157,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, flows, live| {
                     flows.open(
                         session,
@@ -9605,7 +10181,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |_session, flows, _live| {
                     flows.accounted_delivery_for_test(
                         &realtime_test_name(3),
@@ -9653,15 +10229,27 @@ mod tests {
         // value write after the signed policy edge below had already returned.
         let delayed_send = state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .expect("non-vacuity: policy admits the owned send before revocation");
         let racing_send = state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .expect("non-vacuity: a third owned send is admitted before revocation");
         let started_send = state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .expect("non-vacuity: a second owned send is admitted before revocation")
             .begin_for_test(&state.peers)
             .expect("the second send crosses its effect-begin point before revocation");
@@ -9679,7 +10267,11 @@ mod tests {
         fixture.peer.state.write().media_reneg_pending = true;
         let delayed_renegotiation = state
             .peers
-            .claim_renegotiation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .claim_renegotiation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .expect("non-vacuity: the live session claims renegotiation before revocation");
         assert!(delayed_renegotiation.is_live());
 
@@ -9858,7 +10450,7 @@ mod tests {
                 .with_live_session_flow(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, _flows, _live| ()
                 )
                 .is_none(),
@@ -10146,7 +10738,7 @@ mod tests {
                 handoff
                     .into_generic()
                     .expect("a fresh handoff still carries its capability"),
-                &self.state.network_id,
+                &self.state.mesh_context_id().to_string(),
                 self.state.identity.public_id(),
             );
         }
@@ -10163,7 +10755,7 @@ mod tests {
                 .with_live_session_flow(
                     owner,
                     self.state.session_broker.as_ref(),
-                    &self.state.network_id,
+                    &self.state.mesh_context_id().to_string(),
                     |_session, _flows, _live| (),
                 )
                 .is_some()
@@ -10182,7 +10774,7 @@ mod tests {
                 .with_live_session_flow(
                     owner,
                     self.state.session_broker.as_ref(),
-                    &self.state.network_id,
+                    &self.state.mesh_context_id().to_string(),
                     |session, flows, live| {
                         flows.open(
                             session,
@@ -10222,7 +10814,7 @@ mod tests {
                 .with_live_session_flow(
                     owner,
                     self.state.session_broker.as_ref(),
-                    &self.state.network_id,
+                    &self.state.mesh_context_id().to_string(),
                     |_session, flows, _live| {
                         flows.accounted_delivery_for_test(
                             &realtime_test_name(label),
@@ -10273,7 +10865,7 @@ mod tests {
                 .with_live_session_flow(
                     owner,
                     self.state.session_broker.as_ref(),
-                    &self.state.network_id,
+                    &self.state.mesh_context_id().to_string(),
                     |_session, flows, _live| {
                         let (arrived, unit) = flows.inbound_arrivals()?.try_next()?;
                         assert_eq!(
@@ -10312,7 +10904,7 @@ mod tests {
                 .with_live_session_flow(
                     owner,
                     self.state.session_broker.as_ref(),
-                    &self.state.network_id,
+                    &self.state.mesh_context_id().to_string(),
                     |session, flows, live| {
                         let name = flows
                             .open(
@@ -10850,7 +11442,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 gate.state.session_broker.as_ref(),
-                &gate.state.network_id,
+                &gate.state.mesh_context_id().to_string(),
                 |session, flows, live| {
                     // Closed by name, from inside the fence, because the point
                     // is what the *set* then says about the record that left.
@@ -10945,7 +11537,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 gate.state.session_broker.as_ref(),
-                &gate.state.network_id,
+                &gate.state.mesh_context_id().to_string(),
                 |_session, flows, _live| flows.flow_identity(&realtime_test_name(6)).is_some(),
             )
             .expect("the fence still answers for this owner after the handle drops");
@@ -11263,9 +11855,11 @@ mod tests {
         // consumes one pending renegotiation, so each attempt arms its own.
         let claim = |peer: &Arc<PeerConnection>, owner: &peer_registry::PeerOwnerToken| {
             peer.state.write().media_reneg_pending = true;
-            state
-                .peers
-                .claim_renegotiation(owner, state.session_broker.as_ref(), &state.network_id)
+            state.peers.claim_renegotiation(
+                owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
         };
 
         let first_peer = install_live_peer(
@@ -11395,7 +11989,7 @@ mod tests {
             .admit_application_operation(
                 &captured_owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
             )
             .expect("an admitted owner mints a witness")
             .send_frame(
@@ -11418,7 +12012,7 @@ mod tests {
             .admit_application_operation(
                 &captured_owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
             )
             .expect("the owner is still current at mint time");
 
@@ -11787,7 +12381,7 @@ mod tests {
         }
         peer.install_authenticated_channel_over_for_test(
             handoff,
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
         );
         install_peer(&state.peers, Arc::clone(&peer));
@@ -11808,7 +12402,11 @@ mod tests {
         // the same path an outbound send or a realtime open would take.
         let witness = state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .expect("an admitted owner with a live connector promotes");
         drop(witness);
 
@@ -11859,7 +12457,7 @@ mod tests {
             state.peers.with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |_session, session_state| session_state.local_advert_owed(),
             ),
             Some(false),
@@ -12767,7 +13365,7 @@ mod tests {
             .with_admitted_current_or_refused(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |admitted| {
                     let frame = admitted
                         .with_session_state(|session, _record| {
@@ -12787,7 +13385,7 @@ mod tests {
             .with_admitted_current_or_refused(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |admitted| Some(admitted.inbound_application_operation(decoded)),
                 |_| None,
             )
@@ -12820,7 +13418,7 @@ mod tests {
             .with_admitted_current_or_refused(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |admitted| {
                     let frame = admitted
                         .with_session_state(|session, _record| {
@@ -12883,7 +13481,7 @@ mod tests {
             replacement_handoff
                 .into_generic()
                 .expect("a fresh replacement handoff carries its capability"),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
         );
         assert!(
@@ -13597,7 +14195,7 @@ mod tests {
             .with_live_session_state(
                 owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 effect,
             )
             .expect("the promoted session is current")
@@ -14364,73 +14962,141 @@ mod tests {
         assert!(!state.has_reconnect_intent("peer-z"));
     }
 
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a local WebRTC object; run explicitly in the isolated WSL harness"]
+    async fn actual_offerer_recovery_is_recorded_before_native_close_settles() {
+        use crate::transport::Role;
+
+        let state = build_test_state("actual-offerer-close-gate");
+        let target = format!("!{}-actual-offerer", state.identity.public_id());
+        assert!(
+            state.identity.public_id() > target.as_str(),
+            "the fixture target is lexicographically below the local identity"
+        );
+        let (worker, events) = state
+            .transport
+            .open_connector_peer(
+                Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the actual offerer worker opens");
+        let worker = Arc::new(worker);
+        let handoff = match worker.confirm_data_channel_open() {
+            crate::transport::DataChannelOpenOwnership::Connected(handoff) => handoff,
+            _ => panic!("the offerer worker yields its connected handoff"),
+        };
+        let peer = Arc::new(PeerConnection::new(
+            target.clone(),
+            Some(Arc::clone(&worker)),
+        ));
+        {
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::Active;
+            data.data_channel_open = true;
+        }
+        peer.install_authenticated_channel_over_for_test(
+            handoff
+                .into_generic()
+                .expect("the offerer handoff carries its capability"),
+            &state.mesh_context_id().to_string(),
+            state.identity.public_id(),
+        );
+        install_peer(&state.peers, Arc::clone(&peer));
+        let gate = worker.install_native_close_gate_for_test();
+        let (removed, opened_as) =
+            remove_peer(&state.peers, &target).expect("the offerer peer is removed");
+        let drop_state = Arc::clone(&state);
+        let drop_target = target.clone();
+        let drop_task = tokio::spawn(async move {
+            finish_drop_peer_inner(
+                &drop_state,
+                &drop_target,
+                DropReason::IceFailed,
+                Some(removed),
+                opened_as,
+                false,
+            )
+            .await;
+        });
+        gate.wait_for_entry().await;
+        assert!(
+            state.has_reconnect_intent(&target),
+            "actual offerer recovery intent is visible while native close is gated"
+        );
+        gate.open();
+        drop_task
+            .await
+            .expect("offerer drop joins after close settles");
+        try_reoffer(&state, &target).await;
+        let replacement = state
+            .peers
+            .get(&target)
+            .expect("recorded actual-offerer intent installs a replacement");
+        let replacement_worker = replacement
+            .session
+            .lock()
+            .clone()
+            .expect("replacement retains its current worker");
+        assert_eq!(
+            replacement_worker.role(),
+            Role::Offerer,
+            "recorded actual-offerer intent reopens an offerer worker"
+        );
+        drop(events);
+        state.shutdown().await;
+    }
+
     #[tokio::test]
     async fn evicted_peer_drop_never_rearms_reconnect() {
-        // The evicted-peer loop guard. A device our own signed state has
-        // evicted must not be self-dialed back: its post-deny channel close
-        // arrives as a "recoverable" IceFailed, and since we hold the lex-lower
-        // id we're its offerer — so without the guard `drop_peer` re-arms a
-        // reconnect intent, the 2 s tick reconnects, the handshake re-denies,
-        // the channel closes, and it drops again, forever. Dropping an evicted
-        // peer is intentional teardown, so no intent is left behind; the peer's
-        // own announce (answered + re-denied with proof) is the only thing that
-        // re-opens a session, so convergence keeps its channel without the spin.
-        use crate::network_state::{
-            transition_payload, NetworkState as GovState, Transition, TransitionVariant,
-        };
-        use crate::{NetworkKind, Role};
+        // The evicted-peer loop guard: eviction suppresses recovery even when
+        // the otherwise-identical peer is sticky and receives IceFailed.
+        use crate::network_state::{transition_payload, Role, Transition, TransitionVariant};
 
-        let state = build_test_state("evicted-no-reconnect");
+        let state = build_test_closed_state("evicted-no-reconnect", [0x73; 32]);
         let net = state.network_id.clone();
 
-        // Both must sort lex-greater than any base32 identity so `we_offer`
-        // holds (we're the offerer) and dash-free so `pubkey_part` leaves the id
-        // whole and the evict target matches. base32-lowercase tops out at 'z' in
-        // a 52-char id, so any all-'z' string longer than 52 chars clears every
-        // identity deterministically — a plain "y"*60 did not (a ~3 % of ephemeral
-        // identities that happen to start with 'z' sort above it, flaking the
-        // precondition assert). Distinct lengths keep the two ids distinct.
+        // Distinct lengths keep the two control ids separate; role ownership is
+        // supplied by sticky state rather than inferred from their spelling.
         let evicted = "z".repeat(60);
         let live = "z".repeat(61);
-        assert!(
-            state.identity.public_id() < evicted.as_str()
-                && state.identity.public_id() < live.as_str(),
-            "test ids must sort above our identity so we're their offerer"
-        );
 
-        // Seed a Closed governance whose signed member log evicts `evicted`.
-        let owner = crate::identity::Identity::ephemeral();
-        let owner_pk = owner.public_id().to_string();
-        {
-            let mut gov = state.governance_state.write();
-            *gov = GovState::empty_for(&net);
-            gov.kind = NetworkKind::Closed;
-            gov.roles.insert(owner_pk.clone(), Role::Owner);
-            let signed = |variant: TransitionVariant, at: u64| {
-                let payload = transition_payload(&net, &variant);
-                Transition {
-                    at,
-                    signatures: vec![crate::signing::sign_with(owner.signing_key(), &payload)],
-                    signers: vec![owner_pk.clone()],
-                    variant,
-                }
-            };
-            gov.member_log = vec![
-                signed(
-                    TransitionVariant::RoleGrant {
-                        target: evicted.clone(),
-                        role: Role::Member,
-                    },
-                    1,
-                ),
-                signed(
-                    TransitionVariant::Evict {
-                        target: evicted.clone(),
-                    },
-                    2,
-                ),
-            ];
-        }
+        // Seed the compatibility member tier through the production adoption
+        // seam. The verified bootstrap root signs both entries; the governance
+        // tier remains empty and no synthetic KindChange is introduced.
+        let authority_id = state.identity.public_id().to_string();
+        let signed = |variant: TransitionVariant, at: u64| {
+            let payload = transition_payload(&net, &variant);
+            Transition {
+                at,
+                signatures: vec![crate::signing::sign_with(
+                    state.identity.signing_key(),
+                    &payload,
+                )],
+                signers: vec![authority_id.clone()],
+                variant,
+            }
+        };
+        let member_log = vec![
+            signed(
+                TransitionVariant::RoleGrant {
+                    target: evicted.clone(),
+                    role: Role::Member,
+                },
+                1,
+            ),
+            signed(
+                TransitionVariant::Evict {
+                    target: evicted.clone(),
+                },
+                2,
+            ),
+        ];
+        governance::adopt_transition_log(&state, &authority_id, &[], &member_log).await;
         assert!(
             governance::log_evicted(&state, &evicted),
             "seed must make the target read as evicted"
@@ -14439,6 +15105,8 @@ mod tests {
             !governance::log_evicted(&state, &live),
             "the control peer must not read as evicted"
         );
+        state.add_sticky(&evicted);
+        state.add_sticky(&live);
 
         // The evicted peer: its IceFailed drop must leave no reconnect intent.
         insert_session_less_peer(&state, &evicted, None);
@@ -14448,14 +15116,13 @@ mod tests {
             "an evicted peer's drop must not arm a reconnect intent"
         );
 
-        // Control: a non-evicted offerer-role peer with the identical drop DOES
-        // self-reconnect — proving the guard, not the plumbing, suppresses the
-        // evicted one.
+        // Control: a non-evicted sticky peer with the identical drop does arm
+        // recovery, proving the eviction predicate suppresses only the target.
         insert_session_less_peer(&state, &live, None);
         drop_peer(&state, &live, DropReason::IceFailed).await;
         assert!(
             state.has_reconnect_intent(&live),
-            "a non-evicted offerer-role peer still self-reconnects on IceFailed"
+            "a non-evicted sticky peer still recovers on IceFailed"
         );
     }
 
@@ -14863,7 +15530,7 @@ mod tests {
         state.peers.with_live_session_state(
             &owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, app| app.rpc_mut().pending_len(),
         )
     }
@@ -14979,7 +15646,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_c,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&bystander),
                 )
                 .expect("C still has a live session"),
@@ -15086,7 +15753,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_c,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&bystander),
                 )
                 .expect("C still has a live session"),
@@ -15238,7 +15905,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_c,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&bystander),
                 )
                 .expect("C still has a live session"),
@@ -15343,7 +16010,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_c,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&bystander),
                 )
                 .expect("C still has a live session"),
@@ -15427,7 +16094,7 @@ mod tests {
         peer.replace_connector_for_session_control(worker);
         peer.install_authenticated_channel_over_for_test(
             handoff,
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
         );
     }
@@ -15509,7 +16176,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_b,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&filed),
                 )
                 .expect("the successor has a live session"),
@@ -15700,7 +16367,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_b,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&filed),
                 )
                 .expect("the successor has a live session"),
@@ -15995,7 +16662,7 @@ mod tests {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |_session, app| app.rpc_mut().still_holds(filed),
             )
             .unwrap_or(false)
@@ -16058,7 +16725,7 @@ mod tests {
         }
         peer.install_authenticated_channel_over_for_test(
             handoff,
-            &far.network_id,
+            &far.mesh_context_id().to_string(),
             far.identity.public_id(),
         );
         install_peer(&far.peers, Arc::clone(&peer));
@@ -16314,7 +16981,7 @@ mod tests {
         state.peers.with_live_session_state(
             &owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, record| record.inbound_mark_for_test(),
         )
     }
@@ -16413,7 +17080,7 @@ mod tests {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, _record| {
                     // Unsatisfiable on purpose: the answer wanted is not a lease
                     // but the pressure report, which names the scope that binds
@@ -16813,23 +17480,28 @@ mod tests {
     async fn v4_r7_core_an_evicted_device_is_not_admitted_by_the_current_policy() {
         use crate::network_state::{transition_payload, Transition, TransitionVariant};
 
-        let state = build_test_state("evicted-not-admitted");
-        let me = state.identity.public_id().to_string();
         let target = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
+        // NetworkState::new reloads the signed state for its network id. Keep
+        // this adoption control isolated across repeated focused runs: the
+        // test intentionally persists the first adopted log, so reusing a
+        // fixed suffix would make the incoming genesis a non-extension and
+        // invalidate the before-tombstone non-vacuity assertions.
+        let state = build_test_closed_state(&format!("evicted-not-admitted-{target}"), [0x71; 32]);
+        let me = state.identity.public_id().to_string();
 
-        // The network's owner, whose signature is the authority every entry
-        // below is verified against. Held by this control rather than by the
-        // device under test: the point is a member applying somebody else's
-        // signed removal.
-        let authority = crate::identity::Identity::ephemeral();
-        let authority_id = authority.public_id().to_string();
+        // The verified bootstrap root is the authority every member entry
+        // below is verified against; no synthetic founder election is needed.
+        let authority_id = me.clone();
         let signed = |variant: TransitionVariant, at: u64| {
             let payload = transition_payload(&state.network_id, &variant);
             Transition {
                 at,
-                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signatures: vec![crate::signing::sign_with(
+                    state.identity.signing_key(),
+                    &payload,
+                )],
                 signers: vec![authority_id.clone()],
                 variant,
             }
@@ -16843,24 +17515,9 @@ mod tests {
                 at,
             )
         };
-        // The founder self-election that seats the authority as Owner. Without
-        // it nothing below verifies, and every assertion would pass for the
-        // wrong reason.
-        let elected = signed(
-            TransitionVariant::KindChange {
-                to: crate::network_state::NetworkKind::Closed,
-            },
-            1,
-        );
-        let admits = vec![member(&me, 2), member(&target, 3)];
+        let admits = vec![member(&me, 1), member(&target, 2)];
 
-        governance::adopt_transition_log(
-            &state,
-            &authority_id,
-            std::slice::from_ref(&elected),
-            &admits,
-        )
-        .await;
+        governance::adopt_transition_log(&state, &authority_id, &[], &admits).await;
 
         // Non-vacuity: before the tombstone this really is an admitted,
         // rostered member of a closed network.
@@ -16891,13 +17548,7 @@ mod tests {
             },
             4,
         ));
-        governance::adopt_transition_log(
-            &state,
-            &authority_id,
-            std::slice::from_ref(&elected),
-            &evicted,
-        )
-        .await;
+        governance::adopt_transition_log(&state, &authority_id, &[], &evicted).await;
 
         assert!(
             governance::log_evicted(&state, &target),
@@ -16985,19 +17636,21 @@ mod tests {
     async fn v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt() {
         use crate::network_state::{transition_payload, Transition, TransitionVariant};
 
-        let state = build_test_state("carrier-withdrawal-no-durable-leave");
+        let state = build_test_closed_state("carrier-withdrawal-no-durable-leave", [0x72; 32]);
         let me = state.identity.public_id().to_string();
         let target = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
 
-        let authority = crate::identity::Identity::ephemeral();
-        let authority_id = authority.public_id().to_string();
+        let authority_id = me.clone();
         let signed = |variant: TransitionVariant, at: u64| {
             let payload = transition_payload(&state.network_id, &variant);
             Transition {
                 at,
-                signatures: vec![crate::signing::sign_with(authority.signing_key(), &payload)],
+                signatures: vec![crate::signing::sign_with(
+                    state.identity.signing_key(),
+                    &payload,
+                )],
                 signers: vec![authority_id.clone()],
                 variant,
             }
@@ -17011,20 +17664,8 @@ mod tests {
                 at,
             )
         };
-        let elected = signed(
-            TransitionVariant::KindChange {
-                to: crate::network_state::NetworkKind::Closed,
-            },
-            1,
-        );
-        let admits = vec![member(&me, 2), member(&target, 3)];
-        governance::adopt_transition_log(
-            &state,
-            &authority_id,
-            std::slice::from_ref(&elected),
-            &admits,
-        )
-        .await;
+        let admits = vec![member(&me, 1), member(&target, 2)];
+        governance::adopt_transition_log(&state, &authority_id, &[], &admits).await;
 
         // Non-vacuity: a closed network with a real signed member, so the
         // assertions after the withdrawal are about something that could have
@@ -17440,7 +18081,7 @@ mod tests {
         let sent = send_to_peer_owner(
             &state,
             &stale,
-            &MeshMessage::SessionControl(crate::protocol::SessionControl::Depart),
+            &MeshMessage::SessionControl(test_departure_control()),
         )
         .await;
         assert!(
@@ -17483,7 +18124,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id
+                    &state.mesh_context_id().to_string()
                 )
                 .is_some(),
             "the fence mints the session on first admission"
@@ -17529,7 +18170,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "the fixture really reaches a promoted application session"
@@ -17633,7 +18274,11 @@ mod tests {
         let owner = state.peers.owner(target).expect("the promoted peer exists");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         while let Some(event) = fixture._events.try_recv_nonblocking() {
             let _ = handle_transport_event(&state, target.to_string(), event).await;
@@ -17901,7 +18546,7 @@ mod tests {
             primary_handoff
                 .into_generic()
                 .expect("the primary handoff carries its capability"),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
         );
         {
@@ -17935,7 +18580,11 @@ mod tests {
         assert!(
             state
                 .peers
-                .admit_application_operation(&owner, Some(broker), &state.network_id,)
+                .admit_application_operation(
+                    &owner,
+                    Some(broker),
+                    &state.mesh_context_id().to_string(),
+                )
                 .is_none(),
             "promotion staged during the awaited Offer mutation is refused"
         );
@@ -17947,7 +18596,7 @@ mod tests {
                     &candidate,
                     &correlation,
                     broker,
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_none(),
             "speculative promotion staged during the same mutation is refused"
@@ -18174,7 +18823,11 @@ mod tests {
             .expect("the promoted owner exists");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let predecessor = fixture.peer.session.lock().clone().expect("predecessor");
         let (candidate, _candidate_events) = state
@@ -18222,7 +18875,7 @@ mod tests {
                 &candidate,
                 &correlation,
                 state.session_broker.as_ref().expect("broker"),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
             )
             .is_none());
         assert!(candidate.live_connector_incarnation().is_none());
@@ -18246,7 +18899,11 @@ mod tests {
             .expect("the promoted owner exists");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let predecessor = owner
             .connection()
@@ -18296,7 +18953,7 @@ mod tests {
                 &successor,
                 &correlation,
                 state.session_broker.as_ref().expect("the broker exists"),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
             )
             .is_none());
         state.shutdown().await;
@@ -18314,7 +18971,11 @@ mod tests {
             .expect("the promoted owner exists");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let (successor, _successor_events) = state
             .transport
@@ -18339,12 +19000,16 @@ mod tests {
             handoff
                 .into_generic()
                 .expect("the successor handoff carries a capability"),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
         );
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let successor_gate = successor.install_native_close_gate_for_test();
         let removed = match state.peers.terminal_speculative_cleanup(
@@ -18400,7 +19065,11 @@ mod tests {
             .expect("the promoted owner exists");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let (stale, _stale_events) = state
             .transport
@@ -18475,6 +19144,124 @@ mod tests {
         state.shutdown().await;
     }
 
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_production_pump_eof_retires_exact_peer_and_preserves_successor() {
+        let state = build_test_state_with_connector_slots("b2-production-pump-eof", 4);
+
+        // The exact installed promoted peer is still current when its
+        // production receiver reaches EOF, so EOF must remove that peer.
+        let exact_target = "b2-production-pump-eof-exact";
+        let exact_fixture = insert_promoted_peer(&state, exact_target).await;
+        let exact_peer = exact_fixture.peer;
+        let exact_events = exact_fixture._events;
+        let exact_worker = exact_peer
+            .current_worker()
+            .expect("the exact fixture owns its connector");
+        let exact_owner = state
+            .peers
+            .owner(exact_target)
+            .expect("the exact fixture is installed")
+            .for_worker(Arc::clone(&exact_worker));
+        assert!(state
+            .peers
+            .admit_application_operation(
+                &exact_owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+        let exact_pump = spawn_peer_event_pump(
+            Arc::clone(&state),
+            exact_target.to_string(),
+            Arc::clone(&exact_worker),
+            exact_events,
+            Some(exact_owner.clone()),
+        );
+        exact_worker.retire();
+        exact_pump
+            .await
+            .expect("the exact production pump reaches EOF cleanup");
+        assert!(
+            state.peers.get_if_current(&exact_owner).is_none(),
+            "EOF retires the exact installed promoted owner"
+        );
+        assert!(
+            state.peers.get(exact_target).is_none(),
+            "EOF removes the exact promoted peer"
+        );
+        drop(exact_peer);
+
+        // A successor replaces a predecessor before the predecessor's receiver
+        // reaches EOF. The captured predecessor owner must leave the successor
+        // untouched.
+        let successor_target = "b2-production-pump-eof-successor";
+        let stale_fixture = insert_promoted_peer(&state, successor_target).await;
+        let stale_peer = stale_fixture.peer;
+        let stale_events = stale_fixture._events;
+        let stale_worker = stale_peer
+            .current_worker()
+            .expect("the stale fixture owns its connector");
+        let stale_owner = state
+            .peers
+            .owner(successor_target)
+            .expect("the stale fixture is installed")
+            .for_worker(Arc::clone(&stale_worker));
+        assert!(state
+            .peers
+            .admit_application_operation(
+                &stale_owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+        let stale_pump = spawn_peer_event_pump(
+            Arc::clone(&state),
+            successor_target.to_string(),
+            Arc::clone(&stale_worker),
+            stale_events,
+            Some(stale_owner.clone()),
+        );
+
+        let (successor_worker, successor_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the successor connector opens");
+        let successor_worker = Arc::new(successor_worker);
+        let successor = Arc::new(PeerConnection::new(
+            successor_target.to_string(),
+            Some(Arc::clone(&successor_worker)),
+        ));
+        if let Some(replaced) = install_peer(&state.peers, Arc::clone(&successor)) {
+            forget_displacement(&state, replaced);
+        }
+        let successor_owner = state
+            .peers
+            .owner(successor_target)
+            .expect("the successor is installed")
+            .for_worker(Arc::clone(&successor_worker));
+        stale_worker.retire();
+        stale_pump
+            .await
+            .expect("the stale predecessor pump reaches EOF");
+        assert!(
+            state.peers.get_if_current(&stale_owner).is_none(),
+            "the predecessor owner is stale after replacement"
+        );
+        assert!(
+            state.peers.get_if_current(&successor_owner).is_some(),
+            "predecessor EOF cannot retire the successor"
+        );
+        drop(successor_events);
+        state.shutdown().await;
+    }
+
     /// An authenticated Depart removes only the admitted logical session.
     ///
     /// This control is intentionally at the inbound dispatch boundary. It
@@ -18497,7 +19284,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "the exact channel admission mints the logical session"
@@ -18510,10 +19297,8 @@ mod tests {
             state.peers.get_if_current(&owner).is_some(),
             "control 2: the admitted installation is current before dispatch"
         );
-        let depart = serde_json::to_vec(&MeshMessage::SessionControl(
-            crate::protocol::SessionControl::Depart,
-        ))
-        .expect("the authenticated Depart serializes");
+        let depart = serde_json::to_vec(&MeshMessage::SessionControl(test_departure_control()))
+            .expect("the authenticated Depart serializes");
         handle_inbound_frame_from(&state, &owner, Bytes::from(depart.clone())).await;
         assert!(
             !fixture.peer.holds_promoted_session(),
@@ -18532,7 +19317,7 @@ mod tests {
                 .admit_application_operation(
                     &successor_owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "control 5: the replacement admits its own logical session"
@@ -18571,7 +19356,7 @@ mod tests {
             .into_generic()
             .expect("the candidate handoff carries its generic capability");
         let context = crate::endpoint_auth::EndpointAuthContext::new(
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             state.identity.public_id(),
             target,
             binding,
@@ -18662,7 +19447,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id
+                    &state.mesh_context_id().to_string()
                 )
                 .is_some(),
             "first admission mints the real logical session and channel entry"
@@ -18824,7 +19609,7 @@ mod tests {
                     &candidate_one,
                     correlation_one,
                     state.session_broker.as_ref().expect("the broker exists"),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "the authenticated second channel is admitted into the logical session"
@@ -18891,7 +19676,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, flows, live| {
                     flows
                         .open(
@@ -18922,7 +19707,7 @@ mod tests {
             .with_live_session_flow(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, flows, live| {
                     flows
                         .close(session, Some(live), &flow_name)
@@ -18984,7 +19769,7 @@ mod tests {
                     &candidate_two,
                     correlation_two,
                     state.session_broker.as_ref().expect("the broker exists"),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_none(),
             "full provider pressure refuses the additional channel reservation"
@@ -19016,7 +19801,7 @@ mod tests {
                     &candidate_two,
                     correlation_two,
                     state.session_broker.as_ref().expect("the broker exists"),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "released provider capacity admits the retried additional channel"
@@ -19056,7 +19841,11 @@ mod tests {
         let owner = state.peers.owner(target).expect("promoted peer owner");
         assert!(state
             .peers
-            .admit_application_operation(&owner, state.session_broker.as_ref(), &state.network_id,)
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
             .is_some());
         let promoted = fixture.peer.session.lock().clone().expect("main worker");
         let offer_state = build_test_state("b2-speculative-offer-generator");
@@ -19132,7 +19921,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "old promoted application remains usable during candidate auth"
@@ -19234,7 +20023,7 @@ mod tests {
                 .admit_application_operation(
                     &owner,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "the exact legacy worker promotes after production Candidate retention"
@@ -19518,7 +20307,7 @@ mod tests {
                 .admit_application_operation(
                     owner,
                     state.session_broker.as_ref(),
-                    &state.network_id
+                    &state.mesh_context_id().to_string()
                 )
                 .is_some(),
             "candidate-only refusal leaves application admission usable"
@@ -19564,7 +20353,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id
+                    &state_a.mesh_context_id().to_string()
                 )
                 .is_some(),
             "A's initial application admission promotes the predecessor"
@@ -19575,7 +20364,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id
+                    &state_b.mesh_context_id().to_string()
                 )
                 .is_some(),
             "B's initial application admission promotes the predecessor"
@@ -19601,7 +20390,7 @@ mod tests {
             .with_live_session_state(
                 &owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
                 |session, app| {
                     app.submit(
                         session,
@@ -19627,7 +20416,7 @@ mod tests {
             .with_live_session_flow(
                 &old_owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
                 |session, flows, live| {
                     let name = flows
                         .open(
@@ -19668,7 +20457,7 @@ mod tests {
             .with_live_session_flow(
                 &old_owner_b,
                 state_b.session_broker.as_ref(),
-                &state_b.network_id,
+                &state_b.mesh_context_id().to_string(),
                 |session, flows, live| {
                     let name = flows
                         .open(
@@ -19803,7 +20592,7 @@ mod tests {
                         .session_broker
                         .as_ref()
                         .expect("the test state owns a session broker"),
-                    &state_a.network_id,
+                    &state_a.mesh_context_id().to_string(),
                 )
                 .is_none(),
             "a candidate without Endpoint Auth proof cannot promote"
@@ -19821,7 +20610,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id
+                    &state_a.mesh_context_id().to_string()
                 )
                 .is_some(),
             "old application admission remains valid before proof"
@@ -19910,7 +20699,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id
+                    &state_a.mesh_context_id().to_string()
                 )
                 .is_some(),
             "old application admission remains valid while answer is held"
@@ -20234,7 +21023,7 @@ mod tests {
                 .claim_renegotiation(
                     &first_owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id,
+                    &state_a.mesh_context_id().to_string(),
                 )
                 .is_none()
                 && state_b
@@ -20242,7 +21031,7 @@ mod tests {
                     .claim_renegotiation(
                         &first_owner_b,
                         state_b.session_broker.as_ref(),
-                        &state_b.network_id,
+                        &state_b.mesh_context_id().to_string(),
                     )
                     .is_none(),
             "simultaneous changes leave no duplicate offer debt on either fixed role"
@@ -20296,7 +21085,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id
+                    &state_a.mesh_context_id().to_string()
                 )
                 .is_some(),
             "post-swap application admission remains valid on A"
@@ -20307,7 +21096,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id
+                    &state_b.mesh_context_id().to_string()
                 )
                 .is_some(),
             "post-swap application admission remains valid on B"
@@ -20394,7 +21183,7 @@ mod tests {
             .admit_application_operation(
                 &owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
             )
             .expect("A's exact promoted owner admits the application probe")
             .send_frame(
@@ -20528,7 +21317,7 @@ mod tests {
             .admit_application_operation(
                 &owner_b,
                 state_b.session_broker.as_ref(),
-                &state_b.network_id
+                &state_b.mesh_context_id().to_string()
             )
             .is_some());
         assert!(
@@ -20609,7 +21398,7 @@ mod tests {
             .admit_application_operation(
                 &w0_owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
             )
             .expect("A's exact selected W0 funds the production roster request")
             .send_frame(
@@ -20641,7 +21430,7 @@ mod tests {
             .with_live_session_state(
                 &owner_b,
                 state_b.session_broker.as_ref(),
-                &state_b.network_id,
+                &state_b.mesh_context_id().to_string(),
                 |session, app| {
                     let stream = app.stream_for_test();
                     app.submit(
@@ -20667,7 +21456,7 @@ mod tests {
             .with_admitted_current_or_refused(
                 &w0_owner_b,
                 state_b.session_broker.as_ref(),
-                &state_b.network_id,
+                &state_b.mesh_context_id().to_string(),
                 |admitted| {
                     let frame = admitted
                         .with_session_state(|session, _record| {
@@ -20726,7 +21515,7 @@ mod tests {
             .with_live_session_state(
                 &owner_b,
                 state_b.session_broker.as_ref(),
-                &state_b.network_id,
+                &state_b.mesh_context_id().to_string(),
                 |session, app| {
                     app.submit(
                         session,
@@ -20852,7 +21641,7 @@ mod tests {
                 .admit_application_operation(
                     &after_w0_owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id
+                    &state_b.mesh_context_id().to_string()
                 )
                 .is_none(),
             "selection-gated current-channel admission refuses while W1/W2 are ambiguous"
@@ -20926,7 +21715,7 @@ mod tests {
                 .admit_application_operation(
                     &standby_owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id
+                    &state_b.mesh_context_id().to_string()
                 )
                 .is_some(),
             "application admission resumes only after unique W1 selection"
@@ -20986,7 +21775,7 @@ mod tests {
                 .is_some(),
             "the unrelated hostile candidate coexists with held W2 and authenticated W0/W1/W2 before logical Depart"
         );
-        let depart = MeshMessage::SessionControl(crate::protocol::SessionControl::Depart);
+        let depart = MeshMessage::SessionControl(test_departure_control());
         let (_old_depart_msg, _old_depart_claim, old_depart_work, old_depart_dispatch) =
             admit_inbound_for_test(&state_b, &standby_owner_b, depart.clone())
                 .expect("W1 admits the L0 Depart authority before replacement")
@@ -21023,7 +21812,7 @@ mod tests {
             .admit_application_operation(
                 &w1_owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
             )
             .expect("A's selected L0 W1 funds the parked successor control")
             .send_frame(
@@ -21079,7 +21868,7 @@ mod tests {
             .connection()
             .install_authenticated_channel_over_for_test(
                 l1_left_handoff,
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
                 state_a.identity.public_id(),
             );
         owner_b
@@ -21089,7 +21878,7 @@ mod tests {
             .connection()
             .install_authenticated_channel_over_for_test(
                 l1_right_handoff,
-                &state_b.network_id,
+                &state_b.mesh_context_id().to_string(),
                 state_b.identity.public_id(),
             );
         assert!(
@@ -21098,7 +21887,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_a,
                     state_a.session_broker.as_ref(),
-                    &state_a.network_id,
+                    &state_a.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "A promotes a distinct L1 over the unchanged owner installation"
@@ -21109,7 +21898,7 @@ mod tests {
                 .admit_application_operation(
                     &owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id,
+                    &state_b.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "B promotes a distinct L1 over the unchanged owner installation"
@@ -21186,7 +21975,7 @@ mod tests {
             .admit_application_operation(
                 &l1_owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id,
+                &state_a.mesh_context_id().to_string(),
             )
             .expect("A's selected L1 funds the fresh roster request")
             .send_frame(
@@ -21251,23 +22040,13 @@ mod tests {
             "only the fresh L1 response adds one inbound frame after the stale baseline"
         );
 
-        on_session_control(
-            &state_b,
-            &old_depart_dispatch,
-            crate::protocol::SessionControl::Depart,
-        )
-        .await;
+        on_session_control(&state_b, &old_depart_dispatch, test_departure_control()).await;
         assert!(
             state_b.peers.get_if_current(&owner_b).is_some(),
             "a stale L0 Depart cannot retire the same-installation replacement L1"
         );
         drop(old_depart_work);
-        on_session_control(
-            &state_b,
-            &old_stale_dispatch,
-            crate::protocol::SessionControl::Depart,
-        )
-        .await;
+        on_session_control(&state_b, &old_stale_dispatch, test_departure_control()).await;
         drop(old_stale_work);
         assert!(
             state_b.peers.get_if_current(&owner_b).is_some(),
@@ -21282,12 +22061,7 @@ mod tests {
             admit_inbound_for_test(&state_b, &owner_b, depart)
                 .expect("duplicate L1 Depart captures the same exact logical witness")
                 .into_dispatch();
-        on_session_control(
-            &state_b,
-            &depart_dispatch,
-            crate::protocol::SessionControl::Depart,
-        )
-        .await;
+        on_session_control(&state_b, &depart_dispatch, test_departure_control()).await;
         drop(depart_work);
         assert!(
             state_b.peers.owner(&device_a).is_none(),
@@ -21307,12 +22081,7 @@ mod tests {
             ),
             "logical teardown resolves the reliable operation exactly once"
         );
-        on_session_control(
-            &state_b,
-            &stale_dispatch,
-            crate::protocol::SessionControl::Depart,
-        )
-        .await;
+        on_session_control(&state_b, &stale_dispatch, test_departure_control()).await;
         drop(stale_work);
         assert!(
             state_b.peers.owner(&device_a).is_none(),
@@ -21329,7 +22098,7 @@ mod tests {
                 .admit_application_operation(
                     &successor_owner_b,
                     state_b.session_broker.as_ref(),
-                    &state_b.network_id,
+                    &state_b.mesh_context_id().to_string(),
                 )
                 .is_some(),
             "the unrelated successor admits its own logical session"
@@ -21376,12 +22145,7 @@ mod tests {
             "replaying the saved L0 operation leaves the L1 caller pending"
         );
         drop(stale_rpc_work);
-        on_session_control(
-            &state_b,
-            &stale_dispatch,
-            crate::protocol::SessionControl::Depart,
-        )
-        .await;
+        on_session_control(&state_b, &stale_dispatch, test_departure_control()).await;
         let successor_selected_after_stale_b = successor_owner_b
             .connection()
             .select_unique_usable_channel()
@@ -21456,7 +22220,7 @@ mod tests {
             .admit_application_operation(
                 &owner_a,
                 state_a.session_broker.as_ref(),
-                &state_a.network_id
+                &state_a.mesh_context_id().to_string()
             )
             .is_none());
 
@@ -21655,7 +22419,7 @@ mod tests {
                 .with_live_session_state(
                     &owner_c,
                     state.session_broker.as_ref(),
-                    &state.network_id,
+                    &state.mesh_context_id().to_string(),
                     |_session, app| app.rpc_mut().still_holds(&bystander),
                 )
                 .expect("C still has a live session"),

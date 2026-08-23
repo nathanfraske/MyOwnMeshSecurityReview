@@ -126,6 +126,23 @@ impl Ticker for NetworkWatchTicker {
     }
 }
 
+/// Canonical fact anti-entropy backstop. Event-driven advertisements remain
+/// the fast path; this bounded inventory pass repairs a fact lost while a
+/// peer's data channel was transiently unavailable. Governance snapshots
+/// exact current owners before each send and keeps the inventory context-bound.
+pub(crate) struct FactInventoryTicker;
+
+#[async_trait]
+impl Ticker for FactInventoryTicker {
+    fn name(&self) -> &'static str {
+        "fact-inventory"
+    }
+
+    async fn tick(&mut self, state: &Arc<NetworkState>) {
+        super::governance::broadcast_fact_inventory(state).await;
+    }
+}
+
 /// Offerer-side reconnect supervisor — the backstop for the reconnect
 /// intents events couldn't already resolve. Re-offers each peer we owe an
 /// offer to whose backoff has come due, and ages out the ones past the

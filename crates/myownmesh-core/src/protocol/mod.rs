@@ -39,6 +39,8 @@
 //! alpha. `hello.features` carries only the closed endpoint-authentication
 //! profile required before any post-active frame is admitted.
 
+pub mod departure;
+pub mod facts;
 pub mod features;
 pub mod governance;
 pub mod handshake;
@@ -46,10 +48,16 @@ pub mod keepalive;
 pub mod rpc;
 pub mod topology;
 
+pub use departure::{
+    DepartureCorrelation, DepartureCorrelationError, MAX_DEPARTURE_CORRELATION_BYTES,
+};
+pub use facts::{
+    CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactInventoryMessage,
+    FactRequest, FactRequestMessage, SignedFact,
+};
 pub use features::{Feature, ADVERTISED_FEATURES};
 pub use governance::{
-    AckDecision, NetworkStateAckMessage, NetworkStateBroadcast, NetworkStateProposeMessage,
-    NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
+    NetworkStateBroadcast, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
     RosterSummaryMessage,
 };
 pub use handshake::{
@@ -144,6 +152,12 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameAdmission {
     Protocol,
+    /// A canonical signed fact or fact bundle. These frames are durable
+    /// semantic traffic, not application payload: a later admission seam may
+    /// carry them to an authenticated PendingApproval peer without widening
+    /// that peer's access to inventory, requests, or realtime application
+    /// traffic.
+    DurableFact,
     Application,
 }
 
@@ -211,6 +225,21 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
             admission: FrameAdmission::Protocol,
             on_failure: FailurePolicy::EndSession,
         },
+        // Facts are the only non-handshake frames with a self-authenticating
+        // durable semantic body. Keep this exact pair distinct from every
+        // inventory/request/roster/application kind; those remain Application
+        // and retain their existing failure policies below.
+        "fact" | "fact_bundle" => ClassifiedFrame {
+            admission: FrameAdmission::DurableFact,
+            on_failure: FailurePolicy::EndSession,
+        },
+        // Inventories and requests carry only exact context plus identifiers.
+        // They are non-authoritative coordination traffic and must not receive
+        // the durable-fact admission reserved for signed bodies.
+        "fact_inventory" | "fact_request" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        },
         // The one best-effort application delivery. A plain `Channel` frame
         // carries no sequence, is acknowledged by nobody, and resolves no local
         // wait: `MeshMessage::Channel` is delivered to whatever subscribers
@@ -257,9 +286,11 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
 /// on a channel which has since been retired affects nothing; it cannot be
 /// redirected through a Device ID lookup to a successor.
 ///
-/// No acknowledgement, retry, timer, or grace period participates. A departure
-/// that is lost resolves the way every other lost frame does, through ordinary
-/// connector closure and failure detection.
+/// A deliberate departure has exactly one correlated receipt:
+/// [`SessionControl::DepartObserved`]. There is no retry, timer, or grace
+/// period. If either control is lost, ordinary connector closure and lifecycle
+/// cancellation resolve the departure; no alternate acknowledgement framework
+/// is introduced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SessionControl {
@@ -267,7 +298,13 @@ pub enum SessionControl {
     /// network removal, or a daemon shutdown. **Not** sent by a reconnect,
     /// which keeps its session and application state while the transport
     /// underneath it recovers or is replaced.
-    Depart,
+    Depart {
+        /// Opaque bounded receipt correlation. It is scoped to this exact
+        /// authenticated session and carries no target identity.
+        correlation: DepartureCorrelation,
+    },
+    /// Receipt for a matching `Depart` on this exact authenticated session.
+    DepartObserved { correlation: DepartureCorrelation },
     /// The answerer has a locally authorized track-set change. It cannot create
     /// an offer without glare, so it asks this channel's fixed offerer to make
     /// the one in-band offer. The exact authenticated connector carrying the
@@ -318,15 +355,15 @@ pub enum MeshMessage {
     /// Broadcast on ACTIVE; receivers compare against their own to
     /// detect drift.
     NetworkState(NetworkStateBroadcast),
-    /// In-flight transition awaiting signatures. The proposer signs
-    /// at issue time; co-signers respond with `NetworkStateAck`.
-    NetworkStatePropose(NetworkStateProposeMessage),
-    /// Sign-or-deny response to a `NetworkStatePropose`.
-    NetworkStateAck(NetworkStateAckMessage),
-    /// Proposer-initiated split fallback after the consent timeout
-    /// expires on a stuck close. Spawns a derived closed network
-    /// containing the signers the proposer had so far.
-    NetworkStateSplit(NetworkStateSplitMessage),
+    /// One independently verifiable canonical V4 authority fact.
+    Fact(SignedFact),
+    /// A set of canonical V4 authority facts. Each element is verified and
+    /// reduced separately; bundle membership itself is not authority.
+    FactBundle(FactBundleMessage),
+    /// Non-authoritative exact-context inventory of known FactIds.
+    FactInventory(FactInventory),
+    /// Non-authoritative exact-context request for signed facts by FactId.
+    FactRequest(FactRequest),
 
     // -- roster gossip --
     /// Merkle-root summary of the sender's roster. Triggers a
@@ -335,8 +372,8 @@ pub enum MeshMessage {
     /// "Send me the entries I'm missing." Carried alone on a
     /// targeted reply to a `RosterSummary`.
     RosterRequest(RosterRequestMessage),
-    /// Roster entries the responder is sharing. Receivers verify
-    /// each entry's authority chain before merging.
+    /// Unsigned roster discovery data. It is never reduced as governance
+    /// authority; signed facts are carried by `Fact`/`FactBundle`.
     RosterEntries(RosterEntriesMessage),
 
     /// Application payload on a user-defined typed channel. The
@@ -515,7 +552,68 @@ mod tests {
                 on_failure: FailurePolicy::DropFrame,
             })
         );
+        for fact_kind in ["fact", "fact_bundle"] {
+            assert_eq!(
+                classify_frame(format!(r#"{{"kind":"{fact_kind}","payload":[}}"#).as_bytes()),
+                Some(ClassifiedFrame {
+                    admission: FrameAdmission::DurableFact,
+                    on_failure: FailurePolicy::EndSession,
+                }),
+                "only canonical fact kinds receive the durable-fact class"
+            );
+        }
+        for coordination_kind in ["fact_inventory", "fact_request"] {
+            assert_eq!(
+                classify_frame(
+                    format!(r#"{{"kind":"{coordination_kind}","payload":[}}"#).as_bytes()
+                ),
+                Some(ClassifiedFrame {
+                    admission: FrameAdmission::Application,
+                    on_failure: FailurePolicy::EndSession,
+                }),
+                "fact coordination is not durable-fact admission"
+            );
+        }
         assert_eq!(classify_frame(br#"{"payload":[],"kind":"hello"}"#), None);
+    }
+
+    #[test]
+    fn durable_fact_class_does_not_widen_to_inventory_or_application_frames() {
+        let classify = |kind: &str| {
+            classify_frame(format!(r#"{{"kind":"{kind}","payload":[}}"#).as_bytes())
+                .expect("canonical leading tag classifies")
+        };
+
+        for kind in [
+            "fact_inventory",
+            "fact_request",
+            "network_state",
+            "roster_summary",
+            "roster_request",
+            "roster_entries",
+            "rpc_request",
+            "rpc_response",
+            "rpc_stream_chunk",
+            "rpc_stream_end",
+            "channel_seq",
+            "channel_ack",
+        ] {
+            assert_eq!(
+                classify(kind).admission,
+                FrameAdmission::Application,
+                "{kind} remains application admission"
+            );
+            assert_eq!(
+                classify(kind).on_failure,
+                FailurePolicy::EndSession,
+                "{kind} retains its completion-bearing failure policy"
+            );
+        }
+        assert_eq!(classify("channel").admission, FrameAdmission::Application);
+        assert_eq!(classify("channel").on_failure, FailurePolicy::DropFrame);
+        for kind in ["hello", "auth_response", "approve", "deny"] {
+            assert_eq!(classify(kind).admission, FrameAdmission::Protocol);
+        }
     }
 
     /// Only the best-effort delivery is droppable, and the acknowledged one is
@@ -592,8 +690,7 @@ mod tests {
         use crate::network_state::NetworkKind;
         let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
             kind: NetworkKind::Closed,
-            transitions_count: 4,
-            member_log_count: 2,
+            fact_heads_count: 4,
             roster_root: "abcdefghij".into(),
         });
         let s = serde_json::to_string(&msg).unwrap();
@@ -601,8 +698,7 @@ mod tests {
         match back {
             MeshMessage::NetworkState(b) => {
                 assert_eq!(b.kind, NetworkKind::Closed);
-                assert_eq!(b.transitions_count, 4);
-                assert_eq!(b.member_log_count, 2);
+                assert_eq!(b.fact_heads_count, 4);
                 assert_eq!(b.roster_root, "abcdefghij");
             }
             _ => panic!("did not round-trip as NetworkState"),
@@ -617,8 +713,7 @@ mod tests {
         // tweak doesn't silently break interop.
         let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
             kind: crate::network_state::NetworkKind::Open,
-            transitions_count: 0,
-            member_log_count: 0,
+            fact_heads_count: 0,
             roster_root: "x".into(),
         });
         let s = serde_json::to_string(&msg).unwrap();
@@ -626,23 +721,67 @@ mod tests {
     }
 
     #[test]
-    fn ack_decision_round_trips() {
-        let msg = MeshMessage::NetworkStateAck(NetworkStateAckMessage {
-            proposal_id: "prop_x".into(),
-            signer: "alice".into(),
-            decision: AckDecision::Deny,
-            at: 42,
-            signature: "sig".into(),
-        });
+    fn canonical_fact_bundle_round_trips() {
+        let msg = MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() });
         let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""decision":"deny""#));
+        assert!(s.contains(r#""kind":"fact_bundle""#));
         let back: MeshMessage = serde_json::from_str(&s).unwrap();
         match back {
-            MeshMessage::NetworkStateAck(a) => {
-                assert_eq!(a.decision, AckDecision::Deny);
-                assert_eq!(a.signer, "alice");
+            MeshMessage::FactBundle(bundle) => {
+                assert!(bundle.facts.is_empty());
             }
-            _ => panic!("did not round-trip as NetworkStateAck"),
+            _ => panic!("did not round-trip as FactBundle"),
+        }
+    }
+
+    #[test]
+    fn fact_inventory_and_request_canonicalize_ids_and_preserve_context() {
+        let context = crate::semantic::MeshContextId::from_bytes([7; 32]);
+        let first = crate::semantic::FactId::from_bytes([1; 32]);
+        let second = crate::semantic::FactId::from_bytes([2; 32]);
+        let inventory = FactInventory::new(context, [second, first, second]);
+        assert_eq!(inventory.context_id(), context);
+        assert_eq!(inventory.fact_ids(), &[first, second]);
+        let request = FactRequest::new(context, [second, first, second]);
+        assert_eq!(request.context_id(), context);
+        assert_eq!(request.fact_ids(), &[first, second]);
+
+        for message in [
+            MeshMessage::FactInventory(inventory),
+            MeshMessage::FactRequest(request),
+        ] {
+            let encoded = serde_json::to_string(&message).expect("fact coordination serializes");
+            let decoded: MeshMessage =
+                serde_json::from_str(&encoded).expect("fact coordination round-trips");
+            match (message, decoded) {
+                (MeshMessage::FactInventory(expected), MeshMessage::FactInventory(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                (MeshMessage::FactRequest(expected), MeshMessage::FactRequest(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                _ => panic!("fact coordination changed wire variant"),
+            }
+        }
+    }
+
+    #[test]
+    fn fact_coordination_rejects_noncanonical_id_order_or_duplicates() {
+        let context = crate::semantic::MeshContextId::from_bytes([8; 32]);
+        let first = crate::semantic::FactId::from_bytes([1; 32]);
+        let second = crate::semantic::FactId::from_bytes([2; 32]);
+        let context = serde_json::to_string(&context).unwrap();
+        let first = serde_json::to_string(&first).unwrap();
+        let second = serde_json::to_string(&second).unwrap();
+        for kind in ["fact_inventory", "fact_request"] {
+            let raw = format!(
+                r#"{{"kind":"{kind}","context_id":{context},"fact_ids":[{second},{first}]}}"#
+            );
+            assert!(serde_json::from_str::<MeshMessage>(&raw).is_err());
+            let raw = format!(
+                r#"{{"kind":"{kind}","context_id":{context},"fact_ids":[{first},{first}]}}"#
+            );
+            assert!(serde_json::from_str::<MeshMessage>(&raw).is_err());
         }
     }
 
@@ -661,8 +800,7 @@ mod tests {
     #[test]
     fn roster_request_defaults_clean() {
         // include_all + subtree_hashes are #[serde(default)] so an
-        // empty request frame parses without per-field nulls. v1
-        // peers send `{ "kind": "roster_request" }` literally.
+        // empty request frame parses without per-field nulls.
         let raw = r#"{"kind":"roster_request"}"#;
         let msg: MeshMessage = serde_json::from_str(raw).unwrap();
         match msg {
@@ -672,6 +810,40 @@ mod tests {
             }
             _ => panic!("did not parse as RosterRequest"),
         }
+    }
+
+    #[test]
+    fn authenticated_departure_control_round_trips_with_bounded_correlation() {
+        let correlation = DepartureCorrelation::new("leave-opaque-1").unwrap();
+        let message = MeshMessage::SessionControl(SessionControl::Depart {
+            correlation: correlation.clone(),
+        });
+        let encoded = serde_json::to_string(&message).expect("departure serializes");
+        assert!(encoded.contains(r#""op":"depart""#));
+        assert!(!encoded.contains("device_id"));
+        let decoded: MeshMessage = serde_json::from_str(&encoded).expect("departure decodes");
+        assert!(matches!(
+            decoded,
+            MeshMessage::SessionControl(SessionControl::Depart { correlation: value })
+                if value == correlation
+        ));
+        let observed = MeshMessage::SessionControl(SessionControl::DepartObserved {
+            correlation: correlation.clone(),
+        });
+        let observed_encoded = serde_json::to_string(&observed).expect("receipt serializes");
+        assert!(observed_encoded.contains(r#""op":"depart_observed""#));
+        let observed_decoded: MeshMessage =
+            serde_json::from_str(&observed_encoded).expect("receipt decodes");
+        assert!(matches!(
+            observed_decoded,
+            MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
+                if value == correlation
+        ));
+        let too_long = format!("{}x", "a".repeat(MAX_DEPARTURE_CORRELATION_BYTES));
+        assert!(serde_json::from_str::<MeshMessage>(&format!(
+            r#"{{"kind":"session_control","op":"depart","correlation":"{too_long}"}}"#
+        ))
+        .is_err());
     }
 
     #[test]
@@ -691,11 +863,11 @@ mod tests {
     }
 
     #[test]
-    fn a_governance_kind_this_build_implements_decodes_and_a_future_one_is_refused() {
+    fn a_fact_kind_this_build_implements_and_a_future_one_is_refused() {
         // A supported peer decodes this exact frame.
-        let raw = r#"{"kind":"network_state_propose","proposal_id":"x","variant":{"kind":"role_grant","target":"a","role":"member"},"proposer":"b","created_at":0,"signature":"s"}"#;
+        let raw = r#"{"kind":"fact_bundle","facts":[]}"#;
         let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        assert!(matches!(msg, MeshMessage::NetworkStatePropose(_)));
+        assert!(matches!(msg, MeshMessage::FactBundle(_)));
         // The inverse fails closed: there is no mixed-version live fallback.
         let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
         assert!(serde_json::from_str::<MeshMessage>(raw_future).is_err());

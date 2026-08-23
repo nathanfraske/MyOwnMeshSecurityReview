@@ -662,15 +662,12 @@ async fn join_configured(mesh: &MeshHandle, registry: &NetworkRegistry) {
 
 /// Leave every joined network — the node-disable transition.
 async fn leave_all(registry: &NetworkRegistry) {
-    // Announce a graceful departure first so peers drop our sessions now
-    // instead of waiting out their heartbeat timeout (~90 s) — without it,
-    // disabling the node leaves us showing online-but-unconnectable on every
-    // peer for over a minute.
-    registry.announce_all_departures().await;
-    // Every distinct network, none skipped. This is the node-disable
-    // transition, so a network the previous drain could not take sole
-    // ownership of stayed running while the node reported itself disabled.
-    for outcome in registry.shutdown_all().await {
+    // Start authenticated departures and teardown together. A silent peer's
+    // departure waiter is resolved by shutdown; awaiting announcements first
+    // would prevent that cancellation from ever being requested. The carrier
+    // hint remains part of each departure future.
+    // Every distinct network is included; teardown reports each failure.
+    for outcome in registry.shutdown_all_with_departures().await {
         if let Err(e) = outcome {
             warn!("network shutdown failed: {e}");
         }

@@ -137,6 +137,11 @@ pub trait OutboundSource<T>: Send {
 /// Field order is load-bearing: Rust drops fields in declaration order, so the
 /// value and everything derived from it are destroyed *before* the owner that
 /// paid for them is released.
+///
+/// An attempt-owned delivery coordinator may retain this whole pair while it
+/// acquires separate provider custody for each relay session.  Those relay
+/// leases are settlement bookkeeping, not copies of or substitutes for this
+/// source owner; the source pair remains live until the exact attempt ends.
 pub struct OwnedSignal<T, O> {
     value: T,
     owner: O,
