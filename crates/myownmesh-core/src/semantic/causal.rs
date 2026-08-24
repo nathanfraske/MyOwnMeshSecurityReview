@@ -411,6 +411,7 @@ impl FactGraph {
             });
         }
         let mut inserted = Vec::new();
+        let mut first_error = None;
         loop {
             let ready: Vec<_> = self
                 .quarantined
@@ -419,7 +420,7 @@ impl FactGraph {
                 .map(|fact| fact.id)
                 .collect();
             if ready.is_empty() {
-                return Ok(inserted);
+                return first_error.map_or(Ok(inserted), Err);
             }
             let mut round_progress = false;
             for id in ready {
@@ -434,13 +435,16 @@ impl FactGraph {
                     }
                     Ok(Admission::AlreadyPresent | Admission::Quarantined { .. }) => {}
                     Err(error) => {
-                        self.quarantined.insert(id, fact);
-                        return Err(error);
+                        // A ready fact can still fail causal authorization or
+                        // canonical validation.  It is rejected and removed;
+                        // retaining it would let one malformed FactId starve
+                        // every valid sibling in the same ready round.
+                        first_error.get_or_insert(error);
                     }
                 }
             }
             if !round_progress {
-                return Ok(inserted);
+                return first_error.map_or(Ok(inserted), Err);
             }
         }
     }
@@ -703,29 +707,57 @@ impl<'a> SemanticEvaluator<'a> {
     fn resolution_tier(
         &self,
         cell: &ExclusiveCell,
-        _cited_heads: &[FactId],
-        selected_head: &FactId,
+        cited_heads: &[FactId],
+        _selected_head: &FactId,
+    ) -> Role {
+        let mut visited = BTreeSet::new();
+        self.resolution_tier_with_visited(cell, cited_heads, &mut visited)
+    }
+
+    fn resolution_tier_with_visited(
+        &self,
+        cell: &ExclusiveCell,
+        cited_heads: &[FactId],
+        visited: &mut BTreeSet<FactId>,
     ) -> Role {
         match cell {
-            ExclusiveCell::Role { subject } => self
-                .graph
-                .facts
-                .get(selected_head)
-                .and_then(|fact| match &fact.content.body {
-                    FactBody::RoleGrant { target, role } if target == subject => Some(match role {
-                        Role::Member | Role::Controller => Role::Controller,
-                        Role::Owner => Role::Owner,
-                    }),
-                    FactBody::RoleRevoke { target } if target == subject => {
-                        Some(self.target_tier(subject))
-                    }
-                    _ => None,
-                })
+            ExclusiveCell::Role { subject } => cited_heads
+                .iter()
+                .filter_map(|head| self.resolution_candidate_tier(cell, head, subject, visited))
+                .max()
                 .unwrap_or_else(|| self.target_tier(subject)),
             ExclusiveCell::Membership { subject } => self.target_tier(subject),
             ExclusiveCell::Decision { .. } | ExclusiveCell::OpenParticipation { .. } => {
                 Role::Member
             }
+        }
+    }
+
+    fn resolution_candidate_tier(
+        &self,
+        cell: &ExclusiveCell,
+        head: &FactId,
+        subject: &DeviceId,
+        visited: &mut BTreeSet<FactId>,
+    ) -> Option<Role> {
+        if !visited.insert(*head) {
+            return None;
+        }
+        let fact = self.graph.facts.get(head)?;
+        match &fact.content.body {
+            FactBody::RoleGrant { target, role } if target == subject => Some(match role {
+                Role::Member | Role::Controller => Role::Controller,
+                Role::Owner => Role::Owner,
+            }),
+            FactBody::RoleRevoke { target } if target == subject => Some(self.target_tier(subject)),
+            FactBody::Resolution {
+                cell: nested_cell,
+                cited_heads,
+                ..
+            } if nested_cell == cell => {
+                Some(self.resolution_tier_with_visited(nested_cell, cited_heads, visited))
+            }
+            _ => None,
         }
     }
 }

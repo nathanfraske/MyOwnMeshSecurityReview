@@ -335,8 +335,40 @@ fn resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_ti
         },
         Vec::new(),
     );
-    let owner = authored(
-        &graph,
+    graph.admit(member.clone()).expect("member head admits");
+
+    let mut controller_graph = graph.clone();
+    let controller_head = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    controller_graph
+        .admit(controller_head.clone())
+        .expect("controller-tier head admits");
+
+    let cell = ExclusiveCell::role(subject.clone());
+    let controller_resolution = authored(
+        &controller_graph,
+        &controller_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: vec![member.id, controller_head.id],
+            selected_head: member.id,
+        },
+        vec![controller_grant.id],
+    );
+    controller_graph
+        .admit(controller_resolution)
+        .expect("controller resolves controller-tier candidates");
+    assert_eq!(controller_graph.projection().value(&cell), Some(member.id));
+
+    let owner = fact(
+        &bootstrap,
         &root_key,
         FactBody::RoleGrant {
             target: subject.clone(),
@@ -344,25 +376,7 @@ fn resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_ti
         },
         Vec::new(),
     );
-    graph.admit(member.clone()).expect("member head admits");
     graph.admit(owner.clone()).expect("owner head admits");
-    let cell = ExclusiveCell::role(subject.clone());
-
-    let mut controller_graph = graph.clone();
-    let controller_resolution = authored(
-        &controller_graph,
-        &controller_key,
-        FactBody::Resolution {
-            cell: cell.clone(),
-            cited_heads: vec![member.id, owner.id],
-            selected_head: member.id,
-        },
-        vec![controller_grant.id],
-    );
-    controller_graph
-        .admit(controller_resolution)
-        .expect("controller resolves a controller-tier member value");
-    assert_eq!(controller_graph.projection().value(&cell), Some(member.id));
 
     let controller_owner_resolution = authored(
         &graph,

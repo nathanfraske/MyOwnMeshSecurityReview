@@ -154,6 +154,64 @@ fn arrival_order_is_independent_and_missing_parents_quarantine() {
 }
 
 #[test]
+fn ready_invalid_fact_does_not_starve_valid_sibling_in_either_arrival_order() {
+    let root_key = key(63);
+    let bad_key = key(64);
+    let bootstrap = closed_bootstrap(63, 63);
+    let genesis_target = author(&key(65));
+    let good_target = author(&key(66));
+    let genesis = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: genesis_target,
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let bad = fact(
+        &bootstrap,
+        &bad_key,
+        FactBody::RoleGrant {
+            target: good_target.clone(),
+            role: Role::Member,
+        },
+        vec![genesis.id],
+    );
+    let good = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: good_target.clone(),
+            role: Role::Member,
+        },
+        vec![genesis.id],
+    );
+
+    for reverse_order in [false, true] {
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        if reverse_order {
+            graph.admit(good.clone()).expect("good fact quarantines");
+            graph.admit(bad.clone()).expect("bad fact quarantines");
+        } else {
+            graph.admit(bad.clone()).expect("bad fact quarantines");
+            graph.admit(good.clone()).expect("good fact quarantines");
+        }
+        graph.admit(genesis.clone()).expect("genesis admits");
+        assert_eq!(
+            graph.retry_quarantined(),
+            Err(SemanticError::UnauthorizedRoleGrant),
+            "the rejected sibling remains observable without blocking valid work"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&good_target),
+            Some(Role::Member)
+        );
+        assert_eq!(graph.quarantined().count(), 0);
+    }
+}
+
+#[test]
 fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     let signing_key = key(4);
     let bootstrap = VerifiedBootstrap::open("semantic-controls").expect("open bootstrap");

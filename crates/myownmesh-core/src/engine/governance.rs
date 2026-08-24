@@ -1503,6 +1503,12 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
     let verdict = log_evicted(state, state.identity.public_id());
     let was = state.self_evicted.swap(verdict, Ordering::SeqCst);
     if verdict && !was {
+        // Ratification and adopted-log refreshes can reach this edge without
+        // passing through the mod.rs subject reconciler.  Detach the current
+        // exact carrier guards before clearing recovery custody so a stale
+        // source cannot retain or settle an emission after self-eviction.
+        state.detach_signaling_guards();
+        state.cancel_all_recovery_demands();
         state.reconnect_intents.lock().clear();
         state.sticky_peers.lock().clear();
         state.log_diag_with(

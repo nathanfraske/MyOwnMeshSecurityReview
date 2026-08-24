@@ -139,6 +139,7 @@ pub(crate) struct CarrierInstanceGuard {
     instance: Option<RecoveryCarrierInstance>,
     state: Weak<NetworkState>,
     scope: Option<LocalApplicationResourceScope>,
+    detached: std::sync::atomic::AtomicBool,
     attempts: Mutex<Option<Box<GuardedAttempt>>>,
     recoveries: Mutex<Option<Box<GuardedRecovery>>>,
 }
@@ -146,6 +147,7 @@ pub(crate) struct CarrierInstanceGuard {
 struct GuardedAttempt {
     emission: SignalingEmissionId,
     attempt: String,
+    claimed: bool,
     event_id: Option<[u8; 32]>,
     _lease: ResourceLease,
     next: Option<Box<GuardedAttempt>>,
@@ -163,6 +165,7 @@ impl CarrierInstanceGuard {
             instance: None,
             state: Weak::new(),
             scope: None,
+            detached: std::sync::atomic::AtomicBool::new(false),
             attempts: Mutex::new(None),
             recoveries: Mutex::new(None),
         })
@@ -176,16 +179,20 @@ impl CarrierInstanceGuard {
             instance,
             state: Arc::downgrade(state),
             scope: state.local_application_resource_scope().ok(),
+            detached: std::sync::atomic::AtomicBool::new(false),
             attempts: Mutex::new(None),
             recoveries: Mutex::new(None),
         })
     }
 
     pub(crate) fn track_attempt(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
-        if attempt.is_empty() {
+        if self.detached.load(Ordering::Acquire) || attempt.is_empty() {
             return false;
         }
         let mut attempts = self.attempts.lock();
+        if self.detached.load(Ordering::Acquire) {
+            return false;
+        }
         let mut cursor = attempts.as_deref();
         while let Some(known) = cursor {
             if known.emission == emission {
@@ -214,6 +221,7 @@ impl CarrierInstanceGuard {
         let mut node = Box::new(GuardedAttempt {
             emission,
             attempt: attempt.to_owned(),
+            claimed: false,
             event_id: None,
             _lease: lease,
             next: None,
@@ -242,14 +250,37 @@ impl CarrierInstanceGuard {
         }
     }
 
-    pub(crate) fn emission_for_attempt(&self, attempt: &str) -> Option<SignalingEmissionId> {
-        let attempts = self.attempts.lock();
+    /// Claim the exact physical copy being pulled from this carrier.
+    ///
+    /// Attempts are peer-visible strings and may be reused by independent
+    /// emissions.  The list is newest-first, so the last matching unclaimed
+    /// node is the oldest funded copy and is the one a FIFO carrier pull must
+    /// consume.  The returned opaque id is carried to the provider boundary;
+    /// no later operation is allowed to resolve a copy by attempt name.
+    pub(crate) fn claim_attempt(&self, attempt: &str) -> Option<SignalingEmissionId> {
+        if self.detached.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut attempts = self.attempts.lock();
+        if self.detached.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut candidate = None;
         let mut cursor = attempts.as_deref();
         while let Some(known) = cursor {
-            if known.attempt == attempt {
-                return Some(known.emission);
+            if known.attempt == attempt && !known.claimed {
+                candidate = Some(known.emission);
             }
             cursor = known.next.as_deref();
+        }
+        let emission = candidate?;
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.emission == emission && known.attempt == attempt {
+                known.claimed = true;
+                return Some(emission);
+            }
+            cursor = known.next.as_deref_mut();
         }
         None
     }
@@ -261,15 +292,25 @@ impl CarrierInstanceGuard {
     ) -> Option<SignalingEmissionId> {
         let key = event_key(event_id)?;
         let mut attempts = self.attempts.lock();
+        let mut candidate = None;
         let mut cursor = attempts.as_deref_mut();
         while let Some(known) = cursor {
-            if known.attempt == attempt {
-                if known.event_id.is_some_and(|existing| existing != key) {
-                    cursor = known.next.as_deref_mut();
-                    continue;
+            if known.attempt == attempt && known.claimed {
+                if known.event_id == Some(key) {
+                    return Some(known.emission);
                 }
+                if known.event_id.is_none() {
+                    candidate = Some(known.emission);
+                }
+            }
+            cursor = known.next.as_deref_mut();
+        }
+        let emission = candidate?;
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.emission == emission && known.attempt == attempt {
                 known.event_id = Some(key);
-                return Some(known.emission);
+                return Some(emission);
             }
             cursor = known.next.as_deref_mut();
         }
@@ -294,7 +335,13 @@ impl CarrierInstanceGuard {
     }
 
     pub(crate) fn track_recovery(&self, id: RecoveryPublishId) -> bool {
+        if self.detached.load(Ordering::Acquire) {
+            return false;
+        }
         let mut recoveries = self.recoveries.lock();
+        if self.detached.load(Ordering::Acquire) {
+            return false;
+        }
         let mut cursor = recoveries.as_deref();
         while let Some(known) = cursor {
             if known.id == id {
@@ -342,6 +389,35 @@ impl CarrierInstanceGuard {
             }
         }
     }
+
+    /// Release every exact record owned by this carrier instance now.  This is
+    /// used by canonical self-eviction/reconcile before the driver task has
+    /// necessarily observed shutdown; it is idempotent because custody is
+    /// removed from the intrusive lists before any callbacks are made.
+    pub(crate) fn detach(&self) {
+        if self.detached.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(state) = self.state.upgrade() else {
+            self.recoveries.lock().take();
+            self.attempts.lock().take();
+            return;
+        };
+        let mut recoveries = self.recoveries.lock().take();
+        while let Some(mut recovery) = recoveries {
+            recoveries = recovery.next.take();
+            if let Some(instance) = self.instance {
+                state.record_recovery_carrier(recovery.id, instance, false);
+            }
+        }
+        let mut attempts = self.attempts.lock().take();
+        while let Some(mut attempt) = attempts {
+            attempts = attempt.next.take();
+            if let Some(instance) = self.instance {
+                state.record_carrier_emission(attempt.emission, &attempt.attempt, instance, false);
+            }
+        }
+    }
 }
 
 fn event_key(event_id: &str) -> Option<[u8; 32]> {
@@ -367,23 +443,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 impl Drop for CarrierInstanceGuard {
     fn drop(&mut self) {
-        let Some(state) = self.state.upgrade() else {
-            return;
-        };
-        let mut recoveries = std::mem::take(&mut *self.recoveries.lock());
-        while let Some(mut recovery) = recoveries {
-            recoveries = recovery.next.take();
-            if let Some(instance) = self.instance {
-                state.record_recovery_carrier(recovery.id, instance, false);
-            }
-        }
-        let mut attempts = std::mem::take(&mut *self.attempts.lock());
-        if let Some(instance) = self.instance {
-            while let Some(mut attempt) = attempts {
-                attempts = attempt.next.take();
-                state.record_carrier_emission(attempt.emission, &attempt.attempt, instance, false);
-            }
-        }
+        self.detach();
     }
 }
 
@@ -902,8 +962,8 @@ struct SeenKey {
 /// became a session, which is exactly what a withdrawal is allowed to do, so
 /// suppressing one on the strength of another carrier's *claim* bought a
 /// refinement at the price of an unbounded untrusted keyspace. **No untrusted
-/// record is retained here at all now**, which is also why a carrier detach has
-/// nothing to clean up: there is no per-attach state to go stale.
+/// observation record is retained here**: the only per-attach state is the
+/// exact funded guard used for carrier-emission and recovery settlement.
 pub(crate) struct SignalingRuntime {
     tx: ResourceMailboxSender<EphemeralIngress>,
     /// Funds every retained de-duplication key. The provider is the bound; this
@@ -912,6 +972,7 @@ pub(crate) struct SignalingRuntime {
     instances: AtomicU64,
     dedup_instances: AtomicU64,
     seen: Mutex<VecDeque<SeenKey>>,
+    guards: Mutex<Vec<Weak<CarrierInstanceGuard>>>,
 }
 
 /// What one remembered de-duplication key costs.
@@ -934,6 +995,7 @@ impl SignalingRuntime {
             instances: AtomicU64::new(0),
             dedup_instances: AtomicU64::new(0),
             seen: Mutex::new(VecDeque::new()),
+            guards: Mutex::new(Vec::new()),
         })
     }
 
@@ -954,12 +1016,30 @@ impl SignalingRuntime {
         recovery_instance: Option<RecoveryCarrierInstance>,
     ) -> CarrierAttach {
         let instance = CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed));
+        let guard = CarrierInstanceGuard::for_state(state, recovery_instance);
+        runtime.guards.lock().push(Arc::downgrade(&guard));
         CarrierAttach {
             carrier,
             instance,
             runtime: Arc::clone(runtime),
-            guard: CarrierInstanceGuard::for_state(state, recovery_instance),
+            guard,
         }
+    }
+
+    /// Detach all current carrier guards synchronously.  The weak registry is
+    /// only an index; each guard still owns and settles its exact intrusive
+    /// records, so a later task/drop cannot touch a successor generation.
+    pub(crate) fn detach_guards(&self) {
+        let guards = self
+            .guards
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for guard in guards {
+            guard.detach();
+        }
+        self.guards.lock().retain(|guard| guard.strong_count() != 0);
     }
 
     #[cfg(test)]

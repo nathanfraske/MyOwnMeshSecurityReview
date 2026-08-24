@@ -206,18 +206,18 @@ impl CoreAttemptRefusalSink {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
-            return;
-        };
-        if owner.connection().attempt() != refusal.attempt {
-            return;
-        }
         let Some(instance) = self.instance else {
             return;
         };
         let result = state.record_carrier_emission(emission, &refusal.attempt, instance, false);
         self.guard.settle_attempt(emission);
         if result != super::state::CarrierEmissionRecord::FinalRefusal {
+            return;
+        }
+        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
+            return;
+        };
+        if owner.connection().attempt() != refusal.attempt {
             return;
         }
         let _ = state
@@ -247,15 +247,6 @@ impl CoreAttemptRefusalSink {
 
 impl AttemptRefusalSink for CoreAttemptRefusalSink {
     fn refused(&self, refusal: AttemptRefusal) {
-        let Some(state) = self.state.upgrade() else {
-            return;
-        };
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
-            return;
-        };
-        if owner.connection().attempt() != refusal.attempt {
-            return;
-        }
         if refusal.event_id.is_empty() {
             return;
         }
@@ -265,7 +256,6 @@ impl AttemptRefusalSink for CoreAttemptRefusalSink {
         let Some(emission) = emission else {
             return;
         };
-        drop(state);
         self.refused_for(emission, refusal);
     }
 }
@@ -285,12 +275,6 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &outcome.attempt) else {
-            return;
-        };
-        if owner.connection().attempt() != outcome.attempt {
-            return;
-        }
         let emission = self
             .guard
             .emission_for_event(&outcome.attempt, &outcome.event_id);
@@ -306,12 +290,35 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
         );
         let result = state.record_carrier_emission(emission, &outcome.attempt, instance, accepted);
         self.guard.settle_attempt(emission);
-        if result != super::state::CarrierEmissionRecord::Recorded {
+        if !outcome_record_is_routable(&outcome.kind, result) {
+            return;
+        }
+        let Some(owner) = super::owner_for_signaling_attempt(&state, &outcome.attempt) else {
+            return;
+        };
+        if owner.connection().attempt() != outcome.attempt {
             return;
         }
         let _ = state
             .cmd_tx
             .send(NetworkCmd::AttemptOutcome { owner, outcome });
+    }
+}
+
+fn outcome_record_is_routable(
+    kind: &myownmesh_signaling::AttemptOutcomeKind,
+    record: super::state::CarrierEmissionRecord,
+) -> bool {
+    match kind {
+        myownmesh_signaling::AttemptOutcomeKind::Accepted { .. } => {
+            record == super::state::CarrierEmissionRecord::Accepted
+        }
+        myownmesh_signaling::AttemptOutcomeKind::TypedRefused(_)
+        | myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable => {
+            record == super::state::CarrierEmissionRecord::FinalRefusal
+        }
+        myownmesh_signaling::AttemptOutcomeKind::Cancelled
+        | myownmesh_signaling::AttemptOutcomeKind::Replaced => false,
     }
 }
 
@@ -552,8 +559,11 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             }
             let attempt = outbound_attempt(delivery.value()).map(str::to_owned);
             let emission = attempt.as_deref().map(|attempt| {
+                // The guard owns one funded node per physical carrier copy.
+                // Claim that node at pull time; resolving the newest record by
+                // peer-visible attempt would misassociate same-attempt E1/E2.
                 self.guard
-                    .emission_for_attempt(attempt)
+                    .claim_attempt(attempt)
                     .unwrap_or_else(SignalingEmissionId::next)
             });
             let attempt_state = self.recovery_state.as_ref().and_then(Weak::upgrade);
@@ -2039,6 +2049,35 @@ mod tests {
     }
 
     #[test]
+    fn core_provider_accounts_each_retention_delta_once() {
+        let (_root, scope, accountant) = scoped(|dimension| match dimension {
+            crate::resource::ResourceClass::AccountedMemoryBytes => 1_000_000,
+            _ => 10_000,
+        });
+        let provider = CoreNostrDeliveryProvider {
+            scope,
+            guard: CarrierInstanceGuard::noop(None),
+        };
+        let before = accountant
+            .in_use()
+            .amount(crate::resource::ResourceClass::AccountedMemoryBytes);
+        let lease = provider
+            .lease_for_bytes(37, "ledger-control")
+            .expect("the isolated provider admits the exact retention");
+        let after = accountant
+            .in_use()
+            .amount(crate::resource::ResourceClass::AccountedMemoryBytes);
+        assert_eq!(after - before, 37);
+        drop(lease);
+        assert_eq!(
+            accountant
+                .in_use()
+                .amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            before
+        );
+    }
+
+    #[test]
     fn same_attempt_event_ids_settle_out_of_order() {
         let state = crate::engine::build_test_state("emission-events");
         let guard = CarrierInstanceGuard::for_state(&state, state.next_recovery_carrier_instance());
@@ -2046,28 +2085,28 @@ mod tests {
         let second = SignalingEmissionId::next();
         assert!(guard.track_attempt(first, "same-attempt"));
         assert!(guard.track_attempt(second, "same-attempt"));
+        assert_eq!(guard.claim_attempt("same-attempt"), Some(first));
+        assert_eq!(guard.claim_attempt("same-attempt"), Some(second));
         let first_event = "0000000000000000000000000000000000000000000000000000000000000001";
         let second_event = "0000000000000000000000000000000000000000000000000000000000000002";
         assert_eq!(
             guard.bind_event_id("same-attempt", first_event),
-            Some(second)
+            Some(first)
         );
         assert_eq!(
             guard.bind_event_id("same-attempt", second_event),
-            Some(first)
+            Some(second)
         );
         assert_eq!(
             guard.emission_for_event("same-attempt", second_event),
-            Some(first)
-        );
-        guard.settle_attempt(first);
-        assert_eq!(
-            guard.emission_for_event("same-attempt", first_event),
             Some(second)
         );
-        assert!(guard
-            .emission_for_event("same-attempt", second_event)
-            .is_none());
+        guard.settle_attempt(first);
+        assert_eq!(guard.emission_for_event("same-attempt", first_event), None);
+        assert_eq!(
+            guard.emission_for_event("same-attempt", second_event),
+            Some(second)
+        );
     }
 
     #[test]
@@ -2080,7 +2119,7 @@ mod tests {
         assert!(state.begin_carrier_emission(emission, "late-attempt", [instance]));
         assert_eq!(
             state.record_carrier_emission(emission, "late-attempt", instance, true),
-            crate::engine::state::CarrierEmissionRecord::Recorded
+            crate::engine::state::CarrierEmissionRecord::Accepted
         );
         assert_eq!(
             state.record_carrier_emission(emission, "late-attempt", instance, true),
@@ -2090,5 +2129,89 @@ mod tests {
             state.record_carrier_emission(emission, "late-attempt", instance, false),
             crate::engine::state::CarrierEmissionRecord::Stale
         );
+    }
+
+    #[test]
+    fn carrier_refusal_is_pending_until_the_exact_last_copy() {
+        let state = crate::engine::build_test_state("emission-aggregate");
+        let first = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+        let emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "aggregate-attempt", [first, second]));
+        assert!(state.begin_carrier_emission(emission, "aggregate-attempt", [first, second]));
+        assert_eq!(
+            state.record_carrier_emission(emission, "aggregate-attempt", first, false),
+            crate::engine::state::CarrierEmissionRecord::Pending
+        );
+        assert_eq!(
+            state.record_carrier_emission(emission, "aggregate-attempt", second, false),
+            crate::engine::state::CarrierEmissionRecord::FinalRefusal
+        );
+        assert_eq!(
+            state.record_carrier_emission(emission, "aggregate-attempt", second, false),
+            crate::engine::state::CarrierEmissionRecord::Stale
+        );
+    }
+
+    #[test]
+    fn detached_carrier_guard_settles_its_exact_emission_once() {
+        let state = crate::engine::build_test_state("emission-detach");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("test carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "detach-attempt", [instance]));
+        assert!(guard.track_attempt(emission, "detach-attempt"));
+        guard.detach();
+        guard.detach();
+        assert!(!guard.track_attempt(SignalingEmissionId::next(), "stale-attempt"));
+        assert_eq!(
+            state.record_carrier_emission(emission, "detach-attempt", instance, false),
+            crate::engine::state::CarrierEmissionRecord::Stale
+        );
+    }
+
+    #[test]
+    fn outcome_routing_matrix_requires_matching_terminal_record() {
+        use crate::engine::state::CarrierEmissionRecord;
+        use myownmesh_signaling::AttemptOutcomeKind;
+
+        let kinds = [
+            AttemptOutcomeKind::Accepted { session: None },
+            AttemptOutcomeKind::TypedRefused("pressure".to_string()),
+            AttemptOutcomeKind::CarrierUnavailable,
+            AttemptOutcomeKind::Cancelled,
+            AttemptOutcomeKind::Replaced,
+        ];
+        let records = [
+            CarrierEmissionRecord::Stale,
+            CarrierEmissionRecord::Pending,
+            CarrierEmissionRecord::Accepted,
+            CarrierEmissionRecord::FinalRefusal,
+        ];
+        for kind in &kinds {
+            for record in records {
+                let expected = match kind {
+                    AttemptOutcomeKind::Accepted { .. } => {
+                        record == CarrierEmissionRecord::Accepted
+                    }
+                    AttemptOutcomeKind::TypedRefused(_)
+                    | AttemptOutcomeKind::CarrierUnavailable => {
+                        record == CarrierEmissionRecord::FinalRefusal
+                    }
+                    AttemptOutcomeKind::Cancelled | AttemptOutcomeKind::Replaced => false,
+                };
+                assert_eq!(
+                    outcome_record_is_routable(kind, record),
+                    expected,
+                    "unexpected routing for {kind:?} and {record:?}"
+                );
+            }
+        }
     }
 }

@@ -72,7 +72,8 @@ impl SignalingEmissionId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CarrierEmissionRecord {
     Stale,
-    Recorded,
+    Pending,
+    Accepted,
     FinalRefusal,
 }
 
@@ -2028,7 +2029,14 @@ impl NetworkState {
         &self,
         runtime: &Arc<super::signaling_ingress::SignalingRuntime>,
     ) {
-        *self.signaling_runtime.write() = Some(Arc::clone(runtime));
+        let replaced = self.signaling_runtime.write().replace(Arc::clone(runtime));
+        if let Some(replaced) = replaced.filter(|replaced| !Arc::ptr_eq(replaced, runtime)) {
+            // A reattach supersedes the old runtime.  Release its exact guard
+            // custody before the old driver tasks happen to observe the
+            // replacement; otherwise self-eviction could only find the new
+            // runtime and leave stale old-carrier records live.
+            replaced.detach_guards();
+        }
         self.peers.bind_signaling_runtime(Arc::downgrade(runtime));
         // A carrier attach/restore is an explicit recovery trigger.  This
         // path intentionally bypasses the ordinary presence floor; if the
@@ -2042,6 +2050,12 @@ impl NetworkState {
         &self,
     ) -> Option<Arc<super::signaling_ingress::SignalingRuntime>> {
         self.signaling_runtime.read().clone()
+    }
+
+    pub(crate) fn detach_signaling_guards(&self) {
+        if let Some(runtime) = self.signaling_runtime() {
+            runtime.detach_guards();
+        }
     }
 
     pub(crate) fn set_attempt_settlement(&self, settlement: AttemptSettlement) {
@@ -2106,14 +2120,17 @@ impl NetworkState {
         ]) else {
             return false;
         };
+        let mut attempts = self.carrier_attempts.lock();
+        if attempts.find_emission_mut(emission, attempt).is_some() {
+            return true;
+        }
+        // Hold the aggregate lock across the exact existing check and its
+        // provider claim.  A concurrent source must not both observe absence,
+        // acquire pressure, and then race to create a second cohort for the
+        // same opaque emission.
         let Ok(entry_lease) = self.local_resources.acquire(claim) else {
             return false;
         };
-        let mut attempts = self.carrier_attempts.lock();
-        if attempts.find_emission_mut(emission, attempt).is_some() {
-            drop(entry_lease);
-            return true;
-        }
         let mut carriers = None;
         for (index, instance) in instances.clone().into_iter().enumerate() {
             let duplicate = instances
@@ -2144,8 +2161,8 @@ impl NetworkState {
     }
 
     /// Record an exact carrier's source admission without creating custody.
-    /// Stale callbacks are distinguishable from a recorded callback and from
-    /// the one final refusal that may be routed to the attempt owner.
+    /// Stale callbacks are distinguishable from a pending refusal, an accepted
+    /// callback, and the one final refusal that may be routed to the owner.
     pub(crate) fn record_carrier_emission(
         &self,
         emission: SignalingEmissionId,
@@ -2167,7 +2184,7 @@ impl NetworkState {
                 }
                 carrier.accepted = true;
                 state.accepted = true;
-                CarrierEmissionRecord::Recorded
+                CarrierEmissionRecord::Accepted
             } else {
                 let already_resolved = {
                     let Some(carrier) = state.carrier_mut(instance) else {
@@ -2187,7 +2204,7 @@ impl NetworkState {
                 if !state.accepted && state.resolved == state.expected {
                     CarrierEmissionRecord::FinalRefusal
                 } else {
-                    CarrierEmissionRecord::Recorded
+                    CarrierEmissionRecord::Pending
                 }
             }
         };

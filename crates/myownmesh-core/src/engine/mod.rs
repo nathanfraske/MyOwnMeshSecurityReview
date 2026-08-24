@@ -2049,6 +2049,11 @@ pub(crate) fn reconcile_terminal_recovery_policy(
         return;
     }
     if affected_device_id == state.identity.public_id() {
+        // Reconciliation can race a carrier pull after exact recovery/emission
+        // custody was armed.  Detach those carrier guards now; waiting for
+        // driver teardown would leave provider leases live after canonical
+        // self-eviction and let a stale copy settle a later generation.
+        state.detach_signaling_guards();
         state.cancel_all_recovery_demands();
         for device_id in state.flush_reconnect_intents() {
             state.clear_reconnect_intent(&device_id);
