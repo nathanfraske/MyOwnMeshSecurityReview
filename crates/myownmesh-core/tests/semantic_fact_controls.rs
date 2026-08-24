@@ -101,11 +101,12 @@ fn wire_file_and_cache_round_trips_preserve_one_fact_identity() {
 fn arrival_order_is_independent_and_missing_parents_quarantine() {
     let signing_key = key(3);
     let bootstrap = closed_bootstrap(3, 3);
+    let target = author(&key(6));
     let genesis = fact(
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: author(&signing_key),
+            target: target.clone(),
             role: Role::Member,
         },
         Vec::new(),
@@ -113,9 +114,7 @@ fn arrival_order_is_independent_and_missing_parents_quarantine() {
     let successor = fact(
         &bootstrap,
         &signing_key,
-        FactBody::RoleRevoke {
-            target: author(&signing_key),
-        },
+        FactBody::RoleRevoke { target },
         vec![genesis.id],
     );
 
@@ -175,11 +174,12 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     assert_eq!(open_graph.context_id(), bootstrap.context_id());
 
     let eviction_bootstrap = closed_bootstrap(4, 4);
+    let eviction_target = author(&key(6));
     let proposal = fact(
         &eviction_bootstrap,
         &signing_key,
         FactBody::Evict {
-            target: device.clone(),
+            target: eviction_target.clone(),
         },
         Vec::new(),
     );
@@ -187,7 +187,7 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
         &eviction_bootstrap,
         &signing_key,
         FactBody::Attestation {
-            target: device.clone(),
+            target: eviction_target.clone(),
             proposal: proposal.id,
             decision: AttestationDecision::Evict,
             signer: device.clone(),
@@ -199,7 +199,7 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
         &eviction_bootstrap,
         &signing_key,
         FactBody::EvictionProof {
-            target: device.clone(),
+            target: eviction_target.clone(),
             evidence: vec![attestation.id],
         },
         vec![attestation.id],
@@ -209,7 +209,7 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     graph
         .admit(proof)
         .expect("eviction proof quarantines until evidence arrives");
-    assert!(!graph.projection().is_stood_down(&device));
+    assert!(!graph.projection().is_stood_down(&eviction_target));
     graph
         .admit(attestation)
         .expect("eviction attestation admits");
@@ -221,7 +221,7 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     graph
         .retry_quarantined()
         .expect("eviction proof retries after evidence");
-    assert!(graph.projection().is_stood_down(&device));
+    assert!(graph.projection().is_stood_down(&eviction_target));
     let cells_after_proof_retry = graph
         .projection()
         .cells()

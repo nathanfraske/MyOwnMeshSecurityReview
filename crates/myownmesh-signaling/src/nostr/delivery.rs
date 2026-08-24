@@ -7,8 +7,9 @@
 //! This module deliberately has no count cap, elapsed TTL, retry timer, or
 //! route authority.
 
-use std::collections::HashMap;
+use std::borrow::Borrow;
 use std::io::Write;
+use std::mem;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -66,13 +67,16 @@ impl std::hash::Hash for RelaySessionId {
 pub struct DeliveryRetention {
     pub encoded_event_bytes: usize,
     pub structural_entry_bytes: usize,
-    /// Exact bytes for the relay-map node that points at the delivery entry.
+    /// Legacy byte hint retained for provider source compatibility. New
+    /// providers should use `DeliveryProvider::reserve_relay_entry`; this is
+    /// zero so this module never guesses a HashMap tuple layout.
     pub relay_map_growth_bytes: usize,
     /// Exact bytes for the attempt record allocation.
     pub attempt_record_bytes: usize,
     /// Exact bytes for the event-id key allocation.
     pub attempt_key_bytes: usize,
-    /// Exact bytes for the attempt-map growth allocation.
+    /// Legacy byte hint retained for provider source compatibility. New
+    /// providers should use `DeliveryProvider::reserve_attempt_entry`.
     pub attempt_map_growth_bytes: usize,
 }
 
@@ -134,6 +138,15 @@ pub trait DeliveryProvider: Send + Sync {
         retention: SessionRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
+    /// Fund the exact one-allocation session-map entry.
+    fn reserve_session_entry(
+        &self,
+        session: RelaySessionId,
+        retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_session_set_growth(session, retention)
+    }
+
     /// Fund the exact attempt record before it is inserted into the live map.
     fn reserve_attempt_record(
         &self,
@@ -174,6 +187,45 @@ pub trait DeliveryProvider: Send + Sync {
         event: &NostrEvent,
         retention: DeliveryRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
+
+    /// Fund the exact attempt-map entry owned by the provider.
+    ///
+    /// New providers should override this seam. The default preserves the
+    /// older byte-hint adapter while callers migrate; the store never treats
+    /// the HashMap tuple layout as its own custody claim.
+    fn reserve_attempt_entry(
+        &self,
+        attempt: &str,
+        event: &NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_attempt_map_growth(attempt, event, retention)
+    }
+
+    /// Fund the exact relay-map entry owned by the provider.
+    fn reserve_relay_entry(
+        &self,
+        attempt: &str,
+        session: RelaySessionId,
+        event: &NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_relay_map_growth(attempt, session, event, retention)
+    }
+
+    /// Fund the owned attempt-correlation string separately from the event-id
+    /// key. The compatibility default reuses the old key seam with an exact
+    /// correlation-length hint, so existing providers remain source-stable.
+    fn reserve_attempt_correlation(
+        &self,
+        attempt: &str,
+        event: &NostrEvent,
+        retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let mut correlation = retention;
+        correlation.attempt_key_bytes = attempt.len();
+        self.reserve_attempt_key(attempt, event, correlation)
+    }
 }
 
 /// Standalone compatibility provider. Production core attachment should pass
@@ -273,6 +325,13 @@ struct RelayEntry {
 
 impl DeliveryRetention {
     pub fn for_event(event: &NostrEvent) -> Self {
+        Self::for_attempt("", event)
+    }
+
+    /// Compute the frame and owned-record shape before any frame or map entry
+    /// is allocated. HashMap entry custody belongs to the provider seams,
+    /// not to guessed tuple sizes in this module.
+    pub fn for_attempt(_attempt: &str, event: &NostrEvent) -> Self {
         let mut counter = CountingWriter(0);
         counter.write_all(b"[\"EVENT\",").expect("counting writer");
         serde_json::to_writer(&mut counter, event).expect("event serializes");
@@ -280,10 +339,14 @@ impl DeliveryRetention {
         Self {
             encoded_event_bytes: counter.0,
             structural_entry_bytes: std::mem::size_of::<RelayEntry>(),
-            relay_map_growth_bytes: std::mem::size_of::<(RelaySessionId, RelayEntry)>(),
+            // The provider owns this map entry through its exact entry lease;
+            // retain the field only for source compatibility with old
+            // adapters, where zero means no guessed HashMap tuple charge.
+            relay_map_growth_bytes: 0,
             attempt_record_bytes: std::mem::size_of::<AttemptEntry>(),
             attempt_key_bytes: event.id.len(),
-            attempt_map_growth_bytes: std::mem::size_of::<(String, AttemptEntry)>(),
+            // See relay_map_growth_bytes above.
+            attempt_map_growth_bytes: 0,
         }
     }
 }
@@ -293,7 +356,9 @@ impl SessionRetention {
         Self {
             session_record_bytes: std::mem::size_of::<SessionEntry>(),
             session_set_node_bytes: std::mem::size_of::<RelaySessionId>(),
-            session_set_growth_bytes: std::mem::size_of::<(RelaySessionId, SessionEntry)>(),
+            // Session-set entry custody is provider-owned; no HashMap tuple
+            // layout is treated as an exact byte reservation here.
+            session_set_growth_bytes: 0,
         }
     }
 }
@@ -344,8 +409,9 @@ struct AttemptEntry {
     owned: OwnedSignal<NostrEvent, ErasedOwner>,
     record_lease: Box<dyn DeliveryLease>,
     key_lease: Box<dyn DeliveryLease>,
+    correlation_lease: Option<Box<dyn DeliveryLease>>,
     map_lease: Box<dyn DeliveryLease>,
-    relays: HashMap<RelaySessionId, RelayEntry>,
+    relays: DeliveryMap<RelaySessionId, RelayEntry>,
     provider_refused: bool,
 }
 
@@ -355,9 +421,212 @@ struct SessionEntry {
     growth_lease: Box<dyn DeliveryLease>,
 }
 
+/// A provider-funded, one-allocation-per-entry map.
+///
+/// HashMap bucket arrays are process allocations whose geometric growth is
+/// impossible to price from a tuple `size_of`. This intrusive map allocates
+/// exactly one boxed node per insertion; the caller acquires that node's
+/// provider lease before calling `insert`. It has no spare capacity, bucket
+/// control bytes, or reallocation path.
+struct DeliveryMap<K, V> {
+    head: Option<Box<DeliveryMapNode<K, V>>>,
+    len: usize,
+}
+
+struct DeliveryMapNode<K, V> {
+    key: K,
+    value: V,
+    next: Option<Box<DeliveryMapNode<K, V>>>,
+}
+
+impl<K, V> Default for DeliveryMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> Drop for DeliveryMap<K, V> {
+    fn drop(&mut self) {
+        let mut next = self.head.take();
+        while let Some(mut node) = next {
+            // Break the ownership chain before this node drops. Its own
+            // fields then drop normally, while the loop owns the remainder.
+            next = node.next.take();
+        }
+    }
+}
+
+impl<K, V> DeliveryMap<K, V> {
+    fn new() -> Self {
+        Self { head: None, len: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn iter(&self) -> DeliveryMapIter<'_, K, V> {
+        DeliveryMapIter {
+            next: self.head.as_deref(),
+        }
+    }
+
+    fn iter_mut(&mut self) -> DeliveryMapIterMut<'_, K, V> {
+        DeliveryMapIterMut {
+            next: self.head.as_deref_mut(),
+        }
+    }
+
+    fn into_values(self) -> impl Iterator<Item = V> {
+        self.into_iter().map(|(_, value)| value)
+    }
+}
+
+impl<K, V> DeliveryMap<K, V> {
+    fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter()
+            .find_map(|(candidate, value)| (candidate.borrow() == key).then_some(value))
+    }
+
+    fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter_mut()
+            .find_map(|(candidate, value)| (candidate.borrow() == key).then_some(value))
+    }
+
+    fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+
+    fn insert(&mut self, key: K, value: V) -> Option<V>
+    where
+        K: PartialEq,
+    {
+        let mut link = &mut self.head;
+        loop {
+            match link {
+                Some(node) if node.key == key => {
+                    return Some(mem::replace(&mut node.value, value));
+                }
+                Some(node) => link = &mut node.next,
+                None => {
+                    *link = Some(Box::new(DeliveryMapNode {
+                        key,
+                        value,
+                        next: None,
+                    }));
+                    self.len += 1;
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let mut link = &mut self.head;
+        loop {
+            let matches = match link.as_ref() {
+                Some(node) => node.key.borrow() == key,
+                None => return None,
+            };
+            if matches {
+                let mut removed = link.take().expect("the node was borrowed above");
+                *link = removed.next.take();
+                self.len -= 1;
+                return Some(removed.value);
+            }
+            link = &mut link
+                .as_mut()
+                .expect("a nonmatching node exists while advancing")
+                .next;
+        }
+    }
+}
+
+impl<K, V> IntoIterator for DeliveryMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = DeliveryMapIntoIter<K, V>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        DeliveryMapIntoIter {
+            next: self.head.take(),
+        }
+    }
+}
+
+struct DeliveryMapIter<'a, K, V> {
+    next: Option<&'a DeliveryMapNode<K, V>>,
+}
+
+impl<'a, K, V> Iterator for DeliveryMapIter<'a, K, V> {
+    type Item = (&'a K, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.next?;
+        self.next = node.next.as_deref();
+        Some((&node.key, &node.value))
+    }
+}
+
+struct DeliveryMapIterMut<'a, K, V> {
+    next: Option<&'a mut DeliveryMapNode<K, V>>,
+}
+
+impl<'a, K, V> Iterator for DeliveryMapIterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let node = self.next.take()?;
+        self.next = node.next.as_deref_mut();
+        Some((&node.key, &mut node.value))
+    }
+}
+
+struct DeliveryMapIntoIter<K, V> {
+    next: Option<Box<DeliveryMapNode<K, V>>>,
+}
+
+impl<K, V> Drop for DeliveryMapIntoIter<K, V> {
+    fn drop(&mut self) {
+        let mut next = self.next.take();
+        while let Some(mut node) = next {
+            next = node.next.take();
+        }
+    }
+}
+
+impl<K, V> Iterator for DeliveryMapIntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut node = self.next.take()?;
+        self.next = node.next.take();
+        Some((node.key, node.value))
+    }
+}
+
 struct DeliveryState {
-    sessions: HashMap<RelaySessionId, SessionEntry>,
-    attempts: HashMap<String, AttemptEntry>,
+    sessions: DeliveryMap<RelaySessionId, SessionEntry>,
+    attempts: DeliveryMap<String, AttemptEntry>,
 }
 
 /// The live attempt owner and its per-relay delivery entries.
@@ -381,8 +650,8 @@ impl DeliveryStore {
             provider,
             outcome_sink,
             state: Mutex::new(DeliveryState {
-                sessions: HashMap::new(),
-                attempts: HashMap::new(),
+                sessions: DeliveryMap::new(),
+                attempts: DeliveryMap::new(),
             }),
             notify: Notify::new(),
         })
@@ -440,7 +709,7 @@ impl DeliveryStore {
         };
         let growth_lease = match self
             .provider
-            .reserve_session_set_growth(session.clone(), retention)
+            .reserve_session_entry(session.clone(), retention)
         {
             Ok(lease) => lease,
             Err(error) => {
@@ -458,8 +727,8 @@ impl DeliveryStore {
             },
         );
         let mut refused = Vec::new();
-        for entry in state.attempts.values_mut() {
-            let retention = DeliveryRetention::for_event(entry.owned.value());
+        for (_, entry) in state.attempts.iter_mut() {
+            let retention = DeliveryRetention::for_attempt(&entry.attempt, entry.owned.value());
             match self.provider.reserve(
                 &entry.attempt,
                 session.clone(),
@@ -467,7 +736,7 @@ impl DeliveryStore {
                 retention,
             ) {
                 Ok(lease) => {
-                    match self.provider.reserve_relay_map_growth(
+                    match self.provider.reserve_relay_entry(
                         &entry.attempt,
                         session.clone(),
                         entry.owned.value(),
@@ -537,7 +806,7 @@ impl DeliveryStore {
                 attempt_refusal: Some(AdmissionRefusal::DuplicateLiveEvent),
             };
         }
-        let retention = DeliveryRetention::for_event(owned.value());
+        let retention = DeliveryRetention::for_attempt(&attempt, owned.value());
         let record_lease =
             match self
                 .provider
@@ -568,12 +837,14 @@ impl DeliveryStore {
                 };
             }
         };
-        let map_lease =
+        let correlation_lease = if attempt.is_empty() {
+            None
+        } else {
             match self
                 .provider
-                .reserve_attempt_map_growth(&attempt, owned.value(), retention)
+                .reserve_attempt_correlation(&attempt, owned.value(), retention)
             {
-                Ok(lease) => lease,
+                Ok(lease) => Some(lease),
                 Err(error) => {
                     key_lease.finish(DeliveryTerminal::Cancelled);
                     record_lease.finish(DeliveryTerminal::Cancelled);
@@ -584,15 +855,37 @@ impl DeliveryStore {
                         attempt_refusal: Some(AdmissionRefusal::Provider(error)),
                     };
                 }
+            }
+        };
+        let map_lease =
+            match self
+                .provider
+                .reserve_attempt_entry(&attempt, owned.value(), retention)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    if let Some(lease) = correlation_lease {
+                        lease.finish(DeliveryTerminal::Cancelled);
+                    }
+                    key_lease.finish(DeliveryTerminal::Cancelled);
+                    record_lease.finish(DeliveryTerminal::Cancelled);
+                    return AdmissionReport {
+                        event_id,
+                        accepted_sessions: 0,
+                        refused: Vec::new(),
+                        attempt_refusal: Some(AdmissionRefusal::Provider(error)),
+                    };
+                }
             };
-        let mut relays = HashMap::new();
+        let mut relays = DeliveryMap::new();
         let mut refused = Vec::new();
-        for session in state.sessions.keys().cloned() {
+        for (session, _) in state.sessions.iter() {
+            let session = session.clone();
             match self
                 .provider
                 .reserve(&attempt, session.clone(), owned.value(), retention)
             {
-                Ok(lease) => match self.provider.reserve_relay_map_growth(
+                Ok(lease) => match self.provider.reserve_relay_entry(
                     &attempt,
                     session.clone(),
                     owned.value(),
@@ -632,6 +925,7 @@ impl DeliveryStore {
                 owned,
                 record_lease,
                 key_lease,
+                correlation_lease,
                 map_lease,
                 relays,
                 // A partial refusal still has a funded live relay and may
@@ -654,7 +948,7 @@ impl DeliveryStore {
     pub fn pending(&self, session: &RelaySessionId) -> Vec<String> {
         let mut state = self.state.lock();
         let mut ids = Vec::new();
-        for (event_id, entry) in &mut state.attempts {
+        for (event_id, entry) in state.attempts.iter_mut() {
             if let Some(relay) = entry.relays.get_mut(session) {
                 if !relay.in_flight {
                     relay.in_flight = true;
@@ -684,7 +978,7 @@ impl DeliveryStore {
     ) -> bool {
         let (leases, outcome) = {
             let mut state = self.state.lock();
-            let (lease, remove_attempt, attempt) = {
+            let (lease, remove_attempt, attempt, has_remaining) = {
                 let Some(entry) = state.attempts.get_mut(event_id) else {
                     return false;
                 };
@@ -696,7 +990,12 @@ impl DeliveryStore {
                     DeliveryTerminal::Accepted | DeliveryTerminal::TypedRefused(_)
                 ) && entry.relays.is_empty()
                     && !entry.provider_refused;
-                (relay, remove_attempt, entry.attempt.clone())
+                (
+                    relay,
+                    remove_attempt,
+                    entry.attempt.clone(),
+                    !entry.relays.is_empty(),
+                )
             };
             let outcome = match &terminal {
                 DeliveryTerminal::Accepted => Some(AttemptOutcome {
@@ -706,11 +1005,12 @@ impl DeliveryStore {
                         session: Some(session.clone()),
                     },
                 }),
-                DeliveryTerminal::TypedRefused(reason) => Some(AttemptOutcome {
+                DeliveryTerminal::TypedRefused(reason) if !has_remaining => Some(AttemptOutcome {
                     attempt,
                     event_id: event_id.to_string(),
                     kind: AttemptOutcomeKind::TypedRefused(reason.clone()),
                 }),
+                DeliveryTerminal::TypedRefused(_) => None,
                 _ => None,
             };
             if remove_attempt {
@@ -723,16 +1023,17 @@ impl DeliveryStore {
                     .attempts
                     .remove(event_id)
                     .expect("attempt exists while settling its relay");
-                (
-                    vec![
-                        lease.lease,
-                        lease.map_lease,
-                        entry.record_lease,
-                        entry.key_lease,
-                        entry.map_lease,
-                    ],
-                    outcome,
-                )
+                let mut leases = vec![
+                    lease.lease,
+                    lease.map_lease,
+                    entry.record_lease,
+                    entry.key_lease,
+                ];
+                if let Some(correlation_lease) = entry.correlation_lease {
+                    leases.push(correlation_lease);
+                }
+                leases.push(entry.map_lease);
+                (leases, outcome)
             } else {
                 (vec![lease.lease, lease.map_lease], outcome)
             }
@@ -781,6 +1082,7 @@ impl DeliveryStore {
                     });
                     leases.push(entry.record_lease);
                     leases.push(entry.key_lease);
+                    leases.extend(entry.correlation_lease);
                     leases.push(entry.map_lease);
                     leases.extend(
                         entry
@@ -813,14 +1115,16 @@ impl DeliveryStore {
                 leases.push(session_entry.node_lease);
                 leases.push(session_entry.growth_lease);
             }
-            for entry in state.attempts.values_mut() {
+            for (_, entry) in state.attempts.iter_mut() {
                 if let Some(relay) = entry.relays.remove(&session) {
                     count += 1;
-                    outcomes.push(AttemptOutcome {
-                        attempt: entry.attempt.clone(),
-                        event_id: entry.owned.value().id.clone(),
-                        kind: AttemptOutcomeKind::CarrierUnavailable,
-                    });
+                    if entry.relays.is_empty() {
+                        outcomes.push(AttemptOutcome {
+                            attempt: entry.attempt.clone(),
+                            event_id: entry.owned.value().id.clone(),
+                            kind: AttemptOutcomeKind::CarrierUnavailable,
+                        });
+                    }
                     leases.push(relay.lease);
                     leases.push(relay.map_lease);
                 }
@@ -842,12 +1146,12 @@ impl DeliveryStore {
         let mut count = 0;
         {
             let mut state = self.state.lock();
-            for session_entry in state.sessions.drain().map(|(_, entry)| entry) {
+            for (_, session_entry) in mem::take(&mut state.sessions).into_iter() {
                 leases.push(session_entry.record_lease);
                 leases.push(session_entry.node_lease);
                 leases.push(session_entry.growth_lease);
             }
-            for entry in state.attempts.drain().map(|(_, entry)| entry) {
+            for (_, entry) in mem::take(&mut state.attempts).into_iter() {
                 count += entry.relays.len();
                 outcomes.push(AttemptOutcome {
                     attempt: entry.attempt.clone(),
@@ -856,6 +1160,7 @@ impl DeliveryStore {
                 });
                 leases.push(entry.record_lease);
                 leases.push(entry.key_lease);
+                leases.extend(entry.correlation_lease);
                 leases.push(entry.map_lease);
                 leases.extend(
                     entry
@@ -978,6 +1283,68 @@ mod tests {
         }
     }
 
+    struct ExactCustodyProvider {
+        live: Arc<AtomicUsize>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ExactCustodyProvider {
+        fn lease(&self, label: &str) -> Box<dyn DeliveryLease> {
+            self.calls.lock().push(label.to_string());
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Box::new(CountingLease {
+                live: Arc::clone(&self.live),
+            })
+        }
+    }
+
+    impl DeliveryProvider for ExactCustodyProvider {
+        unmetered_reservations!();
+
+        fn reserve(
+            &self,
+            _attempt: &str,
+            _session: RelaySessionId,
+            _event: &NostrEvent,
+            _retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            Ok(self.lease("relay"))
+        }
+
+        fn reserve_attempt_correlation(
+            &self,
+            attempt: &str,
+            _event: &NostrEvent,
+            retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            assert!(!attempt.is_empty());
+            assert_eq!(retention.relay_map_growth_bytes, 0);
+            assert_eq!(retention.attempt_map_growth_bytes, 0);
+            Ok(self.lease("attempt-correlation"))
+        }
+
+        fn reserve_attempt_entry(
+            &self,
+            _attempt: &str,
+            _event: &NostrEvent,
+            retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            assert_eq!(retention.attempt_map_growth_bytes, 0);
+            Ok(self.lease("attempt-entry"))
+        }
+
+        fn reserve_relay_entry(
+            &self,
+            _attempt: &str,
+            _session: RelaySessionId,
+            _event: &NostrEvent,
+            retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            assert_eq!(retention.relay_map_growth_bytes, 0);
+            Ok(self.lease("relay-entry"))
+        }
+    }
+
     struct OpenOnFinishProvider {
         store: Arc<OnceLock<Weak<DeliveryStore>>>,
         fresh: Arc<Mutex<Option<RelaySessionId>>>,
@@ -1074,6 +1441,31 @@ mod tests {
         }
     }
 
+    struct RefuseSpecificProvider {
+        target: Arc<Mutex<Option<RelaySessionId>>>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl DeliveryProvider for RefuseSpecificProvider {
+        unmetered_reservations!();
+
+        fn reserve(
+            &self,
+            _attempt: &str,
+            session: RelaySessionId,
+            _event: &NostrEvent,
+            _retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            if self.target.lock().as_ref() == Some(&session) {
+                return Err(DeliveryRefusal::Provider("selected relay refusal".into()));
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingLease {
+                live: Arc::clone(&self.live),
+            }))
+        }
+    }
+
     fn event() -> NostrEvent {
         make_event(
             &NostrIdentity::generate(),
@@ -1082,6 +1474,37 @@ mod tests {
             "attempt".into(),
             1,
         )
+    }
+
+    #[test]
+    fn large_delivery_map_chain_unlinks_iteratively() {
+        const CHAIN: usize = 100_000;
+        fn chain(size: usize) -> DeliveryMap<usize, usize> {
+            let mut map = DeliveryMap::new();
+            for key in 0..size {
+                let next = map.head.take();
+                map.head = Some(Box::new(DeliveryMapNode {
+                    key,
+                    value: key,
+                    next,
+                }));
+                map.len += 1;
+            }
+            map
+        }
+
+        let mut map = chain(CHAIN);
+        assert_eq!(map.len(), CHAIN);
+        assert_eq!(map.remove(&0), Some(0));
+        assert_eq!(map.remove(&(CHAIN / 2)), Some(CHAIN / 2));
+        assert_eq!(map.remove(&(CHAIN - 1)), Some(CHAIN - 1));
+        assert_eq!(map.len(), CHAIN - 3);
+        drop(map);
+
+        let mut remainder = chain(CHAIN).into_iter();
+        assert_eq!(remainder.next(), Some((CHAIN - 1, CHAIN - 1)));
+        assert_eq!(remainder.next(), Some((CHAIN - 2, CHAIN - 2)));
+        drop(remainder);
     }
 
     #[test]
@@ -1108,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn outcome_sink_records_carrier_unavailable_for_every_closed_relay() {
+    fn outcome_sink_aggregates_carrier_unavailable_after_all_relays_close() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
         let (first, _) = store.open_session();
@@ -1121,12 +1544,10 @@ mod tests {
         store.close_session(second, DeliveryTerminal::Cancelled);
 
         let records = outcomes.lock();
-        assert_eq!(records.len(), 2);
-        assert!(records.iter().all(|record| {
-            record.attempt == "carrier-attempt"
-                && record.event_id == event_id
-                && record.kind == AttemptOutcomeKind::CarrierUnavailable
-        }));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].attempt, "carrier-attempt");
+        assert_eq!(records[0].event_id, event_id);
+        assert_eq!(records[0].kind, AttemptOutcomeKind::CarrierUnavailable);
     }
 
     #[test]
@@ -1363,5 +1784,116 @@ mod tests {
         );
         assert_eq!(live.load(Ordering::SeqCst), 0);
         assert!(!store.settle(&a, &id, DeliveryTerminal::Accepted));
+    }
+
+    #[test]
+    fn admission_refusal_permutation_preserves_the_other_relay() {
+        fn exercise(refuse_first: bool) {
+            let target = Arc::new(Mutex::new(None));
+            let live = Arc::new(AtomicUsize::new(0));
+            let store = DeliveryStore::new(Arc::new(RefuseSpecificProvider {
+                target: Arc::clone(&target),
+                live: Arc::clone(&live),
+            }));
+            let (first, _) = store.open_session();
+            let (second, _) = store.open_session();
+            let refused = if refuse_first {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let healthy = if refuse_first { second } else { first };
+            *target.lock() = Some(refused);
+
+            let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+            let id = owned.value().id.clone();
+            let report = store.admit("admission-permutation".into(), owned);
+            assert_eq!(report.accepted_sessions, 1);
+            assert_eq!(report.refused.len(), 1);
+            assert!(report.attempt_refusal.is_none());
+            assert_eq!(store.pending(&healthy), vec![id.clone()]);
+            assert_eq!(live.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                store.finish_attempt("admission-permutation", DeliveryTerminal::Accepted),
+                1
+            );
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        exercise(true);
+        exercise(false);
+    }
+
+    #[test]
+    fn relay_refusal_outcome_is_order_independent_while_peer_remains_viable() {
+        fn exercise(reverse: bool) {
+            let live = Arc::new(AtomicUsize::new(0));
+            let (store, outcomes) = recording_store(Arc::new(CountingProvider {
+                live: Arc::clone(&live),
+            }));
+            let (first_session, _) = store.open_session();
+            let (second_session, _) = store.open_session();
+            let (first, second) = if reverse {
+                (second_session, first_session)
+            } else {
+                (first_session, second_session)
+            };
+            let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+            let id = owned.value().id.clone();
+            let report = store.admit("refusal-order".into(), owned);
+            assert_eq!(report.accepted_sessions, 2);
+
+            assert!(store.settle(
+                &first,
+                &id,
+                DeliveryTerminal::TypedRefused("first relay refused".into()),
+            ));
+            assert!(outcomes.lock().is_empty());
+            assert_eq!(store.pending(&second), vec![id.clone()]);
+            assert_eq!(live.load(Ordering::SeqCst), 1);
+
+            assert!(store.settle(&second, &id, DeliveryTerminal::Accepted));
+            let records = outcomes.lock();
+            assert_eq!(records.len(), 1);
+            assert!(matches!(
+                records[0].kind,
+                AttemptOutcomeKind::Accepted { .. }
+            ));
+            assert_eq!(live.load(Ordering::SeqCst), 0);
+        }
+
+        exercise(false);
+        exercise(true);
+    }
+
+    #[test]
+    fn provider_delta_covers_correlation_and_each_exact_entry() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
+            live: Arc::clone(&live),
+            calls: Arc::clone(&calls),
+        }));
+        let (session, _) = store.open_session();
+        let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+        let event_id = owned.value().id.clone();
+        let report = store.admit("exact-correlation".into(), owned);
+        assert_eq!(report.accepted_sessions, 1);
+        assert_eq!(
+            *calls.lock(),
+            vec![
+                "attempt-correlation".to_string(),
+                "attempt-entry".to_string(),
+                "relay".to_string(),
+                "relay-entry".to_string(),
+            ]
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            store.finish_attempt("exact-correlation", DeliveryTerminal::Accepted),
+            1
+        );
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(!store.settle(&session, &event_id, DeliveryTerminal::Accepted));
     }
 }

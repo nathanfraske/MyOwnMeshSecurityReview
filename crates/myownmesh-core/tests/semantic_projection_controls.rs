@@ -40,7 +40,7 @@ fn fact(
 fn incomparable_heads_fail_closed_until_full_head_resolution() {
     let signing_key = key(11);
     let bootstrap = bootstrap(11, 11);
-    let subject = author(&signing_key);
+    let subject = author(&key(13));
     let first = fact(
         &bootstrap,
         &signing_key,
@@ -107,11 +107,12 @@ fn incomparable_heads_fail_closed_until_full_head_resolution() {
 fn conflict_projection_does_not_depend_on_arrival_order() {
     let signing_key = key(12);
     let bootstrap = bootstrap(12, 12);
+    let subject = author(&key(13));
     let first = fact(
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: author(&signing_key),
+            target: subject.clone(),
             role: Role::Member,
         },
         Vec::new(),
@@ -120,7 +121,7 @@ fn conflict_projection_does_not_depend_on_arrival_order() {
         &bootstrap,
         &signing_key,
         FactBody::RoleGrant {
-            target: author(&signing_key),
+            target: subject.clone(),
             role: Role::Owner,
         },
         Vec::new(),
@@ -134,5 +135,5 @@ fn conflict_projection_does_not_depend_on_arrival_order() {
     assert_eq!(left.projection(), right.projection());
     assert!(left
         .projection()
-        .is_conflicted(&ExclusiveCell::role(author(&signing_key))));
+        .is_conflicted(&ExclusiveCell::role(subject)));
 }

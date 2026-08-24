@@ -48,7 +48,6 @@ pub(crate) enum RecoveryAttempt {
     Accepted,
     Refused,
     RateLimited,
-    NotAttempted,
 }
 
 /// Result of attempting to settle a recovery demand.

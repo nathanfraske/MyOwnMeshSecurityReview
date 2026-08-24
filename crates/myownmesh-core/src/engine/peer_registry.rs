@@ -631,6 +631,31 @@ impl PeerRegistry {
             .map(|entry| Arc::clone(&entry.value().peer))
     }
 
+    /// Whether an exact current installation is a valid recovery successor.
+    /// A live connector alone is not enough: the promoted session must still
+    /// hold a usable capability, the peer must be authenticated/admitted, and
+    /// the canonical policy must admit this exact device.
+    pub(super) fn has_usable_authenticated_current(&self, owner: &PeerOwnerToken) -> bool {
+        let peer = {
+            let current = match self.peers.get(owner.device_id()) {
+                Some(current) => current,
+                None => return false,
+            };
+            if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+                return false;
+            }
+            if !owner.worker_matches(&current.value().peer) {
+                return false;
+            }
+            Arc::clone(&current.value().peer)
+        };
+        let admitted = peer.state.read().is_admitted();
+        admitted
+            && peer.holds_promoted_session()
+            && peer.has_usable_session_for_recovery()
+            && self.policy_admits(owner.device_id())
+    }
+
     pub(crate) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
         self.peers.get(device_id).map(|entry| PeerOwnerToken {
             peer: Arc::clone(&entry.value().peer),

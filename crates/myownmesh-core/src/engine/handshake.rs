@@ -621,6 +621,13 @@ pub async fn on_auth_response(
         return;
     }
 
+    // The exact pending owner must be visible before the first durable
+    // OpenParticipation send. The pending send admission binds this
+    // installation, worker, endpoint-auth task and context; announcing before
+    // this state transition would race a reciprocal fact against an endpoint
+    // that is still unauthenticated.
+    super::governance::announce_open_participation(state, owner).await;
+
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
         "handshake",
@@ -699,11 +706,18 @@ pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner
 /// fact for that device. An Evict membership cell remains a refusal even if a
 /// stale role grant is present, and stand-down is always fail-closed.
 fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &str) -> bool {
+    if matches!(
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
+    ) {
+        return has_open_participation(state, state.identity.public_id())
+            && has_open_participation(state, remote_device_id);
+    }
     if !matches!(
         state.verified_bootstrap().policy(),
         crate::semantic::VerifiedProjectPolicy::Closed(_)
     ) {
-        return true;
+        return false;
     }
 
     let Ok(local_device_id) =
@@ -715,62 +729,41 @@ fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &st
     else {
         return false;
     };
-    let roots = state.verified_bootstrap().authority_roots();
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
-    let projection = graph.projection();
+    graph
+        .evaluator()
+        .admits_closed_session(&local_device_id, &remote_device_id)
+}
 
-    let role_admits = |device_id: &crate::semantic::DeviceId| {
-        if projection.is_stood_down(device_id) {
-            return false;
-        }
-        if !roots.iter().any(|root| {
-            crate::semantic::DeviceId::from_canonical_str(root)
-                .map(|root| root == device_id.clone())
-                .unwrap_or(false)
-        }) {
-            let role_cell = crate::semantic::ExclusiveCell::role(device_id.clone());
-            let Some(role_id) = projection.value(&role_cell) else {
-                return false;
-            };
-            let Some(role_fact) = graph.get(&role_id) else {
-                return false;
-            };
-            if !matches!(
-                &role_fact.content.body,
-                crate::semantic::FactBody::RoleGrant { target, role }
-                    if target == device_id
-                        && matches!(
-                            role,
-                            crate::semantic::Role::Member
-                                | crate::semantic::Role::Controller
-                                | crate::semantic::Role::Owner
-                        )
-            ) {
-                return false;
-            }
-        }
-
-        let membership_cell = crate::semantic::ExclusiveCell::membership(device_id.clone());
-        if projection.is_conflicted(&membership_cell) {
-            return false;
-        }
-        if let Some(membership_id) = projection.value(&membership_cell) {
-            let Some(membership_fact) = graph.get(&membership_id) else {
-                return false;
-            };
-            if matches!(
-                &membership_fact.content.body,
-                crate::semantic::FactBody::Evict { target }
-                    if target == device_id
-            ) {
-                return false;
-            }
-        }
-        true
+/// Open networks have no root authority, but promotion still requires a
+/// durable self-authored presence fact from each subject. The typed cell and
+/// projection make this exact: a carrier, alias, or another device's fact
+/// cannot satisfy the gate.
+fn has_open_participation(state: &Arc<NetworkState>, device_id: &str) -> bool {
+    let Ok(device) = crate::semantic::DeviceId::from_canonical_str(device_id) else {
+        return false;
     };
-
-    role_admits(&local_device_id) && role_admits(&remote_device_id)
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let evaluator = graph.evaluator();
+    let cell = crate::semantic::ExclusiveCell::open_participation(device.clone());
+    if evaluator.is_stood_down(&device) || evaluator.is_conflicted(&cell) {
+        return false;
+    }
+    let Some(fact_id) = graph.projection().value(&cell) else {
+        return false;
+    };
+    let Some(fact) = graph.get(&fact_id) else {
+        return false;
+    };
+    matches!(
+        &fact.content.body,
+        crate::semantic::FactBody::OpenParticipation {
+            device_id: subject,
+            joined: true,
+        } if subject == &device && fact.content.author == device
+    )
 }
 
 /// Complete the Active edge from facts already established on the exact peer.
@@ -1597,8 +1590,44 @@ mod tests {
     #[tokio::test]
     async fn v4_arc03_remote_approve_before_local_send_acceptance_converges() {
         let state = crate::engine::build_test_state("arc03-approve-remote-first");
-        crate::engine::insert_session_less_peer(&state, "peer", None);
-        let owner = state.peers.owner("peer").expect("installed peer owner");
+        let remote_identity = crate::identity::Identity::ephemeral();
+        let remote_device = remote_identity.public_id().to_string();
+        let local_device =
+            crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+                .expect("test identity is canonical");
+        let remote_device_typed = crate::semantic::DeviceId::from_canonical_str(&remote_device)
+            .expect("remote test identity is canonical");
+        super::super::admit_canonical_test_fact(
+            &state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: local_device,
+                joined: true,
+            },
+        );
+        let remote_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                state.mesh_context_id(),
+                remote_device_typed,
+                true,
+                Vec::new(),
+            ),
+            remote_identity.signing_key(),
+        )
+        .expect("remote participation fact signs");
+        state
+            .authoritative_fact_graph()
+            .write()
+            .admit(remote_fact)
+            .expect("remote participation fact admits");
+        assert!(
+            canonical_policy_admits_both(&state, &remote_device),
+            "control fixture must use the canonical Open participation gate"
+        );
+        crate::engine::insert_session_less_peer(&state, &remote_device, None);
+        let owner = state
+            .peers
+            .owner(&remote_device)
+            .expect("installed peer owner");
         {
             let peer = state
                 .peers

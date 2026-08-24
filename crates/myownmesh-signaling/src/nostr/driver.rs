@@ -17,6 +17,7 @@
 //! The driver is independent of the engine; the
 //! [`crate::SignalingChannel`] trait is the seam.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -813,6 +814,36 @@ where
     Ok(())
 }
 
+/// Prepare a relay session's delivery side before entering the main select
+/// loop. The notification is enabled before the initial scan and remains
+/// armed while the open announcement is written, closing the scan-to-wait
+/// gap in which a directed admission could otherwise lose its wakeup.
+async fn prepare_relay_delivery<'a, S>(
+    url: &str,
+    write: &mut S,
+    shared: &DriverShared,
+    delivery: &'a Arc<DeliveryStore>,
+    session: &RelaySessionId,
+) -> Result<Pin<Box<tokio::sync::futures::Notified<'a>>>, String>
+where
+    S: Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let mut delivery_notified = Box::pin(delivery.notification().notified());
+    delivery_notified.as_mut().enable();
+
+    send_pending_deliveries(url, write, delivery, session).await?;
+
+    let event = build_announce_event(shared);
+    let frame = serde_json::json!(["EVENT", event]).to_string();
+    write
+        .send(WsMessage::Text(frame))
+        .await
+        .map_err(|error| format!("send open-announce: {error}"))?;
+
+    Ok(delivery_notified)
+}
+
 async fn run_relay_session(
     url: &str,
     stream: tokio_tungstenite::WebSocketStream<
@@ -848,26 +879,11 @@ async fn run_relay_session(
     // per driver instance, not one per relay — so the per-cycle
     // publish rate doesn't scale with relay count.
     let mut presence_rx = shared.presence_tx.subscribe();
-    if let Err(error) = send_pending_deliveries(url, &mut write, &shared.delivery, session).await {
-        return RelaySessionOutcome::Error(error);
-    }
-
-    // Replay any directed events buffered while every relay was
-    // mid-reconnect (the network-change race — see
-    // Live negotiation entries are registered by DeliveryStore for this
-    // fresh session and are drained below after provider admission.
-    // One-shot "hello, I'm on this relay" publish so a freshly
-    // (re)connected relay immediately learns we're here, rather
-    // than waiting up to ANNOUNCE_STEADY_MS for the next global
-    // tick. Cheap — the relay-side dedup (by event id) means a
-    // tick that fires shortly after is harmless.
-    {
-        let event = build_announce_event(shared);
-        let frame = serde_json::json!(["EVENT", event]).to_string();
-        if let Err(e) = write.send(WsMessage::Text(frame)).await {
-            return RelaySessionOutcome::Error(format!("send open-announce: {e}"));
-        }
-    }
+    let mut delivery_notified =
+        match prepare_relay_delivery(url, &mut write, shared, &shared.delivery, session).await {
+            Ok(notification) => notification,
+            Err(error) => return RelaySessionOutcome::Error(error),
+        };
 
     loop {
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
@@ -895,7 +911,11 @@ async fn run_relay_session(
                     trace!(relay = %short(url), "inbound frame parse: {e}");
                 }
             }
-            _ = shared.delivery.notification().notified() => {
+            _ = &mut delivery_notified => {
+                // Re-arm before sending so an admission during this write is
+                // observed by the next select turn as well.
+                delivery_notified = Box::pin(shared.delivery.notification().notified());
+                delivery_notified.as_mut().enable();
                 if let Err(error) =
                     send_pending_deliveries(url, &mut write, &shared.delivery, session).await
                 {
@@ -1289,10 +1309,71 @@ fn short(url: &str) -> &str {
 mod tests {
     use super::*;
     use crate::nostr::event::NostrIdentity;
+    use crate::OwnedSignal;
+    use futures::task::{Context, Poll};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     // Only the controls build channels now: the driver itself takes an
     // `OutboundSource` and an `InboundSink`, and owns no queue in either
     // direction.
     use tokio::sync::mpsc;
+
+    struct ParkedWriteGate {
+        parked: tokio::sync::Notify,
+        waker: Mutex<Option<std::task::Waker>>,
+        announced: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl ParkedWriteGate {
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            let waker = self.waker.lock().take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+
+    struct ParkedSink {
+        frames: Vec<WsMessage>,
+        gate: Arc<ParkedWriteGate>,
+    }
+
+    impl Sink<WsMessage> for ParkedSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            if !self.gate.released.load(Ordering::SeqCst) {
+                if !self.gate.announced.swap(true, Ordering::SeqCst) {
+                    self.gate.parked.notify_one();
+                }
+                *self.gate.waker.lock() = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: WsMessage) -> Result<(), Self::Error> {
+            self.frames.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn fallback_holds_while_a_primary_is_up() {
@@ -1329,6 +1410,94 @@ mod tests {
     fn fallback_holds_while_active_and_primary_still_down() {
         // Already covering the outage; don't respawn every tick.
         assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
+    }
+
+    #[tokio::test]
+    async fn prearmed_delivery_survives_open_announcement_scan_wait_gap() {
+        let shared = fixture_shared();
+        let (session, _) = shared.delivery.open_session();
+        let gate = Arc::new(ParkedWriteGate {
+            parked: tokio::sync::Notify::new(),
+            waker: Mutex::new(None),
+            announced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let mut sink = ParkedSink {
+            frames: Vec::new(),
+            gate: Arc::clone(&gate),
+        };
+
+        // Drive the exact production pre-arm -> initial scan -> open-write
+        // helper, parking its open write before it enters the select loop.
+        let mut preparation = Box::pin(prepare_relay_delivery(
+            "wss://relay-gap",
+            &mut sink,
+            &shared,
+            &shared.delivery,
+            &session,
+        ));
+        let parked_wait = gate.parked.notified();
+        tokio::select! {
+            result = &mut preparation => panic!("preparation completed before parked write: {result:?}"),
+            _ = parked_wait => {}
+        }
+
+        // The sole directed event is admitted while the open announcement is
+        // parked, exactly the scan→wait gap under review.
+        let outbound = NostrOutbound::DirectedToPeer {
+            to: "peer-b".into(),
+            msg: SignalingMessage::Offer {
+                peer_id: "peer-b".into(),
+                offer_id: "gap-attempt".into(),
+                sdp: "v=0".into(),
+            },
+        };
+        let event = translate_outbound_event(&shared, outbound);
+        let event_id = event.id.clone();
+        let report = shared.delivery.admit(
+            "gap-attempt".into(),
+            OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+        );
+        assert_eq!(report.accepted_sessions, 1);
+
+        gate.release();
+        let delivery_notified = preparation.await.expect("open write gate settles");
+        delivery_notified.await;
+        send_pending_deliveries("wss://relay-gap", &mut sink, &shared.delivery, &session)
+            .await
+            .expect("same relay sends the admitted event");
+
+        assert_eq!(sink.frames.len(), 2, "open announcement plus one EVENT");
+        let frames = sink
+            .frames
+            .iter()
+            .filter_map(|message| match message {
+                WsMessage::Text(frame) => {
+                    Some(serde_json::from_str::<Value>(frame).expect("EVENT frame is JSON"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(frames.len(), 2, "both writes are EVENT frames");
+        assert!(frames.iter().all(|frame| frame[0] == "EVENT"));
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| {
+                    frame[1]["id"] == event_id && frame[1]["kind"] == SIGNALING_EPHEMERAL_KIND
+                })
+                .count(),
+            1,
+            "exactly one directed EVENT for the admitted id"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame[1]["kind"] == SIGNALING_EVENT_KIND)
+                .count(),
+            1,
+            "exactly one open announcement"
+        );
     }
 
     fn fixture_shared() -> Arc<DriverShared> {

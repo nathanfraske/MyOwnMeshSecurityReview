@@ -17,7 +17,7 @@
 //! assert the opposite of the boundary. The bound and the reason are unchanged;
 //! only the path is.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
@@ -31,6 +31,34 @@ use myownmesh_core::identity::Identity;
 use myownmesh_core::{Channel, MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
+
+static PROCESS_CONTROL_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+
+struct ProcessControlGuard {
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    previous_home: Option<std::ffi::OsString>,
+}
+
+impl Drop for ProcessControlGuard {
+    fn drop(&mut self) {
+        match &self.previous_home {
+            Some(previous) => std::env::set_var("MYOWNMESH_HOME", previous),
+            None => std::env::remove_var("MYOWNMESH_HOME"),
+        }
+    }
+}
+
+async fn exclusive_process_controls() -> ProcessControlGuard {
+    let lock = PROCESS_CONTROL_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    ProcessControlGuard {
+        _lock: lock,
+        previous_home: std::env::var_os("MYOWNMESH_HOME"),
+    }
+}
 
 fn fresh_network(id: &str) -> NetworkConfig {
     NetworkConfig {
@@ -50,6 +78,7 @@ fn fresh_network(id: &str) -> NetworkConfig {
 
 #[tokio::test]
 async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
+    let _process_controls = exclusive_process_controls().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     // SAFETY: set process-wide; leave-tests must not run in parallel against
     // the same env var (same constraint as two_peer_handshake).
@@ -185,6 +214,7 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
 
 #[tokio::test]
 async fn bilateral_departures_are_observed_once_on_both_exact_sessions() {
+    let _process_controls = exclusive_process_controls().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
     let broker = LocalBroker::new();
@@ -305,6 +335,7 @@ async fn bilateral_departures_are_observed_once_on_both_exact_sessions() {
 
 #[tokio::test]
 async fn authenticated_departure_withheld_receipt_cancels_on_shutdown() {
+    let _process_controls = exclusive_process_controls().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
     let broker = LocalBroker::new();

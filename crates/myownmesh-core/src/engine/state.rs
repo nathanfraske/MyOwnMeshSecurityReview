@@ -13,7 +13,7 @@ use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
     LocalApplicationResourceScope, MeshRuntimeResourceScope, NetworkInstanceResourceScope,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceMailboxItem,
+    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
     ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender, ResourceReport,
 };
 use crate::roster::Roster;
@@ -35,6 +35,111 @@ use super::signaling_ingress::EphemeralIngress;
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
 >;
+
+struct RecoveryCohort {
+    pending: RecoveryCohortCauseList,
+    in_flight: Option<RecoveryCohortGeneration>,
+    next_generation: u64,
+}
+
+struct RecoveryCohortGeneration {
+    id: u64,
+    causes: RecoveryCohortCauseList,
+}
+
+struct RecoveryCohortCause {
+    owner: PeerOwnerToken,
+    demand: crate::runtime::peer_session::RecoveryDemandHandle,
+    collection_lease: ResourceLease,
+    next: Option<Box<RecoveryCohortCause>>,
+}
+
+impl RecoveryCohortCause {
+    fn release(self) {
+        let Self {
+            owner,
+            demand,
+            collection_lease,
+            next,
+        } = self;
+        drop(next);
+        drop(collection_lease);
+        drop(demand);
+        drop(owner);
+    }
+
+    fn cancel(self) {
+        let Self {
+            owner,
+            demand,
+            collection_lease,
+            next,
+        } = self;
+        demand.cancel();
+        drop(next);
+        drop(collection_lease);
+        drop(demand);
+        drop(owner);
+    }
+}
+
+#[derive(Default)]
+struct RecoveryCohortCauseList {
+    head: Option<Box<RecoveryCohortCause>>,
+}
+
+impl RecoveryCohortCauseList {
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn push_front(&mut self, mut cause: Box<RecoveryCohortCause>) {
+        cause.next = self.head.take();
+        self.head = Some(cause);
+    }
+
+    fn pop_front(&mut self) -> Option<Box<RecoveryCohortCause>> {
+        let mut cause = self.head.take()?;
+        self.head = cause.next.take();
+        Some(cause)
+    }
+
+    fn append(&mut self, other: &mut Self) {
+        while let Some(cause) = other.pop_front() {
+            self.push_front(cause);
+        }
+    }
+
+    fn contains_owner(&self, owner: &PeerOwnerToken) -> bool {
+        let mut cursor = self.head.as_deref();
+        while let Some(cause) = cursor {
+            if NetworkState::same_recovery_owner(&cause.owner, owner) {
+                return true;
+            }
+            cursor = cause.next.as_deref();
+        }
+        false
+    }
+}
+
+impl Drop for RecoveryCohortCauseList {
+    fn drop(&mut self) {
+        let mut cursor = self.head.take();
+        while let Some(mut cause) = cursor {
+            cursor = cause.next.take();
+        }
+    }
+}
+
+impl RecoveryCohort {
+    fn new() -> Self {
+        Self {
+            pending: RecoveryCohortCauseList::default(),
+            in_flight: None,
+            next_generation: 0,
+        }
+    }
+}
 
 /// Internal driver work for reducing one authenticated candidate.
 ///
@@ -125,13 +230,13 @@ use super::scheduler::{
 
 /// Bookkeeping for an offerer-side reconnect intent. When we drop a peer we
 /// were the *offerer* for (a recoverable `IceFailed`), we keep one of these
-/// in [`NetworkState::reconnect_intents`] and the single state-watch tick
-/// re-offers on a backoff until the link comes back or `give_up_at` passes.
+/// in [`NetworkState::reconnect_intents`] and event paths re-offer on a
+/// backoff until the link comes back or `give_up_at` passes.
 /// This is the offerer-side counterpart to an answerer recovering from the
 /// remote's re-offers — without it, an offerer-role peer that drops on a
 /// network shift is never re-offered (it only comes back on the peer's slow
 /// steady-state announce). The backoff (`next_retry_at`/`attempt`) keeps the
-/// recovery from publishing an offer on every tick — one re-offer per
+/// recovery from publishing an offer on every event — one re-offer per
 /// backoff step, never cadence traffic.
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectIntent {
@@ -139,12 +244,12 @@ pub struct ReconnectIntent {
     /// A sticky intent ignores this — see [`ReconnectIntent::sticky`].
     pub give_up_at: std::time::Instant,
     /// Earliest instant for the next re-offer; advanced by the backoff each
-    /// time the tick services this intent.
+    /// time an event services this intent.
     pub next_retry_at: std::time::Instant,
     /// Number of re-offers issued so far — indexes `RECONNECT_RETRY_BACKOFF_MS`.
     pub attempt: usize,
     /// A pinned peer's intent: never expires, and once the active backoff
-    /// schedule is spent it parks (no more tick-driven re-offers) and waits
+    /// schedule is spent it parks (no more event-driven re-offers) and waits
     /// for the peer's next announce to dial — the recovery loop a support
     /// session needs on a Silent network, without endless blind offers to
     /// a peer that may be off for the weekend.
@@ -744,16 +849,11 @@ pub struct NetworkState {
     /// on a backoff for the cases no event covers.
     pub reconnect_intents: Mutex<std::collections::HashMap<String, ReconnectIntent>>,
 
-    /// Provider-owned answerer recovery demands whose logical session record
-    /// has already been retired.  The owner token is retained with the
-    /// handle, so a replacement installation can never settle or cancel an
-    /// older demand by device id alone.
-    pub(crate) pending_recovery_demands: Mutex<
-        Vec<(
-            PeerOwnerToken,
-            crate::runtime::peer_session::RecoveryDemandHandle,
-        )>,
-    >,
+    /// One provider-owned answerer recovery cohort. Causes are exact owner
+    /// tokens, while the collection itself has one retained provider lease and
+    /// one in-flight publish generation. A later cause waits for the next
+    /// generation rather than mutating a cohort already admitted for publish.
+    recovery_cohort: Mutex<RecoveryCohort>,
 
     /// Peers this node maintains a standing dial for (config
     /// `pinned_peers` plus runtime `connect_peer(…, sticky)`). On a
@@ -1138,7 +1238,7 @@ impl NetworkState {
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
-            pending_recovery_demands: Mutex::new(Vec::new()),
+            recovery_cohort: Mutex::new(RecoveryCohort::new()),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
             traffic: super::traffic::TrafficCounters::default(),
@@ -1778,87 +1878,182 @@ impl NetworkState {
         }
     }
 
-    /// Publish one exact-owner demand after its terminal mutation succeeds.
-    /// Repeated publication of the same owner coalesces without replacing the
-    /// shared handle or releasing its lease.
+    fn recovery_cohort_cause_claim(
+    ) -> std::result::Result<ResourceClaim, ResourceClaimArithmeticError> {
+        let bytes = u64::try_from(std::mem::size_of::<RecoveryCohortCause>()).map_err(|_| {
+            ResourceClaimArithmeticError::Overflow {
+                dimension: ResourceClass::AccountedMemoryBytes,
+            }
+        })?;
+        ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, bytes),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+    }
+
+    /// Publish one exact-owner cause into the network's single provider-owned
+    /// cohort after its terminal mutation succeeds. Repeated publication of
+    /// the same exact owner coalesces without replacing a captured generation.
     pub(crate) fn retain_recovery_demand(
         &self,
         owner: PeerOwnerToken,
         demand: crate::runtime::peer_session::RecoveryDemandHandle,
     ) {
-        let mut pending = self.pending_recovery_demands.lock();
-        if let Some((_, existing)) = pending
-            .iter_mut()
-            .find(|(existing, _)| Self::same_recovery_owner(existing, &owner))
+        let owner_for_check = owner.clone();
+        let mut cohort = self.recovery_cohort.lock();
+        if cohort.pending.contains_owner(&owner)
+            || cohort
+                .in_flight
+                .as_ref()
+                .is_some_and(|generation| generation.causes.contains_owner(&owner))
         {
-            *existing = demand;
-        } else {
-            pending.push((owner, demand));
+            return;
+        }
+        let Ok(claim) = Self::recovery_cohort_cause_claim() else {
+            demand.cancel();
+            return;
+        };
+        let Ok(collection_lease) = self.local_resources.acquire(claim) else {
+            demand.cancel();
+            return;
+        };
+        cohort.pending.push_front(Box::new(RecoveryCohortCause {
+            owner,
+            demand,
+            collection_lease,
+            next: None,
+        }));
+
+        // A successor may have committed between its one-time cancellation
+        // check and this terminal publication. Release the cohort lock before
+        // the registry query to preserve the registry-then-cohort lock order;
+        // either ordering still gets a second cancellation check.
+        drop(cohort);
+        let successor = self
+            .peers
+            .owner(owner_for_check.device_id())
+            .filter(|current| self.peers.has_usable_authenticated_current(current));
+        if successor.is_some() {
+            self.cancel_recovery_demands_for_device(owner_for_check.device_id());
         }
     }
 
-    /// Remove a demand only when its process-local owner token is identical.
-    pub(crate) fn take_recovery_demand(
-        &self,
-        owner: &PeerOwnerToken,
-    ) -> Option<crate::runtime::peer_session::RecoveryDemandHandle> {
-        let mut pending = self.pending_recovery_demands.lock();
-        let index = pending
-            .iter()
-            .position(|(existing, _)| Self::same_recovery_owner(existing, owner))?;
-        Some(pending.swap_remove(index).1)
+    /// Capture the current pending causes as one publish generation. The
+    /// captured set is immutable until its matching outcome settles.
+    pub(crate) fn capture_recovery_cohort(&self) -> Option<u64> {
+        let mut cohort = self.recovery_cohort.lock();
+        if cohort.in_flight.is_some() || cohort.pending.is_empty() {
+            return None;
+        }
+        let next_generation = cohort.next_generation.checked_add(1)?;
+        cohort.next_generation = next_generation;
+        let id = cohort.next_generation;
+        let causes = std::mem::take(&mut cohort.pending);
+        cohort.in_flight = Some(RecoveryCohortGeneration { id, causes });
+        Some(id)
     }
 
-    /// Snapshot demands for the event/tick service without retaining the map
-    /// lock across provider work or an async engine operation.
-    pub(crate) fn recovery_demands_snapshot(
+    /// Apply one provider outcome only to the exact captured generation.
+    /// Refusal/rate-limit returns that generation's causes to the pending
+    /// cohort; accepted consumes only those causes, leaving later causes for a
+    /// subsequent generation.
+    pub(crate) fn settle_recovery_cohort(
         &self,
-    ) -> Vec<(
-        PeerOwnerToken,
-        crate::runtime::peer_session::RecoveryDemandHandle,
-    )> {
-        self.pending_recovery_demands.lock().clone()
+        generation_id: u64,
+        attempt: crate::runtime::peer_session::RecoveryAttempt,
+    ) {
+        let mut cohort = self.recovery_cohort.lock();
+        let Some(mut generation) = cohort.in_flight.take() else {
+            return;
+        };
+        if generation.id != generation_id {
+            cohort.in_flight = Some(generation);
+            return;
+        }
+        let mut retry = RecoveryCohortCauseList::default();
+        let mut causes = std::mem::take(&mut generation.causes);
+        while let Some(cause) = causes.pop_front() {
+            let outcome = cause.demand.settle_post_terminal(attempt);
+            if matches!(
+                outcome,
+                crate::runtime::peer_session::RecoveryDemandSettlement::Unsatisfied
+                    | crate::runtime::peer_session::RecoveryDemandSettlement::PreTerminal
+            ) {
+                retry.push_front(cause);
+            } else {
+                let cause = *cause;
+                cause.release();
+            }
+        }
+        cohort.pending.append(&mut retry);
     }
 
     /// A usable replacement for this device supersedes every older exact
     /// demand.  The removal is keyed by device only for cancellation; no
     /// device lookup is used to settle a terminal demand.
     pub(crate) fn cancel_recovery_demands_for_device(&self, device_id: &str) {
-        let demands = {
-            let mut pending = self.pending_recovery_demands.lock();
-            let mut cancelled = Vec::new();
-            let mut index = 0;
-            while index < pending.len() {
-                if pending[index].0.device_id() == device_id {
-                    cancelled.push(pending.swap_remove(index).1);
+        let mut cancelled = {
+            let mut cohort = self.recovery_cohort.lock();
+            let mut cancelled = RecoveryCohortCauseList::default();
+            let mut pending = std::mem::take(&mut cohort.pending);
+            let mut retained = RecoveryCohortCauseList::default();
+            while let Some(cause) = pending.pop_front() {
+                if cause.owner.device_id() == device_id {
+                    cancelled.push_front(cause);
                 } else {
-                    index += 1;
+                    retained.push_front(cause);
                 }
+            }
+            cohort.pending = retained;
+            if let Some(generation) = cohort.in_flight.as_mut() {
+                let mut causes = std::mem::take(&mut generation.causes);
+                let mut retained = RecoveryCohortCauseList::default();
+                while let Some(cause) = causes.pop_front() {
+                    if cause.owner.device_id() == device_id {
+                        cancelled.push_front(cause);
+                    } else {
+                        retained.push_front(cause);
+                    }
+                }
+                generation.causes = retained;
+            }
+            if cohort
+                .in_flight
+                .as_ref()
+                .is_some_and(|generation| generation.causes.is_empty())
+            {
+                cohort.in_flight = None;
             }
             cancelled
         };
-        for demand in demands {
-            demand.cancel();
+        while let Some(cause) = cancelled.pop_front() {
+            let cause = *cause;
+            cause.cancel();
         }
     }
 
     /// Shutdown owns all remaining provider custody and releases it exactly
     /// once, outside the pending-map lock.
     pub(crate) fn cancel_all_recovery_demands(&self) {
-        let demands = self
-            .pending_recovery_demands
-            .lock()
-            .drain(..)
-            .map(|(_, demand)| demand)
-            .collect::<Vec<_>>();
-        for demand in demands {
-            demand.cancel();
+        let mut demands = {
+            let mut cohort = self.recovery_cohort.lock();
+            let mut demands = std::mem::take(&mut cohort.pending);
+            if let Some(mut generation) = cohort.in_flight.take() {
+                let mut causes = std::mem::take(&mut generation.causes);
+                demands.append(&mut causes);
+            }
+            demands
+        };
+        while let Some(cause) = demands.pop_front() {
+            let cause = *cause;
+            cause.cancel();
         }
     }
 
     /// Intent ids whose backoff is due now. Drops expired intents (past the
     /// reconnecting grace) and advances the backoff of the ones returned, so
     /// the state-watch tick re-offers each at most once per backoff step.
+    #[cfg(test)]
     pub fn due_reconnect_intents(&self) -> Vec<String> {
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use super::{ExclusiveCell, FactBody, FactId, MeshContextId, SignedFact};
+use super::{ExclusiveCell, FactBody, FactId, MeshContextId, Role, SignedFact};
 
 /// Errors raised before a fact can enter the canonical causal graph.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -84,4 +84,14 @@ pub(crate) fn body_advances_cell(body: &FactBody, cell: &ExclusiveCell) -> bool 
     body.exclusive_cells()
         .iter()
         .any(|candidate| candidate == cell)
+}
+
+/// Resolve the role value carried by one already-selected role-cell fact.
+/// Non-grants are deliberately authority-negative; a revoke, eviction,
+/// unresolved head, or unrelated body must never inherit the bootstrap role.
+pub(crate) fn projected_role(body: &FactBody, subject: &super::DeviceId) -> Option<Role> {
+    match body {
+        FactBody::RoleGrant { target, role } if target == subject => Some(*role),
+        _ => None,
+    }
 }

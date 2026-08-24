@@ -2,7 +2,7 @@
 
 //! Production-shaped authenticated departure control over a real TURN link.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{
@@ -23,6 +23,34 @@ use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+static PROCESS_CONTROL_LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+
+struct ProcessControlGuard {
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+    previous_home: Option<std::ffi::OsString>,
+}
+
+impl Drop for ProcessControlGuard {
+    fn drop(&mut self) {
+        match &self.previous_home {
+            Some(previous) => std::env::set_var("MYOWNMESH_HOME", previous),
+            None => std::env::remove_var("MYOWNMESH_HOME"),
+        }
+    }
+}
+
+async fn exclusive_process_controls() -> ProcessControlGuard {
+    let lock = PROCESS_CONTROL_LOCK
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+        .lock_owned()
+        .await;
+    ProcessControlGuard {
+        _lock: lock,
+        previous_home: std::env::var_os("MYOWNMESH_HOME"),
+    }
+}
 
 fn policy() -> WebRtcConnectorCapablePolicy {
     let connectors = std::num::NonZeroU64::new(4).expect("connector bound is nonzero");
@@ -155,6 +183,7 @@ async fn wait_for_user_left(
 #[tokio::test]
 #[ignore = "opens native TURN/WebRTC peers; run explicitly in the isolated Linux harness"]
 async fn authenticated_depart_observed_over_actual_turn() {
+    let _process_controls = exclusive_process_controls().await;
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());
     let turn = TurnServer::start(&TurnServiceConfig {

@@ -102,6 +102,38 @@ fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()
     Ok(())
 }
 
+/// Ensure this Open node has a durable, exact-context self-presence fact.
+/// Repeated startup/handshake calls are idempotent through FactGraph admission.
+fn ensure_open_self_participation(state: &Arc<EngineState>) -> Option<SignedFact> {
+    if !matches!(
+        state.verified_bootstrap().policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
+    ) {
+        return None;
+    }
+    let device_id = canonical_device(state.identity.public_id()).ok()?;
+    let content =
+        FactContent::open_participation(state.mesh_context_id(), device_id, true, Vec::new());
+    let fact = SignedFact::sign(content, state.identity.signing_key()).ok()?;
+    let graph = state.authoritative_fact_graph();
+    let admission = graph.write().admit(fact.clone());
+    match admission {
+        Ok(crate::semantic::Admission::Inserted)
+        | Ok(crate::semantic::Admission::AlreadyPresent) => Some(fact),
+        Ok(crate::semantic::Admission::Quarantined { .. }) | Err(_) => None,
+    }
+}
+
+/// Send the local Open self-presence fact on the exact authenticated channel
+/// before promotion. The remote side can therefore satisfy its own durable
+/// participation gate without making carrier authentication an authority.
+pub(super) async fn announce_open_participation(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
+    let Some(fact) = ensure_open_self_participation(state) else {
+        return;
+    };
+    let _ = super::send_pending_open_participation(state, owner, &fact).await;
+}
+
 /// Strip the display suffix (`-XXXXX`) from a Device ID. The
 /// governance store keys everything on the bare pubkey.
 fn pk(device_id: &str) -> String {
@@ -142,49 +174,8 @@ pub(super) fn canonical_policy_admits_from(
     let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
         return false;
     };
-    let roots = bootstrap.authority_roots();
-    let projection = graph.projection();
-    let role_admits = |device: &crate::semantic::DeviceId| {
-        if projection.is_stood_down(device) {
-            return false;
-        }
-        if !roots.iter().any(|root| root == device) {
-            let cell = crate::semantic::ExclusiveCell::role(device.clone());
-            let Some(id) = projection.value(&cell) else {
-                return false;
-            };
-            let Some(fact) = graph.get(&id) else {
-                return false;
-            };
-            if !matches!(
-                &fact.content.body,
-                crate::semantic::FactBody::RoleGrant { target, role }
-                    if target == device
-                        && matches!(
-                            role,
-                            crate::semantic::Role::Member
-                                | crate::semantic::Role::Controller
-                                | crate::semantic::Role::Owner
-                        )
-            ) {
-                return false;
-            }
-        }
-        let membership = crate::semantic::ExclusiveCell::membership(device.clone());
-        if projection.is_conflicted(&membership) {
-            return false;
-        }
-        projection
-            .value(&membership)
-            .and_then(|id| graph.get(&id))
-            .is_none_or(|fact| {
-                !matches!(
-                    &fact.content.body,
-                    crate::semantic::FactBody::Evict { target } if target == device
-                )
-            })
-    };
-    role_admits(&local) && role_admits(&remote)
+    let _ = bootstrap;
+    graph.evaluator().admits_closed_session(&local, &remote)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -533,7 +524,11 @@ async fn send_pending_role_grant(
 
 /// Ask the exact current pending installation to run the ordinary approval
 /// send/recheck after its canonical RoleGrant projection has committed.
-async fn request_pending_approval(state: &Arc<EngineState>, peer_id: &str) {
+async fn request_pending_approval(
+    state: &Arc<EngineState>,
+    peer_id: &str,
+    echo_open_participation: bool,
+) {
     let Some(owner) = state.peers.owner(peer_id) else {
         return;
     };
@@ -542,6 +537,11 @@ async fn request_pending_approval(state: &Arc<EngineState>, peer_id: &str) {
         data.authenticated && matches!(data.status, PeerStatus::PendingApproval)
     });
     if pending == Some(true) {
+        if echo_open_participation {
+            if let Some(fact) = ensure_open_self_participation(state) {
+                let _ = super::send_pending_open_participation(state, &owner, &fact).await;
+            }
+        }
         super::handshake::reevaluate_after_role_grant(state, &owner).await;
     }
 }
@@ -1055,7 +1055,7 @@ async fn legacy_spawn_split(state: &Arc<EngineState>, proposal_id: &str) -> Resu
         }
         if let FactBody::RoleGrant { target, .. } = &fact.content.body {
             if pk(target) == pk(state.identity.public_id()) {
-                request_pending_approval(state, &fact.content.author).await;
+                request_pending_approval(state, &fact.content.author, false).await;
             }
         }
     }
@@ -1184,18 +1184,6 @@ pub async fn spawn_split(_state: &Arc<EngineState>, _proposal_id: &str) -> Resul
     ))
 }
 
-/// Compatibility callers may still invoke the old adoption hook, but it has
-/// no authority and deliberately performs no mutation. Canonical facts must
-/// arrive through semantic ingress and the shared FactGraph.
-#[cfg(test)]
-pub(super) async fn adopt_transition_log(
-    _state: &Arc<EngineState>,
-    _peer_id: &str,
-    _incoming_gov: &[network_state::Transition],
-    _incoming_members: &[network_state::Transition],
-) {
-}
-
 /// Admit one verified canonical fact and project it into the read-only
 /// compatibility view. The carrier and legacy transition logs are never used
 /// as authority.
@@ -1224,10 +1212,17 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         broadcast_roster_summary(state).await;
         broadcast_state(state).await;
     }
-    if let FactBody::RoleGrant { target, .. } = &fact.content.body {
-        if pk(target) == pk(state.identity.public_id()) {
-            request_pending_approval(state, &fact.content.author).await;
+    match &fact.content.body {
+        FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
+            request_pending_approval(state, &fact.content.author, false).await;
         }
+        FactBody::OpenParticipation {
+            device_id,
+            joined: true,
+        } => {
+            request_pending_approval(state, device_id, true).await;
+        }
+        _ => {}
     }
 }
 
@@ -1413,7 +1408,7 @@ pub(super) async fn on_roster_request(
 /// durable state.
 pub async fn on_roster_entries(state: &Arc<EngineState>, source: &str, msg: RosterEntriesMessage) {
     // `source` names where this arrived from, for the diagnostics below and for
-    // the ones `adopt_transition_log` emits. It is not consulted by any decision
+    // the ones the disabled legacy path emits. It is not consulted by any decision
     // in either place: the governance and member logs authenticate themselves
     // through `verify_log` / `verify_member_log`; the unsigned `entries` are
     // ignored regardless of network kind or carrier.
@@ -1486,6 +1481,7 @@ pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
 /// uses to tear down its fleet state cleanly.
 pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
     use std::sync::atomic::Ordering;
+    let _ = ensure_open_self_participation(state);
     let verdict = log_evicted(state, state.identity.public_id());
     let was = state.self_evicted.swap(verdict, Ordering::SeqCst);
     if verdict && !was {
@@ -1554,7 +1550,7 @@ pub(super) async fn deny_if_evicted(
 
 /// Feed a deny's attached logs through the standard strict-extension
 /// adoption. Nothing about the *sender* is trusted: a forged or foreign
-/// log fails verification inside [`adopt_transition_log`] and changes
+/// log fails verification inside the disabled legacy path and changes
 /// nothing; a genuine one converges our state, and the adoption tail's
 /// [`refresh_self_evicted`] flips this engine to stood-down if the
 /// verified verdict really does evict us.
@@ -1795,7 +1791,7 @@ async fn legacy_adopt_transition_log(
 /// Ratification runs the assembled transition through this so that two peers
 /// which gathered the same co-signatures in different ack-arrival orders record
 /// the *byte-identical* entry. That is what the shared-prefix fork guard in
-/// [`adopt_transition_log`] — and any future hash over the log — depend on.
+/// the disabled legacy adoption path — and any future hash over the log — depend on.
 /// ed25519 signatures are deterministic, so once the signer order agrees the
 /// whole entry agrees. Keeping the proposer first preserves the
 /// `signers.first() == founder/proposer` convention `apply_transition` relies
@@ -1877,7 +1873,7 @@ async fn legacy_try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Resul
             // proposer first, then the rest sorted by signer pubkey — so that two
             // peers who collected the same co-signatures in different ack-arrival
             // orders record the *byte-identical* transition. Without this, the
-            // shared-prefix fork guard in `adopt_transition_log` would see two
+            // shared-prefix fork guard in the disabled legacy path would see two
             // orderings of the same multi-signer transition as divergent logs and
             // refuse to converge. ed25519 signatures are deterministic, so once the
             // signer order agrees the whole entry agrees. Genesis and splits are
@@ -1937,7 +1933,7 @@ async fn legacy_try_ratify(state: &Arc<EngineState>, proposal_id: &str) -> Resul
                 // founder's own close leaves every signed member absent from
                 // `roles`, and `with_governance_commit` then synchronously
                 // revokes the sessions of exactly those members. A node that
-                // adopts a close through `adopt_transition_log` reprojects from
+                // adopts a close through the disabled legacy path reprojects from
                 // both tiers and keeps them; the node that *authors* one used to
                 // drop them, which is the node guaranteed to hit it.
                 let after = network_state::apply_transition(gov.clone(), &transition);

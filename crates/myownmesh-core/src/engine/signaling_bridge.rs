@@ -284,6 +284,14 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         self.lease_for_bytes(retention.session_set_growth_bytes, "session set growth")
     }
 
+    fn reserve_session_entry(
+        &self,
+        _session: RelaySessionId,
+        _retention: myownmesh_signaling::nostr::delivery::SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(0, "session entry")
+    }
+
     fn reserve_attempt_record(
         &self,
         _attempt: &str,
@@ -311,6 +319,27 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         self.lease_for_bytes(retention.attempt_map_growth_bytes, "attempt map growth")
     }
 
+    fn reserve_attempt_entry(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        // The provider owns the HashMap node as one opaque entry custody;
+        // delivery.rs deliberately does not guess the dependency's tuple
+        // layout or bucket growth.
+        self.lease_for_bytes(0, "attempt entry")
+    }
+
+    fn reserve_attempt_correlation(
+        &self,
+        attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(attempt.len(), "attempt correlation")
+    }
+
     fn reserve(
         &self,
         _attempt: &str,
@@ -333,6 +362,18 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         retention: DeliveryRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
         self.lease_for_bytes(retention.relay_map_growth_bytes, "relay map growth")
+    }
+
+    fn reserve_relay_entry(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        // As with the attempt entry, the provider's opaque residual is the
+        // exact custody token for this dependency-owned map node.
+        self.lease_for_bytes(0, "relay entry")
     }
 }
 

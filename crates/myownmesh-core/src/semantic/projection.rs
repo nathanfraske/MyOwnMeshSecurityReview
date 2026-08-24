@@ -104,6 +104,17 @@ impl Projection {
         }
     }
 
+    /// Read the projected role cell without allowing a caller to substitute a
+    /// stringly-typed authority key.
+    pub fn role_cell(&self, subject: &DeviceId) -> Option<&CellProjection> {
+        self.cell(&ExclusiveCell::role(subject.clone()))
+    }
+
+    /// Read the projected membership cell for Closed session admission.
+    pub fn membership_cell(&self, subject: &DeviceId) -> Option<&CellProjection> {
+        self.cell(&ExclusiveCell::membership(subject.clone()))
+    }
+
     pub fn stand_down(&self, target: &DeviceId) -> Option<&StandDown> {
         self.stand_down.get(target)
     }

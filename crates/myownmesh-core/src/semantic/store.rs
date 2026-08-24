@@ -134,6 +134,11 @@ impl BootstrapStore {
 
         if let Some(existing) = self.read_record()? {
             if existing == *verified.record() {
+                let parent = self
+                    .path
+                    .parent()
+                    .ok_or_else(|| BootstrapStoreError::InvalidPath(self.path.clone()))?;
+                sync_directory_chain(parent)?;
                 return Ok(verified);
             }
             return Err(BootstrapStoreError::Conflict {
@@ -145,16 +150,13 @@ impl BootstrapStore {
             .path
             .parent()
             .ok_or_else(|| BootstrapStoreError::InvalidPath(self.path.clone()))?;
-        std::fs::create_dir_all(parent).map_err(|source| BootstrapStoreError::Io {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        sync_parent(parent)?;
+        ensure_directory_chain(parent)?;
+        sync_directory_chain(parent)?;
         let temp = self.write_temp(&bytes)?;
         match std::fs::hard_link(&temp, &self.path) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&temp);
-                sync_parent(parent)?;
+                sync_directory_chain(parent)?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = std::fs::remove_file(&temp);
@@ -166,6 +168,7 @@ impl BootstrapStore {
                     ),
                 })?;
                 if existing == *verified.record() {
+                    sync_directory_chain(parent)?;
                     return Ok(verified);
                 }
                 return Err(BootstrapStoreError::Conflict {
@@ -239,6 +242,110 @@ impl BootstrapStore {
         })?;
         Ok(Some(record))
     }
+}
+
+/// Create a missing directory hierarchy one component at a time. Each newly
+/// created child is followed by a sync of its containing directory, so a
+/// first install does not rely on `create_dir_all`'s unsignaled hierarchy.
+fn ensure_directory_chain(path: &Path) -> Result<(), BootstrapStoreError> {
+    let mut missing = Vec::new();
+    let mut cursor = path.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(BootstrapStoreError::Io {
+                        path: cursor,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotADirectory,
+                            "bootstrap store component is not a directory",
+                        ),
+                    });
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                cursor = cursor
+                    .parent()
+                    .map(|parent| {
+                        if parent.as_os_str().is_empty() {
+                            PathBuf::from(".")
+                        } else {
+                            parent.to_path_buf()
+                        }
+                    })
+                    .ok_or_else(|| BootstrapStoreError::InvalidPath(path.to_path_buf()))?;
+            }
+            Err(source) => {
+                return Err(BootstrapStoreError::Io {
+                    path: cursor,
+                    source,
+                });
+            }
+        }
+    }
+
+    for child in missing.iter().rev() {
+        match std::fs::create_dir(child) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let metadata =
+                    std::fs::symlink_metadata(child).map_err(|source| BootstrapStoreError::Io {
+                        path: child.clone(),
+                        source,
+                    })?;
+                if !metadata.is_dir() {
+                    return Err(BootstrapStoreError::Io {
+                        path: child.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::NotADirectory,
+                            "bootstrap store component is not a directory",
+                        ),
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(BootstrapStoreError::Io {
+                    path: child.clone(),
+                    source,
+                });
+            }
+        }
+        let containing = child
+            .parent()
+            .map(|parent| {
+                if parent.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    parent.to_path_buf()
+                }
+            })
+            .ok_or_else(|| BootstrapStoreError::InvalidPath(child.clone()))?;
+        sync_parent(&containing)?;
+    }
+    Ok(())
+}
+
+/// Re-establish directory durability edges from the record directory through
+/// its existing ancestors. This is needed both after linking and on an
+/// identical-record retry, where the file already exists but a prior caller's
+/// directory sync may have failed or been interrupted.
+fn sync_directory_chain(path: &Path) -> Result<(), BootstrapStoreError> {
+    let mut current = Some(path.to_path_buf());
+    while let Some(directory) = current {
+        sync_parent(&directory)?;
+        current = directory.parent().and_then(|parent| {
+            if parent.as_os_str().is_empty() {
+                (directory.as_path() != Path::new(".")).then(|| PathBuf::from("."))
+            } else if parent == directory.as_path() {
+                None
+            } else {
+                Some(parent.to_path_buf())
+            }
+        });
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -341,6 +448,41 @@ mod tests {
         assert!(store.path().starts_with(root.join(BOOTSTRAP_DIRECTORY)));
         assert!(!store.path().to_string_lossy().contains("local-device-slot"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn hierarchy_obstruction_propagates_without_installing_a_record() {
+        let root = root();
+        let first = closed("scope-a", 10, [10; 32]);
+        let blocked = root.join("blocked");
+        std::fs::write(&blocked, b"not a directory").expect("blocking file");
+        let store = BootstrapStore::new(&blocked, "slot");
+        let principal = principal();
+        assert!(matches!(
+            store.persist_new(&principal, first.record()),
+            Err(BootstrapStoreError::Io { .. })
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_missing_hierarchy_is_created_before_first_install() {
+        let root = root();
+        let first = closed("scope-a", 11, [11; 32]);
+        let instance = root.join("mesh").join("instance");
+        let store = BootstrapStore::new(&instance, "slot");
+        let principal = principal();
+        store
+            .persist_new(&principal, first.record())
+            .expect("nested hierarchy persist");
+        assert!(instance.join(BOOTSTRAP_DIRECTORY).is_dir());
+        assert_eq!(store.restore().expect("nested hierarchy restore"), first);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn relative_dot_ancestor_chain_terminates() {
+        sync_directory_chain(Path::new(".")).expect("relative dot sync");
     }
 
     #[test]

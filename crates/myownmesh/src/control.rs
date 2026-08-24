@@ -132,6 +132,12 @@ pub(crate) struct ControlHooks {
     /// returns when the stream is over.
     #[cfg(test)]
     at_events_stream_entry: Option<Arc<DispatchBarrier>>,
+    /// Pauses one connection immediately before a unary RPC enters the core
+    /// call path.  The control uses this only to separate request decoding
+    /// from the filed-call observation; it never supplies a production
+    /// cancellation or timeout.
+    #[cfg(test)]
+    before_rpc_call: Option<Arc<DispatchBarrier>>,
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -604,6 +610,8 @@ async fn serve_with_hooks(
         before_events_subscribe_commit: hooks.before_events_subscribe_commit,
         #[cfg(test)]
         at_events_stream_entry: hooks.at_events_stream_entry,
+        #[cfg(test)]
+        before_rpc_call: hooks.before_rpc_call,
     });
     #[cfg(not(test))]
     let _ = hooks;
@@ -928,6 +936,10 @@ struct ControlState {
     /// See [`ControlHooks::at_events_stream_entry`].
     #[cfg(test)]
     at_events_stream_entry: Option<Arc<DispatchBarrier>>,
+    /// Test-only witness for the exact point where a decoded unary RPC enters
+    /// the core call path.
+    #[cfg(test)]
+    before_rpc_call: Option<Arc<DispatchBarrier>>,
 }
 
 /// One control surface with nothing joined, for the controls that are about
@@ -974,6 +986,7 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         realtime_frame_bytes: None,
         before_events_subscribe_commit: None,
         at_events_stream_entry: None,
+        before_rpc_call: None,
     })
 }
 
@@ -1978,6 +1991,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 method,
                 payload,
             } => {
+                #[cfg(test)]
+                if let Some(barrier) = &state.before_rpc_call {
+                    barrier.pass().await;
+                }
                 // The only operation that can answer with nothing: a call the
                 // connection's shutdown cancelled never produced a result to
                 // report, so there is no line to write and the loop ends.
@@ -3468,6 +3485,7 @@ mod terminal_shutdown_tests {
 
         let directory = tempfile::tempdir().expect("temporary control root");
         let socket = directory.path().join("private").join("control.sock");
+        let (rpc_barrier, rpc_entered, rpc_release) = DispatchBarrier::paired();
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
         let supervisor = crate::supervisor::RuntimeSupervisor::new();
         let networks = NetworkRegistry::new();
@@ -3495,6 +3513,7 @@ mod terminal_shutdown_tests {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
+                before_rpc_call: Some(rpc_barrier),
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3526,6 +3545,18 @@ mod terminal_shutdown_tests {
             .write_all(&encoded)
             .await
             .expect("the client sends the RPC");
+
+        // First establish that the real control connection decoded the
+        // request and reached the unary RPC boundary.  Releasing this barrier
+        // then lets the production call file its pending operation; the
+        // pending-count observation below is consequently a filed/withdrawn
+        // witness rather than a race with request parsing.
+        guarded("the RPC reaches its dispatch boundary", rpc_entered)
+            .await
+            .expect("the RPC dispatch barrier remains observed");
+        rpc_release
+            .send(())
+            .expect("the RPC dispatch barrier is still parked");
 
         guarded("the RPC is filed under the promoted session", async {
             loop {
@@ -3632,6 +3663,7 @@ mod terminal_shutdown_tests {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
+                before_rpc_call: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3783,6 +3815,7 @@ mod terminal_shutdown_tests {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
                 at_events_stream_entry: Some(barrier),
+                before_rpc_call: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3942,6 +3975,7 @@ mod terminal_shutdown_tests {
                 before_events_subscribe_commit: Some(barrier),
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
+                before_rpc_call: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)

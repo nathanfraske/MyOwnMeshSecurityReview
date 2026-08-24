@@ -143,26 +143,6 @@ impl Ticker for FactInventoryTicker {
     }
 }
 
-/// Offerer-side reconnect supervisor — the backstop for the reconnect
-/// intents events couldn't already resolve. Re-offers each peer we owe an
-/// offer to whose backoff has come due, and ages out the ones past the
-/// reconnecting grace. The event paths (relay-reconnect flush, inbound
-/// announce) handle the common case; this guarantees forward progress when
-/// no event arrives.
-pub(crate) struct ReconnectSupervisor;
-
-#[async_trait]
-impl Ticker for ReconnectSupervisor {
-    fn name(&self) -> &'static str {
-        "reconnect-supervisor"
-    }
-
-    async fn tick(&mut self, state: &Arc<NetworkState>) {
-        super::service_reconnect_intents(state).await;
-        super::service_recovery_demands(state).await;
-    }
-}
-
 /// Connection-shaping pass for pruning topologies — closes
 /// both-sides-shelved non-edges and dials missing edges (see
 /// `ladder::shape_connections`). Keys on the shelve handshake, which

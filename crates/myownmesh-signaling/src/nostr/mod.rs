@@ -22,3 +22,12 @@ pub mod driver;
 pub mod event;
 pub mod handle;
 pub mod shuffle;
+
+// Stable top-level names for the provider-owned delivery boundary. The
+// submodule remains public for compatibility, while adapters can depend on
+// these names without reaching through the Nostr implementation layout.
+pub use delivery::{
+    AdmissionRefusal, AdmissionReport, DeliveryLease, DeliveryProvider, DeliveryRefusal,
+    DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
+    UnmeteredDeliveryProvider,
+};
