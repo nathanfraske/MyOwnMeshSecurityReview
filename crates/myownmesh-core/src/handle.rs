@@ -510,7 +510,7 @@ impl JoinedNetwork {
         self.state.peers.with_live_session_state(
             &owner,
             self.state.session_broker.as_ref(),
-            &self.state.network_id,
+            &self.state.mesh_context_id().to_string(),
             |_session, app| app.rpc_mut().pending_len(),
         )
     }

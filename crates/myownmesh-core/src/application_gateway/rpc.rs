@@ -56,7 +56,7 @@ impl ApplicationGateway {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, app| {
                     app.rpc_mut()
                         .register_local_request_prepared::<S>(peer, session)
@@ -83,7 +83,7 @@ impl ApplicationGateway {
             .with_live_session_state(
                 &owner,
                 state.session_broker.as_ref(),
-                &state.network_id,
+                &state.mesh_context_id().to_string(),
                 |session, app| app.rpc_mut().register_local_request(peer, session, effect),
             )
             .ok_or(crate::rpc::RpcRegistrationRefusal::SessionNotCurrent)?
@@ -101,7 +101,7 @@ impl ApplicationGateway {
         let _ = state.peers.with_live_session_state(
             &owner,
             state.session_broker.as_ref(),
-            &state.network_id,
+            &state.mesh_context_id().to_string(),
             |_session, app| app.rpc_mut().abandon_local_request(filed),
         );
     }
