@@ -47,7 +47,6 @@ impl RecoveryDemandAdmission {
 pub(crate) enum RecoveryAttempt {
     Accepted,
     Refused,
-    RateLimited,
 }
 
 /// Result of attempting to settle a recovery demand.
@@ -55,7 +54,7 @@ pub(crate) enum RecoveryAttempt {
 pub(crate) enum RecoveryDemandSettlement {
     /// The call happened before the exact terminal boundary.
     PreTerminal,
-    /// The terminal attempt was refused or rate-limited; demand remains.
+    /// The terminal attempt was refused; demand remains.
     Unsatisfied,
     /// An accepted post-terminal attempt consumed the demand.
     Satisfied,
@@ -249,7 +248,7 @@ mod tests {
         );
         demand.mark_terminal();
         assert_eq!(
-            demand.settle_post_terminal(RecoveryAttempt::RateLimited),
+            demand.settle_post_terminal(RecoveryAttempt::Refused),
             RecoveryDemandSettlement::Unsatisfied
         );
         assert_eq!(

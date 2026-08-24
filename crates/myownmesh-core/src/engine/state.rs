@@ -40,10 +40,175 @@ struct RecoveryCohort {
     pending: RecoveryCohortCauseList,
     in_flight: Option<RecoveryCohortGeneration>,
     next_generation: u64,
+    queued_publication: Option<RecoveryPublishId>,
+    publication: Option<RecoveryPublication>,
+}
+
+/// Process-local identity for one exact recovery cohort publication.  It is
+/// deliberately separate from any wire/event id: carrier copies must report
+/// back to this process and stale reports must never settle a later cohort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryPublishId {
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct RecoveryCarrierInstance(u64);
+
+struct RecoveryPublication {
+    id: RecoveryPublishId,
+    remaining: CarrierInstanceList,
+}
+
+#[derive(Default)]
+struct CarrierInstanceList {
+    head: Option<Box<CarrierInstanceNode>>,
+}
+
+struct CarrierInstanceNode {
+    instance: RecoveryCarrierInstance,
+    _lease: ResourceLease,
+    next: Option<Box<CarrierInstanceNode>>,
+}
+
+impl CarrierInstanceList {
+    fn is_empty(&self) -> bool {
+        self.head.is_none()
+    }
+
+    fn contains(&self, instance: RecoveryCarrierInstance) -> bool {
+        let mut cursor = self.head.as_deref();
+        while let Some(node) = cursor {
+            if node.instance == instance {
+                return true;
+            }
+            cursor = node.next.as_deref();
+        }
+        false
+    }
+
+    fn push_front(&mut self, mut node: Box<CarrierInstanceNode>) {
+        node.next = self.head.take();
+        self.head = Some(node);
+    }
+
+    fn pop_front(&mut self) -> Option<Box<CarrierInstanceNode>> {
+        let mut node = self.head.take()?;
+        self.head = node.next.take();
+        Some(node)
+    }
+
+    fn remove(&mut self, instance: RecoveryCarrierInstance) -> Option<Box<CarrierInstanceNode>> {
+        let mut link = &mut self.head;
+        loop {
+            match link {
+                Some(node) if node.instance == instance => {
+                    let mut removed = link.take().expect("matched carrier instance");
+                    *link = removed.next.take();
+                    return Some(removed);
+                }
+                Some(node) => link = &mut node.next,
+                None => return None,
+            }
+        }
+    }
+}
+
+impl Drop for CarrierInstanceList {
+    fn drop(&mut self) {
+        while self.pop_front().is_some() {}
+    }
+}
+
+struct CarrierAttemptNode {
+    attempt: String,
+    _entry_lease: ResourceLease,
+    carriers: Option<Box<CarrierAttemptCarrier>>,
+    expected: usize,
+    resolved: usize,
+    accepted: bool,
+    next: Option<Box<CarrierAttemptNode>>,
+}
+
+struct CarrierAttemptCarrier {
+    instance: RecoveryCarrierInstance,
+    resolved: bool,
+    next: Option<Box<CarrierAttemptCarrier>>,
+}
+
+impl CarrierAttemptNode {
+    fn carrier_mut(
+        &mut self,
+        instance: RecoveryCarrierInstance,
+    ) -> Option<&mut CarrierAttemptCarrier> {
+        let mut cursor = self.carriers.as_deref_mut();
+        while let Some(carrier) = cursor {
+            if carrier.instance == instance {
+                return Some(carrier);
+            }
+            cursor = carrier.next.as_deref_mut();
+        }
+        None
+    }
+}
+
+impl Drop for CarrierAttemptNode {
+    fn drop(&mut self) {
+        let mut cursor = self.carriers.take();
+        while let Some(mut carrier) = cursor {
+            cursor = carrier.next.take();
+        }
+    }
+}
+
+#[derive(Default)]
+struct CarrierAttemptList {
+    head: Option<Box<CarrierAttemptNode>>,
+}
+
+impl CarrierAttemptList {
+    fn find_mut(&mut self, attempt: &str) -> Option<&mut CarrierAttemptNode> {
+        let mut cursor = self.head.as_deref_mut();
+        while let Some(node) = cursor {
+            if node.attempt == attempt {
+                return Some(node);
+            }
+            cursor = node.next.as_deref_mut();
+        }
+        None
+    }
+
+    fn push_front(&mut self, mut node: Box<CarrierAttemptNode>) {
+        node.next = self.head.take();
+        self.head = Some(node);
+    }
+
+    fn remove(&mut self, attempt: &str) -> Option<Box<CarrierAttemptNode>> {
+        let mut link = &mut self.head;
+        loop {
+            if link.as_ref().is_some_and(|node| node.attempt == attempt) {
+                let mut removed = link.take().expect("matched attempt node");
+                *link = removed.next.take();
+                return Some(removed);
+            }
+            match link.as_mut() {
+                Some(node) => link = &mut node.next,
+                None => return None,
+            }
+        }
+    }
+}
+
+impl Drop for CarrierAttemptList {
+    fn drop(&mut self) {
+        while let Some(mut node) = self.head.take() {
+            self.head = node.next.take();
+        }
+    }
 }
 
 struct RecoveryCohortGeneration {
-    id: u64,
+    id: RecoveryPublishId,
     causes: RecoveryCohortCauseList,
 }
 
@@ -137,6 +302,8 @@ impl RecoveryCohort {
             pending: RecoveryCohortCauseList::default(),
             in_flight: None,
             next_generation: 0,
+            queued_publication: None,
+            publication: None,
         }
     }
 }
@@ -670,6 +837,11 @@ impl SignalingInbound {
 #[derive(Debug, Clone)]
 pub(crate) enum SignalingOutbound {
     Announce,
+    /// A recovery-scoped announce carrying the exact publication generation.
+    /// Ordinary [`Announce`] values never participate in recovery admission.
+    RecoveryAnnounce {
+        id: RecoveryPublishId,
+    },
     /// Carrier departure observation — the dual of [`Announce`]. This is a
     /// sender-claimed reachability hint, not an authenticated session terminal
     /// and not durable participation or authorization. A receiver may use it
@@ -706,7 +878,7 @@ pub(crate) enum SignalingOutbound {
 impl ResourceMailboxItem for SignalingOutbound {
     fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
         let measure = match self {
-            Self::Announce | Self::Leave => (0, 0, 0),
+            Self::Announce | Self::RecoveryAnnounce { .. } | Self::Leave => (0, 0, 0),
             Self::Offer {
                 device_id,
                 attempt,
@@ -854,6 +1026,11 @@ pub struct NetworkState {
     /// one in-flight publish generation. A later cause waits for the next
     /// generation rather than mutating a cohort already admitted for publish.
     recovery_cohort: Mutex<RecoveryCohort>,
+    /// Exact carrier admission for ordinary attempt publications. The map is
+    /// keyed by the authenticated attempt correlation; each entry is a finite
+    /// attach cohort and is removed once every carrier refuses or the attempt
+    /// is settled.
+    carrier_attempts: Mutex<CarrierAttemptList>,
 
     /// Peers this node maintains a standing dial for (config
     /// `pinned_peers` plus runtime `connect_peer(…, sticky)`). On a
@@ -1053,6 +1230,38 @@ pub struct NetworkState {
 }
 
 impl NetworkState {
+    fn funded_carrier_instances<I>(&self, instances: I) -> Option<CarrierInstanceList>
+    where
+        I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    {
+        let claim = ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(std::mem::size_of::<CarrierInstanceNode>()).ok()?,
+            ),
+            (ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .ok()?;
+        let mut list = CarrierInstanceList::default();
+        for (index, instance) in instances.clone().into_iter().enumerate() {
+            let duplicate = instances
+                .clone()
+                .into_iter()
+                .take(index)
+                .any(|prior| prior == instance);
+            if duplicate {
+                continue;
+            }
+            let lease = self.local_resources.acquire(claim).ok()?;
+            list.push_front(Box::new(CarrierInstanceNode {
+                instance,
+                _lease: lease,
+                next: None,
+            }));
+        }
+        Some(list)
+    }
+
     /// Construct state below an existing Mesh runtime observation scope.
     ///
     /// The entry point for every construction. There used to be a `new` above
@@ -1239,6 +1448,7 @@ impl NetworkState {
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             recovery_cohort: Mutex::new(RecoveryCohort::new()),
+            carrier_attempts: Mutex::new(CarrierAttemptList::default()),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
             traffic: super::traffic::TrafficCounters::default(),
@@ -1728,6 +1938,11 @@ impl NetworkState {
     ) {
         *self.signaling_runtime.write() = Some(Arc::clone(runtime));
         self.peers.bind_signaling_runtime(Arc::downgrade(runtime));
+        // A carrier attach/restore is an explicit recovery trigger.  This
+        // path intentionally bypasses the ordinary presence floor; if the
+        // carrier cannot admit the queued copy, the exact cohort remains
+        // pending for the next attach.
+        let _ = self.queue_recovery_announce();
     }
 
     /// The signaling runtime, if a carrier has attached one.
@@ -1745,13 +1960,148 @@ impl NetworkState {
         self.attempt_settlement.lock().take();
     }
 
+    pub(crate) fn begin_carrier_attempt<I>(&self, attempt: &str, instances: I) -> bool
+    where
+        I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    {
+        if attempt.is_empty() {
+            return false;
+        }
+        let mut expected = 0usize;
+        for (index, instance) in instances.clone().into_iter().enumerate() {
+            let duplicate = instances
+                .clone()
+                .into_iter()
+                .take(index)
+                .any(|prior| prior == instance);
+            if !duplicate {
+                expected = match expected.checked_add(1) {
+                    Some(expected) => expected,
+                    None => return false,
+                };
+            }
+        }
+        if expected == 0 {
+            return false;
+        }
+        let Some(bytes) = std::mem::size_of::<CarrierAttemptNode>()
+            .checked_add(attempt.len())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    expected.checked_mul(std::mem::size_of::<CarrierAttemptCarrier>())?,
+                )
+            })
+        else {
+            return false;
+        };
+        let Ok(bytes) = u64::try_from(bytes) else {
+            return false;
+        };
+        let Some(residual_count) = expected.checked_add(1) else {
+            return false;
+        };
+        let Ok(residuals) = u64::try_from(residual_count) else {
+            return false;
+        };
+        let Ok(claim) = ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, bytes),
+            (ResourceClass::OpaqueDependencyResidual, residuals),
+        ]) else {
+            return false;
+        };
+        let Ok(entry_lease) = self.local_resources.acquire(claim) else {
+            return false;
+        };
+        let mut attempts = self.carrier_attempts.lock();
+        if attempts.find_mut(attempt).is_some() {
+            drop(entry_lease);
+            return true;
+        }
+        let mut carriers = None;
+        for (index, instance) in instances.clone().into_iter().enumerate() {
+            let duplicate = instances
+                .clone()
+                .into_iter()
+                .take(index)
+                .any(|prior| prior == instance);
+            if !duplicate {
+                carriers = Some(Box::new(CarrierAttemptCarrier {
+                    instance,
+                    resolved: false,
+                    next: carriers.take(),
+                }));
+            }
+        }
+        attempts.push_front(Box::new(CarrierAttemptNode {
+            attempt: attempt.to_string(),
+            _entry_lease: entry_lease,
+            carriers,
+            expected,
+            resolved: 0,
+            accepted: false,
+            next: None,
+        }));
+        true
+    }
+
+    /// Record an exact carrier's source admission. `true` is returned only
+    /// for the final refusal in a cohort with no accepted copy; callers may
+    /// then route the typed refusal to the exact attempt owner.
+    pub(crate) fn record_carrier_attempt(
+        &self,
+        attempt: &str,
+        instance: RecoveryCarrierInstance,
+        accepted: bool,
+    ) -> bool {
+        let mut attempts = self.carrier_attempts.lock();
+        let final_refusal = {
+            let Some(state) = attempts.find_mut(attempt) else {
+                return false;
+            };
+            if accepted {
+                if state.carrier_mut(instance).is_none() {
+                    return false;
+                }
+                state.accepted = true;
+                false
+            } else {
+                let already_resolved = {
+                    let Some(carrier) = state.carrier_mut(instance) else {
+                        return false;
+                    };
+                    if carrier.resolved {
+                        true
+                    } else {
+                        carrier.resolved = true;
+                        false
+                    }
+                };
+                if already_resolved {
+                    return false;
+                }
+                state.resolved += 1;
+                !state.accepted && state.resolved == state.expected
+            }
+        };
+        if final_refusal {
+            let _ = attempts.remove(attempt);
+        }
+        final_refusal
+    }
+
+    pub(crate) fn clear_carrier_attempt(&self, attempt: &str) {
+        let _ = self.carrier_attempts.lock().remove(attempt);
+    }
+
     pub(crate) fn settle_attempt(
         &self,
         attempt: &str,
         terminal: myownmesh_signaling::nostr::delivery::DeliveryTerminal,
     ) -> usize {
         let settlement = self.attempt_settlement.lock().clone();
-        settlement.map_or(0, |settlement| settlement(attempt, terminal))
+        let settled = settlement.map_or(0, |settlement| settlement(attempt, terminal));
+        self.clear_carrier_attempt(attempt);
+        settled
     }
 
     pub(crate) fn take_signaling_outbound_rx(
@@ -1940,17 +2290,195 @@ impl NetworkState {
 
     /// Capture the current pending causes as one publish generation. The
     /// captured set is immutable until its matching outcome settles.
-    pub(crate) fn capture_recovery_cohort(&self) -> Option<u64> {
+    pub(crate) fn capture_recovery_cohort(&self) -> Option<RecoveryPublishId> {
         let mut cohort = self.recovery_cohort.lock();
         if cohort.in_flight.is_some() || cohort.pending.is_empty() {
             return None;
         }
         let next_generation = cohort.next_generation.checked_add(1)?;
         cohort.next_generation = next_generation;
-        let id = cohort.next_generation;
+        let id = RecoveryPublishId {
+            generation: cohort.next_generation,
+        };
         let causes = std::mem::take(&mut cohort.pending);
         cohort.in_flight = Some(RecoveryCohortGeneration { id, causes });
         Some(id)
+    }
+
+    /// Queue one recovery announce behind the engine mailbox.  Unlike an
+    /// ordinary reactive presence announce this path has no presence floor:
+    /// the exact captured cohort remains in-flight until a carrier source has
+    /// admitted at least one copy.  The queue marker is installed before the
+    /// mailbox send so a concurrently running carrier cannot consume an
+    /// unmarked publication.
+    pub(crate) fn queue_recovery_announce(&self) -> Option<RecoveryPublishId> {
+        let id = self.capture_recovery_cohort()?;
+        {
+            let mut cohort = self.recovery_cohort.lock();
+            if cohort
+                .in_flight
+                .as_ref()
+                .is_none_or(|generation| generation.id != id)
+                || cohort.queued_publication.is_some()
+            {
+                return None;
+            }
+            cohort.queued_publication = Some(id);
+        }
+        if self
+            .signaling_tx
+            .send(SignalingOutbound::RecoveryAnnounce { id })
+            .is_err()
+        {
+            let mut cohort = self.recovery_cohort.lock();
+            if cohort.queued_publication == Some(id) {
+                cohort.queued_publication = None;
+                drop(cohort);
+                self.settle_recovery_cohort(
+                    id,
+                    crate::runtime::peer_session::RecoveryAttempt::Refused,
+                );
+            }
+            return None;
+        }
+        Some(id)
+    }
+
+    pub(crate) fn recovery_publication_in_flight(&self) -> bool {
+        let cohort = self.recovery_cohort.lock();
+        cohort.in_flight.is_some()
+    }
+
+    /// Snapshot recovery custody for deterministic lifecycle controls. The
+    /// tuple reports pending causes, captured generation, queued mailbox
+    /// publication, and attached carrier publication respectively.
+    #[cfg(test)]
+    pub(crate) fn recovery_custody_snapshot_for_test(&self) -> (bool, bool, bool, bool) {
+        let cohort = self.recovery_cohort.lock();
+        (
+            !cohort.pending.is_empty(),
+            cohort.in_flight.is_some(),
+            cohort.queued_publication.is_some(),
+            cohort.publication.is_some(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recovery_generation_for_test(&self) -> Option<RecoveryPublishId> {
+        self.recovery_cohort
+            .lock()
+            .in_flight
+            .as_ref()
+            .map(|generation| generation.id)
+    }
+
+    /// Move the queued publication into the finite cohort of currently
+    /// attached carrier instances.  A source/driver must present the exact
+    /// instance it was assigned at attach; a stale source cannot begin a new
+    /// publication.
+    pub(crate) fn begin_recovery_publication(
+        &self,
+        id: RecoveryPublishId,
+        instances: impl IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    ) -> bool {
+        let Some(remaining) = self.funded_carrier_instances(instances) else {
+            return false;
+        };
+        let mut cohort = self.recovery_cohort.lock();
+        if cohort.queued_publication != Some(id)
+            || cohort
+                .in_flight
+                .as_ref()
+                .is_none_or(|generation| generation.id != id)
+            || cohort.publication.is_some()
+        {
+            return false;
+        }
+        cohort.queued_publication = None;
+        cohort.publication = Some(RecoveryPublication { id, remaining });
+        true
+    }
+
+    pub(crate) fn begin_recovery_for_carrier(
+        &self,
+        expected_id: RecoveryPublishId,
+        instance: RecoveryCarrierInstance,
+    ) -> Option<RecoveryPublishId> {
+        let queued_id = { self.recovery_cohort.lock().queued_publication };
+        if let Some(id) = queued_id {
+            if id != expected_id {
+                return None;
+            }
+            return self
+                .begin_recovery_publication(id, [instance])
+                .then_some(id);
+        }
+        let cohort = self.recovery_cohort.lock();
+        cohort.publication.as_ref().and_then(|publication| {
+            (publication.id == expected_id && publication.remaining.contains(instance))
+                .then_some(publication.id)
+        })
+    }
+
+    pub(crate) fn refuse_empty_recovery_publication(&self, id: RecoveryPublishId) {
+        let should_refuse =
+            {
+                let mut cohort = self.recovery_cohort.lock();
+                cohort.publication.as_ref().is_some_and(|publication| {
+                    publication.id == id && publication.remaining.is_empty()
+                }) && cohort.publication.take().is_some()
+            };
+        if should_refuse {
+            self.settle_recovery_cohort(id, crate::runtime::peer_session::RecoveryAttempt::Refused);
+        }
+    }
+
+    /// Record one exact carrier admission.  One accepted carrier settles the
+    /// captured generation immediately; refusals only settle as refused after
+    /// every carrier in the finite attach cohort has refused.  Reports from a
+    /// replaced publication or an instance outside the captured cohort are
+    /// ignored.
+    pub(crate) fn record_recovery_carrier(
+        &self,
+        id: RecoveryPublishId,
+        instance: RecoveryCarrierInstance,
+        accepted: bool,
+    ) {
+        let outcome = {
+            let mut cohort = self.recovery_cohort.lock();
+            let Some(publication) = cohort.publication.as_mut() else {
+                return;
+            };
+            if publication.id != id || publication.remaining.remove(instance).is_none() {
+                return;
+            }
+            let terminal = accepted || publication.remaining.is_empty();
+            let outcome = if accepted {
+                crate::runtime::peer_session::RecoveryAttempt::Accepted
+            } else {
+                crate::runtime::peer_session::RecoveryAttempt::Refused
+            };
+            if terminal {
+                cohort.publication.take();
+                Some(outcome)
+            } else {
+                None
+            }
+        };
+        if let Some(outcome) = outcome {
+            self.settle_recovery_cohort(id, outcome);
+        }
+    }
+
+    pub(crate) fn next_recovery_carrier_instance(&self) -> Option<RecoveryCarrierInstance> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |value| value.checked_add(1),
+        )
+        .ok()
+        .map(RecoveryCarrierInstance)
     }
 
     /// Apply one provider outcome only to the exact captured generation.
@@ -1959,40 +2487,52 @@ impl NetworkState {
     /// subsequent generation.
     pub(crate) fn settle_recovery_cohort(
         &self,
-        generation_id: u64,
+        generation_id: RecoveryPublishId,
         attempt: crate::runtime::peer_session::RecoveryAttempt,
     ) {
-        let mut cohort = self.recovery_cohort.lock();
-        let Some(mut generation) = cohort.in_flight.take() else {
-            return;
-        };
-        if generation.id != generation_id {
-            cohort.in_flight = Some(generation);
-            return;
-        }
-        let mut retry = RecoveryCohortCauseList::default();
-        let mut causes = std::mem::take(&mut generation.causes);
-        while let Some(cause) = causes.pop_front() {
-            let outcome = cause.demand.settle_post_terminal(attempt);
-            if matches!(
-                outcome,
-                crate::runtime::peer_session::RecoveryDemandSettlement::Unsatisfied
-                    | crate::runtime::peer_session::RecoveryDemandSettlement::PreTerminal
-            ) {
-                retry.push_front(cause);
-            } else {
-                let cause = *cause;
-                cause.release();
+        let detached_publication = {
+            let mut cohort = self.recovery_cohort.lock();
+            let Some(mut generation) = cohort.in_flight.take() else {
+                return;
+            };
+            if generation.id != generation_id {
+                cohort.in_flight = Some(generation);
+                return;
             }
-        }
-        cohort.pending.append(&mut retry);
+            if cohort.queued_publication == Some(generation_id) {
+                cohort.queued_publication = None;
+            }
+            let detached_publication = cohort
+                .publication
+                .as_ref()
+                .is_some_and(|publication| publication.id == generation_id)
+                .then(|| cohort.publication.take().expect("matching publication"));
+            let mut retry = RecoveryCohortCauseList::default();
+            let mut causes = std::mem::take(&mut generation.causes);
+            while let Some(cause) = causes.pop_front() {
+                let outcome = cause.demand.settle_post_terminal(attempt);
+                if matches!(
+                    outcome,
+                    crate::runtime::peer_session::RecoveryDemandSettlement::Unsatisfied
+                        | crate::runtime::peer_session::RecoveryDemandSettlement::PreTerminal
+                ) {
+                    retry.push_front(cause);
+                } else {
+                    let cause = *cause;
+                    cause.release();
+                }
+            }
+            cohort.pending.append(&mut retry);
+            detached_publication
+        };
+        drop(detached_publication);
     }
 
     /// A usable replacement for this device supersedes every older exact
     /// demand.  The removal is keyed by device only for cancellation; no
     /// device lookup is used to settle a terminal demand.
     pub(crate) fn cancel_recovery_demands_for_device(&self, device_id: &str) {
-        let mut cancelled = {
+        let (mut cancelled, detached_publication) = {
             let mut cohort = self.recovery_cohort.lock();
             let mut cancelled = RecoveryCohortCauseList::default();
             let mut pending = std::mem::take(&mut cohort.pending);
@@ -2017,15 +2557,32 @@ impl NetworkState {
                 }
                 generation.causes = retained;
             }
-            if cohort
+            let empty_generation = cohort
                 .in_flight
                 .as_ref()
-                .is_some_and(|generation| generation.causes.is_empty())
-            {
-                cohort.in_flight = None;
+                .is_some_and(|generation| generation.causes.is_empty());
+            let generation_id = empty_generation.then(|| {
+                cohort
+                    .in_flight
+                    .take()
+                    .expect("empty recovery generation")
+                    .id
+            });
+            if let Some(id) = generation_id {
+                if cohort.queued_publication == Some(id) {
+                    cohort.queued_publication = None;
+                }
             }
-            cancelled
+            let detached_publication = generation_id.and_then(|id| {
+                cohort
+                    .publication
+                    .as_ref()
+                    .is_some_and(|publication| publication.id == id)
+                    .then(|| cohort.publication.take().expect("matching publication"))
+            });
+            (cancelled, detached_publication)
         };
+        drop(detached_publication);
         while let Some(cause) = cancelled.pop_front() {
             let cause = *cause;
             cause.cancel();
@@ -2035,15 +2592,17 @@ impl NetworkState {
     /// Shutdown owns all remaining provider custody and releases it exactly
     /// once, outside the pending-map lock.
     pub(crate) fn cancel_all_recovery_demands(&self) {
-        let mut demands = {
+        let (mut demands, detached_publication) = {
             let mut cohort = self.recovery_cohort.lock();
             let mut demands = std::mem::take(&mut cohort.pending);
             if let Some(mut generation) = cohort.in_flight.take() {
                 let mut causes = std::mem::take(&mut generation.causes);
                 demands.append(&mut causes);
             }
-            demands
+            cohort.queued_publication = None;
+            (demands, cohort.publication.take())
         };
+        drop(detached_publication);
         while let Some(cause) = demands.pop_front() {
             let cause = *cause;
             cause.cancel();
@@ -2120,9 +2679,13 @@ impl NetworkState {
         match self.relay_reconnect.lock().as_ref() {
             Some(signal) => {
                 signal.send_modify(|gen| *gen = gen.wrapping_add(1));
+                let _ = self.queue_recovery_announce();
                 true
             }
-            None => false,
+            None => {
+                let _ = self.queue_recovery_announce();
+                false
+            }
         }
     }
 

@@ -67,16 +67,15 @@ impl std::hash::Hash for RelaySessionId {
 pub struct DeliveryRetention {
     pub encoded_event_bytes: usize,
     pub structural_entry_bytes: usize,
-    /// Legacy byte hint retained for provider source compatibility. New
-    /// providers should use `DeliveryProvider::reserve_relay_entry`; this is
-    /// zero so this module never guesses a HashMap tuple layout.
+    /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
+    /// RelayEntry>>`, reserved before the relay node is inserted.
     pub relay_map_growth_bytes: usize,
     /// Exact bytes for the attempt record allocation.
     pub attempt_record_bytes: usize,
     /// Exact bytes for the event-id key allocation.
     pub attempt_key_bytes: usize,
-    /// Legacy byte hint retained for provider source compatibility. New
-    /// providers should use `DeliveryProvider::reserve_attempt_entry`.
+    /// Exact allocation size of `Box<DeliveryMapNode<String, AttemptEntry>>`,
+    /// reserved before the attempt node is inserted.
     pub attempt_map_growth_bytes: usize,
 }
 
@@ -85,6 +84,8 @@ pub struct DeliveryRetention {
 pub struct SessionRetention {
     pub session_record_bytes: usize,
     pub session_set_node_bytes: usize,
+    /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
+    /// SessionEntry>>`, reserved before the session node is inserted.
     pub session_set_growth_bytes: usize,
 }
 
@@ -328,9 +329,10 @@ impl DeliveryRetention {
         Self::for_attempt("", event)
     }
 
-    /// Compute the frame and owned-record shape before any frame or map entry
-    /// is allocated. HashMap entry custody belongs to the provider seams,
-    /// not to guessed tuple sizes in this module.
+    /// Compute the frame and owned-record shape before any frame or map node
+    /// is allocated. The map-node sizes are the exact boxed allocation types
+    /// used by this module, and their provider leases are acquired before
+    /// insertion.
     pub fn for_attempt(_attempt: &str, event: &NostrEvent) -> Self {
         let mut counter = CountingWriter(0);
         counter.write_all(b"[\"EVENT\",").expect("counting writer");
@@ -339,14 +341,11 @@ impl DeliveryRetention {
         Self {
             encoded_event_bytes: counter.0,
             structural_entry_bytes: std::mem::size_of::<RelayEntry>(),
-            // The provider owns this map entry through its exact entry lease;
-            // retain the field only for source compatibility with old
-            // adapters, where zero means no guessed HashMap tuple charge.
-            relay_map_growth_bytes: 0,
+            relay_map_growth_bytes: std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>(
+            ),
             attempt_record_bytes: std::mem::size_of::<AttemptEntry>(),
             attempt_key_bytes: event.id.len(),
-            // See relay_map_growth_bytes above.
-            attempt_map_growth_bytes: 0,
+            attempt_map_growth_bytes: std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>(),
         }
     }
 }
@@ -356,9 +355,9 @@ impl SessionRetention {
         Self {
             session_record_bytes: std::mem::size_of::<SessionEntry>(),
             session_set_node_bytes: std::mem::size_of::<RelaySessionId>(),
-            // Session-set entry custody is provider-owned; no HashMap tuple
-            // layout is treated as an exact byte reservation here.
-            session_set_growth_bytes: 0,
+            session_set_growth_bytes: std::mem::size_of::<
+                DeliveryMapNode<RelaySessionId, SessionEntry>,
+            >(),
         }
     }
 }
@@ -412,7 +411,88 @@ struct AttemptEntry {
     correlation_lease: Option<Box<dyn DeliveryLease>>,
     map_lease: Box<dyn DeliveryLease>,
     relays: DeliveryMap<RelaySessionId, RelayEntry>,
+    carrier: CarrierAggregate,
     provider_refused: bool,
+}
+
+/// Order-independent carrier observations for one live event.
+///
+/// The first accepted relay wins the event-level outcome, while duplicate ACKs
+/// still release their own custody. A refusal from one relay is only a
+/// candidate terminal until every live relay has either refused or
+/// disappeared. The selected refusal is the lexicographically smallest
+/// observed reason, so relay completion order cannot change the result.
+/// `unavailable_reported` is scoped to the current carrier epoch and is reset
+/// when a reconnect admits a relay.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CarrierAggregate {
+    accepted_session: Option<RelaySessionId>,
+    typed_refusal: Option<String>,
+    terminal_emitted: bool,
+    unavailable_reported: bool,
+}
+
+impl CarrierAggregate {
+    /// Record the first accepted relay. Later duplicate ACKs remain valid
+    /// custody releases but cannot emit a second event-level outcome.
+    pub fn observe_accepted(&mut self, session: RelaySessionId) -> bool {
+        if self.terminal_emitted {
+            return false;
+        }
+        self.accepted_session = Some(session);
+        self.terminal_emitted = true;
+        true
+    }
+
+    /// Record a typed relay refusal without making it terminal while another
+    /// carrier remains viable. Reasons are normalized by deterministic
+    /// ordering so relay arrival order cannot choose the result.
+    pub fn observe_typed_refusal(&mut self, reason: &str) {
+        if self.terminal_emitted {
+            return;
+        }
+        let replace = match self.typed_refusal.as_deref() {
+            None => true,
+            Some(current) => reason < current,
+        };
+        if replace {
+            self.typed_refusal = Some(reason.to_string());
+        }
+    }
+
+    /// Start a fresh carrier epoch after a relay reconnects.
+    pub fn observe_reconnect(&mut self) {
+        if !self.terminal_emitted {
+            self.unavailable_reported = false;
+            self.typed_refusal = None;
+        }
+    }
+
+    /// Claim the one all-carrier refusal notification for this epoch.
+    ///
+    /// Individual relay sessions may fail concurrently after the last funded
+    /// relay has gone away.  Only the first failure owns the provider/core
+    /// refusal; a successful reconnect starts a new epoch through
+    /// [`Self::observe_reconnect`].
+    pub fn observe_all_carrier_refusal(&mut self) -> bool {
+        if self.terminal_emitted || self.unavailable_reported {
+            return false;
+        }
+        self.unavailable_reported = true;
+        true
+    }
+
+    /// Return the one aggregate outcome for this unavailable carrier epoch.
+    pub fn unavailable_outcome(&mut self) -> Option<AttemptOutcomeKind> {
+        if self.terminal_emitted || self.unavailable_reported {
+            return None;
+        }
+        self.unavailable_reported = true;
+        Some(match &self.typed_refusal {
+            Some(reason) => AttemptOutcomeKind::TypedRefused(reason.clone()),
+            None => AttemptOutcomeKind::CarrierUnavailable,
+        })
+    }
 }
 
 struct SessionEntry {
@@ -744,6 +824,7 @@ impl DeliveryStore {
                     ) {
                         Ok(map_lease) => {
                             entry.provider_refused = false;
+                            entry.carrier.observe_reconnect();
                             entry.relays.insert(
                                 session.clone(),
                                 RelayEntry {
@@ -757,13 +838,15 @@ impl DeliveryStore {
                             lease.finish(DeliveryTerminal::Cancelled);
                             if entry.relays.is_empty() {
                                 entry.provider_refused = true;
-                                refused.push(AttemptRefusal {
-                                    attempt: entry.attempt.clone(),
-                                    event_id: entry.owned.value().id.clone(),
-                                    refusal: NegotiationRefusal::Provider(match &error {
-                                        DeliveryRefusal::Provider(reason) => reason.clone(),
-                                    }),
-                                });
+                                if entry.carrier.observe_all_carrier_refusal() {
+                                    refused.push(AttemptRefusal {
+                                        attempt: entry.attempt.clone(),
+                                        event_id: entry.owned.value().id.clone(),
+                                        refusal: NegotiationRefusal::Provider(match &error {
+                                            DeliveryRefusal::Provider(reason) => reason.clone(),
+                                        }),
+                                    });
+                                }
                             }
                         }
                     }
@@ -775,13 +858,15 @@ impl DeliveryStore {
                     // healthy relay's authoritative ACK may retire it.
                     if entry.relays.is_empty() {
                         entry.provider_refused = true;
-                        refused.push(AttemptRefusal {
-                            attempt: entry.attempt.clone(),
-                            event_id: entry.owned.value().id.clone(),
-                            refusal: NegotiationRefusal::Provider(match &error {
-                                DeliveryRefusal::Provider(reason) => reason.clone(),
-                            }),
-                        });
+                        if entry.carrier.observe_all_carrier_refusal() {
+                            refused.push(AttemptRefusal {
+                                attempt: entry.attempt.clone(),
+                                event_id: entry.owned.value().id.clone(),
+                                refusal: NegotiationRefusal::Provider(match &error {
+                                    DeliveryRefusal::Provider(reason) => reason.clone(),
+                                }),
+                            });
+                        }
                     }
                 }
             }
@@ -928,6 +1013,7 @@ impl DeliveryStore {
                 correlation_lease,
                 map_lease,
                 relays,
+                carrier: CarrierAggregate::default(),
                 // A partial refusal still has a funded live relay and may
                 // settle authoritatively there.  Only an all-refused active
                 // set needs to remain marked for a later reconnect retry.
@@ -978,38 +1064,50 @@ impl DeliveryStore {
     ) -> bool {
         let (leases, outcome) = {
             let mut state = self.state.lock();
-            let (lease, remove_attempt, attempt, has_remaining) = {
+            let (lease, remove_attempt, attempt, has_remaining, typed_refusal, accepted_outcome) = {
                 let Some(entry) = state.attempts.get_mut(event_id) else {
                     return false;
                 };
                 let Some(relay) = entry.relays.remove(session) else {
                     return false;
                 };
+                if let DeliveryTerminal::TypedRefused(reason) = &terminal {
+                    entry.carrier.observe_typed_refusal(reason);
+                }
+                let accepted_outcome = matches!(&terminal, DeliveryTerminal::Accepted)
+                    && entry.carrier.observe_accepted(session.clone());
+                let has_remaining = !entry.relays.is_empty();
                 let remove_attempt = matches!(
                     &terminal,
                     DeliveryTerminal::Accepted | DeliveryTerminal::TypedRefused(_)
-                ) && entry.relays.is_empty()
+                ) && !has_remaining
                     && !entry.provider_refused;
+                let typed_refusal = entry.carrier.typed_refusal.clone();
                 (
                     relay,
                     remove_attempt,
                     entry.attempt.clone(),
-                    !entry.relays.is_empty(),
+                    has_remaining,
+                    typed_refusal,
+                    accepted_outcome,
                 )
             };
             let outcome = match &terminal {
-                DeliveryTerminal::Accepted => Some(AttemptOutcome {
+                DeliveryTerminal::Accepted if accepted_outcome => Some(AttemptOutcome {
                     attempt,
                     event_id: event_id.to_string(),
                     kind: AttemptOutcomeKind::Accepted {
                         session: Some(session.clone()),
                     },
                 }),
-                DeliveryTerminal::TypedRefused(reason) if !has_remaining => Some(AttemptOutcome {
-                    attempt,
-                    event_id: event_id.to_string(),
-                    kind: AttemptOutcomeKind::TypedRefused(reason.clone()),
-                }),
+                DeliveryTerminal::Accepted => None,
+                DeliveryTerminal::TypedRefused(_) if !has_remaining => {
+                    typed_refusal.map(|reason| AttemptOutcome {
+                        attempt,
+                        event_id: event_id.to_string(),
+                        kind: AttemptOutcomeKind::TypedRefused(reason),
+                    })
+                }
                 DeliveryTerminal::TypedRefused(_) => None,
                 _ => None,
             };
@@ -1063,23 +1161,25 @@ impl DeliveryStore {
             for id in ids {
                 if let Some(entry) = state.attempts.remove(&id) {
                     count += entry.relays.len();
-                    let kind = match &terminal {
-                        DeliveryTerminal::Accepted | DeliveryTerminal::AttemptCompleted => {
-                            AttemptOutcomeKind::Accepted { session: None }
-                        }
-                        DeliveryTerminal::TypedRefused(reason) => {
-                            AttemptOutcomeKind::TypedRefused(reason.clone())
-                        }
-                        DeliveryTerminal::AttemptReplaced => AttemptOutcomeKind::Replaced,
-                        DeliveryTerminal::Cancelled | DeliveryTerminal::Shutdown => {
-                            AttemptOutcomeKind::Cancelled
-                        }
-                    };
-                    outcomes.push(AttemptOutcome {
-                        attempt: entry.attempt.clone(),
-                        event_id: entry.owned.value().id.clone(),
-                        kind,
-                    });
+                    if !entry.carrier.terminal_emitted {
+                        let kind = match &terminal {
+                            DeliveryTerminal::Accepted | DeliveryTerminal::AttemptCompleted => {
+                                AttemptOutcomeKind::Accepted { session: None }
+                            }
+                            DeliveryTerminal::TypedRefused(reason) => {
+                                AttemptOutcomeKind::TypedRefused(reason.clone())
+                            }
+                            DeliveryTerminal::AttemptReplaced => AttemptOutcomeKind::Replaced,
+                            DeliveryTerminal::Cancelled | DeliveryTerminal::Shutdown => {
+                                AttemptOutcomeKind::Cancelled
+                            }
+                        };
+                        outcomes.push(AttemptOutcome {
+                            attempt: entry.attempt.clone(),
+                            event_id: entry.owned.value().id.clone(),
+                            kind,
+                        });
+                    }
                     leases.push(entry.record_lease);
                     leases.push(entry.key_lease);
                     leases.extend(entry.correlation_lease);
@@ -1119,11 +1219,13 @@ impl DeliveryStore {
                 if let Some(relay) = entry.relays.remove(&session) {
                     count += 1;
                     if entry.relays.is_empty() {
-                        outcomes.push(AttemptOutcome {
-                            attempt: entry.attempt.clone(),
-                            event_id: entry.owned.value().id.clone(),
-                            kind: AttemptOutcomeKind::CarrierUnavailable,
-                        });
+                        if let Some(kind) = entry.carrier.unavailable_outcome() {
+                            outcomes.push(AttemptOutcome {
+                                attempt: entry.attempt.clone(),
+                                event_id: entry.owned.value().id.clone(),
+                                kind,
+                            });
+                        }
                     }
                     leases.push(relay.lease);
                     leases.push(relay.map_lease);
@@ -1153,11 +1255,13 @@ impl DeliveryStore {
             }
             for (_, entry) in mem::take(&mut state.attempts).into_iter() {
                 count += entry.relays.len();
-                outcomes.push(AttemptOutcome {
-                    attempt: entry.attempt.clone(),
-                    event_id: entry.owned.value().id.clone(),
-                    kind: AttemptOutcomeKind::Cancelled,
-                });
+                if !entry.carrier.terminal_emitted {
+                    outcomes.push(AttemptOutcome {
+                        attempt: entry.attempt.clone(),
+                        event_id: entry.owned.value().id.clone(),
+                        kind: AttemptOutcomeKind::Cancelled,
+                    });
+                }
                 leases.push(entry.record_lease);
                 leases.push(entry.key_lease);
                 leases.extend(entry.correlation_lease);
@@ -1318,8 +1422,8 @@ mod tests {
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
             assert!(!attempt.is_empty());
-            assert_eq!(retention.relay_map_growth_bytes, 0);
-            assert_eq!(retention.attempt_map_growth_bytes, 0);
+            assert!(retention.relay_map_growth_bytes > 0);
+            assert!(retention.attempt_map_growth_bytes > 0);
             Ok(self.lease("attempt-correlation"))
         }
 
@@ -1329,7 +1433,7 @@ mod tests {
             _event: &NostrEvent,
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-            assert_eq!(retention.attempt_map_growth_bytes, 0);
+            assert!(retention.attempt_map_growth_bytes > 0);
             Ok(self.lease("attempt-entry"))
         }
 
@@ -1340,7 +1444,7 @@ mod tests {
             _event: &NostrEvent,
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-            assert_eq!(retention.relay_map_growth_bytes, 0);
+            assert!(retention.relay_map_growth_bytes > 0);
             Ok(self.lease("relay-entry"))
         }
     }
@@ -1437,6 +1541,31 @@ mod tests {
             self.live.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(CountingLease {
                 live: self.live.clone(),
+            }))
+        }
+    }
+
+    struct ToggleProvider {
+        allow: Arc<AtomicBool>,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl DeliveryProvider for ToggleProvider {
+        unmetered_reservations!();
+
+        fn reserve(
+            &self,
+            _attempt: &str,
+            _session: RelaySessionId,
+            _event: &NostrEvent,
+            _retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            if !self.allow.load(Ordering::SeqCst) {
+                return Err(DeliveryRefusal::Provider("carrier unavailable".into()));
+            }
+            self.live.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CountingLease {
+                live: Arc::clone(&self.live),
             }))
         }
     }
@@ -1867,9 +1996,128 @@ mod tests {
     }
 
     #[test]
+    fn carrier_aggregate_is_deterministic_and_reconnect_scoped() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
+        let (first, _) = store.open_session();
+        let (second, _) = store.open_session();
+        let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+        let event_id = owned.value().id.clone();
+        let report = store.admit("aggregate-accepted".into(), owned);
+        assert_eq!(report.accepted_sessions, 2);
+        assert!(store.settle(&first, &event_id, DeliveryTerminal::Accepted));
+        assert!(store.settle(&second, &event_id, DeliveryTerminal::Accepted));
+        assert_eq!(outcomes.lock().len(), 1);
+
+        fn refusal_order(reverse: bool) -> String {
+            let live = Arc::new(AtomicUsize::new(0));
+            let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
+            let (first, _) = store.open_session();
+            let (second, _) = store.open_session();
+            let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+            let event_id = owned.value().id.clone();
+            let report = store.admit("aggregate-refusal".into(), owned);
+            assert_eq!(report.accepted_sessions, 2);
+            let (earlier, later) = if reverse {
+                (second, first)
+            } else {
+                (first, second)
+            };
+            assert!(store.settle(
+                &earlier,
+                &event_id,
+                DeliveryTerminal::TypedRefused("z-last".into()),
+            ));
+            assert!(outcomes.lock().is_empty());
+            assert!(store.settle(
+                &later,
+                &event_id,
+                DeliveryTerminal::TypedRefused("a-first".into()),
+            ));
+            let records = outcomes.lock();
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].kind,
+                AttemptOutcomeKind::TypedRefused("a-first".into())
+            );
+            records[0].attempt.clone()
+        }
+
+        assert_eq!(refusal_order(false), refusal_order(true));
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
+        let (first, _) = store.open_session();
+        let (second, _) = store.open_session();
+        let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+        store.admit("aggregate-reconnect".into(), owned);
+        store.close_session(first, DeliveryTerminal::Cancelled);
+        assert!(outcomes.lock().is_empty());
+        store.close_session(second, DeliveryTerminal::Cancelled);
+        assert_eq!(outcomes.lock().len(), 1);
+        let (fresh, _) = store.open_session();
+        assert_eq!(store.pending(&fresh).len(), 1);
+        store.close_session(fresh, DeliveryTerminal::Cancelled);
+        assert_eq!(outcomes.lock().len(), 2);
+    }
+
+    #[test]
+    fn all_carrier_refusal_is_once_only_and_rearms_after_eligible_reconnect() {
+        let allow = Arc::new(AtomicBool::new(true));
+        let live = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ToggleProvider {
+            allow: Arc::clone(&allow),
+            live: Arc::clone(&live),
+        });
+        let store = DeliveryStore::new(provider);
+        let (initial, _) = store.open_session();
+        let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
+        let event_id = owned.value().id.clone();
+        let report = store.admit("all-carrier-once".into(), owned);
+        assert_eq!(report.accepted_sessions, 1);
+        assert!(store.settle(&initial, &event_id, DeliveryTerminal::Cancelled,));
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+
+        allow.store(false, Ordering::SeqCst);
+        let (_, first_session_refusal, first_refusals) = store.open_session_with_refusals();
+        assert!(first_session_refusal.is_none());
+        assert_eq!(first_refusals.len(), 1);
+        assert_eq!(first_refusals[0].attempt, "all-carrier-once");
+        assert_eq!(first_refusals[0].event_id, event_id);
+        let (_, second_session_refusal, second_refusals) = store.open_session_with_refusals();
+        assert!(second_session_refusal.is_none());
+        assert!(second_refusals.is_empty());
+
+        allow.store(true, Ordering::SeqCst);
+        let (fresh, fresh_session_refusal, fresh_refusals) = store.open_session_with_refusals();
+        assert!(fresh_session_refusal.is_none());
+        assert!(fresh_refusals.is_empty());
+        assert_eq!(store.pending(&fresh), vec![event_id.clone()]);
+        assert!(store.settle(&fresh, &event_id, DeliveryTerminal::Cancelled));
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+
+        allow.store(false, Ordering::SeqCst);
+        let (_, third_session_refusal, third_refusals) = store.open_session_with_refusals();
+        assert!(third_session_refusal.is_none());
+        assert_eq!(third_refusals.len(), 1);
+        assert_eq!(third_refusals[0].attempt, "all-carrier-once");
+        assert_eq!(third_refusals[0].event_id, event_id);
+    }
+
+    #[test]
     fn provider_delta_covers_correlation_and_each_exact_entry() {
         let live = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let retention = DeliveryRetention::for_attempt("exact-correlation", &event());
+        assert_eq!(
+            retention.attempt_map_growth_bytes,
+            std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>()
+        );
+        assert_eq!(
+            retention.relay_map_growth_bytes,
+            std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>()
+        );
+        assert!(SessionRetention::exact().session_set_growth_bytes > 0);
         let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
             live: Arc::clone(&live),
             calls: Arc::clone(&calls),

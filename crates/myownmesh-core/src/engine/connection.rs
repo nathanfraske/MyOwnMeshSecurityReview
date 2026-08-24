@@ -1880,6 +1880,15 @@ impl PeerConnection {
         if self.unpromoted_offer_in_flight() {
             return Promotion::Refused;
         }
+        // The promoted slot is retained authority, not a bypass around the
+        // current registry fence. A policy revocation or exact registry
+        // retirement must destroy it before the slot can report `Current`;
+        // otherwise a later operation would reuse a session minted under an
+        // admission the mesh has already withdrawn.
+        if self.registry_retired() || !policy_admits {
+            self.promoted_session.clear();
+            return Promotion::Refused;
+        }
         let worker = self.current_worker();
         let live_connector = worker
             .as_ref()
@@ -1914,9 +1923,6 @@ impl PeerConnection {
             crate::runtime::peer_session::Reuse::Vacant => {}
         }
 
-        if self.registry_retired() || !policy_admits {
-            return Promotion::Refused;
-        }
         let (Some(connector), Some(worker)) = (live_connector, worker) else {
             return Promotion::Refused;
         };

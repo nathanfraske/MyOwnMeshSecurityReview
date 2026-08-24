@@ -195,6 +195,9 @@ where
 }
 
 /// Start with provider custody and consumer-owned refusal/outcome sinks.
+/// Relay ACKs, typed refusals, disconnects, and reconnects are folded by the
+/// delivery store's per-event carrier aggregate before an outcome reaches
+/// this sink; relay order is not an authority signal.
 pub fn start_with_delivery_provider_and_sinks<S>(
     config: NostrDriverConfig,
     outbound: S,
@@ -606,6 +609,10 @@ async fn run_relay(
                     &session,
                 )
                 .await;
+                // The store removes only this relay's custody. Its
+                // per-event carrier aggregate decides whether the resulting
+                // carrier observation is new, order-independent, and
+                // reconnect-scoped before notifying the consumer.
                 shared
                     .delivery
                     .close_session(session, DeliveryTerminal::Cancelled);

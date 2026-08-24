@@ -61,7 +61,7 @@ use super::signaling_ingress::{
     outbound_signal, CarrierAttach, CarrierAttribution, CarrierObservation, SignalingCarrier,
     SignalingRuntime,
 };
-use super::state::{NetworkCmd, NetworkState, SignalingOutbound};
+use super::state::{NetworkCmd, NetworkState, RecoveryCarrierInstance, SignalingOutbound};
 
 /// One driver's outbound side: the engine's admitted values, translated on the
 /// driver's own pull.
@@ -100,6 +100,13 @@ struct TranslatedOutbound<T> {
     scope: LocalApplicationResourceScope,
     translate: Box<dyn Fn(&SignalingOutbound) -> T + Send>,
     refusal_sink: Option<Arc<dyn AttemptRefusalSink>>,
+    recovery_state: Option<Weak<NetworkState>>,
+    recovery_instance: Option<RecoveryCarrierInstance>,
+    /// Nostr source admission only proves that a value reached the driver's
+    /// delivery boundary. Its provider must report the carrier outcome before
+    /// this attempt cohort is marked accepted; local/mDNS sources have no
+    /// downstream delivery store and may settle at source admission.
+    defer_attempt_acceptance: bool,
 }
 
 /// The pre-drain value, built only once its lease exists.
@@ -186,6 +193,7 @@ struct CoreNostrDeliveryLease {
 /// attempts are deliberately ignored; there is no device-id fallback.
 struct CoreAttemptRefusalSink {
     state: Weak<NetworkState>,
+    instance: Option<RecoveryCarrierInstance>,
 }
 
 impl AttemptRefusalSink for CoreAttemptRefusalSink {
@@ -199,6 +207,14 @@ impl AttemptRefusalSink for CoreAttemptRefusalSink {
         if owner.connection().attempt() != refusal.attempt {
             return;
         }
+        if let Some(instance) = self.instance {
+            if !state.begin_carrier_attempt(&refusal.attempt, [instance]) {
+                return;
+            }
+            if !state.record_carrier_attempt(&refusal.attempt, instance, false) {
+                return;
+            }
+        }
         let _ = state
             .cmd_tx
             .send(NetworkCmd::AttemptRefused { owner, refusal });
@@ -211,6 +227,7 @@ impl AttemptRefusalSink for CoreAttemptRefusalSink {
 /// device-id lookup.
 struct CoreAttemptOutcomeSink {
     state: Weak<NetworkState>,
+    instance: Option<RecoveryCarrierInstance>,
 }
 
 impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
@@ -223,6 +240,21 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
         };
         if owner.connection().attempt() != outcome.attempt {
             return;
+        }
+        if let Some(instance) = self.instance {
+            if !state.begin_carrier_attempt(&outcome.attempt, [instance]) {
+                return;
+            }
+            let accepted = matches!(
+                &outcome.kind,
+                myownmesh_signaling::AttemptOutcomeKind::Accepted { .. }
+            );
+            if !accepted && !state.record_carrier_attempt(&outcome.attempt, instance, false) {
+                return;
+            }
+            if accepted {
+                state.record_carrier_attempt(&outcome.attempt, instance, true);
+            }
         }
         let _ = state
             .cmd_tx
@@ -402,7 +434,9 @@ fn outbound_attempt(value: &SignalingOutbound) -> Option<&str> {
         SignalingOutbound::Offer { attempt, .. }
         | SignalingOutbound::Answer { attempt, .. }
         | SignalingOutbound::Candidate { attempt, .. } => Some(attempt),
-        SignalingOutbound::Announce | SignalingOutbound::Leave => None,
+        SignalingOutbound::Announce
+        | SignalingOutbound::RecoveryAnnounce { .. }
+        | SignalingOutbound::Leave => None,
     }
 }
 
@@ -424,6 +458,44 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
         // "finished". See [`OutboundSource::recv`].
         loop {
             let delivery = self.rx.recv().await?;
+            let recovery = self
+                .recovery_state
+                .as_ref()
+                .and_then(|_| match delivery.value() {
+                    SignalingOutbound::RecoveryAnnounce { id } => Some(*id),
+                    _ => None,
+                })
+                .and_then(|recovery_id| {
+                    self.recovery_state
+                        .as_ref()
+                        .and_then(Weak::upgrade)
+                        .map(|state| (state, recovery_id))
+                })
+                .and_then(|(state, recovery_id)| {
+                    self.recovery_instance.and_then(|instance| {
+                        state
+                            .begin_recovery_for_carrier(recovery_id, instance)
+                            .map(|id| (state, instance, id))
+                    })
+                });
+            if matches!(delivery.value(), SignalingOutbound::RecoveryAnnounce { .. })
+                && recovery.is_none()
+            {
+                // A recovery envelope is admitted only against its carried
+                // generation and exact attached carrier instance. Dropping a
+                // stale envelope here prevents it from being translated as an
+                // ordinary wire-level announce for a later generation.
+                continue;
+            }
+            let attempt = outbound_attempt(delivery.value()).map(str::to_owned);
+            let attempt_state = self.recovery_state.as_ref().and_then(Weak::upgrade);
+            if let (Some(state), Some(attempt), Some(instance)) = (
+                attempt_state.as_ref(),
+                attempt.as_deref(),
+                self.recovery_instance,
+            ) {
+                state.begin_carrier_attempt(attempt, [instance]);
+            }
             // Acquire before translating. A refusal here means nothing is built:
             // the delivery is dropped whole, its own funding goes back, and the
             // driver simply does not see this emission. That ordering is the fix
@@ -433,6 +505,18 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             let derived = match self.scope.acquire(DERIVED_OUTBOUND_CLAIM) {
                 Ok(lease) => lease,
                 Err(error) => {
+                    if let Some((state, instance, id)) = recovery {
+                        state.record_recovery_carrier(id, instance, false);
+                    }
+                    if self.refusal_sink.is_none() {
+                        if let (Some(state), Some(attempt), Some(instance)) = (
+                            attempt_state.as_ref(),
+                            attempt.as_deref(),
+                            self.recovery_instance,
+                        ) {
+                            state.record_carrier_attempt(attempt, instance, false);
+                        }
+                    }
                     if let (Some(sink), Some(attempt)) = (
                         self.refusal_sink.as_ref(),
                         outbound_attempt(delivery.value()),
@@ -468,6 +552,18 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             // the result as its owner, alongside the lease that pays for the
             // result itself.
             let value = (self.translate)(delivery.value());
+            if let Some((state, instance, id)) = recovery {
+                state.record_recovery_carrier(id, instance, true);
+            }
+            if !self.defer_attempt_acceptance {
+                if let (Some(state), Some(attempt), Some(instance)) = (
+                    attempt_state.as_ref(),
+                    attempt.as_deref(),
+                    self.recovery_instance,
+                ) {
+                    state.record_carrier_attempt(attempt, instance, true);
+                }
+            }
             // The box is allocated here, after the derived lease exists and
             // after the translation it pays for — never before the funding. The
             // delivery moves into it whole; nothing is read out of it, then or
@@ -581,9 +677,11 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
             rx: outbound_rx,
             scope,
             translate: Box::new(move |outbound| match outbound {
-                SignalingOutbound::Announce => LocalOutbound::Announce {
-                    device_id: device_id_for_out.clone(),
-                },
+                SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
+                    LocalOutbound::Announce {
+                        device_id: device_id_for_out.clone(),
+                    }
+                }
                 SignalingOutbound::Leave => LocalOutbound::Leave {
                     device_id: device_id_for_out.clone(),
                 },
@@ -628,6 +726,9 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                 },
             }),
             refusal_sink: None,
+            recovery_state: Some(Arc::downgrade(state)),
+            recovery_instance: state.next_recovery_carrier_instance(),
+            defer_attempt_acceptance: false,
         });
     let _ = state.with_local_signaling_forwarder(|| {
         let forwarder = broker.join_with_sink(
@@ -797,6 +898,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         state,
         outbound_rx,
         SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr),
+        state.next_recovery_carrier_instance(),
     )
 }
 
@@ -807,6 +909,7 @@ fn attach_nostr_with(
     state: &Arc<NetworkState>,
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
+    recovery_instance: Option<RecoveryCarrierInstance>,
 ) -> Option<NostrDriverHandle> {
     let cfg = state.config.read();
     let nostr_cfg = NostrDriverConfig {
@@ -853,7 +956,9 @@ fn attach_nostr_with(
             rx: outbound_rx,
             scope,
             translate: Box::new(move |outbound| match outbound {
-                SignalingOutbound::Announce => NostrOutbound::Announce,
+                SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
+                    NostrOutbound::Announce
+                }
                 SignalingOutbound::Leave => NostrOutbound::Leave,
                 SignalingOutbound::Offer {
                     device_id: to,
@@ -897,7 +1002,11 @@ fn attach_nostr_with(
             }),
             refusal_sink: Some(Arc::new(CoreAttemptRefusalSink {
                 state: Arc::downgrade(state),
+                instance: recovery_instance,
             })),
+            recovery_state: Some(Arc::downgrade(state)),
+            recovery_instance,
+            defer_attempt_acceptance: true,
         });
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
@@ -909,9 +1018,11 @@ fn attach_nostr_with(
         provider,
         Arc::new(CoreAttemptRefusalSink {
             state: Arc::downgrade(state),
+            instance: recovery_instance,
         }),
         Arc::new(CoreAttemptOutcomeSink {
             state: Arc::downgrade(state),
+            instance: recovery_instance,
         }),
     );
     // Hand the engine the force-reconnect signal so resume-from-sleep
@@ -935,8 +1046,14 @@ fn attach_nostr_shared(
     state: &Arc<NetworkState>,
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
+    recovery_instance: Option<RecoveryCarrierInstance>,
 ) -> Option<Arc<NostrDriverHandle>> {
-    let handle = Arc::new(attach_nostr_with(state, outbound_rx, attach)?);
+    let handle = Arc::new(attach_nostr_with(
+        state,
+        outbound_rx,
+        attach,
+        recovery_instance,
+    )?);
     let settlement_handle = Arc::clone(&handle);
     state.set_attempt_settlement(Arc::new(move |attempt, terminal| {
         settlement_handle.finish_attempt(attempt, terminal)
@@ -958,6 +1075,7 @@ pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
         state,
         outbound_rx,
         SignalingRuntime::attach(&runtime, SignalingCarrier::Mdns),
+        state.next_recovery_carrier_instance(),
     )
 }
 
@@ -969,6 +1087,7 @@ fn attach_mdns_with(
     state: &Arc<NetworkState>,
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
+    recovery_instance: Option<RecoveryCarrierInstance>,
 ) -> Option<MdnsDriverHandle> {
     let mdns_cfg = MdnsDriverConfig {
         app_id: resolve_app_id(),
@@ -989,7 +1108,9 @@ fn attach_mdns_with(
             rx: outbound_rx,
             scope,
             translate: Box::new(move |outbound| match outbound {
-                SignalingOutbound::Announce => MdnsOutbound::Announce,
+                SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
+                    MdnsOutbound::Announce
+                }
                 SignalingOutbound::Leave => MdnsOutbound::Leave,
                 SignalingOutbound::Offer {
                     device_id: to,
@@ -1031,7 +1152,13 @@ fn attach_mdns_with(
                     },
                 },
             }),
-            refusal_sink: None,
+            refusal_sink: Some(Arc::new(CoreAttemptRefusalSink {
+                state: Arc::downgrade(state),
+                instance: recovery_instance,
+            })),
+            recovery_state: Some(Arc::downgrade(state)),
+            recovery_instance,
+            defer_attempt_acceptance: false,
         });
 
     // The driver's setup is synchronously fallible (mDNS daemon, TCP listener),
@@ -1172,16 +1299,24 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let (mdns_tx, mdns_rx) =
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
-            let fanout = spawn_fanout(state.clone(), outbound_rx, vec![nostr_tx, mdns_tx]);
+            let nostr_instance = state.next_recovery_carrier_instance();
+            let mdns_instance = state.next_recovery_carrier_instance();
+            let fanout = spawn_fanout(
+                state.clone(),
+                outbound_rx,
+                vec![(nostr_instance, nostr_tx), (mdns_instance, mdns_tx)],
+            );
             let nostr = attach_nostr_shared(
                 state,
                 nostr_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr),
+                nostr_instance,
             );
             let mdns = attach_mdns_with(
                 state,
                 mdns_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Mdns),
+                mdns_instance,
             );
             SignalingDrivers {
                 nostr,
@@ -1194,6 +1329,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 state,
                 outbound_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr),
+                state.next_recovery_carrier_instance(),
             ),
             mdns: None,
             fanout: None,
@@ -1203,6 +1339,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 state,
                 outbound_rx,
                 SignalingRuntime::attach(&runtime, SignalingCarrier::Mdns),
+                state.next_recovery_carrier_instance(),
             );
             if mdns.is_none() {
                 warn!(
@@ -1244,7 +1381,10 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
 fn spawn_fanout(
     state: Arc<NetworkState>,
     mut outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
-    driver_txs: Vec<ResourceMailboxSender<SignalingOutbound>>,
+    driver_txs: Vec<(
+        Option<RecoveryCarrierInstance>,
+        ResourceMailboxSender<SignalingOutbound>,
+    )>,
 ) -> tokio::task::JoinHandle<()> {
     // While stood-down (signed-evicted), announces are suppressed — but
     // not forever silenced: one probe per this interval still goes out, so
@@ -1261,13 +1401,28 @@ fn spawn_fanout(
             // never owns a translated allocation of its own and has no reason
             // to hold the delivered value away from what funds it.
             let msg = delivery.value();
+            let recovery_id = match msg {
+                SignalingOutbound::RecoveryAnnounce { id } => Some(*id),
+                _ => None,
+            };
+            if let Some(id) = recovery_id {
+                let instances = driver_txs.iter().filter_map(|(instance, _)| *instance);
+                if !state.begin_recovery_publication(id, instances) {
+                    // A stale fan-out copy cannot claim a later publication.
+                    // Do not forward it to a carrier either: forwarding an old
+                    // envelope would let a source observe a later generation.
+                    continue;
+                }
+            }
             // A stood-down engine stops advertising itself: an announce is
             // an invitation to dial us, and every member would answer it
             // with a denial. Directed signaling (offers/answers already in
             // flight) still passes — only the broadcast self-advertisement
             // is throttled, to the slow re-admit probe above.
-            if matches!(msg, SignalingOutbound::Announce)
-                && state.self_evicted.load(std::sync::atomic::Ordering::SeqCst)
+            if matches!(
+                msg,
+                SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. }
+            ) && state.self_evicted.load(std::sync::atomic::Ordering::SeqCst)
             {
                 let due = last_evicted_probe
                     .map(|at| at.elapsed() >= EVICTED_PROBE_INTERVAL)
@@ -1277,9 +1432,10 @@ fn spawn_fanout(
                 }
                 last_evicted_probe = Some(std::time::Instant::now());
             }
-            state
-                .traffic
-                .record_signaling_tx(matches!(msg, SignalingOutbound::Announce));
+            state.traffic.record_signaling_tx(matches!(
+                msg,
+                SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. }
+            ));
             // The outbound half of the ingress boundary. Nothing routes on
             // it — every emission is transport control — but a dropped copy is
             // named by the signal kind it carried as well as its variant, and
@@ -1287,20 +1443,34 @@ fn spawn_fanout(
             // transport control cannot be added without deciding that here.
             let signal = outbound_signal(msg).name();
             let attempt = outbound_attempt(msg).map(str::to_owned);
+            if let Some(attempt) = attempt.as_deref() {
+                let instances = driver_txs.iter().filter_map(|(instance, _)| *instance);
+                state.begin_carrier_attempt(attempt, instances);
+            }
             let mut delivered = false;
             let mut refusal_reason = None;
-            for tx in &driver_txs {
+            for (instance, tx) in &driver_txs {
                 let kind = match msg {
-                    SignalingOutbound::Announce => "announce",
+                    SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
+                        "announce"
+                    }
                     SignalingOutbound::Leave => "leave",
                     SignalingOutbound::Offer { .. } => "offer",
                     SignalingOutbound::Answer { .. } => "answer",
                     SignalingOutbound::Candidate { .. } => "candidate",
                 };
                 match tx.send(msg.clone()) {
-                    Ok(()) => delivered = true,
+                    Ok(()) => {
+                        delivered = true;
+                    }
                     Err(ResourceMailboxSendError::Closed(_)) => {
                         refusal_reason = Some("signaling carrier unavailable".to_string());
+                        if let (Some(attempt), Some(instance)) = (attempt.as_deref(), instance) {
+                            state.record_carrier_attempt(attempt, *instance, false);
+                        }
+                        if let (Some(id), Some(instance)) = (recovery_id, instance) {
+                            state.record_recovery_carrier(id, *instance, false);
+                        }
                     }
                     Err(ResourceMailboxSendError::Pressure { error, .. }) => {
                         refusal_reason = Some(error.to_string());
@@ -1310,17 +1480,33 @@ fn spawn_fanout(
                             ?error,
                             "signaling driver copy dropped under declared resource pressure"
                         );
+                        if let (Some(attempt), Some(instance)) = (attempt.as_deref(), instance) {
+                            state.record_carrier_attempt(attempt, *instance, false);
+                        }
+                        if let (Some(id), Some(instance)) = (recovery_id, instance) {
+                            state.record_recovery_carrier(id, *instance, false);
+                        }
                     }
                     Err(ResourceMailboxSendError::Claim { error, .. }) => {
                         refusal_reason = Some(error.to_string());
                         warn!(kind, signal, %error, "unrepresentable signaling driver copy dropped");
+                        if let (Some(attempt), Some(instance)) = (attempt.as_deref(), instance) {
+                            state.record_carrier_attempt(attempt, *instance, false);
+                        }
+                        if let (Some(id), Some(instance)) = (recovery_id, instance) {
+                            state.record_recovery_carrier(id, *instance, false);
+                        }
                     }
                 }
+            }
+            if let Some(id) = recovery_id {
+                state.refuse_empty_recovery_publication(id);
             }
             if !delivered && !driver_txs.is_empty() {
                 if let (Some(attempt), Some(reason)) = (attempt, refusal_reason) {
                     CoreAttemptRefusalSink {
                         state: Arc::downgrade(&state),
+                        instance: None,
                     }
                     .refused(AttemptRefusal {
                         attempt,
@@ -1399,6 +1585,9 @@ mod tests {
                 }
             }),
             refusal_sink: None,
+            recovery_state: None,
+            recovery_instance: None,
+            defer_attempt_acceptance: false,
         }
     }
 

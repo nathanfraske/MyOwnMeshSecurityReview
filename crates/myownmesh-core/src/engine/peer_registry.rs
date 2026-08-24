@@ -362,6 +362,9 @@ impl PeerRegistry {
     }
 
     fn policy_admits(&self, remote_device_id: &str) -> bool {
+        // All registry fences consume the one bootstrap-bound semantic
+        // evaluator. Compatibility NetworkState roles and kind are never
+        // consulted here.
         let Some(bootstrap) = self.canonical_bootstrap.read().clone() else {
             return false;
         };
@@ -424,6 +427,10 @@ impl PeerRegistry {
         let durable_policy = self.policy_admits(owner.device_id());
         let policy_admits =
             durable_policy && (peer.holds_promoted_session() || peer.state.read().is_admitted());
+        // The exact peer fence receives the canonical verdict even for an
+        // already-promoted slot. A false verdict is intentionally not merely
+        // a refusal hint: `promote_session_if_needed` clears retained session
+        // authority before it can return `Promotion::Current`.
         let promotion = peer.promote_session_if_needed(broker, mesh_context, policy_admits);
         if promotion == super::connection::Promotion::NewlyPromoted {
             if let Some(tx) = self.command_tx.get() {

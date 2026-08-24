@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use super::{ExclusiveCell, FactBody, FactId, MeshContextId, Role, SignedFact};
+use super::{
+    AttestationDecision, ExclusiveCell, FactBody, FactId, MeshContextId, Role, SignedFact,
+};
 
 /// Errors raised before a fact can enter the canonical causal graph.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -92,6 +94,42 @@ pub(crate) fn body_advances_cell(body: &FactBody, cell: &ExclusiveCell) -> bool 
 pub(crate) fn projected_role(body: &FactBody, subject: &super::DeviceId) -> Option<Role> {
     match body {
         FactBody::RoleGrant { target, role } if target == subject => Some(*role),
+        _ => None,
+    }
+}
+
+pub(crate) fn projected_membership(body: &FactBody, subject: &super::DeviceId) -> Option<bool> {
+    match body {
+        FactBody::Evict { target } if target == subject => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn projected_open_participation(
+    body: &FactBody,
+    author: &super::DeviceId,
+    subject: &super::DeviceId,
+) -> Option<bool> {
+    match body {
+        FactBody::OpenParticipation { device_id, joined }
+            if device_id == subject && author == subject =>
+        {
+            Some(*joined)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn projected_decision(
+    body: &FactBody,
+    proposal: &FactId,
+) -> Option<AttestationDecision> {
+    match body {
+        FactBody::Attestation {
+            proposal: fact_proposal,
+            decision,
+            ..
+        } if fact_proposal == proposal => Some(*decision),
         _ => None,
     }
 }

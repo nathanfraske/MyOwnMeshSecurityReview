@@ -1,6 +1,6 @@
 //! Pure projection of the causal graph into exclusive semantic cells.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::causal::FactGraph;
 use super::content::{DeviceId, ExclusiveCell, FactBody};
@@ -22,6 +22,35 @@ pub struct StandDown {
 pub struct Projection {
     cells: BTreeMap<ExclusiveCell, CellProjection>,
     stand_down: BTreeMap<DeviceId, StandDown>,
+}
+
+/// Follow a same-cell resolution chain to the effective non-resolution head.
+/// A malformed or cyclic chain is authority-negative; the visited set keeps
+/// projection total even when a test or a future loader presents a graph that
+/// was not admitted through the normal causal checks.
+fn resolve_effective_head(
+    graph: &FactGraph,
+    cell: &ExclusiveCell,
+    head: FactId,
+    visited: &mut BTreeSet<FactId>,
+) -> Option<FactId> {
+    if !visited.insert(head) {
+        return None;
+    }
+    let fact = graph.facts.get(&head)?;
+    match &fact.content.body {
+        FactBody::Resolution {
+            cell: resolution_cell,
+            selected_head,
+            ..
+        } if resolution_cell == cell => {
+            let selected = graph.facts.get(selected_head)?;
+            super::verify::body_advances_cell(&selected.content.body, cell)
+                .then(|| resolve_effective_head(graph, cell, *selected_head, visited))?
+        }
+        body if super::verify::body_advances_cell(body, cell) => Some(head),
+        _ => None,
+    }
 }
 
 impl Projection {
@@ -58,20 +87,9 @@ impl Projection {
             let heads = graph.cell_heads(&cell);
             let value = match heads.as_slice() {
                 [] => continue,
-                [head] => match &graph.facts[head].content.body {
-                    FactBody::Resolution {
-                        cell: resolution_cell,
-                        selected_head,
-                        ..
-                    } if resolution_cell == &cell
-                        && graph.facts.get(selected_head).is_some_and(|selected| {
-                            super::verify::body_advances_cell(&selected.content.body, &cell)
-                        }) =>
-                    {
-                        CellProjection::Value(*selected_head)
-                    }
-                    _ => CellProjection::Value(*head),
-                },
+                [head] => resolve_effective_head(graph, &cell, *head, &mut BTreeSet::new())
+                    .map(CellProjection::Value)
+                    .unwrap_or_else(|| CellProjection::Conflict(vec![*head])),
                 _ => CellProjection::Conflict(heads),
             };
             cells.insert(cell, value);

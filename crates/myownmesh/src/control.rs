@@ -138,6 +138,16 @@ pub(crate) struct ControlHooks {
     /// cancellation or timeout.
     #[cfg(test)]
     before_rpc_call: Option<Arc<DispatchBarrier>>,
+    /// Pauses the shutdown task immediately before the registry atomically
+    /// enters `Closing`, after shutdown has been requested but before it can
+    /// notify connection cancellation or drain pending work.
+    ///
+    /// This gives a non-vacuous filed -> shutdown-ownership handoff: the
+    /// control can prove the pending operation still exists at this edge, then
+    /// release the production transition that withdraws it. It does not alter
+    /// cancellation or provide a production synchronization path.
+    #[cfg(test)]
+    before_begin_closing: Option<Arc<DispatchBarrier>>,
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -612,6 +622,8 @@ async fn serve_with_hooks(
         at_events_stream_entry: hooks.at_events_stream_entry,
         #[cfg(test)]
         before_rpc_call: hooks.before_rpc_call,
+        #[cfg(test)]
+        before_begin_closing: hooks.before_begin_closing,
     });
     #[cfg(not(test))]
     let _ = hooks;
@@ -773,6 +785,10 @@ async fn serve_with_hooks(
     //    step 3 as well. Without those the count could stay above zero for as
     //    long as an idle client chose to stay connected, and this wait would be
     //    the hang rather than the join.
+    #[cfg(test)]
+    if let Some(barrier) = &state.before_begin_closing {
+        barrier.pass().await;
+    }
     if state.clients.begin_closing() {
         // One client at a time, released before the next is taken, and asked for
         // one at a time too. The registry answers an id rather than a record for
@@ -940,6 +956,10 @@ struct ControlState {
     /// the core call path.
     #[cfg(test)]
     before_rpc_call: Option<Arc<DispatchBarrier>>,
+    /// Test-only witness immediately before the registry's atomic transition
+    /// to `Closing`.
+    #[cfg(test)]
+    before_begin_closing: Option<Arc<DispatchBarrier>>,
 }
 
 /// One control surface with nothing joined, for the controls that are about
@@ -987,6 +1007,7 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         before_events_subscribe_commit: None,
         at_events_stream_entry: None,
         before_rpc_call: None,
+        before_begin_closing: None,
     })
 }
 
@@ -3486,6 +3507,7 @@ mod terminal_shutdown_tests {
         let directory = tempfile::tempdir().expect("temporary control root");
         let socket = directory.path().join("private").join("control.sock");
         let (rpc_barrier, rpc_entered, rpc_release) = DispatchBarrier::paired();
+        let (shutdown_barrier, shutdown_owned, shutdown_release) = DispatchBarrier::paired();
         let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
         let supervisor = crate::supervisor::RuntimeSupervisor::new();
         let networks = NetworkRegistry::new();
@@ -3514,6 +3536,7 @@ mod terminal_shutdown_tests {
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
                 before_rpc_call: Some(rpc_barrier),
+                before_begin_closing: Some(shutdown_barrier),
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3574,6 +3597,20 @@ mod terminal_shutdown_tests {
             supervisor.request_shutdown(),
             "the runtime shutdown is requested exactly once here"
         );
+        guarded(
+            "shutdown reaches parked-RPC withdrawal handoff",
+            shutdown_owned,
+        )
+        .await
+        .expect("shutdown reaches the pre-begin-closing ownership barrier");
+        assert_eq!(
+            observed.pending_call_count_for_test(&peer),
+            Some(1),
+            "the shutdown handoff is non-vacuous: the RPC is still filed"
+        );
+        shutdown_release
+            .send(())
+            .expect("the shutdown ownership barrier is still parked");
         guarded("serve begins closing", clients.closing()).await;
         guarded("the parked RPC is withdrawn", async {
             loop {
@@ -3664,6 +3701,7 @@ mod terminal_shutdown_tests {
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
                 before_rpc_call: None,
+                before_begin_closing: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3816,6 +3854,7 @@ mod terminal_shutdown_tests {
                 registry: Some(registry_tx),
                 at_events_stream_entry: Some(barrier),
                 before_rpc_call: None,
+                before_begin_closing: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3976,6 +4015,7 @@ mod terminal_shutdown_tests {
                 registry: Some(registry_tx),
                 at_events_stream_entry: None,
                 before_rpc_call: None,
+                before_begin_closing: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)

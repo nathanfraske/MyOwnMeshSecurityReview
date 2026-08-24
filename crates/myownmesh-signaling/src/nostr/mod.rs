@@ -16,6 +16,8 @@
 //! - [`defaults`] — built-in default relay URLs.
 
 pub mod defaults;
+// Delivery owns provider-funded per-event state and its order-independent
+// relay-carrier aggregate.
 pub mod delivery;
 pub mod denylist;
 pub mod driver;
@@ -27,7 +29,7 @@ pub mod shuffle;
 // submodule remains public for compatibility, while adapters can depend on
 // these names without reaching through the Nostr implementation layout.
 pub use delivery::{
-    AdmissionRefusal, AdmissionReport, DeliveryLease, DeliveryProvider, DeliveryRefusal,
-    DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
-    UnmeteredDeliveryProvider,
+    AdmissionRefusal, AdmissionReport, CarrierAggregate, DeliveryLease, DeliveryProvider,
+    DeliveryRefusal, DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId,
+    SessionRetention, UnmeteredDeliveryProvider,
 };

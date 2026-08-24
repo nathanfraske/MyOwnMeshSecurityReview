@@ -3,9 +3,9 @@
 //! `RosterEntries` is carrier material, not an authority-bearing fact. The
 //! canonical signed governance projection is the only source that can add a
 //! member to a Closed roster; an unsigned carrier must not do so regardless
-//! of the sender's role. Open networks remain founderless and permissionless
-//! at the policy and local approval boundary, while unsigned roster carriers
-//! remain inert.
+//! of the sender's role. Open networks remain founderless through
+//! self-authorized current participation; approval of an absent device is
+//! refused, and unsigned roster carriers remain inert.
 //!
 //! The test uses explicit per-node bootstrap roots and drives the canonical
 //! Closed RoleGrant path before exercising the inert carrier boundary.
@@ -180,11 +180,14 @@ async fn roster_membership_authority_gate() {
         VerifiedProjectPolicy::Open
     ));
     assert!(alice2.verified_authority_root().is_none());
-    alice2
-        .approve_roster(eve.public_id(), "eve")
-        .await
-        .expect("Open local roster approval remains permissionless");
-    assert!(rostered(&alice2, eve.public_id()));
+    assert!(
+        alice2.approve_roster(eve.public_id(), "eve").await.is_err(),
+        "Open approval of an absent device is refused without self-authored participation"
+    );
+    assert!(
+        !rostered(&alice2, eve.public_id()),
+        "a refused Open approval must leave the compatibility roster unchanged"
+    );
 
     governance::on_roster_entries(
         &alice2,

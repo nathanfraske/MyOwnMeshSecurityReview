@@ -468,20 +468,60 @@ impl<'a> SemanticEvaluator<'a> {
 
     fn effective_role_from_fact(&self, id: &FactId, subject: &DeviceId) -> Option<Role> {
         let fact = self.graph.facts.get(id)?;
-        match &fact.content.body {
-            FactBody::Resolution { selected_head, .. } => {
-                self.graph.facts.get(selected_head).and_then(|selected| {
-                    super::verify::projected_role(&selected.content.body, subject)
-                })
-            }
-            body => super::verify::projected_role(body, subject),
+        super::verify::projected_role(&fact.content.body, subject)
+    }
+
+    /// Effective membership is explicit when a membership cell has advanced;
+    /// callers may treat `None` as the bootstrap-era implicit membership.
+    pub fn effective_membership(&self, subject: &DeviceId) -> Option<bool> {
+        let cell = ExclusiveCell::membership(subject.clone());
+        let fact = self.projected_fact(&cell)?;
+        super::verify::projected_membership(&fact.content.body, subject)
+    }
+
+    /// Open participation is a profile-specific, self-authored value. Closed
+    /// graphs never derive it, and a selected fact authored by another device
+    /// cannot become participation authority through a resolution.
+    pub fn effective_open_participation(&self, subject: &DeviceId) -> Option<bool> {
+        if !matches!(&self.graph.policy, VerifiedProjectPolicy::Open) {
+            return None;
         }
+        let cell = ExclusiveCell::open_participation(subject.clone());
+        let fact = self.projected_fact(&cell)?;
+        super::verify::projected_open_participation(
+            &fact.content.body,
+            &fact.content.author,
+            subject,
+        )
+    }
+
+    /// Effective attestation decision for one proposal. Conflicts and
+    /// malformed resolution chains return `None` through `projected_fact`.
+    pub fn effective_decision(&self, proposal: &FactId) -> Option<super::AttestationDecision> {
+        let cell = ExclusiveCell::decision(*proposal);
+        let fact = self.projected_fact(&cell)?;
+        super::verify::projected_decision(&fact.content.body, proposal)
+    }
+
+    fn projected_fact(&self, cell: &ExclusiveCell) -> Option<&SignedFact> {
+        let id = self.projection.value(cell)?;
+        let fact = self.graph.facts.get(&id)?;
+        super::verify::body_advances_cell(&fact.content.body, cell).then_some(fact)
     }
 
     /// Whether an author may create the supplied operation under the current
     /// projected authority. Controllers may grant or demote Controllers, but
     /// only an Owner may grant an Owner.
     pub fn authorizes(&self, author: &DeviceId, body: &FactBody) -> bool {
+        if matches!(&self.graph.policy, VerifiedProjectPolicy::Open) {
+            if let FactBody::Resolution {
+                cell: ExclusiveCell::OpenParticipation { subject },
+                ..
+            } = body
+            {
+                return author == subject;
+            }
+        }
         let required = match body {
             FactBody::RoleGrant { role, .. } => match role {
                 Role::Member | Role::Controller => Role::Controller,
@@ -521,25 +561,8 @@ impl<'a> SemanticEvaluator<'a> {
         if self.effective_role(subject).is_none() {
             return false;
         }
-        if matches!(
-            self.projection.membership_cell(subject),
-            Some(super::CellProjection::Conflict(_))
-        ) {
-            return false;
-        }
-        self.projection
-            .membership_cell(subject)
-            .and_then(|cell| match cell {
-                super::CellProjection::Value(id) => Some(*id),
-                super::CellProjection::Conflict(_) => None,
-            })
-            .and_then(|id| self.graph.facts.get(&id))
-            .is_none_or(|fact| {
-                !matches!(
-                    &fact.content.body,
-                    FactBody::Evict { target } if target == subject
-                )
-            })
+        self.effective_membership(subject)
+            .is_none_or(|joined| joined)
     }
 
     fn has_tier(&self, signer: &DeviceId, required: Role) -> bool {
@@ -657,6 +680,61 @@ mod tests {
     }
 
     #[test]
+    fn projection_follows_nested_same_cell_resolutions() {
+        let (bootstrap, root_key) = closed(40);
+        let target = device(&key(41));
+        let first = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let second = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let first_resolution = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target.clone()),
+                cited_heads: vec![first.id, second.id],
+                selected_head: first.id,
+            },
+            vec![first.id, second.id],
+        );
+        let second_resolution = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target.clone()),
+                cited_heads: vec![first_resolution.id, second.id],
+                selected_head: first_resolution.id,
+            },
+            vec![first_resolution.id, second.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.facts.insert(first.id, first.clone());
+        graph.facts.insert(second.id, second);
+        graph.facts.insert(first_resolution.id, first_resolution);
+        graph.facts.insert(second_resolution.id, second_resolution);
+        let evaluator = graph.evaluator();
+        assert_eq!(
+            evaluator.effective_role(&target),
+            Some(Role::Member),
+            "nested resolution selects the terminal same-cell head"
+        );
+    }
+
+    #[test]
     fn conflicted_root_role_cell_fails_closed() {
         let (bootstrap, root_key) = closed(47);
         let root = device(&root_key);
@@ -766,11 +844,47 @@ mod tests {
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.admit(grant).expect("member grant admits");
         assert!(graph.evaluator().admits_closed_session(&root, &controller));
+        assert_eq!(graph.evaluator().effective_membership(&controller), None);
         graph.admit(eviction).expect("root eviction admits");
         let evaluator = graph.evaluator();
         assert!(!evaluator.is_conflicted(&ExclusiveCell::role(controller.clone())));
         assert_eq!(evaluator.effective_role(&controller), None);
+        assert_eq!(evaluator.effective_membership(&controller), Some(false));
         assert!(!evaluator.admits_closed_session(&root, &controller));
+    }
+
+    #[test]
+    fn evaluator_derives_decision_from_the_selected_attestation() {
+        let (bootstrap, root_key) = closed(46);
+        let target = device(&key(47));
+        let proposal = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let attestation = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Attestation {
+                target,
+                proposal: proposal.id,
+                decision: super::super::AttestationDecision::Approve,
+                signer: device(&root_key),
+                contributions: Vec::new(),
+            },
+            vec![proposal.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(proposal.clone()).expect("proposal admits");
+        graph.admit(attestation).expect("attestation admits");
+        assert_eq!(
+            graph.evaluator().effective_decision(&proposal.id),
+            Some(super::super::AttestationDecision::Approve)
+        );
     }
 
     #[test]
@@ -804,6 +918,37 @@ mod tests {
         open_graph
             .admit(participation.clone())
             .expect("self-authored Open participation admits");
+        let left = fact(
+            &open,
+            &participant_key,
+            FactBody::OpenParticipation {
+                device_id: participant.clone(),
+                joined: false,
+            },
+            Vec::new(),
+        );
+        open_graph
+            .admit(left.clone())
+            .expect("second participation admits");
+        let participation_resolution = fact(
+            &open,
+            &participant_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::open_participation(participant.clone()),
+                cited_heads: vec![participation.id, left.id],
+                selected_head: participation.id,
+            },
+            vec![participation.id, left.id],
+        );
+        open_graph
+            .admit(participation_resolution)
+            .expect("self-authored participation resolution admits");
+        assert_eq!(
+            open_graph
+                .evaluator()
+                .effective_open_participation(&participant),
+            Some(true)
+        );
         let foreign_resolution = fact(
             &open,
             &participant_key,

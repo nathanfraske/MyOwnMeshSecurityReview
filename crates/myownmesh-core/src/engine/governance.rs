@@ -140,33 +140,19 @@ fn pk(device_id: &str) -> String {
     crate::signing::pubkey_part(device_id).to_string()
 }
 
-/// The single temporary live-policy projection used by every session edge.
-#[cfg(test)]
-pub(super) fn current_policy_admits(
-    gov: &network_state::NetworkState,
-    local_device_id: &str,
-    remote_device_id: &str,
-) -> bool {
-    if gov.kind.is_open_governance() {
-        return true;
-    }
-    gov.roles.contains_key(&pk(local_device_id)) && gov.roles.contains_key(&pk(remote_device_id))
-}
-
-/// Canonical Closed-policy admission for registry fences. The bootstrap roots
-/// and the shared FactGraph are the only authority inputs; compatibility
-/// NetworkState roles/logs are intentionally not consulted.
+/// Canonical policy admission for registry and handshake fences. The bootstrap
+/// binding and the shared FactGraph are the only authority inputs;
+/// compatibility NetworkState roles/logs are intentionally not consulted.
+/// The decision itself is always delegated to the graph's sealed semantic
+/// evaluator so every consumer uses one projection and one conflict rule.
 pub(super) fn canonical_policy_admits_from(
     bootstrap: &crate::semantic::VerifiedBootstrap,
     graph: &crate::semantic::FactGraph,
     local_device_id: &str,
     remote_device_id: &str,
 ) -> bool {
-    if matches!(
-        bootstrap.policy(),
-        crate::semantic::VerifiedProjectPolicy::Open
-    ) {
-        return true;
+    if graph.context_id() != bootstrap.context_id() {
+        return false;
     }
     let Ok(local) = crate::semantic::DeviceId::from_canonical_str(local_device_id) else {
         return false;
@@ -174,8 +160,15 @@ pub(super) fn canonical_policy_admits_from(
     let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
         return false;
     };
-    let _ = bootstrap;
-    graph.evaluator().admits_closed_session(&local, &remote)
+    let evaluator = graph.evaluator();
+    if matches!(
+        bootstrap.policy(),
+        crate::semantic::VerifiedProjectPolicy::Open
+    ) {
+        return evaluator.effective_open_participation(&local) == Some(true)
+            && evaluator.effective_open_participation(&remote) == Some(true);
+    }
+    evaluator.admits_closed_session(&local, &remote)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2097,41 +2090,6 @@ pub(super) async fn broadcast_state_for_owner(
         MeshMessage::NetworkState(local_state_snapshot(state)),
     )
     .await
-}
-
-/// Controls for [`current_policy_admits`], which is declared near the top of
-/// this file with the rest of the policy projection.
-///
-/// The module sits here rather than beside what it exercises because a test
-/// module is the end of a file by convention, and items following one read as
-/// though they were meant to be inside it.
-#[cfg(test)]
-mod current_policy_controls {
-    use super::*;
-
-    #[test]
-    fn closed_requires_positive_local_and_remote_roles() {
-        let mut gov = network_state::NetworkState::empty_for("closed-policy-control");
-        gov.kind = NetworkKind::Closed;
-        gov.roles.insert("local".into(), Role::Owner);
-        assert!(!current_policy_admits(&gov, "local", "unknown"));
-        gov.roles.insert("remote".into(), Role::Member);
-        assert!(current_policy_admits(&gov, "local", "remote"));
-        gov.roles.remove("local");
-        assert!(!current_policy_admits(&gov, "local", "remote"));
-    }
-
-    #[test]
-    fn open_and_silent_are_only_the_policy_half() {
-        for kind in [NetworkKind::Open, NetworkKind::Silent] {
-            let mut gov = network_state::NetworkState::empty_for("open-policy-control");
-            gov.kind = kind;
-            assert!(current_policy_admits(&gov, "local", "remote"));
-        }
-        // Mutual approval remains a separate conjunct in PeerRegistry's
-        // promotion lender; this predicate deliberately does not manufacture
-        // that legacy admission fact.
-    }
 }
 
 /// Controls for the projection [`try_ratify`] owes on a governance transition.

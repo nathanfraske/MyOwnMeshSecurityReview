@@ -181,6 +181,8 @@ async fn wait_for_user_left(
 }
 
 #[tokio::test]
+// Native TURN owns UDP sockets and is therefore opt-in for ordinary test
+// suites; the Linux integration job invokes this exact ignored test.
 #[ignore = "opens native TURN/WebRTC peers; run explicitly in the isolated Linux harness"]
 async fn authenticated_depart_observed_over_actual_turn() {
     let _process_controls = exclusive_process_controls().await;

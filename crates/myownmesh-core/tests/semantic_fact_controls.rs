@@ -308,3 +308,98 @@ fn foreign_context_is_rejected_before_quarantine() {
     assert_eq!(graph.len(), 0);
     assert_eq!(graph.quarantined().count(), 0);
 }
+
+#[test]
+fn open_resolution_is_recursive_and_foreign_resolution_fails_closed() {
+    let participant_key = key(18);
+    let participant = author(&participant_key);
+    let bootstrap =
+        VerifiedBootstrap::open("semantic-open-resolution").expect("open bootstrap verifies");
+    let cell = myownmesh_core::semantic::ExclusiveCell::open_participation(participant.clone());
+    let joined = fact(
+        &bootstrap,
+        &participant_key,
+        FactBody::OpenParticipation {
+            device_id: participant.clone(),
+            joined: true,
+        },
+        Vec::new(),
+    );
+    let left = fact(
+        &bootstrap,
+        &participant_key,
+        FactBody::OpenParticipation {
+            device_id: participant.clone(),
+            joined: false,
+        },
+        Vec::new(),
+    );
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+    graph
+        .admit(joined.clone())
+        .expect("joined participation admits");
+    graph
+        .admit(left.clone())
+        .expect("left participation admits");
+    let mut heads = graph.cell_heads(&cell);
+    heads.sort();
+    let first_resolution = fact(
+        &bootstrap,
+        &participant_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: heads.clone(),
+            selected_head: joined.id,
+        },
+        heads,
+    );
+    graph
+        .admit(first_resolution.clone())
+        .expect("self-authored Open resolution admits");
+
+    let right = fact(
+        &bootstrap,
+        &participant_key,
+        FactBody::OpenParticipation {
+            device_id: participant.clone(),
+            joined: false,
+        },
+        vec![joined.id],
+    );
+    graph.admit(right).expect("successor participation admits");
+    let mut current_heads = graph.cell_heads(&cell);
+    current_heads.sort();
+    let foreign_key = key(19);
+    let foreign_resolution = fact(
+        &bootstrap,
+        &foreign_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: current_heads.clone(),
+            selected_head: first_resolution.id,
+        },
+        current_heads.clone(),
+    );
+    assert_eq!(
+        graph.admit(foreign_resolution),
+        Err(SemanticError::InvalidOpenAuthor)
+    );
+
+    let nested_resolution = fact(
+        &bootstrap,
+        &participant_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: current_heads.clone(),
+            selected_head: first_resolution.id,
+        },
+        current_heads,
+    );
+    graph
+        .admit(nested_resolution)
+        .expect("recursive self-authored Open resolution admits");
+    assert_eq!(
+        graph.evaluator().effective_open_participation(&participant),
+        Some(true)
+    );
+}

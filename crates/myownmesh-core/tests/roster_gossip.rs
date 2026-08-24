@@ -1,7 +1,8 @@
 //! End-to-end engine integration test: roster persistence + gossip.
 //!
-//! Covers the "remember bilateral membership while keeping local approvals
-//! local" contract:
+//! Covers the contract that mutual active participation persists, while an
+//! absent non-participant cannot be approved or authorize others through
+//! roster gossip:
 //!
 //!   1. When two peers complete the bilateral approve handshake and the
 //!      link goes ACTIVE, each side persists the other into its roster —
@@ -9,9 +10,10 @@
 //!      (Before this landed, auto-approved peers reached ACTIVE but were
 //!      never remembered — the "we keep losing our roster" symptom.)
 //!
-//!   2. A local approval for a peer that isn't directly connected remains
-//!      local authority. It must not become a cross-member authorization just
-//!      because unsigned roster-entry gossip can carry the name elsewhere.
+//!   2. An approval attempt for a peer that isn't directly connected and has
+//!      no current self-authored participation is refused. It must not mutate
+//!      either roster or become cross-member authorization through unsigned
+//!      roster-entry gossip.
 //!
 //! Both scenarios live in ONE test on purpose: each integration-test file
 //! is its own process, but the tests *within* a file share it, and the
@@ -124,7 +126,7 @@ async fn bring_up_pair(
 }
 
 #[tokio::test]
-async fn roster_persists_on_mutual_approve_and_local_approval_stays_local() {
+async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() {
     // One MYOWNMESH_HOME for the whole test; distinct network_ids below
     // keep the two scenarios' roster files apart. It remains alive until every
     // production driver has been explicitly shut down and joined.
@@ -149,11 +151,16 @@ async fn roster_persists_on_mutual_approve_and_local_approval_stays_local() {
     let (a2, _a2_id, b2, _b2_id, broker2, a2_driver, b2_driver) =
         bring_up_pair("roster-gossip-local-authority", &transport).await;
     // Carol never connects — she's only ever a roster entry Alice vouches
-    // for. Approve her through the command queue (the path the GUI's Approve
-    // takes), which persists Alice's local approval. That local decision must
-    // not authorize Bob through unsigned RosterEntries gossip.
+    // for. Attempt to approve her through the command queue (the path the
+    // GUI's Approve takes). Because Carol has no current self-authored
+    // participation, the canonical evaluator must refuse the approval and
+    // neither side may gain a roster entry through unsigned gossip.
     let carol_id = Arc::new(Identity::ephemeral());
     let (tx, rx) = tokio::sync::oneshot::channel();
+    let alice_before = rostered(&a2, carol_id.public_id());
+    let bob_before = rostered(&b2, carol_id.public_id());
+    assert!(!alice_before, "Carol starts absent from Alice's roster");
+    assert!(!bob_before, "Carol starts absent from Bob's roster");
     assert!(
         a2.cmd_tx
             .send(NetworkCmd::ApproveRoster {
@@ -164,15 +171,19 @@ async fn roster_persists_on_mutual_approve_and_local_approval_stays_local() {
             .is_ok(),
         "queue approve"
     );
-    rx.await.expect("approve reply").expect("approve ok");
-
     assert!(
-        rostered(&a2, carol_id.public_id()),
-        "Alice's explicit local approval must persist in Alice's roster"
+        rx.await.expect("approve reply").is_err(),
+        "approval for an absent, non-participating Carol must be refused"
     );
-    assert!(
-        !rostered(&b2, carol_id.public_id()),
-        "Bob must not gain authorization from Alice's unsigned roster gossip"
+    assert_eq!(
+        rostered(&a2, carol_id.public_id()),
+        alice_before,
+        "refused approval must not mutate Alice's roster"
+    );
+    assert_eq!(
+        rostered(&b2, carol_id.public_id()),
+        bob_before,
+        "unsigned roster gossip must not mutate Bob's roster"
     );
 
     // Shut down every production driver before releasing the brokers or the

@@ -498,7 +498,9 @@ fn admit(message: &SignalingMessage) -> EphemeralSignal {
 /// can see it rather than at whichever driver happens to carry it.
 pub(crate) fn outbound_signal(outbound: &SignalingOutbound) -> EphemeralSignal {
     match outbound {
-        SignalingOutbound::Announce => EphemeralSignal::Presence,
+        SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
+            EphemeralSignal::Presence
+        }
         SignalingOutbound::Leave => EphemeralSignal::Withdrawal,
         SignalingOutbound::Offer { .. } => EphemeralSignal::ConnectIntent,
         SignalingOutbound::Answer { .. } => EphemeralSignal::ConnectAnswer,

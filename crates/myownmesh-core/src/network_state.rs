@@ -69,7 +69,12 @@ pub enum NetworkKind {
 }
 
 impl NetworkKind {
-    /// True for the kinds whose governance is permissionless / auto-accept
+    /// True for compatibility snapshots whose governance is permissionless /
+    /// auto-accept.
+    ///
+    /// This is not a live session-authority decision. Engine policy consumers
+    /// must use the bootstrap-bound semantic evaluator instead of consulting
+    /// this legacy compatibility kind.
     /// (`Open` and `Silent`) — i.e. NOT the signed-authority `Closed` model.
     /// Every governance branch that asks "open vs closed?" routes `Silent`
     /// down the open path through this predicate.

@@ -706,63 +706,13 @@ pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner
 /// fact for that device. An Evict membership cell remains a refusal even if a
 /// stale role grant is present, and stand-down is always fail-closed.
 fn canonical_policy_admits_both(state: &Arc<NetworkState>, remote_device_id: &str) -> bool {
-    if matches!(
-        state.verified_bootstrap().policy(),
-        crate::semantic::VerifiedProjectPolicy::Open
-    ) {
-        return has_open_participation(state, state.identity.public_id())
-            && has_open_participation(state, remote_device_id);
-    }
-    if !matches!(
-        state.verified_bootstrap().policy(),
-        crate::semantic::VerifiedProjectPolicy::Closed(_)
-    ) {
-        return false;
-    }
-
-    let Ok(local_device_id) =
-        crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
-    else {
-        return false;
-    };
-    let Ok(remote_device_id) = crate::semantic::DeviceId::from_canonical_str(remote_device_id)
-    else {
-        return false;
-    };
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
-    graph
-        .evaluator()
-        .admits_closed_session(&local_device_id, &remote_device_id)
-}
-
-/// Open networks have no root authority, but promotion still requires a
-/// durable self-authored presence fact from each subject. The typed cell and
-/// projection make this exact: a carrier, alias, or another device's fact
-/// cannot satisfy the gate.
-fn has_open_participation(state: &Arc<NetworkState>, device_id: &str) -> bool {
-    let Ok(device) = crate::semantic::DeviceId::from_canonical_str(device_id) else {
-        return false;
-    };
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
-    let evaluator = graph.evaluator();
-    let cell = crate::semantic::ExclusiveCell::open_participation(device.clone());
-    if evaluator.is_stood_down(&device) || evaluator.is_conflicted(&cell) {
-        return false;
-    }
-    let Some(fact_id) = graph.projection().value(&cell) else {
-        return false;
-    };
-    let Some(fact) = graph.get(&fact_id) else {
-        return false;
-    };
-    matches!(
-        &fact.content.body,
-        crate::semantic::FactBody::OpenParticipation {
-            device_id: subject,
-            joined: true,
-        } if subject == &device && fact.content.author == device
+    super::governance::canonical_policy_admits_from(
+        state.verified_bootstrap(),
+        &graph,
+        state.identity.public_id(),
+        remote_device_id,
     )
 }
 

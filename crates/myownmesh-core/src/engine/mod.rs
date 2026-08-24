@@ -1962,6 +1962,16 @@ enum ReactiveAnnounceResult {
 }
 
 fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounceResult {
+    // Recovery publications are carrier-admission work, not ordinary
+    // presence reflection.  Capture and queue them before consulting the
+    // presence floor; the cohort is settled later by the exact carrier
+    // instance that admits a copy.
+    if state.recovery_publication_in_flight() {
+        return ReactiveAnnounceResult::NotAttempted;
+    }
+    if state.queue_recovery_announce().is_some() {
+        return ReactiveAnnounceResult::Sent;
+    }
     let mut guard = state.last_reactive_announce_at.lock();
     let now = Instant::now();
     let due = guard
@@ -1969,14 +1979,7 @@ fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounce
             now.duration_since(prev) >= Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
         })
         .unwrap_or(true);
-    let generation = state.capture_recovery_cohort();
     if !due {
-        if let Some(generation) = generation {
-            state.settle_recovery_cohort(
-                generation,
-                crate::runtime::peer_session::RecoveryAttempt::RateLimited,
-            );
-        }
         return ReactiveAnnounceResult::RateLimited;
     }
     // Admission can refuse under provider pressure or after shutdown. Do not
@@ -1986,62 +1989,10 @@ fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounce
     if state.signaling_tx.send(SignalingOutbound::Announce).is_ok() {
         *guard = Some(now);
         drop(guard);
-        if let Some(generation) = generation {
-            state.settle_recovery_cohort(
-                generation,
-                crate::runtime::peer_session::RecoveryAttempt::Accepted,
-            );
-        }
         ReactiveAnnounceResult::Sent
     } else {
-        if let Some(generation) = generation {
-            state.settle_recovery_cohort(
-                generation,
-                crate::runtime::peer_session::RecoveryAttempt::Refused,
-            );
-        }
         ReactiveAnnounceResult::Refused
     }
-}
-
-/// Complete one terminal-owned recovery opportunity after a rate-limited
-/// publish.  The remaining floor is copied while its lock is held, then the
-/// lock is released before the await.  This is an event-owned wait: it belongs
-/// to the terminal cleanup task and is not a periodic retry service or a
-/// detached timer.  A demand already settled by another accepted producer
-/// (or cancelled by a successor/shutdown) is coalesced rather than emitting a
-/// second unowned announce.
-async fn retry_post_terminal_reactive_announce(
-    state: &Arc<NetworkState>,
-    mut result: ReactiveAnnounceResult,
-    demand: Option<&crate::runtime::peer_session::RecoveryDemandHandle>,
-) -> ReactiveAnnounceResult {
-    while result == ReactiveAnnounceResult::RateLimited {
-        let remaining = {
-            let guard = state.last_reactive_announce_at.lock();
-            guard
-                .map(|previous| {
-                    Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
-                        .saturating_sub(previous.elapsed())
-                })
-                .unwrap_or_default()
-        };
-        if remaining.is_zero() {
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(remaining).await;
-        }
-        if demand.is_some_and(|demand| {
-            matches!(
-                demand.settle_post_terminal(crate::runtime::peer_session::RecoveryAttempt::Refused),
-                crate::runtime::peer_session::RecoveryDemandSettlement::NoDemand
-            )
-        }) {
-            return ReactiveAnnounceResult::NotAttempted;
-        }
-        result = maybe_reactive_announce_result(state);
-    }
-    result
 }
 
 pub(crate) fn maybe_reactive_announce(state: &Arc<NetworkState>) -> bool {
@@ -7369,7 +7320,6 @@ async fn finish_drop_peer_inner_with_recovery(
     )>,
 ) -> ReactiveAnnounceResult {
     let mut announce_result = ReactiveAnnounceResult::NotAttempted;
-    let recovery_demand = recovery.as_ref().map(|(_, demand)| demand.clone());
     if let Some(peer) = removed {
         let removed_attempt = peer.attempt();
         if !removed_attempt.is_empty() {
@@ -7400,15 +7350,6 @@ async fn finish_drop_peer_inner_with_recovery(
             state.resolve_connect_waiters(device_id, Some(&why));
         }
 
-        // An exact recoverable Answerer cannot arm local reconnect: the
-        // remote Offerer owns the next negotiation. Nudge that owner before
-        // native close settles, but only when the removed worker's role is
-        // known exactly; an absent role fails closed. The helper's existing
-        // floor coalesces repeated terminal edges into one announce.
-        if recoverable && !sticky && opened_as.is_some_and(|opened_as| !opened_as.is_offerer()) {
-            announce_result = maybe_reactive_announce_result(state);
-        }
-
         if !already_started {
             state.peers.track_removed_close(Arc::clone(&peer));
             // Retire synchronously to move every exact channel/candidate into
@@ -7422,13 +7363,10 @@ async fn finish_drop_peer_inner_with_recovery(
         }
         state.peers.complete_removed_close(&peer);
         if recovery.is_some() && announce_result != ReactiveAnnounceResult::Sent {
-            let post_terminal = maybe_reactive_announce_result(state);
-            announce_result = retry_post_terminal_reactive_announce(
-                state,
-                post_terminal,
-                recovery_demand.as_ref(),
-            )
-            .await;
+            // One terminal-owned follow-up is enough. If it is refused or
+            // rate-limited, the provider-owned demand remains pending for a
+            // later explicit carrier/network/lifecycle event.
+            announce_result = maybe_reactive_announce_result(state);
         }
         state.emit(MeshEvent::Peer(PeerEvent::Dropped {
             network_id: state.network_id.clone(),
@@ -15553,7 +15491,7 @@ mod tests {
     #[cfg(feature = "transport-lab")]
     #[tokio::test]
     #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
-    async fn answerer_recovery_announces_before_native_close_without_local_intent() {
+    async fn answerer_recovery_announces_after_native_close_without_local_intent() {
         let (state, _signaling_in_rx, cmd_rx, _provider, _grant) =
             build_test_state_parts_metered_with_creation(
                 "answerer-recovery-announce",
@@ -15675,50 +15613,163 @@ mod tests {
         let mut positive_signaling_out_rx = positive_state
             .take_signaling_outbound_rx()
             .expect("the positive control takes the outbound receiver");
-        let recovering = "recovering-answerer";
-        let recovering_fixture = insert_promoted_peer(&positive_state, recovering).await;
+        let recovering_identity = crate::identity::Identity::ephemeral();
+        let recovering = recovering_identity.public_id().to_string();
+        let local_device =
+            crate::semantic::DeviceId::from_canonical_str(positive_state.identity.public_id())
+                .expect("positive local identity is canonical");
+        let recovering_device = crate::semantic::DeviceId::from_canonical_str(&recovering)
+            .expect("positive remote identity is canonical");
+        admit_canonical_test_fact(
+            &positive_state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: local_device,
+                joined: true,
+            },
+        );
+        let recovering_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                positive_state.mesh_context_id(),
+                recovering_device,
+                true,
+                Vec::new(),
+            ),
+            recovering_identity.signing_key(),
+        )
+        .expect("positive remote participation fact signs");
+        positive_state
+            .authoritative_fact_graph()
+            .write()
+            .admit(recovering_fact)
+            .expect("positive remote participation fact admits");
+        let recovering_fixture = insert_promoted_peer(&positive_state, &recovering).await;
+        assert!(
+            fence_admits(&positive_state, &recovering),
+            "positive control crosses the real promotion fence before arming recovery"
+        );
         let recovering_worker = recovering_fixture
             .peer
             .current_worker()
             .expect("recovering control exposes its answerer worker");
+        let recovering_owner = positive_state
+            .peers
+            .owner(&recovering)
+            .expect("recovering control exposes its exact owner")
+            .for_worker(Arc::clone(&recovering_worker));
+        let recovery =
+            prepare_answerer_recovery(&positive_state, &recovering_owner, &DropReason::IceFailed)
+                .expect("recovering control arms the exact answerer demand");
         let recovering_gate = recovering_worker.install_native_close_gate_for_test();
-        let (removed, opened_as) = remove_peer(&positive_state.peers, recovering)
+        let (removed, opened_as) = remove_peer(&positive_state.peers, &recovering)
             .expect("recovering answerer peer is removed");
         assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
+        let recovery = if Arc::ptr_eq(&removed, recovering_owner.connection()) {
+            publish_terminal_recovery(&positive_state, Some(recovery))
+        } else {
+            cancel_recovery_demand(Some(recovery));
+            None
+        };
         let drop_state = Arc::clone(&positive_state);
+        let drop_target = recovering.clone();
         let drop_task = tokio::spawn(async move {
-            finish_drop_peer_inner(
+            finish_drop_peer_inner_with_recovery(
                 &drop_state,
-                recovering,
+                &drop_target,
                 DropReason::IceFailed,
                 Some(removed),
                 opened_as,
                 false,
+                recovery,
             )
             .await
         });
         recovering_gate.wait_for_entry().await;
-        let announcement =
-            tokio::time::timeout(Duration::from_secs(1), positive_signaling_out_rx.recv())
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), positive_signaling_out_rx.recv())
                 .await
-                .expect("recoverable answerer announce arrives while close is gated")
-                .expect("the positive outbound receiver remains open");
-        assert!(matches!(announcement.value(), SignalingOutbound::Announce));
-        drop(announcement);
-        assert!(!positive_state.has_reconnect_intent(recovering));
+                .is_err(),
+            "recoverable answerer emits no recovery announce while native close is gated"
+        );
+        assert!(!positive_state.has_reconnect_intent(&recovering));
         recovering_gate.open();
         assert_eq!(
             drop_task.await.expect("recovering answerer drop joins"),
             ReactiveAnnounceResult::Sent
+        );
+        let announcement = positive_signaling_out_rx
+            .recv()
+            .await
+            .expect("the post-close recovery announce remains queued");
+        let observed_first_id = match announcement.value() {
+            SignalingOutbound::RecoveryAnnounce { id } => *id,
+            other => panic!("expected typed recovery announce, got {other:?}"),
+        };
+        drop(announcement);
+        assert_eq!(
+            positive_state.recovery_custody_snapshot_for_test(),
+            (false, true, true, false),
+            "post-close publication remains owned until a carrier admission"
+        );
+        let first_generation = positive_state
+            .recovery_generation_for_test()
+            .expect("post-close recovery captured a generation");
+        assert_eq!(
+            observed_first_id, first_generation,
+            "the outbound envelope carries the exact captured generation"
+        );
+        positive_state.settle_recovery_cohort(
+            first_generation,
+            crate::runtime::peer_session::RecoveryAttempt::Refused,
+        );
+        let fresh_generation = positive_state
+            .queue_recovery_announce()
+            .expect("refused recovery remains available for a fresh generation");
+        assert_ne!(
+            first_generation, fresh_generation,
+            "a refused generation cannot be reused after explicit re-publication"
+        );
+        let stale_instance = positive_state
+            .next_recovery_carrier_instance()
+            .expect("stale-generation control allocates a carrier instance");
+        assert_eq!(
+            positive_state.begin_recovery_for_carrier(first_generation, stale_instance),
+            None,
+            "a buffered id1 delivery cannot admit the queued id2 publication"
+        );
+        assert_eq!(
+            positive_state.begin_recovery_for_carrier(fresh_generation, stale_instance),
+            Some(fresh_generation),
+            "the exact queued id2 delivery admits only its own publication"
+        );
+        let fresh_announcement = positive_signaling_out_rx
+            .recv()
+            .await
+            .expect("fresh generation announce remains queued");
+        assert!(matches!(
+            fresh_announcement.value(),
+            SignalingOutbound::RecoveryAnnounce { id } if *id == fresh_generation
+        ));
+        drop(fresh_announcement);
+        positive_state.cancel_recovery_demands_for_device(&recovering);
+        assert_eq!(
+            positive_state.recovery_custody_snapshot_for_test(),
+            (false, false, false, false),
+            "successor cancellation detaches queued generation and carrier custody"
+        );
+        positive_state.cancel_all_recovery_demands();
+        assert_eq!(
+            positive_state.recovery_custody_snapshot_for_test(),
+            (false, false, false, false),
+            "shutdown cancellation remains idempotent after detachment"
         );
 
         drop(recovering_fixture._events);
         positive_state.shutdown().await;
 
         // A cooldown already occupied by an unrelated announce must not turn
-        // this exact recoverable Answerer terminal into a permanent no-op.
-        // The retry is joined by this same close task and therefore happens
-        // only after native terminal settlement.
+        // this exact recoverable Answerer terminal into a permanent no-op:
+        // recovery publication bypasses the ordinary presence floor and is
+        // attempted once after native terminal settlement.
         let (cooldown_state, _signaling_in_rx, cooldown_cmd_rx, _provider, _grant) =
             build_test_state_parts_metered("answerer-recovery-cooldown", None, 1, None);
         cooldown_state.park_command_receiver_for_test(cooldown_cmd_rx);
@@ -15726,9 +15777,38 @@ mod tests {
             .take_signaling_outbound_rx()
             .expect("the cooldown control takes the outbound receiver");
         *cooldown_state.last_reactive_announce_at.lock() = Some(Instant::now());
-        let cooldown_fixture = insert_promoted_peer(&cooldown_state, "cooldown-answerer").await;
+        let cooldown_identity = crate::identity::Identity::ephemeral();
+        let cooldown = cooldown_identity.public_id().to_string();
+        let cooldown_local_device =
+            crate::semantic::DeviceId::from_canonical_str(cooldown_state.identity.public_id())
+                .expect("cooldown local identity is canonical");
+        let cooldown_device = crate::semantic::DeviceId::from_canonical_str(&cooldown)
+            .expect("cooldown remote identity is canonical");
+        admit_canonical_test_fact(
+            &cooldown_state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: cooldown_local_device,
+                joined: true,
+            },
+        );
+        let cooldown_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                cooldown_state.mesh_context_id(),
+                cooldown_device,
+                true,
+                Vec::new(),
+            ),
+            cooldown_identity.signing_key(),
+        )
+        .expect("cooldown remote participation fact signs");
+        cooldown_state
+            .authoritative_fact_graph()
+            .write()
+            .admit(cooldown_fact)
+            .expect("cooldown remote participation fact admits");
+        let cooldown_fixture = insert_promoted_peer(&cooldown_state, &cooldown).await;
         assert!(
-            fence_admits(&cooldown_state, "cooldown-answerer"),
+            fence_admits(&cooldown_state, &cooldown),
             "cooldown control crosses the real promotion fence before arming recovery"
         );
         let cooldown_worker = cooldown_fixture
@@ -15737,14 +15817,14 @@ mod tests {
             .expect("cooldown control exposes its answerer worker");
         let cooldown_owner = cooldown_state
             .peers
-            .owner("cooldown-answerer")
+            .owner(&cooldown)
             .expect("cooldown control exposes its exact owner")
             .for_worker(Arc::clone(&cooldown_worker));
         let recovery =
             prepare_answerer_recovery(&cooldown_state, &cooldown_owner, &DropReason::IceFailed)
                 .expect("cooldown control arms the exact answerer recovery demand");
         let cooldown_gate = cooldown_worker.install_native_close_gate_for_test();
-        let (removed, opened_as) = remove_peer(&cooldown_state.peers, "cooldown-answerer")
+        let (removed, opened_as) = remove_peer(&cooldown_state.peers, &cooldown)
             .expect("cooldown answerer peer is removed");
         assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
         let recovery = if Arc::ptr_eq(&removed, cooldown_owner.connection()) {
@@ -15757,7 +15837,7 @@ mod tests {
         let cooldown_drop_task = tokio::spawn(async move {
             finish_drop_peer_inner_with_recovery(
                 &cooldown_drop_state,
-                "cooldown-answerer",
+                &cooldown,
                 DropReason::IceFailed,
                 Some(removed),
                 opened_as,
@@ -15785,7 +15865,10 @@ mod tests {
             .recv()
             .await
             .expect("the post-terminal cooldown announce remains queued");
-        assert!(matches!(announcement.value(), SignalingOutbound::Announce));
+        assert!(matches!(
+            announcement.value(),
+            SignalingOutbound::RecoveryAnnounce { .. }
+        ));
         drop(announcement);
         drop(cooldown_fixture._events);
         cooldown_state.shutdown().await;
@@ -21058,7 +21141,9 @@ mod tests {
                     sdp_mline_index: candidate.sdp_mline_index,
                     username_fragment: candidate.username_fragment,
                 }),
-                SignalingOutbound::Announce | SignalingOutbound::Leave => None,
+                SignalingOutbound::Announce
+                | SignalingOutbound::RecoveryAnnounce { .. }
+                | SignalingOutbound::Leave => None,
             };
             let Some(message) = message else {
                 continue;

@@ -87,6 +87,17 @@ jobs:
             turn_selected_session_authenticates_endpoints_before_bidirectional_data \
             -- --test-threads=1
 
+      # This is the real Linux-only TURN departure control. The test starts
+      # the repository's TURN service in-process, uses relay-only ICE, and is
+      # ignored by ordinary workspace runs because it owns native sockets.
+      # Keep the explicit ignored invocation here so Depart/DepartObserved is
+      # exercised honestly without changing compile behavior on other hosts.
+      - name: TURN-relayed authenticated departure
+        run: |
+          cargo test -p myownmesh-services --test turn_peer_leave \
+            authenticated_depart_observed_over_actual_turn \
+            -- --ignored --test-threads=1
+
       - name: Native connector replacement and cleanup
         run: |
           cargo test -p myownmesh-core --lib --features "transport-lab" \
