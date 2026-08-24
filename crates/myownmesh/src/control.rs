@@ -120,6 +120,13 @@ pub(crate) struct ControlHooks {
     /// left behind. Fired once, immediately after construction.
     #[cfg(test)]
     registry: Option<tokio::sync::oneshot::Sender<crate::ipc::ClientRegistry>>,
+    /// Replaces the mesh-issued registry for one production-shaped control.
+    ///
+    /// The override is test-only and per-serve. It lets a control fund the
+    /// exact task and join-node owners it will hold without enlarging the
+    /// process-wide mesh grant.
+    #[cfg(test)]
+    registry_override: Option<crate::ipc::ClientRegistry>,
     /// Pauses one connection task at the instant `EventsSubscribe` becomes a
     /// live stream.
     ///
@@ -567,6 +574,8 @@ async fn serve_with_hooks(
         realtime,
         supervisor,
     } = surface;
+    #[cfg(test)]
+    let mut hooks = hooks;
     // Read before the listener binds and kept for the whole accept loop. The
     // request it resolves on is a latched state, so a reset that lands between
     // this line and the first poll below is not a lost wake.
@@ -590,13 +599,22 @@ async fn serve_with_hooks(
     // went away. Taken before the listener binds, so a daemon that cannot fund
     // its own registry fails to start rather than accepting a connection it
     // cannot register.
+    #[cfg(test)]
+    let clients = if let Some(clients) = hooks.registry_override.take() {
+        clients
+    } else {
+        crate::ipc::ClientRegistry::new(
+            mesh.local_application_resource_scope()
+                .context("issue the IPC registry's local application resource scope")?,
+        )
+    };
+    #[cfg(not(test))]
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .context("issue the IPC registry's local application resource scope")?,
     );
     #[cfg(test)]
     let hooks = {
-        let mut hooks = hooks;
         if let Some(publish) = hooks.registry.take() {
             let _ = publish.send(clients.clone());
         }
@@ -3467,6 +3485,26 @@ mod terminal_shutdown_tests {
         }
     }
 
+    /// Exact private funding for the parked-RPC control's live owners: the
+    /// registry scope, its accepted connection task, and the retained join
+    /// list node. No process-wide task or connector headroom is borrowed.
+    fn parked_rpc_registry() -> crate::ipc::ClientRegistry {
+        let registry = crate::ipc::clients::registry_fixture_claim(0, 0, 0)
+            .expect("the parked-RPC registry scope claim is representable");
+        let task = crate::ipc::clients::task_reservation_planning_charge_for_test()
+            .expect("the parked-RPC task reservation is representable");
+        let join_node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the parked-RPC join node claim is representable");
+        let join_node =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(join_node)
+                .expect("the parked-RPC join-node reservation is representable");
+        let grant = registry
+            .checked_add(task)
+            .and_then(|grant| grant.checked_add(join_node))
+            .expect("the parked-RPC exact registry grant is representable");
+        crate::ipc::ClientRegistry::over_grant(grant)
+    }
+
     #[tokio::test]
     async fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
         let _fixture = crate::exclusive_connector_fixture().await;
@@ -3543,6 +3581,7 @@ mod terminal_shutdown_tests {
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
+                registry_override: Some(parked_rpc_registry()),
                 at_events_stream_entry: None,
                 before_rpc_call: Some(rpc_barrier),
                 before_begin_closing: Some(shutdown_barrier),
@@ -3708,6 +3747,7 @@ mod terminal_shutdown_tests {
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
+                registry_override: None,
                 at_events_stream_entry: None,
                 before_rpc_call: None,
                 before_begin_closing: None,
@@ -3861,6 +3901,7 @@ mod terminal_shutdown_tests {
             ControlHooks {
                 before_events_subscribe_commit: None,
                 registry: Some(registry_tx),
+                registry_override: None,
                 at_events_stream_entry: Some(barrier),
                 before_rpc_call: None,
                 before_begin_closing: None,
@@ -4022,6 +4063,7 @@ mod terminal_shutdown_tests {
             ControlHooks {
                 before_events_subscribe_commit: Some(barrier),
                 registry: Some(registry_tx),
+                registry_override: None,
                 at_events_stream_entry: None,
                 before_rpc_call: None,
                 before_begin_closing: None,
