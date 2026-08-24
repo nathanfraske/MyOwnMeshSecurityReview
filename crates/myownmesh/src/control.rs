@@ -3480,6 +3480,15 @@ mod terminal_shutdown_tests {
             .join(network_config("far-control", "terminal-rpc-mesh"))
             .await
             .expect("far network joins");
+        let mut near_events = near_mesh.events();
+        let mut far_events = far_mesh.events();
+        let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+        myownmesh_core::engine::attach_local(&near.state(), &_local_broker);
+        myownmesh_core::engine::attach_local(&far.state(), &_local_broker);
+        let near_device = near_mesh.device_id();
+        let far_device = far_mesh.device_id();
+        crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+        crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
         let (handler_entered_tx, handler_entered_rx) = tokio::sync::oneshot::channel();
         let handler_entered = std::sync::Mutex::new(Some(handler_entered_tx));
         let _parked_handler = far
