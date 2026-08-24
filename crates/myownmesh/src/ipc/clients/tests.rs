@@ -1607,6 +1607,84 @@ async fn the_closing_signal_resolves_for_a_task_that_arrives_after_it() {
         .expect("a late arrival sees the state, not the missed wake");
 }
 
+/// The process test grant names IPC task capacity separately from connector
+/// structural capacity.
+///
+/// The connector floor is held first, then the whole named IPC task cohort is
+/// held beside it. The next task refuses for the worker dimension, proving the
+/// cohort is finite and that it did not silently consume a connector slot.
+/// Dropping both owners must return the private provider to the exact baseline;
+/// this control never reads or mutates the process-wide fixture provider.
+#[test]
+fn shared_provider_task_cohort_is_admitted_without_borrowing_connector_floor() {
+    let structural = myownmesh_core::connector_resource_structural_claims();
+    let connector = structural.connector_opening();
+    let connector_charge =
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(connector)
+            .expect("the connector opening reservation is representable");
+    let task = super::task_claim_for_test().expect("the IPC task claim is representable");
+    let task_charge = super::task_reservation_planning_charge_for_test()
+        .expect("the IPC task reservation is representable");
+    let grant = myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_add(connector_charge)
+        .and_then(|grant| {
+            grant.checked_add(
+                task_charge
+                    .checked_scale(crate::TEST_IPC_TASKS)
+                    .expect("the IPC task cohort charge is representable"),
+            )
+        })
+        .expect("the connector and IPC task grant is representable");
+    let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+    let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+        .expect("the private grant funds its process scope");
+    let scope = port.process_scope();
+    let baseline = provider.in_use();
+
+    let connector_lease = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            connector,
+        )
+        .expect("the connector floor is admitted before IPC tasks");
+    let mut tasks = Vec::new();
+    for index in 0..crate::TEST_IPC_TASKS {
+        tasks.push(
+            port.acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                task,
+            )
+            .unwrap_or_else(|error| panic!("IPC task {index} must be admitted: {error:?}")),
+        );
+    }
+    assert_eq!(tasks.len(), crate::TEST_IPC_TASKS as usize);
+    let refusal = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            task,
+        )
+        .expect_err("the N+1 IPC task exceeds its named finite cohort");
+    assert!(
+        matches!(
+            refusal,
+            myownmesh_core::ResourceUnavailable::Pressure(pressure)
+                if pressure.dimension == myownmesh_core::ResourceClass::WorkerOrTask
+        ),
+        "the refusal is IPC task pressure, not connector-floor pressure: {refusal:?}"
+    );
+
+    drop(tasks);
+    drop(connector_lease);
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "dropping the connector and IPC task owners returns the exact baseline"
+    );
+}
+
 // ---- off-node retention -------------------------------------------------
 
 /// A long coordinate costs more than a short one, at every record shape.

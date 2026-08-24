@@ -522,6 +522,28 @@ fn task_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
     ])
 }
 
+/// The exact one-task claim exposed to the daemon test grant and its controls.
+///
+/// Keeping this seam beside [`task_claim`] makes the process-wide fixture pay
+/// for the same worker and residual terms that [`ClientRegistry::lease_task`]
+/// acquires, rather than maintaining a second formula in the crate root.
+#[cfg(test)]
+pub(crate) fn task_claim_for_test() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    task_claim()
+}
+
+/// One IPC task's exact provider reservation charge for test-grant planning.
+///
+/// The provider's own planning helper adds the reservation record that exists
+/// when the task lease is held; callers must fund that record before acquiring
+/// the task claim, just as they do for every other finite test reservation.
+#[cfg(test)]
+pub(crate) fn task_reservation_planning_charge_for_test(
+) -> Result<ResourceClaim, myownmesh_core::ResourceUnavailable> {
+    let claim = task_claim().expect("the fixed IPC task claim is representable");
+    myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
 /// [`task_claim`] plus the heap a task's captured state holds for its lifetime.
 ///
 /// Additive rather than a second claim so the task and the state it carries are
