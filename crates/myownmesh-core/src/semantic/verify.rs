@@ -58,6 +58,8 @@ pub enum SemanticError {
     UnauthorizedAttestation,
     #[error("role grant author is not currently authorized")]
     UnauthorizedRoleGrant,
+    #[error("membership admit author is not currently authorized")]
+    UnauthorizedMembershipAdmit,
     #[error("eviction evidence is not a valid same-target authorized attestation")]
     InvalidEvictionEvidence,
     #[error("self-stand-down does not cite a valid same-target eviction proof")]
@@ -94,6 +96,10 @@ pub(crate) fn body_advances_cell(body: &FactBody, cell: &ExclusiveCell) -> bool 
 pub(crate) fn projected_role(body: &FactBody, subject: &super::DeviceId) -> Option<Role> {
     match body {
         FactBody::RoleGrant { target, role } if target == subject => Some(*role),
+        // A revoke advances the role cell but carries no role value.  In
+        // particular, callers must not fall back to the bootstrap Owner after
+        // selecting this proposition.
+        FactBody::RoleRevoke { target } if target == subject => None,
         _ => None,
     }
 }
@@ -101,6 +107,7 @@ pub(crate) fn projected_role(body: &FactBody, subject: &super::DeviceId) -> Opti
 pub(crate) fn projected_membership(body: &FactBody, subject: &super::DeviceId) -> Option<bool> {
     match body {
         FactBody::Evict { target } if target == subject => Some(false),
+        FactBody::MembershipAdmit { target } if target == subject => Some(true),
         _ => None,
     }
 }

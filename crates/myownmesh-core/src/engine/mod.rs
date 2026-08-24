@@ -555,6 +555,13 @@ pub(crate) async fn run_driver(
     // embedding app that missed it can clean up), not spend another
     // session redialing into denials.
     governance::refresh_self_evicted(&state);
+    if state.self_evicted.load(std::sync::atomic::Ordering::SeqCst) {
+        // A terminal recovery cohort is a carrier-owned retry, not a
+        // re-admission mechanism.  A persisted self-eviction therefore
+        // releases it at startup; only a later signed lifecycle event may
+        // make the device live again.
+        state.cancel_all_recovery_demands();
+    }
     // Surface the ICE-server configuration so users can confirm at
     // a glance whether they have any relay coverage. Mirrors
     // MyOwnLLM's pattern: when peers get stuck at ICE-checking with
@@ -2009,6 +2016,49 @@ fn is_recoverable_terminal(reason: &DropReason) -> bool {
     )
 }
 
+/// Whether the signed state still permits a terminal recovery for this peer.
+/// Recovery is not an admission path: a stood-down local device, an evicted
+/// peer, or a peer that no longer satisfies the canonical policy must not keep
+/// provider custody or acquire a reconnect intent.  The graph and bootstrap
+/// are the same authority pair used by the handshake fence.
+pub(crate) fn terminal_recovery_policy_allows(state: &Arc<NetworkState>, device_id: &str) -> bool {
+    if state.self_evicted.load(std::sync::atomic::Ordering::SeqCst)
+        || governance::log_evicted(state, device_id)
+    {
+        return false;
+    }
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    governance::canonical_policy_admits_from(
+        state.verified_bootstrap(),
+        &graph,
+        state.identity.public_id(),
+        device_id,
+    )
+}
+
+/// Reconcile terminal recovery at an explicit canonical lifecycle boundary.
+/// This is intentionally synchronous and subject-scoped: fact admission or
+/// self-eviction handling calls it for the exact affected device, rather than
+/// relying on elapsed time to discover that a retry is no longer admissible.
+pub(crate) fn reconcile_terminal_recovery_policy(
+    state: &Arc<NetworkState>,
+    affected_device_id: &str,
+) {
+    if terminal_recovery_policy_allows(state, affected_device_id) {
+        return;
+    }
+    if affected_device_id == state.identity.public_id() {
+        state.cancel_all_recovery_demands();
+        for device_id in state.flush_reconnect_intents() {
+            state.clear_reconnect_intent(&device_id);
+        }
+    } else {
+        state.cancel_recovery_demands_for_device(affected_device_id);
+        state.clear_reconnect_intent(affected_device_id);
+    }
+}
+
 /// Arm recovery before a terminal registry operation retires the promoted
 /// logical record. The returned handle is the exact provider custody carried
 /// through native close; the owner token prevents a stale callback from arming
@@ -2023,7 +2073,7 @@ fn prepare_answerer_recovery(
 )> {
     if !is_recoverable_terminal(reason)
         || state.is_sticky(owner.device_id())
-        || governance::log_evicted(state, owner.device_id())
+        || !terminal_recovery_policy_allows(state, owner.device_id())
         || !owner
             .worker()
             .is_some_and(|worker| worker.role() == Role::Answerer)
@@ -7362,7 +7412,16 @@ async fn finish_drop_peer_inner_with_recovery(
             warn!(%error, "peer cleanup did not complete successfully");
         }
         state.peers.complete_removed_close(&peer);
-        if recovery.is_some() && announce_result != ReactiveAnnounceResult::Sent {
+        // Policy can change while native close is in flight.  Revalidate at
+        // the terminal boundary and detach the exact provider-owned cohort;
+        // this path must never turn a stale terminal handle into admission.
+        let policy_allows_after_close =
+            recovery.is_some() && terminal_recovery_policy_allows(state, device_id);
+        if recovery.is_some() && !policy_allows_after_close {
+            state.cancel_recovery_demands_for_device(device_id);
+            state.clear_reconnect_intent(device_id);
+        }
+        if policy_allows_after_close && announce_result != ReactiveAnnounceResult::Sent {
             // One terminal-owned follow-up is enough. If it is refused or
             // rate-limited, the provider-owned demand remains pending for a
             // later explicit carrier/network/lifecycle event.
@@ -15750,6 +15809,19 @@ mod tests {
             SignalingOutbound::RecoveryAnnounce { id } if *id == fresh_generation
         ));
         drop(fresh_announcement);
+        // The pending generation is deliberately non-empty here. A
+        // self-eviction arriving after terminal publication must cancel the
+        // provider-owned cohort rather than leave a retry that could act as
+        // re-admission.
+        positive_state
+            .self_evicted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        reconcile_terminal_recovery_policy(&positive_state, &recovering);
+        assert_eq!(
+            positive_state.recovery_custody_snapshot_for_test(),
+            (false, false, false, false),
+            "stand-down cancels an already queued terminal recovery cohort"
+        );
         positive_state.cancel_recovery_demands_for_device(&recovering);
         assert_eq!(
             positive_state.recovery_custody_snapshot_for_test(),
@@ -15907,6 +15979,10 @@ mod tests {
         assert!(
             governance::log_evicted(&state, &evicted),
             "seed must make the target read as evicted"
+        );
+        assert!(
+            !terminal_recovery_policy_allows(&state, &evicted),
+            "canonical policy-negative peers cannot arm terminal recovery"
         );
         assert!(
             !governance::log_evicted(&state, &live),

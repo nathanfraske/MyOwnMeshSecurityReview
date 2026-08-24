@@ -67,6 +67,10 @@ impl std::hash::Hash for RelaySessionId {
 pub struct DeliveryRetention {
     pub encoded_event_bytes: usize,
     pub structural_entry_bytes: usize,
+    /// Exact allocation size of the provider-owned relay entry node. This is
+    /// the canonical per-emission entry charge; the legacy `*_map_growth`
+    /// field below is an equal compatibility alias, not an additional charge.
+    pub relay_entry_bytes: usize,
     /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
     /// RelayEntry>>`, reserved before the relay node is inserted.
     pub relay_map_growth_bytes: usize,
@@ -76,6 +80,9 @@ pub struct DeliveryRetention {
     pub attempt_key_bytes: usize,
     /// Exact allocation size of `Box<DeliveryMapNode<String, AttemptEntry>>`,
     /// reserved before the attempt node is inserted.
+    pub attempt_entry_bytes: usize,
+    /// Compatibility alias for `attempt_entry_bytes`; providers must charge
+    /// one or the other, never both.
     pub attempt_map_growth_bytes: usize,
 }
 
@@ -84,6 +91,9 @@ pub struct DeliveryRetention {
 pub struct SessionRetention {
     pub session_record_bytes: usize,
     pub session_set_node_bytes: usize,
+    /// Exact allocation size of the provider-owned session entry node. The
+    /// existing growth field is an equal compatibility alias.
+    pub session_entry_bytes: usize,
     /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
     /// SessionEntry>>`, reserved before the session node is inserted.
     pub session_set_growth_bytes: usize,
@@ -338,26 +348,30 @@ impl DeliveryRetention {
         counter.write_all(b"[\"EVENT\",").expect("counting writer");
         serde_json::to_writer(&mut counter, event).expect("event serializes");
         counter.write_all(b"]").expect("counting writer");
+        let relay_entry_bytes = std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>();
+        let attempt_entry_bytes = std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>();
         Self {
             encoded_event_bytes: counter.0,
             structural_entry_bytes: std::mem::size_of::<RelayEntry>(),
-            relay_map_growth_bytes: std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>(
-            ),
+            relay_entry_bytes,
+            relay_map_growth_bytes: relay_entry_bytes,
             attempt_record_bytes: std::mem::size_of::<AttemptEntry>(),
             attempt_key_bytes: event.id.len(),
-            attempt_map_growth_bytes: std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>(),
+            attempt_entry_bytes,
+            attempt_map_growth_bytes: attempt_entry_bytes,
         }
     }
 }
 
 impl SessionRetention {
     fn exact() -> Self {
+        let session_entry_bytes =
+            std::mem::size_of::<DeliveryMapNode<RelaySessionId, SessionEntry>>();
         Self {
             session_record_bytes: std::mem::size_of::<SessionEntry>(),
             session_set_node_bytes: std::mem::size_of::<RelaySessionId>(),
-            session_set_growth_bytes: std::mem::size_of::<
-                DeliveryMapNode<RelaySessionId, SessionEntry>,
-            >(),
+            session_entry_bytes,
+            session_set_growth_bytes: session_entry_bytes,
         }
     }
 }
@@ -2114,10 +2128,23 @@ mod tests {
             std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>()
         );
         assert_eq!(
+            retention.attempt_entry_bytes,
+            retention.attempt_map_growth_bytes
+        );
+        assert_eq!(
             retention.relay_map_growth_bytes,
             std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>()
         );
-        assert!(SessionRetention::exact().session_set_growth_bytes > 0);
+        assert_eq!(
+            retention.relay_entry_bytes,
+            retention.relay_map_growth_bytes
+        );
+        let session_retention = SessionRetention::exact();
+        assert!(session_retention.session_entry_bytes > 0);
+        assert_eq!(
+            session_retention.session_entry_bytes,
+            session_retention.session_set_growth_bytes
+        );
         let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
             live: Arc::clone(&live),
             calls: Arc::clone(&calls),

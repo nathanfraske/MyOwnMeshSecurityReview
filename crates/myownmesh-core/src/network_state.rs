@@ -156,14 +156,14 @@ pub enum TransitionVariant {
     KindChange { to: NetworkKind },
     /// Grant or change a peer's role.
     RoleGrant { target: String, role: Role },
-    /// Drop a peer's role tag back to `Member` (or remove from the
-    /// closed-network's controlling set).
+    /// Remove a peer's effective role. A durable demotion to `Member` is an
+    /// explicit `RoleGrant { role: Member }` instead.
     RoleRevoke { target: String },
     /// Evict a peer from the closed network entirely: drop its role
     /// *and* remove it from the roster, so every member that ratifies
-    /// this transition stops authorising it. Where [`Self::RoleRevoke`]
-    /// only demotes (the peer stays a `Member`), an evict is the
-    /// propagating removal — the lost/stolen-device kick. Authority
+    /// this transition stops authorising it. An evict additionally records
+    /// membership removal and is the propagating lost/stolen-device kick.
+    /// Authority
     /// mirrors revoke: over a member or controller needs a
     /// controller/owner, over an owner needs an owner.
     Evict { target: String },
@@ -325,6 +325,15 @@ pub struct NetworkState {
     /// Compatibility role projection derived from the canonical FactGraph;
     /// this map is not an authority source.
     pub roles: std::collections::BTreeMap<String, Role>,
+    /// Effective self-authored Open participation, when the canonical graph's
+    /// project policy is Open. This is an observation, never an authority
+    /// input for canonical admission.
+    #[serde(default)]
+    pub open_participation: std::collections::BTreeMap<String, bool>,
+    /// Devices stood down by canonical eviction/stand-down evidence. This is
+    /// a compatibility observation and is not consulted to authorize facts.
+    #[serde(default)]
+    pub stood_down: std::collections::BTreeSet<String>,
     /// Legacy transition records retained only for migration serialization;
     /// they are never an engine admission source.
     pub transitions: Vec<Transition>,
@@ -357,6 +366,8 @@ impl NetworkState {
             network_id: network_id.to_string(),
             kind: NetworkKind::Open,
             roles: Default::default(),
+            open_participation: Default::default(),
+            stood_down: Default::default(),
             transitions: Vec::new(),
             member_log: Vec::new(),
             pending: Vec::new(),
@@ -374,9 +385,30 @@ impl NetworkState {
         kind: NetworkKind,
         roles: std::collections::BTreeMap<String, Role>,
     ) -> Self {
+        Self::from_canonical_evaluator_projection(
+            network_id,
+            kind,
+            roles,
+            Default::default(),
+            Default::default(),
+        )
+    }
+
+    /// Build a compatibility snapshot from the one canonical evaluator's
+    /// effective role, participation, and stand-down observations. Legacy
+    /// logs, pending proposals, and split records remain empty.
+    pub fn from_canonical_evaluator_projection(
+        network_id: &str,
+        kind: NetworkKind,
+        roles: std::collections::BTreeMap<String, Role>,
+        open_participation: std::collections::BTreeMap<String, bool>,
+        stood_down: std::collections::BTreeSet<String>,
+    ) -> Self {
         let mut state = Self::empty_for(network_id);
         state.kind = kind;
         state.roles = roles;
+        state.open_participation = open_participation;
+        state.stood_down = stood_down;
         state
     }
 
@@ -385,11 +417,11 @@ impl NetworkState {
         self
     }
 
-    /// Role for a peer in this network. Returns [`Role::Member`]
-    /// when the peer is not in the `roles` map (the default for
-    /// open networks and for un-promoted members on closed ones).
-    pub fn role_of(&self, pubkey: &str) -> Role {
-        self.roles.get(pubkey).copied().unwrap_or(Role::Member)
+    /// Role for a peer in this compatibility snapshot. An absent role is not
+    /// an implicit Member: it means the canonical evaluator has no effective
+    /// role for that subject.
+    pub fn role_of(&self, pubkey: &str) -> Option<Role> {
+        self.roles.get(pubkey).copied()
     }
 }
 
@@ -603,7 +635,11 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
         }
 
         (TransitionVariant::RoleRevoke { target }, NetworkKind::Closed) => {
-            let target_role = state_before.role_of(target);
+            let Some(target_role) = state_before.role_of(target) else {
+                return Err(Error::Protocol(
+                    "revoke target has no effective canonical role".into(),
+                ));
+            };
             // Demotion requires authority at the *target's* current tier: an
             // owner demotes an owner; a controller (or owner) demotes a
             // controller or a member. Flat peer authority — no consensus round.
@@ -633,7 +669,11 @@ pub fn verify_quorum(state_before: &NetworkState, transition: &Transition) -> Re
             // Eviction authority is authority over the *target's* current tier —
             // identical to revoke, since an evict subsumes a revoke (it also
             // strips roster membership).
-            let target_role = state_before.role_of(target);
+            let Some(target_role) = state_before.role_of(target) else {
+                return Err(Error::Protocol(
+                    "evict target has no effective canonical role".into(),
+                ));
+            };
             match target_role {
                 Role::Owner => {
                     if !signers.iter().any(|s| owners.contains(s)) {
@@ -1253,7 +1293,7 @@ mod tests {
         assert!(verify_quorum(&state, &close(vec![])).is_err());
 
         let after = apply_transition(state, &close(vec![pk_alice.clone()]));
-        assert_eq!(after.role_of(&pk_alice), Role::Owner);
+        assert_eq!(after.role_of(&pk_alice), Some(Role::Owner));
     }
 
     #[test]
@@ -1467,7 +1507,7 @@ mod tests {
         };
         let after = apply_transition(s, &t);
         assert_eq!(after.kind, NetworkKind::Closed);
-        assert_eq!(after.role_of(&pk), Role::Owner);
+        assert_eq!(after.role_of(&pk), Some(Role::Owner));
         assert_eq!(after.transitions.len(), 1);
     }
 
@@ -1479,7 +1519,7 @@ mod tests {
         let mut state = NetworkState::empty_for("net-1");
         state.kind = NetworkKind::Closed;
         state.roles.insert(owner.clone(), Role::Owner);
-        // `target` is a plain member (absent from roles → defaults Member).
+        state.roles.insert(target.clone(), Role::Member);
 
         // A member-only signer can't evict.
         let t_bad = Transition {
@@ -1519,7 +1559,8 @@ mod tests {
         state.roles.insert(other_owner.clone(), Role::Owner);
         state.roles.insert(manager.clone(), Role::Controller);
         state.roles.insert(other_manager.clone(), Role::Controller);
-        // `member` / `other_member` are absent → default Member.
+        state.roles.insert(member.clone(), Role::Member);
+        state.roles.insert(other_member.clone(), Role::Member);
 
         let can_evict = |signer: &str, target: &str| {
             verify_quorum(
@@ -1577,7 +1618,7 @@ mod tests {
         };
         let after = apply_transition(s, &t);
         // Role gone (roster removal is the engine's job, tested there).
-        assert_eq!(after.role_of("alice"), Role::Member);
+        assert_eq!(after.role_of("alice"), None);
         assert!(!after.roles.contains_key("alice"));
         assert_eq!(after.transitions.len(), 1);
     }
@@ -1596,7 +1637,7 @@ mod tests {
             signatures: vec![String::new()],
         };
         let after = apply_transition(s, &t);
-        assert_eq!(after.role_of("alice"), Role::Controller);
+        assert_eq!(after.role_of("alice"), Some(Role::Controller));
     }
 
     #[test]
@@ -1648,8 +1689,8 @@ mod tests {
         let state = verify_log(net, &[t0, t1]).expect("a well-formed log verifies");
         assert_eq!(state.kind, NetworkKind::Closed);
         // The whole fleet can re-derive *who the owner is* from the log alone.
-        assert_eq!(state.role_of(&owner), Role::Owner);
-        assert_eq!(state.role_of(&member), Role::Controller);
+        assert_eq!(state.role_of(&owner), Some(Role::Owner));
+        assert_eq!(state.role_of(&member), Some(Role::Controller));
         assert_eq!(state.transitions.len(), 2);
     }
 

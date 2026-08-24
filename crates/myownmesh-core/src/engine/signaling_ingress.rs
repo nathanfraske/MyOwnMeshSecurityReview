@@ -40,7 +40,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 use tracing::{trace, warn};
@@ -53,7 +53,10 @@ use crate::resource::{
 };
 use crate::transport::LocalIceCandidate;
 
-use super::state::{SignalingInbound, SignalingOutbound};
+use super::state::{
+    NetworkState, RecoveryCarrierInstance, RecoveryPublishId, SignalingEmissionId,
+    SignalingInbound, SignalingOutbound,
+};
 use crate::runtime::peer_session::DedupToken;
 
 /// Which carrier observed a signaling message.
@@ -124,6 +127,265 @@ impl SignalingCarrier {
 /// preference. The only question it answers is "same attach?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CarrierInstance(u64);
+
+/// Exact lifecycle custody for one carrier attach.
+///
+/// The bridge records only the recovery generations and signaling attempts it
+/// actually presents to this instance. Dropping the attach settles those
+/// exact records as refusals; it never searches by device, carrier kind, or
+/// URL. The state-side owner remains authoritative for stale-generation and
+/// successor checks.
+pub(crate) struct CarrierInstanceGuard {
+    instance: Option<RecoveryCarrierInstance>,
+    state: Weak<NetworkState>,
+    scope: Option<LocalApplicationResourceScope>,
+    attempts: Mutex<Option<Box<GuardedAttempt>>>,
+    recoveries: Mutex<Option<Box<GuardedRecovery>>>,
+}
+
+struct GuardedAttempt {
+    emission: SignalingEmissionId,
+    attempt: String,
+    event_id: Option<[u8; 32]>,
+    _lease: ResourceLease,
+    next: Option<Box<GuardedAttempt>>,
+}
+
+struct GuardedRecovery {
+    id: RecoveryPublishId,
+    _lease: ResourceLease,
+    next: Option<Box<GuardedRecovery>>,
+}
+
+impl CarrierInstanceGuard {
+    pub(crate) fn noop(_instance: Option<RecoveryCarrierInstance>) -> Arc<Self> {
+        Arc::new(Self {
+            instance: None,
+            state: Weak::new(),
+            scope: None,
+            attempts: Mutex::new(None),
+            recoveries: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn for_state(
+        state: &Arc<NetworkState>,
+        instance: Option<RecoveryCarrierInstance>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            instance,
+            state: Arc::downgrade(state),
+            scope: state.local_application_resource_scope().ok(),
+            attempts: Mutex::new(None),
+            recoveries: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn track_attempt(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        if attempt.is_empty() {
+            return false;
+        }
+        let mut attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.emission == emission {
+                return true;
+            }
+            cursor = known.next.as_deref();
+        }
+        let Some(scope) = self.scope.as_ref() else {
+            return false;
+        };
+        let bytes = std::mem::size_of::<GuardedAttempt>()
+            .checked_add(attempt.len())
+            .and_then(|bytes| u64::try_from(bytes).ok());
+        let Some(bytes) = bytes else {
+            return false;
+        };
+        let Ok(claim) = ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ]) else {
+            return false;
+        };
+        let Ok(lease) = scope.acquire(claim) else {
+            return false;
+        };
+        let mut node = Box::new(GuardedAttempt {
+            emission,
+            attempt: attempt.to_owned(),
+            event_id: None,
+            _lease: lease,
+            next: None,
+        });
+        node.next = attempts.take();
+        *attempts = Some(node);
+        true
+    }
+
+    pub(crate) fn settle_attempt(&self, emission: SignalingEmissionId) {
+        let mut attempts = self.attempts.lock();
+        let mut link = &mut *attempts;
+        loop {
+            if link
+                .as_ref()
+                .is_some_and(|known| known.emission == emission)
+            {
+                let mut removed = link.take().expect("matched emission custody");
+                *link = removed.next.take();
+                return;
+            }
+            match link.as_mut() {
+                Some(known) => link = &mut known.next,
+                None => return,
+            }
+        }
+    }
+
+    pub(crate) fn emission_for_attempt(&self, attempt: &str) -> Option<SignalingEmissionId> {
+        let attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.attempt == attempt {
+                return Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        None
+    }
+
+    pub(crate) fn bind_event_id(
+        &self,
+        attempt: &str,
+        event_id: &str,
+    ) -> Option<SignalingEmissionId> {
+        let key = event_key(event_id)?;
+        let mut attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.attempt == attempt {
+                if known.event_id.is_some_and(|existing| existing != key) {
+                    cursor = known.next.as_deref_mut();
+                    continue;
+                }
+                known.event_id = Some(key);
+                return Some(known.emission);
+            }
+            cursor = known.next.as_deref_mut();
+        }
+        None
+    }
+
+    pub(crate) fn emission_for_event(
+        &self,
+        attempt: &str,
+        event_id: &str,
+    ) -> Option<SignalingEmissionId> {
+        let key = event_key(event_id)?;
+        let attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.attempt == attempt && known.event_id == Some(key) {
+                return Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        None
+    }
+
+    pub(crate) fn track_recovery(&self, id: RecoveryPublishId) -> bool {
+        let mut recoveries = self.recoveries.lock();
+        let mut cursor = recoveries.as_deref();
+        while let Some(known) = cursor {
+            if known.id == id {
+                return true;
+            }
+            cursor = known.next.as_deref();
+        }
+        let Some(scope) = self.scope.as_ref() else {
+            return false;
+        };
+        let Ok(claim) = ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                u64::try_from(std::mem::size_of::<GuardedRecovery>()).unwrap_or(u64::MAX),
+            ),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ]) else {
+            return false;
+        };
+        let Ok(lease) = scope.acquire(claim) else {
+            return false;
+        };
+        let mut node = Box::new(GuardedRecovery {
+            id,
+            _lease: lease,
+            next: None,
+        });
+        node.next = recoveries.take();
+        *recoveries = Some(node);
+        true
+    }
+
+    pub(crate) fn settle_recovery(&self, id: RecoveryPublishId) {
+        let mut recoveries = self.recoveries.lock();
+        let mut link = &mut *recoveries;
+        loop {
+            if link.as_ref().is_some_and(|known| known.id == id) {
+                let mut removed = link.take().expect("matched recovery custody");
+                *link = removed.next.take();
+                return;
+            }
+            match link.as_mut() {
+                Some(known) => link = &mut known.next,
+                None => return,
+            }
+        }
+    }
+}
+
+fn event_key(event_id: &str) -> Option<[u8; 32]> {
+    let bytes = event_id.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut key = [0u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        key[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(key)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+impl Drop for CarrierInstanceGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut recoveries = std::mem::take(&mut *self.recoveries.lock());
+        while let Some(mut recovery) = recoveries {
+            recoveries = recovery.next.take();
+            if let Some(instance) = self.instance {
+                state.record_recovery_carrier(recovery.id, instance, false);
+            }
+        }
+        let mut attempts = std::mem::take(&mut *self.attempts.lock());
+        if let Some(instance) = self.instance {
+            while let Some(mut attempt) = attempts {
+                attempts = attempt.next.take();
+                state.record_carrier_emission(attempt.emission, &attempt.attempt, instance, false);
+            }
+        }
+    }
+}
 
 /// How a carrier came by the device id in a presence or withdrawal report.
 ///
@@ -680,11 +942,43 @@ impl SignalingRuntime {
     /// The receipt is minted here and nowhere else, which is what makes it a
     /// receipt: a pump cannot invent an instance, and two attaches of the same
     /// carrier are distinguishable without either of them naming anything.
+    #[cfg(test)]
     pub(crate) fn attach(runtime: &Arc<Self>, carrier: SignalingCarrier) -> CarrierAttach {
+        Self::attach_with_guard(runtime, carrier, Self::noop_guard(runtime))
+    }
+
+    pub(crate) fn attach_for_state(
+        runtime: &Arc<Self>,
+        carrier: SignalingCarrier,
+        state: &Arc<NetworkState>,
+        recovery_instance: Option<RecoveryCarrierInstance>,
+    ) -> CarrierAttach {
+        let instance = CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed));
+        CarrierAttach {
+            carrier,
+            instance,
+            runtime: Arc::clone(runtime),
+            guard: CarrierInstanceGuard::for_state(state, recovery_instance),
+        }
+    }
+
+    #[cfg(test)]
+    fn noop_guard(runtime: &Arc<Self>) -> Arc<CarrierInstanceGuard> {
+        let _ = runtime;
+        CarrierInstanceGuard::noop(None)
+    }
+
+    #[cfg(test)]
+    fn attach_with_guard(
+        runtime: &Arc<Self>,
+        carrier: SignalingCarrier,
+        guard: Arc<CarrierInstanceGuard>,
+    ) -> CarrierAttach {
         CarrierAttach {
             carrier,
             instance: CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed)),
             runtime: Arc::clone(runtime),
+            guard,
         }
     }
 
@@ -877,6 +1171,7 @@ pub(crate) struct CarrierAttach {
     runtime: Arc<SignalingRuntime>,
     carrier: SignalingCarrier,
     instance: CarrierInstance,
+    guard: Arc<CarrierInstanceGuard>,
 }
 
 impl CarrierAttach {
@@ -938,6 +1233,10 @@ impl CarrierAttach {
     /// Hand an observation to the runtime. `false` once the engine side is gone.
     pub(crate) fn deliver(&self, observation: CarrierObservation) -> bool {
         self.runtime.deliver(observation)
+    }
+
+    pub(crate) fn guard(&self) -> Arc<CarrierInstanceGuard> {
+        Arc::clone(&self.guard)
     }
 }
 

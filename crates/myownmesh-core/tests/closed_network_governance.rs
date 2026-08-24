@@ -275,22 +275,22 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
 
         assert_eq!(
             alice_view.role_of(alice_id.public_id()),
-            Role::Owner,
+            Some(Role::Owner),
             "alice should be the verified bootstrap root Owner"
         );
         assert_eq!(
             bob_view.role_of(alice_id.public_id()),
-            Role::Owner,
+            Some(Role::Owner),
             "alice should remain the verified bootstrap root Owner on Bob's view"
         );
         assert_eq!(
             alice_view.role_of(bob_id.public_id()),
-            Role::Member,
+            Some(Role::Member),
             "bob should be the root-signed plain Member, not an Owner"
         );
         assert_eq!(
             bob_view.role_of(bob_id.public_id()),
-            Role::Member,
+            Some(Role::Member),
             "bob's own view agrees with the signed Member grant"
         );
 
@@ -396,7 +396,7 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     .await;
     assert_eq!(
         canonical_role(&bob_state, carol_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Carol must converge as a Member on Bob via the canonical fact graph"
     );
     shutdown_drivers([
@@ -569,7 +569,7 @@ async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     wait_for(
         "bob's governance view makes bob a controller",
         Duration::from_secs(10),
-        || canonical_role(&bob_state, bob_id.public_id()) == Role::Controller,
+        || canonical_role(&bob_state, bob_id.public_id()) == Some(Role::Controller),
     )
     .await;
 
@@ -595,7 +595,7 @@ async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     // legacy log representation is authoritative.
     assert_eq!(
         canonical_role(&bob_state, dave_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Dave's canonical member grant must project on the manager"
     );
 
@@ -609,7 +609,7 @@ async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     .await;
     assert_eq!(
         canonical_role(&alice_state, dave_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Dave converges as a Member on the owner via canonical fact exchange"
     );
     shutdown_drivers([
@@ -677,7 +677,7 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
     );
     assert_eq!(
         canonical_role(&bob_state, bob_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Bob's valid canonical membership must remain after the refusal"
     );
     assert!(rostered(&bob_state, bob_id.public_id()));
@@ -733,7 +733,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
     .expect("admit");
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
-        Role::Member,
+        Some(Role::Member),
         "the root-authored member grant must be visible before eviction"
     );
     propose(
@@ -749,6 +749,17 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
         !canonical_has_role(&alice_state, carol_pk.as_str()),
         "an evicted member must be absent from the projected membership"
     );
+    myownmesh_core::engine::governance::propose_membership_admit(&alice_state, &carol_pk, None)
+        .await
+        .expect("re-admit membership");
+    assert_eq!(
+        canonical_snapshot(&alice_state)
+            .roles
+            .get(&carol_pk)
+            .copied(),
+        None,
+        "membership admission alone must not grant a role"
+    );
     propose(
         &alice_state,
         TransitionVariant::RoleGrant {
@@ -762,7 +773,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
 
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
-        Role::Member,
+        Some(Role::Member),
         "a causal re-admit must supersede the evict head deterministically"
     );
     assert!(
@@ -835,7 +846,7 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     .expect("promote carol");
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
-        Role::Controller,
+        Some(Role::Controller),
         "carol should be a manager after promotion"
     );
 
@@ -857,7 +868,7 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     assert!(!canonical_has_role(&alice_state, &carol_pk));
     assert_eq!(
         canonical_role(&alice_state, alice_id.public_id()),
-        Role::Owner,
+        Some(Role::Owner),
         "evicting Carol must not remove the verified bootstrap root"
     );
     assert!(!rostered(&alice_state, &carol_pk));
@@ -915,7 +926,7 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     .expect("promote bob");
     assert_eq!(
         canonical_role(&alice_state, &bob_pk),
-        Role::Controller,
+        Some(Role::Controller),
         "Bob must be a Controller before the withdrawal"
     );
     // The mirrored roster tag should read controller on the authoring device.
@@ -926,11 +937,13 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     )
     .await;
 
-    // Withdraw Bob's role back to a plain member.
+    // Demote Bob explicitly back to a plain member. RoleRevoke means no role;
+    // a durable demotion is a canonical RoleGrant(Member).
     propose(
         &alice_state,
-        TransitionVariant::RoleRevoke {
+        TransitionVariant::RoleGrant {
             target: bob_pk.clone(),
+            role: Role::Member,
         },
         None,
     )
@@ -946,12 +959,12 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     );
     assert_eq!(
         canonical_role(&alice_state, &bob_pk),
-        Role::Member,
-        "the canonical projection must demote Bob to the default Member role"
+        Some(Role::Member),
+        "the canonical projection must retain Bob as an explicit Member"
     );
     assert!(
-        !canonical_has_role(&alice_state, &bob_pk),
-        "the revoked Controller cell must no longer project an authority role"
+        canonical_has_role(&alice_state, &bob_pk),
+        "the demotion grant must remain an explicit canonical role"
     );
     // ...and Bob stays in the roster — a withdraw demotes, it doesn't remove.
     assert!(
@@ -1195,8 +1208,8 @@ async fn two_owners_converge_their_rosters() {
         "both governance views make bob an owner",
         Duration::from_secs(10),
         || {
-            canonical_role(&alice_state, bob_id.public_id()) == Role::Owner
-                && canonical_role(&bob_state, bob_id.public_id()) == Role::Owner
+            canonical_role(&alice_state, bob_id.public_id()) == Some(Role::Owner)
+                && canonical_role(&bob_state, bob_id.public_id()) == Some(Role::Owner)
         },
     )
     .await;
@@ -1248,7 +1261,7 @@ async fn two_owners_converge_their_rosters() {
     );
     assert_eq!(
         canonical_role(&alice_state, carol_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Alice's local canonical fact must project Carol locally"
     );
     assert!(
@@ -1257,7 +1270,7 @@ async fn two_owners_converge_their_rosters() {
     );
     assert_eq!(
         canonical_role(&bob_state, dave_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Bob's local canonical fact must project Dave locally"
     );
     assert!(
@@ -1266,7 +1279,7 @@ async fn two_owners_converge_their_rosters() {
     );
     assert_eq!(
         canonical_role(&alice_state, dave_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Bob's remote canonical fact must reach Alice's role projection"
     );
     assert!(
@@ -1275,7 +1288,7 @@ async fn two_owners_converge_their_rosters() {
     );
     assert_eq!(
         canonical_role(&bob_state, carol_id.public_id()),
-        Role::Member,
+        Some(Role::Member),
         "Alice's remote canonical fact must reach Bob's role projection"
     );
     assert!(
@@ -1508,7 +1521,7 @@ fn canonical_snapshot(state: &Arc<NetworkState>) -> CanonicalNetworkState {
     myownmesh_core::engine::governance::snapshot(state)
 }
 
-fn canonical_role(state: &Arc<NetworkState>, id: &str) -> Role {
+fn canonical_role(state: &Arc<NetworkState>, id: &str) -> Option<Role> {
     canonical_snapshot(state).role_of(id)
 }
 

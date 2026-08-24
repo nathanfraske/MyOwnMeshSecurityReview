@@ -131,6 +131,32 @@ impl FactContent {
         )
     }
 
+    /// Construct canonical content from the graph's exact exclusive-cell
+    /// witness.  Callers may add authority/evidence support explicitly; body
+    /// support (evidence, attestation inputs, and cited resolution heads) is
+    /// included automatically.  This prevents an unrelated current graph
+    /// fact from silently becoming part of the candidate's causal past.
+    pub fn from_authoring_witness<I>(
+        graph: &super::FactGraph,
+        body: FactBody,
+        witness: &super::causal::AuthoringWitness,
+        support: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = FactId>,
+    {
+        let mut parents = witness.clone().into_parents();
+        parents.extend(body.causal_support());
+        parents.extend(support);
+        Self::new(
+            body.domain(),
+            graph.context_id(),
+            body,
+            witness.author().clone(),
+            parents,
+        )
+    }
+
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = Encoder::new();
         out.tag("myownmesh-semantic-v4");

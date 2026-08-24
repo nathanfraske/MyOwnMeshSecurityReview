@@ -88,15 +88,6 @@ const TEST_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 #[cfg(test)]
 const TEST_IPC_CLIENT_MAILBOXES: u64 = 64;
 
-/// IPC task leases this binary's fixtures may hold concurrently.
-///
-/// This is a separately named cohort from the connector opening floor. IPC
-/// tasks consume the same provider dimension as connectors, but they are not
-/// connector capacity and must not borrow the four connector slots merely
-/// because the test grant omitted their own finite term.
-#[cfg(test)]
-const TEST_IPC_TASKS: u64 = 16;
-
 /// Outbound frames one fixture client may hold queued at once.
 ///
 /// The mailbox is count-unbounded by design — nothing in the daemon names a
@@ -214,14 +205,6 @@ fn test_resource_pair() -> (
                 .checked_scale(connectors)
                 .and_then(|claim| claim.checked_add(structural.process_infrastructure()))
                 .expect("daemon test structural claims are representable");
-            // IPC tasks are a distinct finite cohort. Price the exact claim
-            // through the owner module's task helper and the provider's own
-            // reservation planner; do not restate WorkerOrTask or residual
-            // terms here, and do not increase connector capacity.
-            let ipc_tasks = crate::ipc::clients::task_reservation_planning_charge_for_test()
-                .expect("daemon test IPC task reservation is representable")
-                .checked_scale(TEST_IPC_TASKS)
-                .expect("daemon test IPC task cohort is representable");
             let workload = myownmesh_core::ResourceClaim::try_from_entries([
                 (
                     myownmesh_core::ResourceClass::AccountedMemoryBytes,
@@ -316,7 +299,6 @@ fn test_resource_pair() -> (
                 .and_then(|claim| claim.checked_add(json_input_work))
                 .and_then(|claim| claim.checked_add(ipc_mailboxes))
                 .and_then(|claim| claim.checked_add(ipc_registry))
-                .and_then(|claim| claim.checked_add(ipc_tasks))
                 .and_then(|claim| claim.checked_add(control_inbound))
                 .expect("daemon test resource grant is representable");
             let provider = myownmesh_core::FiniteResourceProvider::new(claim);

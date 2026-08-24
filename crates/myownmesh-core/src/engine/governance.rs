@@ -54,38 +54,18 @@ fn fact_body(variant: &TransitionVariant) -> Result<FactBody> {
     }
 }
 
-fn causal_parents(
-    state: &Arc<EngineState>,
-    body: &FactBody,
-    mut extra: Vec<FactId>,
-) -> Vec<FactId> {
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
-    for cell in body.exclusive_cells() {
-        extra.extend(graph.cell_heads(&cell));
-    }
-    extra.sort();
-    extra.dedup();
-    extra
-}
-
 fn signed_fact(
     state: &Arc<EngineState>,
     body: FactBody,
     extra_parents: Vec<FactId>,
 ) -> Result<SignedFact> {
-    let parents = causal_parents(state, &body, extra_parents);
-    SignedFact::sign(
-        FactContent::new(
-            body.domain(),
-            state.mesh_context_id(),
-            body,
-            canonical_device(state.identity.public_id())?,
-            parents,
-        ),
-        state.identity.signing_key(),
-    )
-    .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))
+    let author = canonical_device(state.identity.public_id())?;
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let witness = graph.authoring_witness(&body, &author);
+    let content = FactContent::from_authoring_witness(&graph, body, &witness, extra_parents);
+    SignedFact::sign(content, state.identity.signing_key())
+        .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))
 }
 
 fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()> {
@@ -171,78 +151,65 @@ pub(super) fn canonical_policy_admits_from(
     evaluator.admits_closed_session(&local, &remote)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CanonicalRoleProjection {
-    Granted(Role),
-    Revoked,
-    Evicted,
-    Invalid,
-}
-
 #[derive(Default)]
 struct CanonicalProjection {
     roles: BTreeMap<String, Role>,
     evicted: BTreeSet<String>,
-}
-
-fn canonical_role_projection(
-    graph: &crate::semantic::FactGraph,
-    id: &FactId,
-) -> CanonicalRoleProjection {
-    let Some(fact) = graph.get(id) else {
-        return CanonicalRoleProjection::Invalid;
-    };
-    match &fact.content.body {
-        FactBody::RoleGrant { role, .. } => CanonicalRoleProjection::Granted(match role {
-            crate::semantic::Role::Member => Role::Member,
-            crate::semantic::Role::Controller => Role::Controller,
-            crate::semantic::Role::Owner => Role::Owner,
-        }),
-        FactBody::RoleRevoke { .. } => CanonicalRoleProjection::Revoked,
-        FactBody::Evict { .. } => CanonicalRoleProjection::Evicted,
-        FactBody::Resolution { selected_head, .. } => {
-            canonical_role_projection(graph, selected_head)
-        }
-        _ => CanonicalRoleProjection::Invalid,
-    }
+    stood_down: BTreeSet<String>,
+    open_participation: BTreeMap<String, bool>,
 }
 
 fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjection {
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
     let projection = graph.projection();
+    let evaluator = graph.evaluator();
     let mut result = CanonicalProjection::default();
 
+    let mut subjects = BTreeSet::new();
     for root in state.verified_bootstrap().authority_roots().iter() {
-        result.roles.insert(root.to_string(), Role::Owner);
+        subjects.insert(root.clone());
     }
-
     for (cell, _) in projection.cells() {
-        let crate::semantic::ExclusiveCell::Role { subject } = cell else {
-            continue;
-        };
+        match cell {
+            crate::semantic::ExclusiveCell::Role { subject }
+            | crate::semantic::ExclusiveCell::Membership { subject }
+            | crate::semantic::ExclusiveCell::OpenParticipation { subject } => {
+                subjects.insert(subject.clone());
+            }
+            crate::semantic::ExclusiveCell::Decision { .. } => {}
+        }
+    }
+    subjects.extend(projection.stand_down_targets().cloned());
 
-        let subject = subject.to_string();
-        let Some(id) = projection.value(cell) else {
-            // A conflict is not a vote for any side.  Remove the cached role
-            // so legacy policy cannot accidentally treat a conflicted subject
-            // as authoritative.
-            result.roles.remove(&subject);
-            continue;
-        };
-        match canonical_role_projection(&graph, &id) {
-            CanonicalRoleProjection::Granted(role) => {
-                result.roles.insert(subject, role);
-            }
-            CanonicalRoleProjection::Revoked => {
-                result.roles.remove(&subject);
-            }
-            CanonicalRoleProjection::Evicted => {
-                result.roles.remove(&subject);
-                result.evicted.insert(subject);
-            }
-            CanonicalRoleProjection::Invalid => {
-                result.roles.remove(&subject);
+    for subject in subjects {
+        let subject_string = subject.to_string();
+        let role = evaluator.effective_role(&subject);
+        let membership = evaluator.effective_membership(&subject);
+        let stood_down = evaluator.is_stood_down(&subject);
+        let open_participation = evaluator.effective_open_participation(&subject);
+
+        if membership == Some(false) {
+            result.evicted.insert(subject_string.clone());
+        }
+        if stood_down {
+            result.stood_down.insert(subject_string.clone());
+        }
+        if let Some(joined) = open_participation {
+            result
+                .open_participation
+                .insert(subject_string.clone(), joined);
+        }
+        if let Some(role) = role {
+            if membership != Some(false) && !stood_down {
+                result.roles.insert(
+                    subject_string,
+                    match role {
+                        crate::semantic::Role::Member => Role::Member,
+                        crate::semantic::Role::Controller => Role::Controller,
+                        crate::semantic::Role::Owner => Role::Owner,
+                    },
+                );
             }
         }
     }
@@ -251,7 +218,12 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
 
 async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
     let projection = canonical_projection_snapshot(state);
-    let CanonicalProjection { roles, evicted } = projection;
+    let CanonicalProjection {
+        roles,
+        evicted,
+        stood_down,
+        ..
+    } = projection;
     let roster_changed = {
         let mut roster = state.roster.write();
         let mut changed = false;
@@ -265,16 +237,12 @@ async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
             }
         }
         let before = roster.authorized_devices.len();
-        roster
-            .authorized_devices
-            .retain(|entry| !evicted.contains(&entry.device_id));
+        roster.authorized_devices.retain(|entry| {
+            roles.contains_key(&entry.device_id)
+                && !evicted.contains(&entry.device_id)
+                && !stood_down.contains(&entry.device_id)
+        });
         changed |= before != roster.authorized_devices.len();
-        for entry in &mut roster.authorized_devices {
-            if !roles.contains_key(&entry.device_id) && entry.role != Role::Member {
-                entry.role = Role::Member;
-                changed = true;
-            }
-        }
         if changed {
             let _ = crate::roster::save(&roster);
         }
@@ -559,10 +527,13 @@ pub fn snapshot(state: &Arc<EngineState>) -> network_state::NetworkState {
     } else {
         NetworkKind::Open
     };
-    network_state::NetworkState::from_canonical_projection(
+    let projection = canonical_projection_snapshot(state);
+    network_state::NetworkState::from_canonical_evaluator_projection(
         &state.network_id,
         kind,
-        canonical_projection_snapshot(state).roles,
+        projection.roles,
+        projection.open_participation,
+        projection.stood_down,
     )
 }
 
@@ -604,13 +575,15 @@ async fn legacy_propose(
             .unwrap_or(false);
         if gov.roles.get(target).copied() == Some(*role) && signed_member {
             let body = fact_body(&variant)?;
-            let parents = causal_parents(state, &body, Vec::new());
-            let content = FactContent::new(
-                body.domain(),
-                state.mesh_context_id(),
+            let author = canonical_device(state.identity.public_id())?;
+            let graph = state.authoritative_fact_graph();
+            let graph = graph.read();
+            let witness = graph.authoring_witness(&body, &author);
+            let content = FactContent::from_authoring_witness(
+                &graph,
                 body,
-                canonical_device(state.identity.public_id())?,
-                parents,
+                &witness,
+                std::iter::empty::<FactId>(),
             );
             return Ok(FactId::from_content(&content));
         }
@@ -721,6 +694,31 @@ pub async fn propose(
             }
         }
     }
+    Ok(fact.id)
+}
+
+/// Author and broadcast the owner-signed membership restoration fact used
+/// after a Closed eviction. Membership admission and the role grant remain
+/// separate canonical cells; callers must issue the causal RoleGrant(Member)
+/// afterward when session authority is also being restored.
+pub async fn propose_membership_admit(
+    state: &Arc<EngineState>,
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    crate::custody::require(&state.network_id, mfa_code)?;
+    let fact = signed_fact(
+        state,
+        FactBody::MembershipAdmit {
+            target: canonical_device(target)?,
+        },
+        Vec::new(),
+    )?;
+    admit_authored_fact(state, &fact)?;
+    let _ = apply_canonical_projection(state).await;
+    broadcast_fact_inventory(state).await;
+    broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    broadcast_state(state).await;
     Ok(fact.id)
 }
 
@@ -1200,6 +1198,33 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         return;
     }
     let changed = apply_canonical_projection(state).await;
+    // Fact admission is the explicit lifecycle boundary for terminal recovery.
+    // Refresh the local stand-down cache, then reconcile only the subject whose
+    // canonical cell may have changed. Recovery never waits for a ticker to
+    // discover that signed policy has become negative.
+    refresh_self_evicted(state);
+    match &fact.content.body {
+        FactBody::RoleGrant { target, .. }
+        | FactBody::RoleRevoke { target }
+        | FactBody::Evict { target }
+        | FactBody::MembershipAdmit { target }
+        | FactBody::EvictionProof { target, .. }
+        | FactBody::Attestation { target, .. } => {
+            super::reconcile_terminal_recovery_policy(state, target);
+        }
+        FactBody::OpenParticipation { device_id, .. }
+        | FactBody::SelfStandDown { device_id, .. } => {
+            super::reconcile_terminal_recovery_policy(state, device_id);
+        }
+        FactBody::Resolution { cell, .. } => match cell {
+            crate::semantic::ExclusiveCell::Role { subject }
+            | crate::semantic::ExclusiveCell::Membership { subject }
+            | crate::semantic::ExclusiveCell::OpenParticipation { subject } => {
+                super::reconcile_terminal_recovery_policy(state, subject);
+            }
+            crate::semantic::ExclusiveCell::Decision { .. } => {}
+        },
+    }
     broadcast_fact_inventory(state).await;
     if changed {
         broadcast_roster_summary(state).await;
@@ -2174,6 +2199,64 @@ mod governance_projection_controls {
             ),
             "the verified root owner must retain self-admission"
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_root_revoke_removes_owner_without_member_fallback() {
+        let state = crate::engine::build_test_closed_state("canonical-root-revoke", [8; 32]);
+        let root = state
+            .verified_bootstrap()
+            .authority_roots()
+            .iter()
+            .next()
+            .cloned()
+            .expect("closed bootstrap supplies one verified root");
+
+        propose(
+            &state,
+            TransitionVariant::RoleRevoke {
+                target: root.to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("the root may revoke its own role cell");
+
+        let projected = snapshot(&state);
+        assert_eq!(projected.role_of(&root.to_string()), None);
+        assert!(!projected.roles.contains_key(&root.to_string()));
+        assert!(!state.is_rostered(&root.to_string()));
+    }
+
+    #[tokio::test]
+    async fn canonical_root_evict_removes_role_and_membership() {
+        let state = crate::engine::build_test_closed_state("canonical-root-evict", [9; 32]);
+        let root = state
+            .verified_bootstrap()
+            .authority_roots()
+            .iter()
+            .next()
+            .cloned()
+            .expect("closed bootstrap supplies one verified root");
+
+        propose(
+            &state,
+            TransitionVariant::Evict {
+                target: root.to_string(),
+            },
+            None,
+        )
+        .await
+        .expect("the root may evict its own membership");
+
+        let projected = snapshot(&state);
+        assert_eq!(projected.role_of(&root.to_string()), None);
+        let graph = state.authoritative_fact_graph();
+        let graph = graph.read();
+        let evaluator = graph.evaluator();
+        assert_eq!(evaluator.effective_membership(&root), Some(false));
+        assert!(!evaluator.is_stood_down(&root));
+        assert!(!state.is_rostered(&root.to_string()));
     }
 }
 

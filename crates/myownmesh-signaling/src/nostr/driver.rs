@@ -802,6 +802,9 @@ where
     S: Sink<WsMessage> + Unpin,
     S::Error: std::fmt::Display,
 {
+    // Admission has already funded the attempt record and this exact relay
+    // entry. Each loop iteration emits one frame for one funded relay; it
+    // never re-admits or acquires a second provider lease for the emission.
     for event_id in delivery.pending(session) {
         let Some(frame) = delivery.with_event(&event_id, |event| {
             serde_json::json!(["EVENT", event]).to_string()

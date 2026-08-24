@@ -17,7 +17,9 @@
 
 pub mod defaults;
 // Delivery owns provider-funded per-event state and its order-independent
-// relay-carrier aggregate.
+// relay-carrier aggregate. `DeliveryRetention` exposes one canonical exact
+// entry size for each production map node; compatibility growth aliases are
+// not additive charges.
 pub mod delivery;
 pub mod denylist;
 pub mod driver;

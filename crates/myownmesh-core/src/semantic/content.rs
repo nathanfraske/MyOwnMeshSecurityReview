@@ -215,6 +215,12 @@ pub enum FactBody {
     Evict {
         target: DeviceId,
     },
+    /// Owner-authored Closed membership restoration. Role authority remains
+    /// a separate role-cell fact and must be carried causally when both are
+    /// needed to restore session admission.
+    MembershipAdmit {
+        target: DeviceId,
+    },
     /// Self-authored Open participation.  Presentation labels are local UI
     /// data and are intentionally not signed into membership authority.
     OpenParticipation {
@@ -298,6 +304,9 @@ impl FactBody {
                 ExclusiveCell::role(target.clone()),
                 ExclusiveCell::membership(target.clone()),
             ],
+            Self::MembershipAdmit { target } => {
+                vec![ExclusiveCell::membership(target.clone())]
+            }
             Self::OpenParticipation { device_id, .. } => {
                 vec![ExclusiveCell::open_participation(device_id.clone())]
             }
@@ -305,6 +314,32 @@ impl FactBody {
             Self::Attestation { proposal, .. } => vec![ExclusiveCell::decision(*proposal)],
             Self::Resolution { cell, .. } => vec![cell.clone()],
         }
+    }
+
+    /// Return the non-cell facts that must be in the causal past of this
+    /// body.  Exclusive-cell predecessors come from `FactGraph`'s
+    /// authoring witness; evidence and cited heads are body-owned support and
+    /// must be carried explicitly as parents as well.
+    pub fn causal_support(&self) -> Vec<FactId> {
+        let mut support = match self {
+            Self::EvictionProof { evidence, .. } | Self::SelfStandDown { evidence, .. } => {
+                evidence.clone()
+            }
+            Self::Attestation {
+                proposal,
+                contributions,
+                ..
+            } => {
+                let mut ids = vec![*proposal];
+                ids.extend(contributions.iter().copied());
+                ids
+            }
+            Self::Resolution { cited_heads, .. } => cited_heads.clone(),
+            _ => Vec::new(),
+        };
+        support.sort();
+        support.dedup();
+        support
     }
 
     pub(crate) fn encode(&self, out: &mut Encoder) {
@@ -324,6 +359,10 @@ impl FactBody {
             }
             Self::Evict { target } => {
                 out.tag("evict");
+                out.device(target);
+            }
+            Self::MembershipAdmit { target } => {
+                out.tag("membership_admit");
                 out.device(target);
             }
             Self::OpenParticipation { device_id, joined } => {

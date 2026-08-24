@@ -43,6 +43,36 @@ pub enum Admission {
     Quarantined { missing: Vec<FactId> },
 }
 
+/// The causal inputs a caller must carry when authoring a fact.
+///
+/// Exclusive-cell predecessors are derived from the graph rather than guessed
+/// by a caller.  Evidence and other non-cell dependencies remain explicit in
+/// the signed body and are added by [`dependencies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoringWitness {
+    author: DeviceId,
+    parents: Vec<FactId>,
+    required_tier: Option<Role>,
+}
+
+impl AuthoringWitness {
+    pub fn author(&self) -> &DeviceId {
+        &self.author
+    }
+
+    pub fn parents(&self) -> &[FactId] {
+        &self.parents
+    }
+
+    pub fn required_tier(&self) -> Option<Role> {
+        self.required_tier
+    }
+
+    pub fn into_parents(self) -> Vec<FactId> {
+        self.parents
+    }
+}
+
 /// An arrival-order-independent set of verified canonical facts.
 #[derive(Debug, Clone)]
 pub struct FactGraph {
@@ -127,6 +157,7 @@ impl FactGraph {
                 return Err(SemanticError::MissingParent(*parent));
             }
         }
+        let causal = self.causal_past(&fact)?;
         if let FactBody::Resolution {
             cell,
             cited_heads,
@@ -146,34 +177,34 @@ impl FactGraph {
                 return Err(SemanticError::IncompleteResolution);
             }
             for head in &cited {
-                if !self.facts.contains_key(head) {
+                if !causal.facts.contains_key(head) {
                     return Err(SemanticError::UnknownResolutionHead(*head));
                 }
                 if !fact.content.parents.contains(head) {
                     return Err(SemanticError::IncompleteResolution);
                 }
-                if !super::verify::body_advances_cell(&self.facts[head].content.body, cell) {
+                if !super::verify::body_advances_cell(&causal.facts[head].content.body, cell) {
                     return Err(SemanticError::IncompleteResolution);
                 }
             }
-            if self.cell_heads(cell) != cited {
+            if causal.cell_heads(cell) != cited {
                 return Err(SemanticError::ResolutionNotCurrent);
             }
         }
         if let Some(error) = Self::authorization_error(&fact.content.body) {
-            if !self.is_authorized_for(&fact.content.body, &fact.content.author) {
+            if !causal.is_authorized_for(&fact.content.body, &fact.content.author) {
                 return Err(error);
             }
         }
         match &fact.content.body {
             FactBody::EvictionProof { target, evidence } => {
-                self.validate_eviction_proof(target, evidence, &fact.content.author)?;
+                causal.validate_eviction_proof(target, evidence, &fact.content.author)?;
             }
             FactBody::SelfStandDown {
                 device_id,
                 evidence,
             } => {
-                self.validate_self_stand_down(device_id, evidence, &fact.content.author)?;
+                causal.validate_self_stand_down(device_id, evidence, &fact.content.author)?;
             }
             _ => {}
         }
@@ -206,6 +237,7 @@ impl FactGraph {
             FactBody::RoleGrant { .. }
             | FactBody::RoleRevoke { .. }
             | FactBody::Evict { .. }
+            | FactBody::MembershipAdmit { .. }
             | FactBody::EvictionProof { .. }
             | FactBody::SelfStandDown { .. }
             | FactBody::Attestation { .. }
@@ -265,6 +297,7 @@ impl FactGraph {
             | FactBody::RoleRevoke { .. }
             | FactBody::Evict { .. }
             | FactBody::Resolution { .. } => Some(SemanticError::UnauthorizedRoleGrant),
+            FactBody::MembershipAdmit { .. } => Some(SemanticError::UnauthorizedMembershipAdmit),
             FactBody::Attestation { .. } => Some(SemanticError::UnauthorizedAttestation),
             _ => None,
         }
@@ -306,6 +339,58 @@ impl FactGraph {
             .into_iter()
             .filter(|dependency| !self.facts.contains_key(dependency))
             .collect()
+    }
+
+    /// Build the exact graph visible to a candidate fact.  Facts that merely
+    /// arrived earlier in this process, but are not ancestors or explicitly
+    /// cited evidence, are deliberately excluded from authorization and head
+    /// resolution.
+    fn causal_past(&self, fact: &SignedFact) -> Result<Self, SemanticError> {
+        let mut ids = BTreeSet::new();
+        let mut pending = dependencies(fact);
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id) {
+                continue;
+            }
+            let Some(parent) = self.facts.get(&id) else {
+                return Err(SemanticError::MissingParent(id));
+            };
+            pending.extend(dependencies(parent));
+        }
+        Ok(Self {
+            facts: ids
+                .into_iter()
+                .filter_map(|id| self.facts.get(&id).cloned().map(|fact| (id, fact)))
+                .collect(),
+            quarantined: BTreeMap::new(),
+            context_id: self.context_id,
+            authority_roots: self.authority_roots.clone(),
+            policy: self.policy.clone(),
+        })
+    }
+
+    /// Derive exclusive-cell predecessors and the authority tier needed to
+    /// author the supplied body from the current canonical graph.  Tiered
+    /// operations also carry the author's current role-cell heads.  Without
+    /// those heads, a revoked bootstrap root could omit its own revoke from a
+    /// later candidate's causal past and incorrectly regain root fallback.
+    pub fn authoring_witness(&self, body: &FactBody, author: &DeviceId) -> AuthoringWitness {
+        let required_tier = self.evaluator().required_tier(body);
+        let mut parents = body
+            .exclusive_cells()
+            .into_iter()
+            .flat_map(|cell| self.cell_heads(&cell))
+            .collect::<Vec<_>>();
+        if required_tier.is_some() {
+            parents.extend(self.cell_heads(&ExclusiveCell::role(author.clone())));
+        }
+        parents.sort();
+        parents.dedup();
+        AuthoringWitness {
+            author: author.clone(),
+            parents,
+            required_tier,
+        }
     }
 
     /// Retry quarantined facts whose dependencies have since arrived.
@@ -530,13 +615,42 @@ impl<'a> SemanticEvaluator<'a> {
             FactBody::RoleRevoke { target } | FactBody::Evict { target } => {
                 self.target_tier(target)
             }
+            FactBody::MembershipAdmit { .. } => Role::Owner,
             FactBody::Attestation { .. } => Role::Member,
             FactBody::Resolution {
-                cell, cited_heads, ..
-            } => self.resolution_tier(cell, cited_heads),
+                cell,
+                cited_heads,
+                selected_head,
+            } => self.resolution_tier(cell, cited_heads, selected_head),
             _ => return true,
         };
         self.has_tier(author, required)
+    }
+
+    /// The tier required by an authoring witness.  This is public so an
+    /// authoring caller can use the same candidate-relative rule as admission
+    /// without reconstructing predecessor state itself.
+    pub fn required_tier(&self, body: &FactBody) -> Option<Role> {
+        if matches!(&self.graph.policy, VerifiedProjectPolicy::Open) {
+            return None;
+        }
+        match body {
+            FactBody::RoleGrant { role, .. } => Some(match role {
+                Role::Member | Role::Controller => Role::Controller,
+                Role::Owner => Role::Owner,
+            }),
+            FactBody::RoleRevoke { target } | FactBody::Evict { target } => {
+                Some(self.target_tier(target))
+            }
+            FactBody::MembershipAdmit { .. } => Some(Role::Owner),
+            FactBody::Attestation { .. } => Some(Role::Member),
+            FactBody::Resolution {
+                cell,
+                cited_heads,
+                selected_head,
+            } => Some(self.resolution_tier(cell, cited_heads, selected_head)),
+            _ => None,
+        }
     }
 
     /// Closed-profile session admission. Open participation remains governed
@@ -586,22 +700,28 @@ impl<'a> SemanticEvaluator<'a> {
         }
     }
 
-    fn resolution_tier(&self, cell: &ExclusiveCell, cited_heads: &[FactId]) -> Role {
+    fn resolution_tier(
+        &self,
+        cell: &ExclusiveCell,
+        _cited_heads: &[FactId],
+        selected_head: &FactId,
+    ) -> Role {
         match cell {
-            ExclusiveCell::Role { subject } => match self.effective_role(subject) {
-                Some(_) => self.target_tier(subject),
-                None => cited_heads
-                    .iter()
-                    .filter_map(|id| self.graph.facts.get(id))
-                    .map(|fact| match &fact.content.body {
-                        FactBody::RoleGrant {
-                            role: Role::Member, ..
-                        } => Role::Controller,
-                        _ => Role::Owner,
-                    })
-                    .max()
-                    .unwrap_or(Role::Owner),
-            },
+            ExclusiveCell::Role { subject } => self
+                .graph
+                .facts
+                .get(selected_head)
+                .and_then(|fact| match &fact.content.body {
+                    FactBody::RoleGrant { target, role } if target == subject => Some(match role {
+                        Role::Member | Role::Controller => Role::Controller,
+                        Role::Owner => Role::Owner,
+                    }),
+                    FactBody::RoleRevoke { target } if target == subject => {
+                        Some(self.target_tier(subject))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| self.target_tier(subject)),
             ExclusiveCell::Membership { subject } => self.target_tier(subject),
             ExclusiveCell::Decision { .. } | ExclusiveCell::OpenParticipation { .. } => {
                 Role::Member
@@ -680,6 +800,49 @@ mod tests {
     }
 
     #[test]
+    fn authoring_witness_carries_root_revoke_into_later_root_authored_fact() {
+        let (bootstrap, root_key) = closed(48);
+        let root = device(&root_key);
+        let revoke = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: root.clone(),
+            },
+            Vec::new(),
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph
+            .admit(revoke.clone())
+            .expect("the root revoke is admitted into the canonical graph");
+
+        let body = FactBody::RoleGrant {
+            target: device(&key(49)),
+            role: Role::Member,
+        };
+        let witness = graph.authoring_witness(&body, &root);
+        assert!(
+            witness.parents().contains(&revoke.id),
+            "tiered root-authored work must carry the author's current role head"
+        );
+        let candidate = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &graph,
+                body,
+                &witness,
+                std::iter::empty(),
+            ),
+            &root_key,
+        )
+        .expect("witness-derived candidate signs");
+        assert_eq!(
+            graph.admit(candidate),
+            Err(SemanticError::UnauthorizedRoleGrant),
+            "the revoked root must not regain bootstrap-owner fallback"
+        );
+    }
+
+    #[test]
     fn projection_follows_nested_same_cell_resolutions() {
         let (bootstrap, root_key) = closed(40);
         let target = device(&key(41));
@@ -701,6 +864,15 @@ mod tests {
             },
             Vec::new(),
         );
+        let third = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Owner,
+            },
+            Vec::new(),
+        );
         let first_resolution = fact(
             &bootstrap,
             &root_key,
@@ -716,14 +888,15 @@ mod tests {
             &root_key,
             FactBody::Resolution {
                 cell: ExclusiveCell::role(target.clone()),
-                cited_heads: vec![first_resolution.id, second.id],
+                cited_heads: vec![first_resolution.id, third.id],
                 selected_head: first_resolution.id,
             },
-            vec![first_resolution.id, second.id],
+            vec![first_resolution.id, third.id],
         );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.facts.insert(first.id, first.clone());
         graph.facts.insert(second.id, second);
+        graph.facts.insert(third.id, third);
         graph.facts.insert(first_resolution.id, first_resolution);
         graph.facts.insert(second_resolution.id, second_resolution);
         let evaluator = graph.evaluator();
@@ -819,6 +992,117 @@ mod tests {
     }
 
     #[test]
+    fn authorization_uses_candidate_causal_past_not_later_target_role() {
+        let (bootstrap, root_key) = closed(51);
+        let controller_key = key(52);
+        let controller = device(&controller_key);
+        let target_key = key(53);
+        let target = device(&target_key);
+        let grant_controller = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let grant_member = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let later_owner = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Owner,
+            },
+            vec![grant_member.id],
+        );
+        let revoke = fact(
+            &bootstrap,
+            &controller_key,
+            FactBody::RoleRevoke {
+                target: target.clone(),
+            },
+            vec![grant_controller.id, grant_member.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph
+            .admit(grant_controller)
+            .expect("root controller grant admits");
+        graph
+            .admit(grant_member.clone())
+            .expect("root member grant admits");
+        graph.admit(later_owner).expect("later owner grant admits");
+        graph
+            .admit(revoke)
+            .expect("controller is authorized by the candidate's causal target role");
+    }
+
+    #[test]
+    fn resolution_authority_uses_selected_controller_proposition() {
+        let (bootstrap, root_key) = closed(54);
+        let controller_key = key(55);
+        let controller = device(&controller_key);
+        let target = device(&key(56));
+        let controller_grant = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let member_head = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let controller_head = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let resolution = fact(
+            &bootstrap,
+            &controller_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target),
+                cited_heads: vec![member_head.id, controller_head.id],
+                selected_head: controller_head.id,
+            },
+            vec![controller_grant.id, member_head.id, controller_head.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph
+            .admit(controller_grant)
+            .expect("root controller grant admits");
+        graph.admit(member_head).expect("first target head admits");
+        graph
+            .admit(controller_head)
+            .expect("second target head admits");
+        graph
+            .admit(resolution)
+            .expect("a controller may resolve to a controller proposition");
+    }
+
+    #[test]
     fn eviction_removes_closed_session_admission() {
         let (bootstrap, root_key) = closed(45);
         let controller_key = key(46);
@@ -851,6 +1135,140 @@ mod tests {
         assert_eq!(evaluator.effective_role(&controller), None);
         assert_eq!(evaluator.effective_membership(&controller), Some(false));
         assert!(!evaluator.admits_closed_session(&root, &controller));
+    }
+
+    #[test]
+    fn membership_admit_restores_membership_but_not_role() {
+        let (bootstrap, root_key) = closed(57);
+        let root = device(&root_key);
+        let target_key = key(58);
+        let target = device(&target_key);
+        let grant = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let eviction = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Evict {
+                target: target.clone(),
+            },
+            vec![grant.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(grant).expect("initial member grant admits");
+        graph.admit(eviction.clone()).expect("eviction admits");
+        assert_eq!(graph.evaluator().effective_membership(&target), Some(false));
+
+        let membership_body = FactBody::MembershipAdmit {
+            target: target.clone(),
+        };
+        let witness = graph.authoring_witness(&membership_body, &root);
+        assert!(witness.parents().contains(&eviction.id));
+        let membership = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &graph,
+                membership_body,
+                &witness,
+                std::iter::empty(),
+            ),
+            &root_key,
+        )
+        .expect("owner membership admit signs");
+        graph.admit(membership).expect("membership admit admits");
+        let evaluator = graph.evaluator();
+        assert_eq!(evaluator.effective_membership(&target), Some(true));
+        assert_eq!(evaluator.effective_role(&target), None);
+        assert!(!evaluator.admits_closed_session(&root, &target));
+
+        let role_body = FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        };
+        let role_witness = graph.authoring_witness(&role_body, &root);
+        assert!(
+            role_witness.parents().contains(&eviction.id),
+            "role restoration must retain the evicted role-cell head"
+        );
+        let role = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &graph,
+                role_body,
+                &role_witness,
+                std::iter::empty(),
+            ),
+            &root_key,
+        )
+        .expect("owner role grant signs");
+        graph.admit(role).expect("causal role restoration admits");
+        assert!(graph.evaluator().admits_closed_session(&root, &target));
+    }
+
+    #[test]
+    fn membership_admit_rejects_self_and_open_profile_facts() {
+        let (bootstrap, root_key) = closed(59);
+        let target_key = key(60);
+        let target = device(&target_key);
+        let grant = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let eviction = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Evict {
+                target: target.clone(),
+            },
+            vec![grant.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(grant).expect("initial member grant admits");
+        graph.admit(eviction).expect("eviction admits");
+        let self_body = FactBody::MembershipAdmit {
+            target: target.clone(),
+        };
+        let self_witness = graph.authoring_witness(&self_body, &target);
+        let self_admit = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &graph,
+                self_body,
+                &self_witness,
+                std::iter::empty(),
+            ),
+            &target_key,
+        )
+        .expect("self-authored candidate signs");
+        assert_eq!(
+            graph.admit(self_admit),
+            Err(SemanticError::UnauthorizedMembershipAdmit)
+        );
+
+        let open = VerifiedBootstrap::open("membership-open").expect("open bootstrap");
+        let open_key = key(61);
+        let open_target = device(&key(62));
+        let open_admit = fact(
+            &open,
+            &open_key,
+            FactBody::MembershipAdmit {
+                target: open_target,
+            },
+            Vec::new(),
+        );
+        let mut open_graph = FactGraph::from_bootstrap(&open);
+        assert_eq!(
+            open_graph.admit(open_admit),
+            Err(SemanticError::DomainMismatch)
+        );
     }
 
     #[test]

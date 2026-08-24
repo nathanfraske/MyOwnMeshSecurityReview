@@ -544,6 +544,23 @@ pub(crate) fn task_reservation_planning_charge_for_test(
     myownmesh_core::FiniteResourceProvider::reservation_planning_charge(claim)
 }
 
+/// Price an isolated cohort from the exact number of task owners the fixture
+/// will hold. The owner count belongs to the caller because only the fixture
+/// can know how many leases it actually retains; this helper owns the shape of
+/// one task and the provider's reservation record, so no caller can restate
+/// either term when building its private grant.
+#[cfg(test)]
+pub(crate) fn task_cohort_reservation_planning_charge_for_test(
+    owners: usize,
+) -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+    let owners = u64::try_from(owners).map_err(|_| ResourceClaimArithmeticError::Overflow {
+        dimension: ResourceClass::WorkerOrTask,
+    })?;
+    let per_owner = task_reservation_planning_charge_for_test()
+        .expect("the fixed IPC task reservation is representable");
+    per_owner.checked_scale(owners)
+}
+
 /// [`task_claim`] plus the heap a task's captured state holds for its lifetime.
 ///
 /// Additive rather than a second claim so the task and the state it carries are
