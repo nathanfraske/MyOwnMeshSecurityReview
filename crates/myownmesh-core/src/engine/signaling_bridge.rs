@@ -797,14 +797,17 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             self.recovery_instance,
                             emission,
                         ) {
-                            state.record_carrier_emission(emission, attempt, instance, false)
-                                == CarrierEmissionRecord::FinalRefusal
+                            let record =
+                                state.record_carrier_emission(emission, attempt, instance, false);
+                            self.guard
+                                .settle_attempt_and_acknowledge(state, emission, attempt, instance);
+                            record == CarrierEmissionRecord::FinalRefusal
                         } else {
+                            if let Some(emission) = emission {
+                                self.guard.settle_attempt(emission);
+                            }
                             false
                         };
-                    if let Some(emission) = emission {
-                        self.guard.settle_attempt(emission);
-                    }
                     if let (true, true, Some(attempt), Some(state), Some(instance)) = (
                         final_refusal,
                         self.refusal_sink.is_some(),
@@ -1953,7 +1956,6 @@ fn spawn_fanout(
                 gate.entered.notify_waiters();
                 gate.release.notified().await;
             }
-            let mut delivered = false;
             let mut final_refusal = false;
             let mut final_owner = None;
             let mut refusal_reason = None;
@@ -1968,9 +1970,7 @@ fn spawn_fanout(
                     SignalingOutbound::Candidate { .. } => "candidate",
                 };
                 match tx.send(msg.clone()) {
-                    Ok(()) => {
-                        delivered = true;
-                    }
+                    Ok(()) => {}
                     Err(ResourceMailboxSendError::Closed(_)) => {
                         refusal_reason = Some("signaling carrier unavailable".to_string());
                         if let (Some(attempt), Some(instance), Some(emission)) =
@@ -1983,7 +1983,9 @@ fn spawn_fanout(
                                 final_refusal = true;
                                 final_owner = settlement.owner;
                             }
-                            guard.settle_attempt(emission);
+                            guard.settle_attempt_and_acknowledge(
+                                &state, emission, attempt, *instance,
+                            );
                         }
                         if let (Some(id), Some(instance)) = (recovery_id, instance) {
                             state.record_recovery_carrier(id, *instance, false);
@@ -2008,7 +2010,9 @@ fn spawn_fanout(
                                 final_refusal = true;
                                 final_owner = settlement.owner;
                             }
-                            guard.settle_attempt(emission);
+                            guard.settle_attempt_and_acknowledge(
+                                &state, emission, attempt, *instance,
+                            );
                         }
                         if let (Some(id), Some(instance)) = (recovery_id, instance) {
                             state.record_recovery_carrier(id, *instance, false);
@@ -2028,7 +2032,9 @@ fn spawn_fanout(
                                 final_refusal = true;
                                 final_owner = settlement.owner;
                             }
-                            guard.settle_attempt(emission);
+                            guard.settle_attempt_and_acknowledge(
+                                &state, emission, attempt, *instance,
+                            );
                         }
                         if let (Some(id), Some(instance)) = (recovery_id, instance) {
                             state.record_recovery_carrier(id, *instance, false);
@@ -2040,7 +2046,7 @@ fn spawn_fanout(
             if let Some(id) = recovery_id {
                 state.refuse_empty_recovery_publication(id);
             }
-            if final_refusal && !delivered && !driver_txs.is_empty() {
+            if final_refusal && !driver_txs.is_empty() {
                 if let Some(reason) = refusal_reason {
                     if let Some(attempt) = attempt.clone() {
                         CoreAttemptRefusalSink {
@@ -3240,7 +3246,7 @@ mod tests {
             "accepted-one",
             myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
         );
-        one_guard.settle_attempt(one_copy);
+        one_guard.settle_attempt_and_acknowledge(&state, one_copy, "accepted-one", first);
         let one_successor = SignalingEmissionId::next();
         assert!(state.begin_carrier_emission(one_successor, "accepted-one", [first]));
         state.settle_attempt(
@@ -3270,8 +3276,8 @@ mod tests {
             state.record_carrier_emission(two_copy, "accepted-two", second, true),
             CarrierEmissionRecord::Accepted
         );
-        first_guard.settle_attempt(two_copy);
-        second_guard.settle_attempt(two_copy);
+        first_guard.settle_attempt_and_acknowledge(&state, two_copy, "accepted-two", first);
+        second_guard.settle_attempt_and_acknowledge(&state, two_copy, "accepted-two", second);
         assert!(!state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
         state.settle_attempt(
             "accepted-two",
@@ -3295,6 +3301,67 @@ mod tests {
             provider.in_use(),
             baseline,
             "Accepted one-copy and Pending-to-Accepted two-copy custody return to baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_copy_late_sibling_failure_acknowledges_exact_carrier() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered("accepted-late-sibling", None, 5, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
+        let first = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+        let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
+        let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
+        let emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "accepted-late-sibling", [first, second]));
+        assert!(first_guard.track_attempt(emission, "accepted-late-sibling"));
+        assert!(second_guard.track_attempt(emission, "accepted-late-sibling"));
+        assert_eq!(
+            first_guard.claim_attempt("accepted-late-sibling"),
+            Some(emission)
+        );
+        assert_eq!(
+            second_guard.claim_attempt("accepted-late-sibling"),
+            Some(emission)
+        );
+        state.mark_carrier_emission_claimed(emission, "accepted-late-sibling");
+        assert_eq!(
+            state.record_carrier_emission(emission, "accepted-late-sibling", first, true,),
+            CarrierEmissionRecord::Accepted
+        );
+        assert_eq!(
+            state.record_carrier_emission(emission, "accepted-late-sibling", second, false,),
+            CarrierEmissionRecord::Stale
+        );
+        first_guard.settle_attempt_and_acknowledge(
+            &state,
+            emission,
+            "accepted-late-sibling",
+            first,
+        );
+        second_guard.settle_attempt_and_acknowledge(
+            &state,
+            emission,
+            "accepted-late-sibling",
+            second,
+        );
+        state.settle_attempt(
+            "accepted-late-sibling",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        drop(first_guard);
+        drop(second_guard);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "late sibling failure releases exact Accepted carrier custody"
         );
     }
 
