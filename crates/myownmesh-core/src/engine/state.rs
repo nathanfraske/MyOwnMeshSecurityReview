@@ -77,6 +77,20 @@ pub(crate) enum CarrierEmissionRecord {
     FinalRefusal,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CarrierEmissionAdmission {
+    Admitted,
+    Existing,
+    Stale,
+    Refused,
+}
+
+impl CarrierEmissionAdmission {
+    pub(crate) fn is_admitted(self) -> bool {
+        matches!(self, Self::Admitted | Self::Existing)
+    }
+}
+
 pub(crate) struct CarrierEmissionSettlement {
     pub(crate) record: CarrierEmissionRecord,
     pub(crate) owner: Option<PeerOwnerToken>,
@@ -175,6 +189,7 @@ struct CarrierAttemptNode {
     expected: usize,
     resolved: usize,
     accepted: bool,
+    terminal: Option<CarrierEmissionRecord>,
     next: Option<Box<CarrierAttemptNode>>,
 }
 
@@ -241,28 +256,6 @@ impl CarrierAttemptList {
         loop {
             if link.as_ref().is_some_and(|node| node.attempt == attempt) {
                 let mut removed = link.take().expect("matched attempt node");
-                *link = removed.next.take();
-                return Some(removed);
-            }
-            match link.as_mut() {
-                Some(node) => link = &mut node.next,
-                None => return None,
-            }
-        }
-    }
-
-    fn remove_emission(
-        &mut self,
-        emission: SignalingEmissionId,
-        attempt: &str,
-    ) -> Option<Box<CarrierAttemptNode>> {
-        let mut link = &mut self.head;
-        loop {
-            if link
-                .as_ref()
-                .is_some_and(|node| node.emission == emission && node.attempt == attempt)
-            {
-                let mut removed = link.take().expect("matched emission node");
                 *link = removed.next.take();
                 return Some(removed);
             }
@@ -553,6 +546,13 @@ pub enum NetworkCmd {
         device_id: String,
         reason: DropReason,
     },
+    /// Drop only the exact installed owner that produced an early carrier
+    /// refusal.  The command handler rechecks installation and worker fences;
+    /// it must never resolve the owner by its device id.
+    DropPeerIfCurrent {
+        owner: super::peer_registry::PeerOwnerToken,
+        reason: DropReason,
+    },
     /// A Nostr provider refused this exact outbound attempt before it could
     /// enter the driver's live delivery map.  The owner token is captured at
     /// refusal routing time; the command must never re-resolve by device id.
@@ -689,6 +689,18 @@ impl ResourceMailboxItem for NetworkCmd {
                 };
                 strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
             }
+            Self::DropPeerIfCurrent { reason, .. } => {
+                let reason = match reason {
+                    DropReason::TransportError { message } => Some(message.as_str()),
+                    DropReason::Denied
+                    | DropReason::IceFailed
+                    | DropReason::AuthFailed
+                    | DropReason::UserLeft
+                    | DropReason::TopologyPruned
+                    | DropReason::HeartbeatTimeout => None,
+                };
+                strings_measure([reason].into_iter().flatten())?
+            }
             Self::AttemptRefused { refusal, .. } => {
                 let reason = match &refusal.refusal {
                     myownmesh_signaling::NegotiationRefusal::DuplicateLiveEvent => None,
@@ -764,7 +776,10 @@ impl ResourceMailboxItem for NetworkCmd {
             // No reply, no cancellation, no channel: nothing to fund past the
             // payload the walk above already measured.
             Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
-            Self::SetTopology(_) | Self::DropPeer { .. } | Self::Reconnect { .. } => 0,
+            Self::SetTopology(_)
+            | Self::DropPeer { .. }
+            | Self::DropPeerIfCurrent { .. }
+            | Self::Reconnect { .. } => 0,
             Self::AttemptRefused { .. } | Self::AttemptOutcome { .. } => 1,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
             Self::ApproveRoster { .. }
@@ -2138,15 +2153,16 @@ impl NetworkState {
         I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
     {
         self.begin_carrier_emission_inner(emission, attempt, None, instances)
+            .is_admitted()
     }
 
-    pub(crate) fn begin_carrier_emission_for_owner<I>(
+    pub(crate) fn begin_carrier_emission_for_owner_result<I>(
         &self,
         emission: SignalingEmissionId,
         attempt: &str,
         owner: PeerOwnerToken,
         instances: I,
-    ) -> bool
+    ) -> CarrierEmissionAdmission
     where
         I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
     {
@@ -2159,12 +2175,12 @@ impl NetworkState {
         attempt: &str,
         owner: Option<PeerOwnerToken>,
         instances: I,
-    ) -> bool
+    ) -> CarrierEmissionAdmission
     where
         I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
     {
         if attempt.is_empty() {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         }
         let mut expected = 0usize;
         for (index, instance) in instances.clone().into_iter().enumerate() {
@@ -2176,12 +2192,12 @@ impl NetworkState {
             if !duplicate {
                 expected = match expected.checked_add(1) {
                     Some(expected) => expected,
-                    None => return false,
+                    None => return CarrierEmissionAdmission::Refused,
                 };
             }
         }
         if expected == 0 {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         }
         let Some(bytes) = std::mem::size_of::<CarrierAttemptNode>()
             .checked_add(attempt.len())
@@ -2191,36 +2207,39 @@ impl NetworkState {
                 )
             })
         else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let Ok(bytes) = u64::try_from(bytes) else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let Some(residual_count) = expected.checked_add(1) else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let Ok(residuals) = u64::try_from(residual_count) else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let Ok(claim) = ResourceClaim::try_from_entries([
             (ResourceClass::AccountedMemoryBytes, bytes),
             (ResourceClass::OpaqueDependencyResidual, residuals),
         ]) else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let mut attempts = self.carrier_attempts.lock();
         if let Some(existing) = attempts.find_emission_mut(emission, attempt) {
+            if existing.terminal.is_some() {
+                return CarrierEmissionAdmission::Stale;
+            }
             if existing.owner.is_none() {
                 existing.owner = owner;
             }
-            return true;
+            return CarrierEmissionAdmission::Existing;
         }
         // Hold the aggregate lock across the exact existing check and its
         // provider claim.  A concurrent source must not both observe absence,
         // acquire pressure, and then race to create a second cohort for the
         // same opaque emission.
         let Ok(entry_lease) = self.local_resources.acquire(claim) else {
-            return false;
+            return CarrierEmissionAdmission::Refused;
         };
         let mut carriers = None;
         for (index, instance) in instances.clone().into_iter().enumerate() {
@@ -2247,9 +2266,10 @@ impl NetworkState {
             expected,
             resolved: 0,
             accepted: false,
+            terminal: None,
             next: None,
         }));
-        true
+        CarrierEmissionAdmission::Admitted
     }
 
     /// Record an exact carrier's source admission without creating custody.
@@ -2281,6 +2301,12 @@ impl NetworkState {
                     owner: None,
                 };
             };
+            if state.terminal.is_some() {
+                return CarrierEmissionSettlement {
+                    record: CarrierEmissionRecord::Stale,
+                    owner: None,
+                };
+            }
             if accepted {
                 let Some(carrier) = state.carrier_mut(instance) else {
                     return CarrierEmissionSettlement {
@@ -2330,8 +2356,11 @@ impl NetworkState {
             || result == CarrierEmissionRecord::FinalRefusal;
         let owner = if terminal {
             attempts
-                .remove_emission(emission, attempt)
-                .and_then(|node| node.owner.clone())
+                .find_emission_mut(emission, attempt)
+                .and_then(|node| {
+                    node.terminal = Some(result);
+                    node.owner.clone()
+                })
         } else {
             None
         };

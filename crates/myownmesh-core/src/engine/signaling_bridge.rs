@@ -63,8 +63,8 @@ use super::signaling_ingress::{
     SignalingCarrier, SignalingRuntime,
 };
 use super::state::{
-    CarrierEmissionRecord, NetworkCmd, NetworkState, RecoveryCarrierInstance, SignalingEmissionId,
-    SignalingOutbound,
+    CarrierEmissionAdmission, CarrierEmissionRecord, NetworkCmd, NetworkState,
+    RecoveryCarrierInstance, SignalingEmissionId, SignalingOutbound,
 };
 
 /// One driver's outbound side: the engine's admitted values, translated on the
@@ -107,6 +107,7 @@ struct TranslatedOutbound<T> {
     recovery_state: Option<Weak<NetworkState>>,
     recovery_instance: Option<RecoveryCarrierInstance>,
     guard: Arc<CarrierInstanceGuard>,
+    allow_untracked_emission: bool,
     /// Nostr source admission only proves that a value reached the driver's
     /// delivery boundary. Its provider must report the carrier outcome before
     /// this attempt cohort is marked accepted; local/mDNS sources have no
@@ -249,8 +250,8 @@ impl CoreAttemptRefusalSink {
         let Some(owner) = owner else {
             return;
         };
-        let _ = state.cmd_tx.send(NetworkCmd::DropPeer {
-            device_id: owner.device_id().to_owned(),
+        let _ = state.cmd_tx.send(NetworkCmd::DropPeerIfCurrent {
+            owner,
             reason: DropReason::TransportError {
                 message: reason.into(),
             },
@@ -592,14 +593,19 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 | SignalingOutbound::Candidate { owner, .. } => owner.clone(),
                 _ => None,
             };
-            let emission = attempt.as_deref().map(|attempt| {
-                // The guard owns one funded node per physical carrier copy.
-                // Claim that node at pull time; resolving the newest record by
-                // peer-visible attempt would misassociate same-attempt E1/E2.
-                self.guard
-                    .claim_attempt(attempt)
-                    .unwrap_or_else(SignalingEmissionId::next)
-            });
+            let emission = if let Some(attempt) = attempt.as_deref() {
+                // Fan-out guards precreate one funded node per physical copy.
+                // A missing node there is a stale/terminal delivery and must
+                // not mint a fresh aggregate; direct single-carrier sources
+                // retain their explicit untracked admission path.
+                match self.guard.claim_attempt(attempt) {
+                    Some(emission) => Some(emission),
+                    None if self.allow_untracked_emission => Some(SignalingEmissionId::next()),
+                    None => continue,
+                }
+            } else {
+                None
+            };
             let attempt_state = self.recovery_state.as_ref().and_then(Weak::upgrade);
             if let (Some(state), Some(attempt), Some(instance), Some(emission)) = (
                 attempt_state.as_ref(),
@@ -607,10 +613,22 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 self.recovery_instance,
                 emission,
             ) {
-                let admitted = outbound_owner.clone().is_some_and(|owner| {
-                    state.begin_carrier_emission_for_owner(emission, attempt, owner, [instance])
-                });
-                if admitted && self.guard.track_attempt(emission, attempt) {
+                let admission =
+                    outbound_owner
+                        .clone()
+                        .map_or(CarrierEmissionAdmission::Refused, |owner| {
+                            state.begin_carrier_emission_for_owner_result(
+                                emission,
+                                attempt,
+                                owner,
+                                [instance],
+                            )
+                        });
+                if admission == CarrierEmissionAdmission::Stale {
+                    self.guard.settle_attempt(emission);
+                    continue;
+                }
+                if admission.is_admitted() && self.guard.track_attempt(emission, attempt) {
                     // The exact attempt and emission are now both funded.
                 } else {
                     if self.refusal_sink.is_some() {
@@ -897,6 +915,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard,
+            allow_untracked_emission: true,
             defer_attempt_acceptance: false,
         });
     let _ = state.with_local_signaling_forwarder(|| {
@@ -1069,6 +1088,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
             recovery_instance,
         ),
         recovery_instance,
+        true,
     )
 }
 
@@ -1080,6 +1100,7 @@ fn attach_nostr_with(
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
     recovery_instance: Option<RecoveryCarrierInstance>,
+    allow_untracked_emission: bool,
 ) -> Option<NostrDriverHandle> {
     let guard = attach.guard();
     let cfg = state.config.read();
@@ -1182,6 +1203,7 @@ fn attach_nostr_with(
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard: Arc::clone(&guard),
+            allow_untracked_emission,
             defer_attempt_acceptance: true,
         });
 
@@ -1225,12 +1247,14 @@ fn attach_nostr_shared(
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
     recovery_instance: Option<RecoveryCarrierInstance>,
+    allow_untracked_emission: bool,
 ) -> Option<Arc<NostrDriverHandle>> {
     let handle = Arc::new(attach_nostr_with(
         state,
         outbound_rx,
         attach,
         recovery_instance,
+        allow_untracked_emission,
     )?);
     let settlement_handle = Arc::clone(&handle);
     state.set_attempt_settlement(Arc::new(move |attempt, terminal| {
@@ -1260,6 +1284,7 @@ pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
             recovery_instance,
         ),
         recovery_instance,
+        true,
     )
 }
 
@@ -1272,6 +1297,7 @@ fn attach_mdns_with(
     outbound_rx: ResourceMailboxReceiver<SignalingOutbound>,
     attach: CarrierAttach,
     recovery_instance: Option<RecoveryCarrierInstance>,
+    allow_untracked_emission: bool,
 ) -> Option<MdnsDriverHandle> {
     let guard = attach.guard();
     let mdns_cfg = MdnsDriverConfig {
@@ -1348,6 +1374,7 @@ fn attach_mdns_with(
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard: Arc::clone(&guard),
+            allow_untracked_emission,
             defer_attempt_acceptance: false,
         });
 
@@ -1511,8 +1538,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                     (mdns_instance, mdns_tx, mdns_attach.guard()),
                 ],
             );
-            let nostr = attach_nostr_shared(state, nostr_rx, nostr_attach, nostr_instance);
-            let mdns = attach_mdns_with(state, mdns_rx, mdns_attach, mdns_instance);
+            let nostr = attach_nostr_shared(state, nostr_rx, nostr_attach, nostr_instance, false);
+            let mdns = attach_mdns_with(state, mdns_rx, mdns_attach, mdns_instance, false);
             SignalingDrivers {
                 nostr,
                 mdns,
@@ -1528,7 +1555,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 recovery_instance,
             );
             SignalingDrivers {
-                nostr: attach_nostr_shared(state, outbound_rx, attach, recovery_instance),
+                nostr: attach_nostr_shared(state, outbound_rx, attach, recovery_instance, true),
                 mdns: None,
                 fanout: None,
             }
@@ -1541,7 +1568,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 state,
                 recovery_instance,
             );
-            let mdns = attach_mdns_with(state, outbound_rx, attach, recovery_instance);
+            let mdns = attach_mdns_with(state, outbound_rx, attach, recovery_instance, true);
             if mdns.is_none() {
                 warn!(
                     network = %state.network_id,
@@ -1670,15 +1697,24 @@ fn spawn_fanout(
             if let Some(attempt) = attempt.as_deref() {
                 let instances = driver_txs.iter().filter_map(|(instance, _, _)| *instance);
                 if let Some(emission) = emission {
-                    let admitted = outbound_owner.clone().is_some_and(|owner| {
-                        state.begin_carrier_emission_for_owner(
-                            emission,
-                            attempt,
-                            owner,
-                            instances.clone(),
-                        )
-                    });
-                    if !admitted {
+                    let admission =
+                        outbound_owner
+                            .clone()
+                            .map_or(CarrierEmissionAdmission::Refused, |owner| {
+                                state.begin_carrier_emission_for_owner_result(
+                                    emission,
+                                    attempt,
+                                    owner,
+                                    instances.clone(),
+                                )
+                            });
+                    if admission == CarrierEmissionAdmission::Stale {
+                        for (_, _, guard) in &driver_txs {
+                            guard.settle_attempt(emission);
+                        }
+                        continue;
+                    }
+                    if !admission.is_admitted() {
                         CoreAttemptRefusalSink {
                             state: Arc::downgrade(&state),
                             instance: None,
@@ -1891,6 +1927,7 @@ mod tests {
             recovery_state: None,
             recovery_instance: None,
             guard: CarrierInstanceGuard::noop(None),
+            allow_untracked_emission: true,
             defer_attempt_acceptance: false,
         }
     }
@@ -2153,6 +2190,10 @@ mod tests {
         });
         let store = myownmesh_signaling::nostr::delivery::DeliveryStore::new(provider.clone());
         let baseline = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            baseline, 0,
+            "a fresh production provider starts at baseline"
+        );
         let (session, session_refusals) = store.open_session();
         assert!(session_refusals.is_empty());
         let after_session = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
@@ -2164,6 +2205,27 @@ mod tests {
             "ledger-control".to_string(),
             1,
         );
+        let retention = DeliveryRetention::for_attempt("ledger-attempt", &event);
+        let attempt_custody = u64::try_from(retention.attempt_key_bytes)
+            .expect("attempt key retention fits the provider ledger")
+            .checked_add(
+                u64::try_from(retention.attempt_entry_bytes)
+                    .expect("attempt entry retention fits the provider ledger"),
+            )
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    u64::try_from("ledger-attempt".len())
+                        .expect("attempt correlation retention fits the provider ledger"),
+                )
+            })
+            .expect("attempt custody retention does not overflow the provider ledger");
+        let relay_custody = u64::try_from(retention.encoded_event_bytes)
+            .expect("encoded event retention fits the provider ledger")
+            .checked_add(
+                u64::try_from(retention.relay_entry_bytes)
+                    .expect("relay entry retention fits the provider ledger"),
+            )
+            .expect("relay custody retention does not overflow the provider ledger");
         let event_id = event.id.clone();
         let report = store.admit(
             "ledger-attempt".to_string(),
@@ -2173,6 +2235,12 @@ mod tests {
             ),
         );
         assert_eq!(report.accepted_sessions, 1);
+        let after_admission = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            after_admission,
+            after_session + attempt_custody + relay_custody,
+            "CoreNostrDeliveryProvider charges each real session/attempt/relay allocation once"
+        );
         assert_eq!(guard.emission_for_source(report.source), Some(emission));
         let duplicate = store.admit(
             "ledger-attempt".to_string(),
@@ -2198,10 +2266,15 @@ mod tests {
         );
         guard.settle_attempt(emission);
         guard.settle_attempt(duplicate_emission);
-        assert!(provider.ledger.load(std::sync::atomic::Ordering::SeqCst) > after_session);
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            after_admission,
+            "carrier settlement does not release provider-owned delivery custody"
+        );
         assert!(store.settle(&session, &event_id, DeliveryTerminal::Cancelled));
-        assert!(
-            provider.ledger.load(std::sync::atomic::Ordering::SeqCst) > after_session,
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            after_session + attempt_custody,
             "cancelled relay custody remains while the attempt is reconnectable"
         );
         assert_eq!(
@@ -2211,7 +2284,8 @@ mod tests {
         );
         assert_eq!(
             provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
-            after_session
+            after_session,
+            "attempt custody is released only at its lifecycle terminal"
         );
         store.close_session(session, DeliveryTerminal::Cancelled);
         assert_eq!(
@@ -2282,22 +2356,28 @@ mod tests {
     #[test]
     fn late_emission_callbacks_are_stale_without_recreation() {
         let state = crate::engine::build_test_state("emission-stale");
-        let instance = state
+        let first = state
             .next_recovery_carrier_instance()
             .expect("test carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second test carrier instance");
         let emission = SignalingEmissionId::next();
-        assert!(state.begin_carrier_emission(emission, "late-attempt", [instance]));
+        assert!(state.begin_carrier_emission(emission, "late-attempt", [first, second]));
         assert_eq!(
-            state.record_carrier_emission(emission, "late-attempt", instance, true),
+            state.record_carrier_emission(emission, "late-attempt", first, true),
             crate::engine::state::CarrierEmissionRecord::Accepted
         );
+        assert!(!state.begin_carrier_emission(emission, "late-attempt", [second]));
         assert_eq!(
-            state.record_carrier_emission(emission, "late-attempt", instance, true),
+            state.record_carrier_emission(emission, "late-attempt", second, false),
             crate::engine::state::CarrierEmissionRecord::Stale
         );
+        let successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(successor, "late-attempt", [second]));
         assert_eq!(
-            state.record_carrier_emission(emission, "late-attempt", instance, false),
-            crate::engine::state::CarrierEmissionRecord::Stale
+            state.record_carrier_emission(successor, "late-attempt", second, false),
+            crate::engine::state::CarrierEmissionRecord::FinalRefusal
         );
     }
 

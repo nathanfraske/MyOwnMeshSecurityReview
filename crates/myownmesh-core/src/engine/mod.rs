@@ -753,11 +753,18 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         NetworkCmd::DropPeer { device_id, reason } => {
             drop_peer(state, &device_id, reason).await;
         }
+        NetworkCmd::DropPeerIfCurrent { owner, reason } => {
+            drop_peer_if_current(state, &owner, reason).await;
+        }
         NetworkCmd::AttemptRefused { owner, refusal } => {
-            let current = state
-                .peers
-                .get_if_current(&owner)
-                .is_some_and(|peer| peer.attempt() == refusal.attempt);
+            let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
+                owner.worker().map_or_else(
+                    || peer.attempt() == refusal.attempt,
+                    |worker| {
+                        peer.attempt_for_worker(worker).as_deref() == Some(refusal.attempt.as_str())
+                    },
+                )
+            });
             if current {
                 let reason = match refusal.refusal {
                     myownmesh_signaling::NegotiationRefusal::DuplicateLiveEvent => {
@@ -774,10 +781,14 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             }
         }
         NetworkCmd::AttemptOutcome { owner, outcome } => {
-            let current = state
-                .peers
-                .get_if_current(&owner)
-                .is_some_and(|peer| peer.attempt() == outcome.attempt);
+            let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
+                owner.worker().map_or_else(
+                    || peer.attempt() == outcome.attempt,
+                    |worker| {
+                        peer.attempt_for_worker(worker).as_deref() == Some(outcome.attempt.as_str())
+                    },
+                )
+            });
             if !current {
                 return;
             }
@@ -1130,16 +1141,26 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
             // roles into the far side's live negotiation. The session's own
             // role is the only thing that answers "did I build this to offer".
             let now = Instant::now();
-            let reoffer_session = state.peers.get(&device_id).and_then(|p| {
-                let mut data = p.state.write();
-                let session = p.session.lock().clone();
-                if !claim_reoffer(&mut data, session.as_deref().map(OpenedAs::of), now) {
-                    return None;
-                }
-                session
+            let reoffer_witness = state.peers.owner(&device_id).and_then(|owner| {
+                state
+                    .peers
+                    .with_current(&owner, |peer| {
+                        let mut data = peer.state.write();
+                        let worker = peer.session.lock().clone()?;
+                        if !claim_reoffer(&mut data, Some(OpenedAs::of(&worker)), now) {
+                            return None;
+                        }
+                        let attempt = peer.attempt_for_worker(&worker)?;
+                        Some(ExactOfferWitness {
+                            owner: owner.for_worker(Arc::clone(&worker)),
+                            worker,
+                            attempt,
+                        })
+                    })
+                    .flatten()
             });
-            if let Some(session) = reoffer_session {
-                match session.create_offer().await {
+            if let Some(witness) = reoffer_witness {
+                match witness.worker.create_offer().await {
                     Ok(desc) => {
                         state.log_diag_with(
                             crate::events::DiagLevel::Debug,
@@ -1151,12 +1172,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                                 "reason": "stuck-at-sighted",
                             }),
                         );
-                        let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                            device_id: device_id.clone(),
-                            attempt: attempt_of(state, &device_id),
-                            sdp: desc.sdp,
-                            owner: current_owner_for_signaling(state, &device_id),
-                        });
+                        if !send_exact_offer(state, &device_id, &witness, desc.sdp) {
+                            trace!(
+                                peer = %device_id,
+                                "stuck-Sighted offer refused after exact owner/attempt recheck"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(peer = %device_id, "re-offer create_offer failed: {e}");
@@ -1498,16 +1519,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                                 serde_json::json!({ "peer": device_id, "sdp_bytes": sdp_bytes }),
                             );
                         } else if send_result == Some(false) {
-                            let removed = state.peers.remove_if_current_unpromoted_offer(&owner);
-                            if let Some(removed) = removed {
-                                finish_drop_peer(
-                                    state,
-                                    &device_id,
-                                    DropReason::IceFailed,
-                                    Some(removed),
-                                )
-                                .await;
-                            } else {
+                            let retired = drop_unpromoted_offer_if_current(
+                                state,
+                                &owner,
+                                &accepted_attempt,
+                                DropReason::IceFailed,
+                            )
+                            .await;
+                            if !retired {
                                 let ended_tokens = owner.connection().take_current_dedups();
                                 forget_dedups(
                                     state,
@@ -2103,13 +2122,67 @@ fn prepare_answerer_recovery(
         .flatten()
 }
 
-fn current_owner_for_signaling(
+/// Exact custody for an Offer built across an await.  The owner token, worker,
+/// and attempt are captured together before native SDP construction begins;
+/// the send fence below refuses output from a replaced installation rather
+/// than resolving the device id again and stamping a successor.
+struct ExactOfferWitness {
+    owner: peer_registry::PeerOwnerToken,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    attempt: String,
+}
+
+fn capture_offer_witness_for_owner(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+) -> Option<ExactOfferWitness> {
+    state
+        .peers
+        .with_current(owner, |peer| {
+            let worker = owner
+                .worker()
+                .cloned()
+                .or_else(|| peer.session.lock().clone())?;
+            let attempt = peer.attempt_for_worker(&worker)?;
+            Some(ExactOfferWitness {
+                owner: owner.for_worker(Arc::clone(&worker)),
+                worker,
+                attempt,
+            })
+        })
+        .flatten()
+}
+
+fn offer_witness_is_current(state: &Arc<NetworkState>, witness: &ExactOfferWitness) -> bool {
+    state.peers.with_current(&witness.owner, |peer| {
+        peer.attempt_for_worker(&witness.worker).as_deref() == Some(witness.attempt.as_str())
+    }) == Some(true)
+}
+
+fn send_exact_offer(
     state: &Arc<NetworkState>,
     device_id: &str,
-) -> Option<peer_registry::PeerOwnerToken> {
-    let owner = state.peers.owner(device_id)?;
-    let worker = owner.connection().current_worker()?;
-    Some(owner.for_worker(worker))
+    witness: &ExactOfferWitness,
+    sdp: String,
+) -> bool {
+    state
+        .peers
+        .with_current(&witness.owner, |peer| {
+            if peer.attempt_for_worker(&witness.worker).as_deref() != Some(witness.attempt.as_str())
+            {
+                return false;
+            }
+            state
+                .signaling_tx
+                .send(SignalingOutbound::Offer {
+                    device_id: device_id.to_string(),
+                    attempt: witness.attempt.clone(),
+                    sdp,
+                    owner: Some(witness.owner.clone()),
+                })
+                .is_ok()
+        })
+        .unwrap_or(false)
 }
 
 fn cancel_recovery_demand(
@@ -2367,14 +2440,14 @@ pub(crate) async fn renegotiate_ice_for_owner(
     if state.is_offline() {
         return;
     }
-    let session = {
-        let Some(peer) = state.peers.get_if_current(owner) else {
-            return;
-        };
-        let s = peer.session.lock().clone();
-        s
+    // Capture the exact owner/worker/attempt before restart_ice or SDP
+    // construction can await. A replacement during either operation must
+    // cause the old restart offer to be refused, never stamped onto W1.
+    let Some(witness) = capture_offer_witness_for_owner(state, owner) else {
+        return;
     };
-    let Some(session) = session else { return };
+    let session = Arc::clone(&witness.worker);
+    let owner = witness.owner.clone();
 
     // Snapshot the ICE state we're firing from — together with `trigger`
     // this is the instrumentation that answers "what kicked a link that
@@ -2390,7 +2463,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
         // (`force`), leave it alone — and opportunistically settle the
         // tier back to Steady if a prior restart has since recovered.
         RTCIceConnectionState::Connected | RTCIceConnectionState::Completed if !force => {
-            state.peers.with_current(owner, |peer| {
+            state.peers.with_current(&owner, |peer| {
                 let mut data = peer.state.write();
                 data.ice_disconnected_since = None;
                 if matches!(
@@ -2410,7 +2483,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
 
     // Single-flight: collapse overlapping triggers into one offer/window.
     let offerer = {
-        let Some(offerer) = state.peers.with_current(owner, |peer| {
+        let Some(offerer) = state.peers.with_current(&owner, |peer| {
             let mut data = peer.state.write();
             let due = data
                 .last_offer_sent_at
@@ -2446,7 +2519,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
     // network watcher mis-firing on a multi-homed host.
     let Some(restarts) = state
         .peers
-        .with_current(owner, |peer| peer.state.read().diag.ice_restarts)
+        .with_current(&owner, |peer| peer.state.read().diag.ice_restarts)
     else {
         return;
     };
@@ -2482,7 +2555,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
             // the next watchdog poll picks it up once that settles.
             debug!(peer = %device_id, "restart_ice during renegotiate: {e}");
         }
-        if state.peers.get_if_current(owner).is_none() {
+        if !offer_witness_is_current(state, &witness) {
             return;
         }
         // create_offer runs INLINE on the single driver task, so an unbounded
@@ -2503,7 +2576,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
         .await;
         match built {
             Ok(Ok(desc)) => {
-                if state.peers.get_if_current(owner).is_none() {
+                if !offer_witness_is_current(state, &witness) {
                     return;
                 }
                 // The single INFO line for this restart is the `trigger=…`
@@ -2522,14 +2595,12 @@ pub(crate) async fn renegotiate_ice_for_owner(
                         "sdp_bytes": desc.sdp.len(),
                     }),
                 );
-                state.peers.with_current(owner, |peer| {
-                    let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                        device_id: device_id.to_string(),
-                        attempt: peer.attempt(),
-                        sdp: desc.sdp,
-                        owner: Some(owner.clone()),
-                    });
-                });
+                if !send_exact_offer(state, device_id, &witness, desc.sdp) {
+                    trace!(
+                        peer = %device_id,
+                        "ICE restart offer refused after exact owner/worker/attempt recheck"
+                    );
+                }
             }
             Ok(Err(e)) => warn!(peer = %device_id, "renegotiate create_offer failed: {e}"),
             Err(_) => warn!(
@@ -2544,7 +2615,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
         // side with "can not be restarted when gathering". Just nudge the
         // offerer to send the restart offer; the reactive announce is globally
         // rate-limited so this can't add signaling load.
-        if state.peers.get_if_current(owner).is_none() {
+        if !offer_witness_is_current(state, &witness) {
             return;
         }
         state.log_diag_with(
@@ -3377,6 +3448,9 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
         .peers
         .owner(device_id)
         .map(|owner| owner.for_worker(Arc::clone(&session)));
+    let offer_witness = pump_owner
+        .as_ref()
+        .and_then(|owner| capture_offer_witness_for_owner(state, owner));
     if let Some(replaced) = replaced {
         forget_displacement(state, replaced);
     }
@@ -3401,27 +3475,52 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // now costs this one attempt (the watchdog rebuilds it), not the engine.
     debug!(peer = %short_peer(device_id), "ensure_peer_session: building offer");
     if role == Role::Offerer {
+        let Some(witness) = offer_witness else {
+            warn!(peer = %device_id, "offer refused: exact owner/worker/attempt witness unavailable");
+            spawn_peer_event_pump(
+                Arc::clone(state),
+                device_id.to_string(),
+                Arc::clone(&session),
+                rx,
+                pump_owner,
+            );
+            return;
+        };
         let built = tokio::time::timeout(
             Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
-            session.create_offer(),
+            witness.worker.create_offer(),
         )
         .await;
         match built {
             Ok(Ok(desc)) => {
-                state.log_diag_with(
-                    crate::events::DiagLevel::Debug,
-                    "signaling",
-                    format!("offer sent to {}", short_peer(device_id)),
-                    serde_json::json!({ "peer": device_id, "sdp_bytes": desc.sdp.len() }),
-                );
-                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                    device_id: device_id.to_string(),
-                    attempt: attempt_of(state, device_id),
-                    sdp: desc.sdp,
-                    owner: current_owner_for_signaling(state, device_id),
-                });
-                if let Some(p) = state.peers.get(device_id) {
-                    p.state.write().last_offer_sent_at = Some(Instant::now());
+                let sdp_bytes = desc.sdp.len();
+                if send_exact_offer(state, device_id, &witness, desc.sdp) {
+                    state.log_diag_with(
+                        crate::events::DiagLevel::Debug,
+                        "signaling",
+                        format!("offer sent to {}", short_peer(device_id)),
+                        serde_json::json!({ "peer": device_id, "sdp_bytes": sdp_bytes }),
+                    );
+                    if state.peers.with_current(&witness.owner, |peer| {
+                        if peer.attempt_for_worker(&witness.worker).as_deref()
+                            != Some(witness.attempt.as_str())
+                        {
+                            return false;
+                        }
+                        peer.state.write().last_offer_sent_at = Some(Instant::now());
+                        true
+                    }) != Some(true)
+                    {
+                        trace!(
+                            peer = %device_id,
+                            "offer timestamp refused after exact owner/attempt recheck"
+                        );
+                    }
+                } else {
+                    trace!(
+                        peer = %device_id,
+                        "initial offer refused after exact owner/attempt recheck"
+                    );
                 }
             }
             Ok(Err(e)) => {
@@ -3654,39 +3753,50 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
     let bootstrap_offerer = state.identity.public_id() < device_id;
     // Resolve the throttle + session under the peer lock, then act
     // outside it (the create_offer / open_peer awaits must not hold it).
-    let session = match state.peers.get(device_id) {
+    let offer_witness = match state.peers.owner(device_id) {
         None => {
             if !bootstrap_offerer {
                 return;
             }
             None
         }
-        Some(peer) => {
-            let mut data = peer.state.write();
-            let session = peer.session.lock().clone();
-            let permitted = match session.as_deref() {
-                Some(session) => OpenedAs::of(session).is_offerer(),
-                None => bootstrap_offerer,
-            };
-            if !permitted {
-                return;
+        Some(owner) => {
+            let decision = state.peers.with_current(&owner, |peer| {
+                let mut data = peer.state.write();
+                let Some(worker) = peer.session.lock().clone() else {
+                    return if bootstrap_offerer { Ok(None) } else { Err(()) };
+                };
+                if !OpenedAs::of(&worker).is_offerer() {
+                    return Err(());
+                }
+                let due = data
+                    .last_offer_sent_at
+                    .map(|t| {
+                        Instant::now().duration_since(t)
+                            >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                    })
+                    .unwrap_or(true);
+                if !due {
+                    return Err(());
+                }
+                data.last_offer_sent_at = Some(Instant::now());
+                let Some(attempt) = peer.attempt_for_worker(&worker) else {
+                    return Err(());
+                };
+                Ok(Some(ExactOfferWitness {
+                    owner: owner.for_worker(Arc::clone(&worker)),
+                    worker,
+                    attempt,
+                }))
+            });
+            match decision {
+                Some(Ok(witness)) => witness,
+                Some(Err(())) | None => return,
             }
-            let due = data
-                .last_offer_sent_at
-                .map(|t| {
-                    Instant::now().duration_since(t)
-                        >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
-                })
-                .unwrap_or(true);
-            if !due {
-                return;
-            }
-            data.last_offer_sent_at = Some(Instant::now());
-            session
         }
     };
-    match session {
-        Some(session) => match session.create_offer().await {
+    match offer_witness {
+        Some(witness) => match witness.worker.create_offer().await {
             Ok(desc) => {
                 state.log_diag_with(
                     crate::events::DiagLevel::Debug,
@@ -3701,12 +3811,12 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
                         "reason": "failed-answer",
                     }),
                 );
-                let _ = state.signaling_tx.send(SignalingOutbound::Offer {
-                    device_id: device_id.to_string(),
-                    attempt: attempt_of(state, device_id),
-                    sdp: desc.sdp,
-                    owner: current_owner_for_signaling(state, device_id),
-                });
+                if !send_exact_offer(state, device_id, &witness, desc.sdp) {
+                    trace!(
+                        peer = %device_id,
+                        "failed-Answer offer refused after exact owner/attempt recheck"
+                    );
+                }
             }
             Err(e) => warn!(peer = %device_id, "re-offer create_offer failed: {e}"),
         },
@@ -7475,19 +7585,6 @@ fn forget_displacement(state: &Arc<NetworkState>, displaced: connection::Attempt
     forget_dedups(state, displaced.retired_dedup);
 }
 
-/// This peer's current attempt correlation, for stamping an outbound signal.
-///
-/// Empty when there is no installation to ask — a signal emitted for a peer
-/// that has already gone correlates with nothing, which is the honest answer
-/// and de-duplicates against nothing rather than against some other attempt.
-fn attempt_of(state: &Arc<NetworkState>, device_id: impl AsRef<str>) -> String {
-    state
-        .peers
-        .get(device_id.as_ref())
-        .map(|peer| peer.attempt())
-        .unwrap_or_default()
-}
-
 /// Whether an inbound signal belongs to the attempt this peer is running.
 ///
 /// The correlation is peer-supplied and unauthenticated, so it is read as a
@@ -7666,6 +7763,29 @@ pub(crate) async fn drop_peer_if_current(
     } else if let Some(recovery) = recovery {
         cancel_recovery_demand(Some(recovery));
     }
+}
+
+/// Retire an unpromoted Offer only when both the installation token and the
+/// attempt correlation captured by its producer still match. A refusal from
+/// an old Offer must not fall through to a device-id removal and take a newer
+/// attempt for the same peer.
+async fn drop_unpromoted_offer_if_current(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    attempt: &str,
+    reason: DropReason,
+) -> bool {
+    let current = state.peers.with_current(owner, |peer| {
+        !peer.holds_promoted_session() && peer.attempt() == attempt
+    }) == Some(true);
+    if !current {
+        return false;
+    }
+    let Some(removed) = state.peers.remove_if_current_unpromoted_offer(owner) else {
+        return false;
+    };
+    finish_drop_peer(state, owner.device_id(), reason, Some(removed)).await;
+    true
 }
 
 /// Build one logical-session dispatch for a current owner.

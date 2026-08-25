@@ -983,14 +983,14 @@ impl DeliveryStore {
         owned: OwnedSignal<NostrEvent, ErasedOwner>,
     ) -> AdmissionReport {
         let source = AdmissionSource::fresh();
-        let event_id = owned.value().id.clone();
+        let event_id_ref = owned.value().id.as_str();
         self.provider
-            .on_admission_source(source, &attempt, &event_id);
+            .on_admission_source(source, &attempt, event_id_ref);
         let mut state = self.state.lock();
-        if state.attempts.contains_key(&event_id) {
+        if state.attempts.contains_key(event_id_ref) {
             return AdmissionReport {
                 source,
-                event_id,
+                event_id: event_id_ref.to_owned(),
                 accepted_sessions: 0,
                 refused: Vec::new(),
                 attempt_refusal: Some(AdmissionRefusal::DuplicateLiveEvent),
@@ -1006,7 +1006,7 @@ impl DeliveryStore {
                 Err(error) => {
                     return AdmissionReport {
                         source,
-                        event_id,
+                        event_id: event_id_ref.to_owned(),
                         accepted_sessions: 0,
                         refused: Vec::new(),
                         attempt_refusal: Some(AdmissionRefusal::Provider(error)),
@@ -1022,7 +1022,7 @@ impl DeliveryStore {
                 record_lease.finish(DeliveryTerminal::Cancelled);
                 return AdmissionReport {
                     source,
-                    event_id,
+                    event_id: event_id_ref.to_owned(),
                     accepted_sessions: 0,
                     refused: Vec::new(),
                     attempt_refusal: Some(AdmissionRefusal::Provider(error)),
@@ -1042,7 +1042,7 @@ impl DeliveryStore {
                     record_lease.finish(DeliveryTerminal::Cancelled);
                     return AdmissionReport {
                         source,
-                        event_id,
+                        event_id: event_id_ref.to_owned(),
                         accepted_sessions: 0,
                         refused: Vec::new(),
                         attempt_refusal: Some(AdmissionRefusal::Provider(error)),
@@ -1064,13 +1064,14 @@ impl DeliveryStore {
                     record_lease.finish(DeliveryTerminal::Cancelled);
                     return AdmissionReport {
                         source,
-                        event_id,
+                        event_id: event_id_ref.to_owned(),
                         accepted_sessions: 0,
                         refused: Vec::new(),
                         attempt_refusal: Some(AdmissionRefusal::Provider(error)),
                     };
                 }
             };
+        let event_id = owned.value().id.clone();
         let mut relays = DeliveryMap::new();
         let mut refused = Vec::new();
         for (session, _) in state.sessions.iter() {
@@ -1456,6 +1457,19 @@ mod tests {
         }
     }
 
+    struct ByteLease {
+        live: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+        amount: usize,
+    }
+
+    impl DeliveryLease for ByteLease {
+        fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            self.bytes.fetch_sub(self.amount, Ordering::SeqCst);
+        }
+    }
+
     macro_rules! unmetered_reservations {
         () => {
             fn reserve_session_identity(
@@ -1498,15 +1512,6 @@ mod tests {
                 Ok(Box::new(UnmeteredLease))
             }
 
-            fn reserve_attempt_key(
-                &self,
-                _attempt: &str,
-                _event: &NostrEvent,
-                _retention: DeliveryRetention,
-            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-                Ok(Box::new(UnmeteredLease))
-            }
-
             fn reserve_attempt_map_growth(
                 &self,
                 _attempt: &str,
@@ -1528,8 +1533,22 @@ mod tests {
         };
     }
 
+    macro_rules! unmetered_attempt_key {
+        () => {
+            fn reserve_attempt_key(
+                &self,
+                _attempt: &str,
+                _event: &NostrEvent,
+                _retention: DeliveryRetention,
+            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+                Ok(Box::new(UnmeteredLease))
+            }
+        };
+    }
+
     impl DeliveryProvider for CountingProvider {
         unmetered_reservations!();
+        unmetered_attempt_key!();
 
         fn reserve(
             &self,
@@ -1547,15 +1566,19 @@ mod tests {
 
     struct ExactCustodyProvider {
         live: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl ExactCustodyProvider {
-        fn lease(&self, label: &str) -> Box<dyn DeliveryLease> {
+        fn lease_bytes(&self, label: &str, amount: usize) -> Box<dyn DeliveryLease> {
             self.calls.lock().push(label.to_string());
             self.live.fetch_add(1, Ordering::SeqCst);
-            Box::new(CountingLease {
+            self.bytes.fetch_add(amount, Ordering::SeqCst);
+            Box::new(ByteLease {
                 live: Arc::clone(&self.live),
+                bytes: Arc::clone(&self.bytes),
+                amount,
             })
         }
     }
@@ -1568,21 +1591,28 @@ mod tests {
             _attempt: &str,
             _session: RelaySessionId,
             _event: &NostrEvent,
-            _retention: DeliveryRetention,
+            retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-            Ok(self.lease("relay"))
+            Ok(self.lease_bytes("encoded-event", retention.encoded_event_bytes))
+        }
+
+        fn reserve_attempt_key(
+            &self,
+            _attempt: &str,
+            _event: &NostrEvent,
+            retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            Ok(self.lease_bytes("attempt-key", retention.attempt_key_bytes))
         }
 
         fn reserve_attempt_correlation(
             &self,
             attempt: &str,
             _event: &NostrEvent,
-            retention: DeliveryRetention,
+            _retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
             assert!(!attempt.is_empty());
-            assert!(retention.relay_map_growth_bytes > 0);
-            assert!(retention.attempt_map_growth_bytes > 0);
-            Ok(self.lease("attempt-correlation"))
+            Ok(self.lease_bytes("attempt-correlation", attempt.len()))
         }
 
         fn reserve_attempt_entry(
@@ -1592,7 +1622,7 @@ mod tests {
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
             assert!(retention.attempt_map_growth_bytes > 0);
-            Ok(self.lease("attempt-entry"))
+            Ok(self.lease_bytes("attempt-entry", retention.attempt_entry_bytes))
         }
 
         fn reserve_relay_entry(
@@ -1603,7 +1633,7 @@ mod tests {
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
             assert!(retention.relay_map_growth_bytes > 0);
-            Ok(self.lease("relay-entry"))
+            Ok(self.lease_bytes("relay-entry", retention.relay_entry_bytes))
         }
     }
 
@@ -1632,6 +1662,7 @@ mod tests {
 
     impl DeliveryProvider for OpenOnFinishProvider {
         unmetered_reservations!();
+        unmetered_attempt_key!();
 
         fn reserve(
             &self,
@@ -1685,6 +1716,7 @@ mod tests {
 
     impl DeliveryProvider for RejectOnceProvider {
         unmetered_reservations!();
+        unmetered_attempt_key!();
 
         fn reserve(
             &self,
@@ -1710,6 +1742,7 @@ mod tests {
 
     impl DeliveryProvider for ToggleProvider {
         unmetered_reservations!();
+        unmetered_attempt_key!();
 
         fn reserve(
             &self,
@@ -1735,6 +1768,7 @@ mod tests {
 
     impl DeliveryProvider for RefuseSpecificProvider {
         unmetered_reservations!();
+        unmetered_attempt_key!();
 
         fn reserve(
             &self,
@@ -2308,30 +2342,44 @@ mod tests {
         assert_eq!(session_retention.session_set_node_bytes, 0);
         assert!(session_retention.session_entry_bytes > 0);
         assert_eq!(session_retention.session_set_growth_bytes, 0);
+        let bytes = Arc::new(AtomicUsize::new(0));
         let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
             live: Arc::clone(&live),
+            bytes: Arc::clone(&bytes),
             calls: Arc::clone(&calls),
         }));
         let (session, _) = store.open_session();
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
+        let expected_retained_bytes = retention.attempt_key_bytes
+            + retention.attempt_entry_bytes
+            + "exact-correlation".len()
+            + retention.encoded_event_bytes
+            + retention.relay_entry_bytes;
+        let baseline_bytes = bytes.load(Ordering::SeqCst);
         let report = store.admit("exact-correlation".into(), owned);
         assert_eq!(report.accepted_sessions, 1);
         assert_eq!(
             *calls.lock(),
             vec![
+                "attempt-key".to_string(),
                 "attempt-correlation".to_string(),
                 "attempt-entry".to_string(),
-                "relay".to_string(),
+                "encoded-event".to_string(),
                 "relay-entry".to_string(),
             ]
         );
-        assert_eq!(live.load(Ordering::SeqCst), 4);
+        assert_eq!(live.load(Ordering::SeqCst), 5);
+        assert_eq!(
+            bytes.load(Ordering::SeqCst),
+            baseline_bytes + expected_retained_bytes
+        );
         assert_eq!(
             store.finish_attempt("exact-correlation", DeliveryTerminal::Accepted),
             1
         );
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(bytes.load(Ordering::SeqCst), baseline_bytes);
         assert!(!store.settle(&session, &event_id, DeliveryTerminal::Accepted));
     }
 }
