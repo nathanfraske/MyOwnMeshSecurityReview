@@ -3357,12 +3357,19 @@ mod tests {
         state.park_command_receiver_for_test(cmd_rx);
         let baseline = provider.in_use();
         let fixture = super::super::insert_promoted_peer(&state, "local-derived-peer").await;
+        let successor_fixture =
+            super::super::insert_promoted_peer(&state, "local-derived-successor").await;
         let attempt = "local-derived-pressure";
         fixture.peer.adopt_attempt(attempt);
         let owner = state
             .peers
             .owner("local-derived-peer")
             .expect("the local owner is current");
+        let captured_owner = owner.clone();
+        let successor_owner = state
+            .peers
+            .owner("local-derived-successor")
+            .expect("the successor owner is current");
         let instance = state
             .next_recovery_carrier_instance()
             .expect("local carrier instance");
@@ -3390,12 +3397,17 @@ mod tests {
         // cleanup path rather than enqueueing behind a parked receiver.
         provider.script_pressure(crate::resource::ResourceClass::OpaqueDependencyResidual);
         state.cmd_tx.close();
+        let translated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let translated_clone = Arc::clone(&translated);
         let source = TranslatedOutbound {
             first: None,
             rx,
             scope,
-            translate: Box::new(|_| LocalOutbound::Leave {
-                device_id: "local-derived-peer".to_string(),
+            translate: Box::new(move |_| {
+                translated_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                LocalOutbound::Leave {
+                    device_id: "local-derived-peer".to_string(),
+                }
             }),
             recovery_state: Some(Arc::downgrade(&state)),
             recovery_instance: Some(instance),
@@ -3413,8 +3425,21 @@ mod tests {
         forwarder
             .await
             .expect("LocalBroker forwarder completes after the refused source");
+        assert!(
+            state.peers.get_if_current(&captured_owner).is_none(),
+            "the exact pressured LocalBroker owner is retired before shutdown"
+        );
+        assert!(
+            state.peers.get_if_current(&successor_owner).is_some(),
+            "a distinct successor owner remains untouched"
+        );
+        assert!(
+            !translated.load(std::sync::atomic::Ordering::SeqCst),
+            "derived pressure produces no translated LocalBroker payload"
+        );
         state.shutdown().await;
         drop(fixture);
+        drop(successor_fixture);
         assert_eq!(
             provider.in_use(),
             baseline,
