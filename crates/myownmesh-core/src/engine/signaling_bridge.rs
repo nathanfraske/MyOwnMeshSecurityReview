@@ -40,18 +40,19 @@ use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
 };
 use myownmesh_signaling::nostr::delivery::{
-    DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryTerminal,
-    RelaySessionId,
+    AdmissionSource, DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention,
+    DeliveryTerminal, RelaySessionId,
 };
 use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
 };
 use myownmesh_signaling::{
     AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, InboundSink,
-    NegotiationRefusal, OutboundSource, OwnedSignal, SignalingMessage,
+    OutboundSource, OwnedSignal, SignalingMessage,
 };
 use tracing::{trace, warn};
 
+use crate::events::DropReason;
 use crate::resource::{
     LocalApplicationResourceScope, ResourceClaim, ResourceLease, ResourceMailboxDelivery,
     ResourceMailboxReceiver, ResourceMailboxSendError, ResourceMailboxSender,
@@ -62,7 +63,8 @@ use super::signaling_ingress::{
     SignalingCarrier, SignalingRuntime,
 };
 use super::state::{
-    NetworkCmd, NetworkState, RecoveryCarrierInstance, SignalingEmissionId, SignalingOutbound,
+    CarrierEmissionRecord, NetworkCmd, NetworkState, RecoveryCarrierInstance, SignalingEmissionId,
+    SignalingOutbound,
 };
 
 /// One driver's outbound side: the engine's admitted values, translated on the
@@ -186,10 +188,20 @@ enum CoreOutboundOwner {
 pub(crate) struct CoreNostrDeliveryProvider {
     scope: LocalApplicationResourceScope,
     guard: Arc<CarrierInstanceGuard>,
+    ledger: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct CoreNostrDeliveryLease {
     _lease: ResourceLease,
+    ledger: Arc<std::sync::atomic::AtomicU64>,
+    bytes: u64,
+}
+
+impl Drop for CoreNostrDeliveryLease {
+    fn drop(&mut self) {
+        self.ledger
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Routes a typed Nostr attempt admission refusal through the exact owner
@@ -209,12 +221,13 @@ impl CoreAttemptRefusalSink {
         let Some(instance) = self.instance else {
             return;
         };
-        let result = state.record_carrier_emission(emission, &refusal.attempt, instance, false);
+        let settlement =
+            state.record_carrier_emission_with_owner(emission, &refusal.attempt, instance, false);
         self.guard.settle_attempt(emission);
-        if result != super::state::CarrierEmissionRecord::FinalRefusal {
+        if settlement.record != CarrierEmissionRecord::FinalRefusal {
             return;
         }
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
+        let Some(owner) = settlement.owner else {
             return;
         };
         if owner.connection().attempt() != refusal.attempt {
@@ -225,34 +238,29 @@ impl CoreAttemptRefusalSink {
             .send(NetworkCmd::AttemptRefused { owner, refusal });
     }
 
-    fn forward_refusal(&self, refusal: AttemptRefusal) {
+    fn drop_unadmitted(
+        &self,
+        owner: Option<super::peer_registry::PeerOwnerToken>,
+        reason: impl Into<String>,
+    ) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &refusal.attempt) else {
+        let Some(owner) = owner else {
             return;
         };
-        if owner.connection().attempt() != refusal.attempt {
-            return;
-        }
-        let _ = state
-            .cmd_tx
-            .send(NetworkCmd::AttemptRefused { owner, refusal });
-    }
-
-    fn refused_unadmitted(&self, refusal: AttemptRefusal) {
-        self.forward_refusal(refusal);
+        let _ = state.cmd_tx.send(NetworkCmd::DropPeer {
+            device_id: owner.device_id().to_owned(),
+            reason: DropReason::TransportError {
+                message: reason.into(),
+            },
+        });
     }
 }
 
 impl AttemptRefusalSink for CoreAttemptRefusalSink {
     fn refused(&self, refusal: AttemptRefusal) {
-        if refusal.event_id.is_empty() {
-            return;
-        }
-        let emission = self
-            .guard
-            .emission_for_event(&refusal.attempt, &refusal.event_id);
+        let emission = self.guard.emission_for_source(refusal.source);
         let Some(emission) = emission else {
             return;
         };
@@ -275,9 +283,7 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
         let Some(state) = self.state.upgrade() else {
             return;
         };
-        let emission = self
-            .guard
-            .emission_for_event(&outcome.attempt, &outcome.event_id);
+        let emission = self.guard.emission_for_source(outcome.source);
         let Some(instance) = self.instance else {
             return;
         };
@@ -288,12 +294,17 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
             &outcome.kind,
             myownmesh_signaling::AttemptOutcomeKind::Accepted { .. }
         );
-        let result = state.record_carrier_emission(emission, &outcome.attempt, instance, accepted);
+        let settlement = state.record_carrier_emission_with_owner(
+            emission,
+            &outcome.attempt,
+            instance,
+            accepted,
+        );
         self.guard.settle_attempt(emission);
-        if !outcome_record_is_routable(&outcome.kind, result) {
+        if !outcome_record_is_routable(&outcome.kind, settlement.record) {
             return;
         }
-        let Some(owner) = super::owner_for_signaling_attempt(&state, &outcome.attempt) else {
+        let Some(owner) = settlement.owner else {
             return;
         };
         if owner.connection().attempt() != outcome.attempt {
@@ -347,11 +358,24 @@ impl CoreNostrDeliveryProvider {
             .scope
             .acquire(claim)
             .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
-        Ok(Box::new(CoreNostrDeliveryLease { _lease: lease }))
+        self.ledger
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(CoreNostrDeliveryLease {
+            _lease: lease,
+            ledger: Arc::clone(&self.ledger),
+            bytes,
+        }))
     }
 }
 
 impl DeliveryProvider for CoreNostrDeliveryProvider {
+    fn on_admission_source(&self, source: AdmissionSource, attempt: &str, _event_id: &str) {
+        // DeliveryStore invokes this before duplicate detection. Bind the
+        // fresh process-local source to the already claimed physical emission;
+        // refusal routing can therefore ignore attempt/event aliases.
+        let _ = self.guard.bind_admission_source(source, attempt);
+    }
+
     fn reserve_session_record(
         &self,
         _session: RelaySessionId,
@@ -484,7 +508,11 @@ pub(crate) fn nostr_delivery_provider(
     scope: LocalApplicationResourceScope,
     guard: Arc<CarrierInstanceGuard>,
 ) -> Arc<dyn DeliveryProvider> {
-    Arc::new(CoreNostrDeliveryProvider { scope, guard })
+    Arc::new(CoreNostrDeliveryProvider {
+        scope,
+        guard,
+        ledger: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    })
 }
 
 /// What one translated outbound value and its downstream copies cost.
@@ -558,6 +586,12 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 continue;
             }
             let attempt = outbound_attempt(delivery.value()).map(str::to_owned);
+            let outbound_owner = match delivery.value() {
+                SignalingOutbound::Offer { owner, .. }
+                | SignalingOutbound::Answer { owner, .. }
+                | SignalingOutbound::Candidate { owner, .. } => owner.clone(),
+                _ => None,
+            };
             let emission = attempt.as_deref().map(|attempt| {
                 // The guard owns one funded node per physical carrier copy.
                 // Claim that node at pull time; resolving the newest record by
@@ -573,33 +607,22 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 self.recovery_instance,
                 emission,
             ) {
-                let admitted = state.begin_carrier_emission(emission, attempt, [instance]);
+                let admitted = outbound_owner.clone().is_some_and(|owner| {
+                    state.begin_carrier_emission_for_owner(emission, attempt, owner, [instance])
+                });
                 if admitted && self.guard.track_attempt(emission, attempt) {
                     // The exact attempt and emission are now both funded.
                 } else {
                     if self.refusal_sink.is_some() {
-                        let refusal = AttemptRefusal {
-                            attempt: attempt.to_owned(),
-                            event_id: String::new(),
-                            refusal: NegotiationRefusal::Provider(
-                                "carrier emission admission refused".to_string(),
-                            ),
-                        };
-                        if !admitted {
-                            CoreAttemptRefusalSink {
-                                state: Arc::downgrade(state),
-                                instance: self.recovery_instance,
-                                guard: Arc::clone(&self.guard),
-                            }
-                            .refused_unadmitted(refusal);
-                        } else {
-                            CoreAttemptRefusalSink {
-                                state: Arc::downgrade(state),
-                                instance: self.recovery_instance,
-                                guard: Arc::clone(&self.guard),
-                            }
-                            .refused_for(emission, refusal);
+                        CoreAttemptRefusalSink {
+                            state: Arc::downgrade(state),
+                            instance: self.recovery_instance,
+                            guard: Arc::clone(&self.guard),
                         }
+                        .drop_unadmitted(
+                            outbound_owner.clone(),
+                            "carrier emission admission refused",
+                        );
                     } else {
                         self.guard.settle_attempt(emission);
                         state.record_carrier_emission(emission, attempt, instance, false);
@@ -639,26 +662,18 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             self.guard.settle_attempt(emission);
                         }
                     }
-                    if self.refusal_sink.is_some() {
-                        if let Some(attempt) = outbound_attempt(delivery.value()) {
-                            if let (Some(state), Some(instance), Some(emission)) =
-                                (attempt_state.as_ref(), self.recovery_instance, emission)
-                            {
-                                CoreAttemptRefusalSink {
-                                    state: Arc::downgrade(state),
-                                    instance: Some(instance),
-                                    guard: Arc::clone(&self.guard),
-                                }
-                                .refused_for(
-                                    emission,
-                                    AttemptRefusal {
-                                        attempt: attempt.to_string(),
-                                        event_id: String::new(),
-                                        refusal: NegotiationRefusal::Provider(error.to_string()),
-                                    },
-                                );
-                            }
+                    if let (true, true, Some(state), Some(instance)) = (
+                        self.refusal_sink.is_some(),
+                        outbound_attempt(delivery.value()).is_some(),
+                        attempt_state.as_ref(),
+                        self.recovery_instance,
+                    ) {
+                        CoreAttemptRefusalSink {
+                            state: Arc::downgrade(state),
+                            instance: Some(instance),
+                            guard: Arc::clone(&self.guard),
                         }
+                        .drop_unadmitted(outbound_owner.clone(), error.to_string());
                     }
                     // This emission is dropped, and only this emission. The
                     // delivery falls out of scope at the end of the iteration,
@@ -839,6 +854,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Offer {
@@ -851,6 +867,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Answer {
@@ -863,6 +880,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     device_id: to,
                     attempt,
                     candidate,
+                    ..
                 } => LocalOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Candidate {
@@ -1117,6 +1135,7 @@ fn attach_nostr_with(
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => NostrOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Offer {
@@ -1129,6 +1148,7 @@ fn attach_nostr_with(
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => NostrOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Answer {
@@ -1141,6 +1161,7 @@ fn attach_nostr_with(
                     device_id: to,
                     attempt,
                     candidate,
+                    ..
                 } => NostrOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Candidate {
@@ -1280,6 +1301,7 @@ fn attach_mdns_with(
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => MdnsOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Offer {
@@ -1292,6 +1314,7 @@ fn attach_mdns_with(
                     device_id: to,
                     attempt,
                     sdp,
+                    ..
                 } => MdnsOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Answer {
@@ -1304,6 +1327,7 @@ fn attach_mdns_with(
                     device_id: to,
                     attempt,
                     candidate,
+                    ..
                 } => MdnsOutbound::DirectedToPeer {
                     to: to.clone(),
                     msg: SignalingMessage::Candidate {
@@ -1582,7 +1606,10 @@ fn spawn_fanout(
                 _ => None,
             };
             if let Some(id) = recovery_id {
-                let instances = driver_txs.iter().filter_map(|(instance, _, _)| *instance);
+                let instances: Vec<_> = driver_txs
+                    .iter()
+                    .filter_map(|(instance, _, _)| *instance)
+                    .collect();
                 match state.begin_recovery_publication_result(id, instances) {
                     super::state::RecoveryPublicationStart::Started(_) => {}
                     super::state::RecoveryPublicationStart::Stale => {
@@ -1633,23 +1660,34 @@ fn spawn_fanout(
             // transport control cannot be added without deciding that here.
             let signal = outbound_signal(msg).name();
             let attempt = outbound_attempt(msg).map(str::to_owned);
+            let outbound_owner = match msg {
+                SignalingOutbound::Offer { owner, .. }
+                | SignalingOutbound::Answer { owner, .. }
+                | SignalingOutbound::Candidate { owner, .. } => owner.clone(),
+                _ => None,
+            };
             let emission = attempt.as_deref().map(|_| SignalingEmissionId::next());
             if let Some(attempt) = attempt.as_deref() {
                 let instances = driver_txs.iter().filter_map(|(instance, _, _)| *instance);
                 if let Some(emission) = emission {
-                    if !state.begin_carrier_emission(emission, attempt, instances) {
+                    let admitted = outbound_owner.clone().is_some_and(|owner| {
+                        state.begin_carrier_emission_for_owner(
+                            emission,
+                            attempt,
+                            owner,
+                            instances.clone(),
+                        )
+                    });
+                    if !admitted {
                         CoreAttemptRefusalSink {
                             state: Arc::downgrade(&state),
                             instance: None,
                             guard: CarrierInstanceGuard::noop(None),
                         }
-                        .refused_unadmitted(AttemptRefusal {
-                            attempt: attempt.to_owned(),
-                            event_id: String::new(),
-                            refusal: NegotiationRefusal::Provider(
-                                "signaling emission cohort refused".to_string(),
-                            ),
-                        });
+                        .drop_unadmitted(
+                            outbound_owner.clone(),
+                            "signaling emission cohort refused",
+                        );
                         continue;
                     }
                     let all_tracked = driver_txs
@@ -1657,14 +1695,16 @@ fn spawn_fanout(
                         .all(|(_, _, guard)| guard.track_attempt(emission, attempt));
                     if !all_tracked {
                         let mut final_refusal = false;
+                        let mut final_owner = None;
                         for (instance, _, guard) in &driver_txs {
                             guard.settle_attempt(emission);
                             if let Some(instance) = instance {
-                                if state
-                                    .record_carrier_emission(emission, attempt, *instance, false)
-                                    == super::state::CarrierEmissionRecord::FinalRefusal
-                                {
+                                let settlement = state.record_carrier_emission_with_owner(
+                                    emission, attempt, *instance, false,
+                                );
+                                if settlement.record == CarrierEmissionRecord::FinalRefusal {
                                     final_refusal = true;
+                                    final_owner = settlement.owner;
                                 }
                             }
                         }
@@ -1674,13 +1714,7 @@ fn spawn_fanout(
                                 instance: None,
                                 guard: CarrierInstanceGuard::noop(None),
                             }
-                            .forward_refusal(AttemptRefusal {
-                                attempt: attempt.to_owned(),
-                                event_id: String::new(),
-                                refusal: NegotiationRefusal::Provider(
-                                    "carrier emission custody refused".to_string(),
-                                ),
-                            });
+                            .drop_unadmitted(final_owner, "carrier emission custody refused");
                         }
                         continue;
                     }
@@ -1688,6 +1722,7 @@ fn spawn_fanout(
             }
             let mut delivered = false;
             let mut final_refusal = false;
+            let mut final_owner = None;
             let mut refusal_reason = None;
             for (instance, tx, guard) in &driver_txs {
                 let kind = match msg {
@@ -1708,10 +1743,12 @@ fn spawn_fanout(
                         if let (Some(attempt), Some(instance), Some(emission)) =
                             (attempt.as_deref(), instance, emission)
                         {
-                            if state.record_carrier_emission(emission, attempt, *instance, false)
-                                == super::state::CarrierEmissionRecord::FinalRefusal
-                            {
+                            let settlement = state.record_carrier_emission_with_owner(
+                                emission, attempt, *instance, false,
+                            );
+                            if settlement.record == CarrierEmissionRecord::FinalRefusal {
                                 final_refusal = true;
+                                final_owner = settlement.owner;
                             }
                             guard.settle_attempt(emission);
                         }
@@ -1731,10 +1768,12 @@ fn spawn_fanout(
                         if let (Some(attempt), Some(instance), Some(emission)) =
                             (attempt.as_deref(), instance, emission)
                         {
-                            if state.record_carrier_emission(emission, attempt, *instance, false)
-                                == super::state::CarrierEmissionRecord::FinalRefusal
-                            {
+                            let settlement = state.record_carrier_emission_with_owner(
+                                emission, attempt, *instance, false,
+                            );
+                            if settlement.record == CarrierEmissionRecord::FinalRefusal {
                                 final_refusal = true;
+                                final_owner = settlement.owner;
                             }
                             guard.settle_attempt(emission);
                         }
@@ -1749,10 +1788,12 @@ fn spawn_fanout(
                         if let (Some(attempt), Some(instance), Some(emission)) =
                             (attempt.as_deref(), instance, emission)
                         {
-                            if state.record_carrier_emission(emission, attempt, *instance, false)
-                                == super::state::CarrierEmissionRecord::FinalRefusal
-                            {
+                            let settlement = state.record_carrier_emission_with_owner(
+                                emission, attempt, *instance, false,
+                            );
+                            if settlement.record == CarrierEmissionRecord::FinalRefusal {
                                 final_refusal = true;
+                                final_owner = settlement.owner;
                             }
                             guard.settle_attempt(emission);
                         }
@@ -1767,17 +1808,13 @@ fn spawn_fanout(
                 state.refuse_empty_recovery_publication(id);
             }
             if final_refusal && !delivered && !driver_txs.is_empty() {
-                if let (Some(attempt), Some(reason)) = (attempt, refusal_reason) {
+                if let Some(reason) = refusal_reason {
                     CoreAttemptRefusalSink {
                         state: Arc::downgrade(&state),
                         instance: None,
                         guard: CarrierInstanceGuard::noop(None),
                     }
-                    .forward_refusal(AttemptRefusal {
-                        attempt,
-                        event_id: String::new(),
-                        refusal: NegotiationRefusal::Provider(reason),
-                    });
+                    .drop_unadmitted(final_owner, reason);
                 }
             }
         }
@@ -1828,6 +1865,7 @@ mod tests {
             device_id: device_id.to_string(),
             attempt: "attempt-1".to_string(),
             sdp: "sdp".to_string(),
+            owner: None,
         }
     }
 
@@ -2057,6 +2095,7 @@ mod tests {
         let provider = CoreNostrDeliveryProvider {
             scope,
             guard: CarrierInstanceGuard::noop(None),
+            ledger: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let before = accountant
             .in_use()
@@ -2068,12 +2107,116 @@ mod tests {
             .in_use()
             .amount(crate::resource::ResourceClass::AccountedMemoryBytes);
         assert_eq!(after - before, 37);
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            37,
+            "provider ledger tracks the exact live retention"
+        );
         drop(lease);
         assert_eq!(
             accountant
                 .in_use()
                 .amount(crate::resource::ResourceClass::AccountedMemoryBytes),
             before
+        );
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider ledger returns to baseline after settlement"
+        );
+    }
+
+    #[test]
+    fn core_provider_delivery_store_session_and_admission_return_to_ledger_baseline() {
+        let state = crate::engine::build_test_state("delivery-store-ledger");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("the isolated state mints one carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let emission = SignalingEmissionId::next();
+        let duplicate_emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "ledger-attempt", [instance]));
+        assert!(state.begin_carrier_emission(duplicate_emission, "ledger-attempt", [instance]));
+        assert!(guard.track_attempt(emission, "ledger-attempt"));
+        assert!(guard.track_attempt(duplicate_emission, "ledger-attempt"));
+        assert_eq!(guard.claim_attempt("ledger-attempt"), Some(emission));
+        assert_eq!(
+            guard.claim_attempt("ledger-attempt"),
+            Some(duplicate_emission)
+        );
+        let provider = Arc::new(CoreNostrDeliveryProvider {
+            scope: state
+                .local_application_resource_scope()
+                .expect("the test state has a local application scope"),
+            guard: Arc::clone(&guard),
+            ledger: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+        let store = myownmesh_signaling::nostr::delivery::DeliveryStore::new(provider.clone());
+        let baseline = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
+        let (session, session_refusals) = store.open_session();
+        assert!(session_refusals.is_empty());
+        let after_session = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after_session > baseline);
+        let event = myownmesh_signaling::nostr::event::make_event(
+            &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+            myownmesh_signaling::nostr::event::SIGNALING_EPHEMERAL_KIND,
+            Vec::new(),
+            "ledger-control".to_string(),
+            1,
+        );
+        let event_id = event.id.clone();
+        let report = store.admit(
+            "ledger-attempt".to_string(),
+            OwnedSignal::new(
+                event.clone(),
+                Box::new(()) as myownmesh_signaling::ErasedOwner,
+            ),
+        );
+        assert_eq!(report.accepted_sessions, 1);
+        assert_eq!(guard.emission_for_source(report.source), Some(emission));
+        let duplicate = store.admit(
+            "ledger-attempt".to_string(),
+            OwnedSignal::new(event, Box::new(()) as myownmesh_signaling::ErasedOwner),
+        );
+        assert_eq!(duplicate.accepted_sessions, 0);
+        assert!(matches!(
+            duplicate.attempt_refusal,
+            Some(myownmesh_signaling::nostr::delivery::AdmissionRefusal::DuplicateLiveEvent)
+        ));
+        assert_ne!(duplicate.source, report.source);
+        assert_eq!(
+            guard.emission_for_source(duplicate.source),
+            Some(duplicate_emission)
+        );
+        assert_eq!(
+            state.record_carrier_emission(emission, "ledger-attempt", instance, true),
+            crate::engine::state::CarrierEmissionRecord::Accepted
+        );
+        assert_eq!(
+            state.record_carrier_emission(duplicate_emission, "ledger-attempt", instance, false,),
+            crate::engine::state::CarrierEmissionRecord::FinalRefusal
+        );
+        guard.settle_attempt(emission);
+        guard.settle_attempt(duplicate_emission);
+        assert!(provider.ledger.load(std::sync::atomic::Ordering::SeqCst) > after_session);
+        assert!(store.settle(&session, &event_id, DeliveryTerminal::Cancelled));
+        assert!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst) > after_session,
+            "cancelled relay custody remains while the attempt is reconnectable"
+        );
+        assert_eq!(
+            store.finish_attempt("ledger-attempt", DeliveryTerminal::Cancelled),
+            0,
+            "the cancelled relay leaves attempt custody to its lifecycle terminal"
+        );
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            after_session
+        );
+        store.close_session(session, DeliveryTerminal::Cancelled);
+        assert_eq!(
+            provider.ledger.load(std::sync::atomic::Ordering::SeqCst),
+            baseline
         );
     }
 
@@ -2106,6 +2249,33 @@ mod tests {
         assert_eq!(
             guard.emission_for_event("same-attempt", second_event),
             Some(second)
+        );
+    }
+
+    #[test]
+    fn duplicate_event_id_binds_the_next_emission_without_recreating_custody() {
+        let state = crate::engine::build_test_state("duplicate-event-id");
+        let instance = state.next_recovery_carrier_instance().unwrap();
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let first = SignalingEmissionId::next();
+        let second = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(first, "same-attempt", [instance]));
+        assert!(state.begin_carrier_emission(second, "same-attempt", [instance]));
+        assert!(guard.track_attempt(first, "same-attempt"));
+        assert!(guard.track_attempt(second, "same-attempt"));
+        assert_eq!(guard.claim_attempt("same-attempt"), Some(first));
+        assert_eq!(guard.claim_attempt("same-attempt"), Some(second));
+        let event = "000000000000000000000000000000000000000000000000000000000000000a";
+        assert_eq!(guard.bind_event_id("same-attempt", event), Some(first));
+        assert_eq!(guard.bind_event_id("same-attempt", event), Some(second));
+        guard.settle_attempt(first);
+        assert_eq!(
+            guard.emission_for_event("same-attempt", event),
+            Some(second)
+        );
+        assert_eq!(
+            state.record_carrier_emission(second, "same-attempt", instance, false),
+            crate::engine::state::CarrierEmissionRecord::FinalRefusal
         );
     }
 

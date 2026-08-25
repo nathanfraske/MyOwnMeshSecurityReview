@@ -1155,6 +1155,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                             device_id: device_id.clone(),
                             attempt: attempt_of(state, &device_id),
                             sdp: desc.sdp,
+                            owner: current_owner_for_signaling(state, &device_id),
                         });
                     }
                     Err(e) => {
@@ -1483,6 +1484,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                                             device_id: device_id.clone(),
                                             attempt: accepted_attempt.clone(),
                                             sdp: desc.sdp,
+                                            owner: Some(owner.clone()),
                                         })
                                         .is_ok(),
                                 )
@@ -2101,29 +2103,13 @@ fn prepare_answerer_recovery(
         .flatten()
 }
 
-/// Capture the exact current owner for a typed signaling refusal.  The scan
-/// is only an index walk; the returned token and the handler's current-owner
-/// fence are the authority for the eventual retirement.
-pub(crate) fn owner_for_signaling_attempt(
+fn current_owner_for_signaling(
     state: &Arc<NetworkState>,
-    attempt: &str,
+    device_id: &str,
 ) -> Option<peer_registry::PeerOwnerToken> {
-    if attempt.is_empty() {
-        return None;
-    }
-    state
-        .peers
-        .device_ids_snapshot()
-        .into_iter()
-        .find_map(|device_id| {
-            let owner = state.peers.owner(&device_id)?;
-            let peer = owner.connection();
-            if peer.attempt() != attempt {
-                return None;
-            }
-            let worker = peer.current_worker()?;
-            Some(owner.for_worker(worker))
-        })
+    let owner = state.peers.owner(device_id)?;
+    let worker = owner.connection().current_worker()?;
+    Some(owner.for_worker(worker))
 }
 
 fn cancel_recovery_demand(
@@ -2541,6 +2527,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
                         device_id: device_id.to_string(),
                         attempt: peer.attempt(),
                         sdp: desc.sdp,
+                        owner: Some(owner.clone()),
                     });
                 });
             }
@@ -2751,6 +2738,7 @@ async fn start_speculative_local_offer(
             device_id: owner.device_id().to_string(),
             attempt: correlation.clone(),
             sdp: offer.sdp,
+            owner: Some(owner.clone()),
         })
         .is_err()
     {
@@ -2893,6 +2881,7 @@ async fn start_speculative_offer(
             device_id: device_id.to_string(),
             attempt: correlation.to_string(),
             sdp: answer.sdp,
+            owner: Some(owner.clone()),
         })
         .is_err()
     {
@@ -3078,6 +3067,7 @@ async fn handle_speculative_transport_event(
                 device_id,
                 attempt: correlation,
                 candidate,
+                owner: Some(owner.clone()),
             });
         }
         TransportEvent::IceConnectionStateChanged(RTCIceConnectionState::Failed) => {
@@ -3428,6 +3418,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
                     device_id: device_id.to_string(),
                     attempt: attempt_of(state, device_id),
                     sdp: desc.sdp,
+                    owner: current_owner_for_signaling(state, device_id),
                 });
                 if let Some(p) = state.peers.get(device_id) {
                     p.state.write().last_offer_sent_at = Some(Instant::now());
@@ -3714,6 +3705,7 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
                     device_id: device_id.to_string(),
                     attempt: attempt_of(state, device_id),
                     sdp: desc.sdp,
+                    owner: current_owner_for_signaling(state, device_id),
                 });
             }
             Err(e) => warn!(peer = %device_id, "re-offer create_offer failed: {e}"),
@@ -3795,6 +3787,7 @@ async fn handle_transport_event_from_worker(
                         device_id: device_id.clone(),
                         attempt,
                         candidate: cand.clone(),
+                        owner: Some(owner.clone()),
                     }))
                 })
                 .flatten()
@@ -8140,6 +8133,7 @@ fn build_test_state_parts_metered_with_creation(
         device_id: "fixture-signaling-peer".into(),
         attempt: "fixture-attempt".into(),
         sdp: "s".repeat(ENGINE_FIXTURE_MAILBOX_PAYLOAD_BYTES),
+        owner: None,
     };
     let outbound_signaling =
         crate::resource::ResourceMailboxSender::<SignalingOutbound>::accepted_item_charge_for_test(
@@ -21196,6 +21190,7 @@ mod tests {
                     device_id,
                     attempt,
                     sdp,
+                    ..
                 } => Some(myownmesh_signaling::SignalingMessage::Offer {
                     peer_id: device_id,
                     offer_id: attempt,
@@ -21205,6 +21200,7 @@ mod tests {
                     device_id,
                     attempt,
                     sdp,
+                    ..
                 } => Some(myownmesh_signaling::SignalingMessage::Answer {
                     peer_id: device_id,
                     offer_id: attempt,
@@ -21214,6 +21210,7 @@ mod tests {
                     device_id,
                     attempt,
                     candidate,
+                    ..
                 } => Some(myownmesh_signaling::SignalingMessage::Candidate {
                     peer_id: device_id,
                     offer_id: attempt,

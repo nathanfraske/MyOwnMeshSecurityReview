@@ -78,6 +78,9 @@ pub enum NegotiationRefusal {
 /// Exact attempt identity and its typed admission refusal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptRefusal {
+    /// Process-local source of the exact admission that produced this
+    /// refusal.  It is never serialized onto the signaling wire.
+    pub source: crate::nostr::AdmissionSource,
     pub attempt: String,
     pub event_id: String,
     pub refusal: NegotiationRefusal,
@@ -110,6 +113,10 @@ pub enum AttemptOutcomeKind {
 /// Exact attempt/event identity paired with an authoritative outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptOutcome {
+    /// Process-local source of the exact admission that owns this terminal.
+    /// This is never serialized and prevents same-wire-id emissions from
+    /// aliasing one another at the consumer boundary.
+    pub source: crate::nostr::AdmissionSource,
     pub attempt: String,
     pub event_id: String,
     pub kind: AttemptOutcomeKind,

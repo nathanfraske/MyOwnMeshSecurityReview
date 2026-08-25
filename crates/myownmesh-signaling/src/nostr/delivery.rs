@@ -10,6 +10,7 @@
 use std::borrow::Borrow;
 use std::io::Write;
 use std::mem;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -26,25 +27,43 @@ use crate::{
 /// Pointer identity is intentional: a reconnect can never reuse an old
 /// numeric generation and therefore cannot settle an old entry by ABA.
 #[derive(Clone)]
-pub struct RelaySessionId(Arc<()>);
+pub enum RelaySessionId {
+    Live(Arc<()>),
+    /// A provider-refused session has no allocated identity and can never be
+    /// inserted or used to settle delivery. Keeping this zero-allocation
+    /// sentinel lets `open_session` report refusal without creating an
+    /// unfunded `Arc` merely to satisfy its return shape.
+    Rejected,
+}
 
 impl RelaySessionId {
     pub(crate) fn fresh() -> Self {
-        Self(Arc::new(()))
+        Self::Live(Arc::new(()))
+    }
+
+    fn rejected() -> Self {
+        Self::Rejected
     }
 }
 
 impl std::fmt::Debug for RelaySessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("RelaySessionId")
-            .field(&(Arc::as_ptr(&self.0) as usize))
+            .field(&match self {
+                Self::Live(value) => Arc::as_ptr(value) as usize,
+                Self::Rejected => 0,
+            })
             .finish()
     }
 }
 
 impl PartialEq for RelaySessionId {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        match (self, other) {
+            (Self::Live(left), Self::Live(right)) => Arc::ptr_eq(left, right),
+            (Self::Rejected, Self::Rejected) => true,
+            _ => false,
+        }
     }
 }
 
@@ -52,7 +71,10 @@ impl Eq for RelaySessionId {}
 
 impl std::hash::Hash for RelaySessionId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&(Arc::as_ptr(&self.0) as usize), state);
+        match self {
+            Self::Live(value) => std::hash::Hash::hash(&(Arc::as_ptr(value) as usize), state),
+            Self::Rejected => std::hash::Hash::hash(&0usize, state),
+        }
     }
 }
 
@@ -66,6 +88,8 @@ impl std::hash::Hash for RelaySessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeliveryRetention {
     pub encoded_event_bytes: usize,
+    /// The relay record is inline in `DeliveryMapNode`; the node lease below
+    /// owns this allocation, so the compatibility record charge is zero.
     pub structural_entry_bytes: usize,
     /// Exact allocation size of the provider-owned relay entry node. This is
     /// the canonical per-emission entry charge; the legacy `*_map_growth`
@@ -75,6 +99,8 @@ pub struct DeliveryRetention {
     /// RelayEntry>>`, reserved before the relay node is inserted.
     pub relay_map_growth_bytes: usize,
     /// Exact bytes for the attempt record allocation.
+    /// The attempt record is inline in `DeliveryMapNode`; the node lease owns
+    /// it and this compatibility record charge is therefore zero.
     pub attempt_record_bytes: usize,
     /// Exact bytes for the event-id key allocation.
     pub attempt_key_bytes: usize,
@@ -89,13 +115,18 @@ pub struct DeliveryRetention {
 /// Exact provider inputs for one relay-session registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionRetention {
+    /// Exact `Arc<()>` allocation for a live RelaySessionId. This is acquired
+    /// before the identity is materialized.
+    pub session_identity_bytes: usize,
+    /// Compatibility record lease carrying the identity allocation above.
+    /// The session map record itself is inline in `session_entry_bytes`.
     pub session_record_bytes: usize,
     pub session_set_node_bytes: usize,
     /// Exact allocation size of the provider-owned session entry node. The
     /// existing growth field is an equal compatibility alias.
     pub session_entry_bytes: usize,
-    /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
-    /// SessionEntry>>`, reserved before the session node is inserted.
+    /// Compatibility growth alias; the exact session-map node is charged by
+    /// `session_entry_bytes` and this value is intentionally zero.
     pub session_set_growth_bytes: usize,
 }
 
@@ -128,6 +159,26 @@ pub trait DeliveryLease: Send {
 /// before the encoded frame is allocated.  The returned lease remains with
 /// that relay-session entry until one terminal outcome consumes it.
 pub trait DeliveryProvider: Send + Sync {
+    /// Observe the process-local source before duplicate detection.  This is
+    /// intentionally not a wire or allocation boundary: an owner-aware
+    /// provider can bind the source to its exact emission before a duplicate
+    /// refusal is produced, while compatibility providers may ignore it.
+    fn on_admission_source(&self, _source: AdmissionSource, _attempt: &str, _event_id: &str) {}
+
+    /// Fund the `RelaySessionId` Arc allocation before it is created.
+    /// Providers that do not own a finite resource scope should explicitly
+    /// return an unmetered lease; the compatibility default delegates to the
+    /// existing session-record seam with a zero-allocation sentinel identity.
+    fn reserve_session_identity(
+        &self,
+        retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        // The rejected sentinel is zero-allocation. This compatibility
+        // adapter lets existing providers fund the Arc before it is created
+        // without requiring a second provider API or a temporary Arc.
+        self.reserve_session_record(RelaySessionId::rejected(), retention)
+    }
+
     /// Fund the session record before it is inserted into the live session set.
     fn reserve_session_record(
         &self,
@@ -256,6 +307,13 @@ impl DeliveryLease for UnmeteredLease {
 }
 
 impl DeliveryProvider for UnmeteredDeliveryProvider {
+    fn reserve_session_identity(
+        &self,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(UnmeteredLease))
+    }
+
     fn reserve_session_record(
         &self,
         _session: RelaySessionId,
@@ -352,10 +410,10 @@ impl DeliveryRetention {
         let attempt_entry_bytes = std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>();
         Self {
             encoded_event_bytes: counter.0,
-            structural_entry_bytes: std::mem::size_of::<RelayEntry>(),
+            structural_entry_bytes: 0,
             relay_entry_bytes,
             relay_map_growth_bytes: relay_entry_bytes,
-            attempt_record_bytes: std::mem::size_of::<AttemptEntry>(),
+            attempt_record_bytes: 0,
             attempt_key_bytes: event.id.len(),
             attempt_entry_bytes,
             attempt_map_growth_bytes: attempt_entry_bytes,
@@ -368,12 +426,21 @@ impl SessionRetention {
         let session_entry_bytes =
             std::mem::size_of::<DeliveryMapNode<RelaySessionId, SessionEntry>>();
         Self {
-            session_record_bytes: std::mem::size_of::<SessionEntry>(),
-            session_set_node_bytes: std::mem::size_of::<RelaySessionId>(),
+            session_identity_bytes: std::mem::size_of::<ArcUnitAllocation>(),
+            session_record_bytes: std::mem::size_of::<ArcUnitAllocation>(),
+            session_set_node_bytes: 0,
             session_entry_bytes,
-            session_set_growth_bytes: session_entry_bytes,
+            session_set_growth_bytes: 0,
         }
     }
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct ArcUnitAllocation {
+    strong: AtomicUsize,
+    weak: AtomicUsize,
+    value: (),
 }
 
 struct CountingWriter(usize);
@@ -398,6 +465,22 @@ pub enum AdmissionRefusal {
     Provider(DeliveryRefusal),
 }
 
+/// Process-local identity for one source emission admission. It deliberately
+/// never enters a Nostr frame: two identical wire event ids can still be
+/// distinguished while their source owners are alive in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AdmissionSource(u64);
+
+static NEXT_ADMISSION_SOURCE: AtomicU64 = AtomicU64::new(1);
+
+impl AdmissionSource {
+    /// Mint a process-local source for an exact emission.  The value is never
+    /// serialized and carries no authority beyond this process.
+    pub fn fresh() -> Self {
+        Self(NEXT_ADMISSION_SOURCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 impl AdmissionRefusal {
     pub(crate) fn into_negotiation(self) -> NegotiationRefusal {
         match self {
@@ -411,6 +494,9 @@ impl AdmissionRefusal {
 
 #[derive(Debug)]
 pub struct AdmissionReport {
+    /// Process-local source identity for this admission, including a refused
+    /// duplicate. It is never serialized into a Nostr event.
+    pub source: AdmissionSource,
     pub event_id: String,
     pub accepted_sessions: usize,
     pub refused: Vec<(RelaySessionId, DeliveryRefusal)>,
@@ -418,6 +504,7 @@ pub struct AdmissionReport {
 }
 
 struct AttemptEntry {
+    source: AdmissionSource,
     attempt: String,
     owned: OwnedSignal<NostrEvent, ErasedOwner>,
     record_lease: Box<dyn DeliveryLease>,
@@ -782,15 +869,13 @@ impl DeliveryStore {
         &self,
     ) -> (RelaySessionId, Option<DeliveryRefusal>, Vec<AttemptRefusal>) {
         let mut state = self.state.lock();
-        let session = RelaySessionId::fresh();
         let retention = SessionRetention::exact();
-        let record_lease = match self
-            .provider
-            .reserve_session_record(session.clone(), retention)
-        {
+        let identity_lease = match self.provider.reserve_session_identity(retention) {
             Ok(lease) => lease,
-            Err(error) => return (session, Some(error), Vec::new()),
+            Err(error) => return (RelaySessionId::rejected(), Some(error), Vec::new()),
         };
+        let session = RelaySessionId::fresh();
+        let record_lease = identity_lease;
         let node_lease = match self
             .provider
             .reserve_session_set_node(session.clone(), retention)
@@ -798,7 +883,7 @@ impl DeliveryStore {
             Ok(lease) => lease,
             Err(error) => {
                 record_lease.finish(DeliveryTerminal::Cancelled);
-                return (session, Some(error), Vec::new());
+                return (RelaySessionId::rejected(), Some(error), Vec::new());
             }
         };
         let growth_lease = match self
@@ -809,7 +894,7 @@ impl DeliveryStore {
             Err(error) => {
                 node_lease.finish(DeliveryTerminal::Cancelled);
                 record_lease.finish(DeliveryTerminal::Cancelled);
-                return (session, Some(error), Vec::new());
+                return (RelaySessionId::rejected(), Some(error), Vec::new());
             }
         };
         state.sessions.insert(
@@ -854,6 +939,7 @@ impl DeliveryStore {
                                 entry.provider_refused = true;
                                 if entry.carrier.observe_all_carrier_refusal() {
                                     refused.push(AttemptRefusal {
+                                        source: entry.source,
                                         attempt: entry.attempt.clone(),
                                         event_id: entry.owned.value().id.clone(),
                                         refusal: NegotiationRefusal::Provider(match &error {
@@ -874,6 +960,7 @@ impl DeliveryStore {
                         entry.provider_refused = true;
                         if entry.carrier.observe_all_carrier_refusal() {
                             refused.push(AttemptRefusal {
+                                source: entry.source,
                                 attempt: entry.attempt.clone(),
                                 event_id: entry.owned.value().id.clone(),
                                 refusal: NegotiationRefusal::Provider(match &error {
@@ -895,10 +982,14 @@ impl DeliveryStore {
         attempt: String,
         owned: OwnedSignal<NostrEvent, ErasedOwner>,
     ) -> AdmissionReport {
+        let source = AdmissionSource::fresh();
         let event_id = owned.value().id.clone();
+        self.provider
+            .on_admission_source(source, &attempt, &event_id);
         let mut state = self.state.lock();
         if state.attempts.contains_key(&event_id) {
             return AdmissionReport {
+                source,
                 event_id,
                 accepted_sessions: 0,
                 refused: Vec::new(),
@@ -914,6 +1005,7 @@ impl DeliveryStore {
                 Ok(lease) => lease,
                 Err(error) => {
                     return AdmissionReport {
+                        source,
                         event_id,
                         accepted_sessions: 0,
                         refused: Vec::new(),
@@ -929,6 +1021,7 @@ impl DeliveryStore {
             Err(error) => {
                 record_lease.finish(DeliveryTerminal::Cancelled);
                 return AdmissionReport {
+                    source,
                     event_id,
                     accepted_sessions: 0,
                     refused: Vec::new(),
@@ -948,6 +1041,7 @@ impl DeliveryStore {
                     key_lease.finish(DeliveryTerminal::Cancelled);
                     record_lease.finish(DeliveryTerminal::Cancelled);
                     return AdmissionReport {
+                        source,
                         event_id,
                         accepted_sessions: 0,
                         refused: Vec::new(),
@@ -969,6 +1063,7 @@ impl DeliveryStore {
                     key_lease.finish(DeliveryTerminal::Cancelled);
                     record_lease.finish(DeliveryTerminal::Cancelled);
                     return AdmissionReport {
+                        source,
                         event_id,
                         accepted_sessions: 0,
                         refused: Vec::new(),
@@ -1020,6 +1115,7 @@ impl DeliveryStore {
         state.attempts.insert(
             event_id.clone(),
             AttemptEntry {
+                source,
                 attempt,
                 owned,
                 record_lease,
@@ -1037,6 +1133,7 @@ impl DeliveryStore {
         drop(state);
         self.notify.notify_waiters();
         AdmissionReport {
+            source,
             event_id,
             accepted_sessions,
             refused,
@@ -1076,12 +1173,46 @@ impl DeliveryStore {
         event_id: &str,
         terminal: DeliveryTerminal,
     ) -> bool {
+        self.settle_with_source(None, session, event_id, terminal)
+    }
+
+    /// Settle only when the event still belongs to this exact process-local
+    /// admission. This is the Core seam for same-wire-id E1/E2 emissions;
+    /// stale E2 disposal cannot consume E1's relay custody.
+    pub fn settle_source(
+        &self,
+        source: AdmissionSource,
+        session: &RelaySessionId,
+        event_id: &str,
+        terminal: DeliveryTerminal,
+    ) -> bool {
+        self.settle_with_source(Some(source), session, event_id, terminal)
+    }
+
+    fn settle_with_source(
+        &self,
+        source: Option<AdmissionSource>,
+        session: &RelaySessionId,
+        event_id: &str,
+        terminal: DeliveryTerminal,
+    ) -> bool {
         let (leases, outcome) = {
             let mut state = self.state.lock();
-            let (lease, remove_attempt, attempt, has_remaining, typed_refusal, accepted_outcome) = {
+            let (
+                lease,
+                remove_attempt,
+                source,
+                attempt,
+                has_remaining,
+                typed_refusal,
+                accepted_outcome,
+            ) = {
                 let Some(entry) = state.attempts.get_mut(event_id) else {
                     return false;
                 };
+                if source.is_some_and(|expected| expected != entry.source) {
+                    return false;
+                }
                 let Some(relay) = entry.relays.remove(session) else {
                     return false;
                 };
@@ -1100,6 +1231,7 @@ impl DeliveryStore {
                 (
                     relay,
                     remove_attempt,
+                    entry.source,
                     entry.attempt.clone(),
                     has_remaining,
                     typed_refusal,
@@ -1108,6 +1240,7 @@ impl DeliveryStore {
             };
             let outcome = match &terminal {
                 DeliveryTerminal::Accepted if accepted_outcome => Some(AttemptOutcome {
+                    source,
                     attempt,
                     event_id: event_id.to_string(),
                     kind: AttemptOutcomeKind::Accepted {
@@ -1117,6 +1250,7 @@ impl DeliveryStore {
                 DeliveryTerminal::Accepted => None,
                 DeliveryTerminal::TypedRefused(_) if !has_remaining => {
                     typed_refusal.map(|reason| AttemptOutcome {
+                        source,
                         attempt,
                         event_id: event_id.to_string(),
                         kind: AttemptOutcomeKind::TypedRefused(reason),
@@ -1189,6 +1323,7 @@ impl DeliveryStore {
                             }
                         };
                         outcomes.push(AttemptOutcome {
+                            source: entry.source,
                             attempt: entry.attempt.clone(),
                             event_id: entry.owned.value().id.clone(),
                             kind,
@@ -1235,6 +1370,7 @@ impl DeliveryStore {
                     if entry.relays.is_empty() {
                         if let Some(kind) = entry.carrier.unavailable_outcome() {
                             outcomes.push(AttemptOutcome {
+                                source: entry.source,
                                 attempt: entry.attempt.clone(),
                                 event_id: entry.owned.value().id.clone(),
                                 kind,
@@ -1271,6 +1407,7 @@ impl DeliveryStore {
                 count += entry.relays.len();
                 if !entry.carrier.terminal_emitted {
                     outcomes.push(AttemptOutcome {
+                        source: entry.source,
                         attempt: entry.attempt.clone(),
                         event_id: entry.owned.value().id.clone(),
                         kind: AttemptOutcomeKind::Cancelled,
@@ -1321,6 +1458,13 @@ mod tests {
 
     macro_rules! unmetered_reservations {
         () => {
+            fn reserve_session_identity(
+                &self,
+                _retention: SessionRetention,
+            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+                Ok(Box::new(UnmeteredLease))
+            }
+
             fn reserve_session_record(
                 &self,
                 _session: RelaySessionId,
@@ -1663,6 +1807,7 @@ mod tests {
 
         let records = outcomes.lock();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, report.source);
         assert_eq!(records[0].attempt, "accepted-attempt");
         assert_eq!(records[0].event_id, event_id);
         assert_eq!(
@@ -1688,6 +1833,7 @@ mod tests {
 
         let records = outcomes.lock();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, report.source);
         assert_eq!(records[0].attempt, "carrier-attempt");
         assert_eq!(records[0].event_id, event_id);
         assert_eq!(records[0].kind, AttemptOutcomeKind::CarrierUnavailable);
@@ -1710,6 +1856,7 @@ mod tests {
 
         let records = outcomes.lock();
         assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, report.source);
         assert_eq!(records[0].attempt, "refused-attempt");
         assert_eq!(records[0].event_id, event_id);
         assert_eq!(
@@ -1725,14 +1872,14 @@ mod tests {
         let (session, _) = store.open_session();
         let replaced = event();
         let replaced_id = replaced.id.clone();
-        store.admit(
+        let replaced_report = store.admit(
             "replaced-attempt".into(),
             OwnedSignal::new(replaced, Box::new(()) as ErasedOwner),
         );
         assert!(store.finish_attempt("replaced-attempt", DeliveryTerminal::AttemptReplaced) > 0);
         let cancelled = event();
         let cancelled_id = cancelled.id.clone();
-        store.admit(
+        let cancelled_report = store.admit(
             "cancelled-attempt".into(),
             OwnedSignal::new(cancelled, Box::new(()) as ErasedOwner),
         );
@@ -1742,11 +1889,13 @@ mod tests {
         let records = outcomes.lock();
         assert!(records.iter().any(|record| {
             record.attempt == "replaced-attempt"
+                && record.source == replaced_report.source
                 && record.event_id == replaced_id
                 && record.kind == AttemptOutcomeKind::Replaced
         }));
         assert!(records.iter().any(|record| {
             record.attempt == "cancelled-attempt"
+                && record.source == cancelled_report.source
                 && record.event_id == cancelled_id
                 && record.kind == AttemptOutcomeKind::Cancelled
         }));
@@ -1857,13 +2006,13 @@ mod tests {
     #[test]
     fn duplicate_live_event_refusal_preserves_original_custody() {
         let live = Arc::new(AtomicUsize::new(0));
-        let store = DeliveryStore::new(Arc::new(CountingProvider { live: live.clone() }));
+        let (store, outcomes) = recording_store(Arc::new(CountingProvider { live: live.clone() }));
         let (session, _) = store.open_session();
         let event = event();
         let event_id = event.id.clone();
         let original_dropped = Arc::new(AtomicBool::new(false));
         let first = store.admit(
-            "attempt-original".into(),
+            "attempt-same-source".into(),
             OwnedSignal::new(
                 event.clone(),
                 Box::new(DropMarker(Arc::clone(&original_dropped))) as ErasedOwner,
@@ -1875,7 +2024,7 @@ mod tests {
 
         let duplicate_dropped = Arc::new(AtomicBool::new(false));
         let duplicate = store.admit(
-            "attempt-duplicate".into(),
+            "attempt-same-source".into(),
             OwnedSignal::new(
                 event,
                 Box::new(DropMarker(Arc::clone(&duplicate_dropped))) as ErasedOwner,
@@ -1887,21 +2036,30 @@ mod tests {
             duplicate.attempt_refusal,
             Some(AdmissionRefusal::DuplicateLiveEvent)
         );
+        assert_ne!(first.source, duplicate.source);
         assert!(duplicate_dropped.load(Ordering::SeqCst));
         assert!(!original_dropped.load(Ordering::SeqCst));
         assert_eq!(store.pending(&session), vec![event_id.clone()]);
         assert_eq!(live.load(Ordering::SeqCst), 1);
 
-        assert_eq!(
-            store.finish_attempt("attempt-duplicate", DeliveryTerminal::Cancelled),
-            0
-        );
-        assert_eq!(
-            store.finish_attempt("attempt-original", DeliveryTerminal::AttemptCompleted),
-            1
-        );
+        assert!(!store.settle_source(
+            duplicate.source,
+            &session,
+            &event_id,
+            DeliveryTerminal::Accepted,
+        ));
+        assert!(store.settle_source(
+            first.source,
+            &session,
+            &event_id,
+            DeliveryTerminal::Accepted,
+        ));
         assert!(original_dropped.load(Ordering::SeqCst));
         assert_eq!(live.load(Ordering::SeqCst), 0);
+        let records = outcomes.lock();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, first.source);
+        assert_eq!(records[0].event_id, event_id);
         assert!(!store.settle(&session, &event_id, DeliveryTerminal::Accepted));
     }
 
@@ -2123,6 +2281,8 @@ mod tests {
         let live = Arc::new(AtomicUsize::new(0));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let retention = DeliveryRetention::for_attempt("exact-correlation", &event());
+        assert_eq!(retention.structural_entry_bytes, 0);
+        assert_eq!(retention.attempt_record_bytes, 0);
         assert_eq!(
             retention.attempt_map_growth_bytes,
             std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>()
@@ -2140,11 +2300,14 @@ mod tests {
             retention.relay_map_growth_bytes
         );
         let session_retention = SessionRetention::exact();
-        assert!(session_retention.session_entry_bytes > 0);
+        assert!(session_retention.session_identity_bytes > 0);
         assert_eq!(
-            session_retention.session_entry_bytes,
-            session_retention.session_set_growth_bytes
+            session_retention.session_record_bytes,
+            session_retention.session_identity_bytes
         );
+        assert_eq!(session_retention.session_set_node_bytes, 0);
+        assert!(session_retention.session_entry_bytes > 0);
+        assert_eq!(session_retention.session_set_growth_bytes, 0);
         let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
             live: Arc::clone(&live),
             calls: Arc::clone(&calls),

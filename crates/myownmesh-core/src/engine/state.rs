@@ -77,6 +77,11 @@ pub(crate) enum CarrierEmissionRecord {
     FinalRefusal,
 }
 
+pub(crate) struct CarrierEmissionSettlement {
+    pub(crate) record: CarrierEmissionRecord,
+    pub(crate) owner: Option<PeerOwnerToken>,
+}
+
 struct RecoveryPublication {
     id: RecoveryPublishId,
     remaining: CarrierInstanceList,
@@ -164,6 +169,7 @@ impl Drop for CarrierInstanceList {
 struct CarrierAttemptNode {
     emission: SignalingEmissionId,
     attempt: String,
+    owner: Option<PeerOwnerToken>,
     _entry_lease: ResourceLease,
     carriers: Option<Box<CarrierAttemptCarrier>>,
     expected: usize,
@@ -907,7 +913,7 @@ impl SignalingInbound {
 /// `engine` constructs one, and a `pub` emission type is exactly the generic
 /// message bus `FORMAL-PROOFS.md` Theorem 11.2 turns on application code not
 /// having.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) enum SignalingOutbound {
     Announce,
     /// A recovery-scoped announce carrying the exact publication generation.
@@ -933,19 +939,71 @@ pub(crate) enum SignalingOutbound {
         /// belonged to and the value was useless for correlating anything.
         attempt: String,
         sdp: String,
+        owner: Option<PeerOwnerToken>,
     },
     Answer {
         device_id: String,
         /// The offerer's correlation, echoed verbatim — see [`Self::Offer`].
         attempt: String,
         sdp: String,
+        owner: Option<PeerOwnerToken>,
     },
     Candidate {
         device_id: String,
         /// The attempt this candidate belongs to — see [`Self::Offer`].
         attempt: String,
         candidate: LocalIceCandidate,
+        owner: Option<PeerOwnerToken>,
     },
+}
+
+impl std::fmt::Debug for SignalingOutbound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Announce => formatter.write_str("Announce"),
+            Self::RecoveryAnnounce { id } => formatter
+                .debug_struct("RecoveryAnnounce")
+                .field("id", id)
+                .finish(),
+            Self::Leave => formatter.write_str("Leave"),
+            Self::Offer {
+                device_id,
+                attempt,
+                sdp,
+                owner,
+            } => formatter
+                .debug_struct("Offer")
+                .field("device_id", device_id)
+                .field("attempt", attempt)
+                .field("sdp", sdp)
+                .field("owner", &owner.is_some())
+                .finish(),
+            Self::Answer {
+                device_id,
+                attempt,
+                sdp,
+                owner,
+            } => formatter
+                .debug_struct("Answer")
+                .field("device_id", device_id)
+                .field("attempt", attempt)
+                .field("sdp", sdp)
+                .field("owner", &owner.is_some())
+                .finish(),
+            Self::Candidate {
+                device_id,
+                attempt,
+                candidate,
+                owner,
+            } => formatter
+                .debug_struct("Candidate")
+                .field("device_id", device_id)
+                .field("attempt", attempt)
+                .field("candidate", candidate)
+                .field("owner", &owner.is_some())
+                .finish(),
+        }
+    }
 }
 
 impl ResourceMailboxItem for SignalingOutbound {
@@ -956,16 +1014,19 @@ impl ResourceMailboxItem for SignalingOutbound {
                 device_id,
                 attempt,
                 sdp,
+                ..
             }
             | Self::Answer {
                 device_id,
                 attempt,
                 sdp,
+                ..
             } => strings_measure([device_id.as_str(), attempt.as_str(), sdp.as_str()])?,
             Self::Candidate {
                 device_id,
                 attempt,
                 candidate,
+                ..
             } => strings_measure(
                 [
                     Some(device_id.as_str()),
@@ -2066,10 +2127,37 @@ impl NetworkState {
         self.attempt_settlement.lock().take();
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_carrier_emission<I>(
         &self,
         emission: SignalingEmissionId,
         attempt: &str,
+        instances: I,
+    ) -> bool
+    where
+        I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    {
+        self.begin_carrier_emission_inner(emission, attempt, None, instances)
+    }
+
+    pub(crate) fn begin_carrier_emission_for_owner<I>(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        owner: PeerOwnerToken,
+        instances: I,
+    ) -> bool
+    where
+        I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    {
+        self.begin_carrier_emission_inner(emission, attempt, Some(owner), instances)
+    }
+
+    fn begin_carrier_emission_inner<I>(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        owner: Option<PeerOwnerToken>,
         instances: I,
     ) -> bool
     where
@@ -2121,7 +2209,10 @@ impl NetworkState {
             return false;
         };
         let mut attempts = self.carrier_attempts.lock();
-        if attempts.find_emission_mut(emission, attempt).is_some() {
+        if let Some(existing) = attempts.find_emission_mut(emission, attempt) {
+            if existing.owner.is_none() {
+                existing.owner = owner;
+            }
             return true;
         }
         // Hold the aggregate lock across the exact existing check and its
@@ -2150,6 +2241,7 @@ impl NetworkState {
         attempts.push_front(Box::new(CarrierAttemptNode {
             emission,
             attempt: attempt.to_string(),
+            owner,
             _entry_lease: entry_lease,
             carriers,
             expected,
@@ -2170,17 +2262,37 @@ impl NetworkState {
         instance: RecoveryCarrierInstance,
         accepted: bool,
     ) -> CarrierEmissionRecord {
+        self.record_carrier_emission_with_owner(emission, attempt, instance, accepted)
+            .record
+    }
+
+    pub(crate) fn record_carrier_emission_with_owner(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        instance: RecoveryCarrierInstance,
+        accepted: bool,
+    ) -> CarrierEmissionSettlement {
         let mut attempts = self.carrier_attempts.lock();
         let result = {
             let Some(state) = attempts.find_emission_mut(emission, attempt) else {
-                return CarrierEmissionRecord::Stale;
+                return CarrierEmissionSettlement {
+                    record: CarrierEmissionRecord::Stale,
+                    owner: None,
+                };
             };
             if accepted {
                 let Some(carrier) = state.carrier_mut(instance) else {
-                    return CarrierEmissionRecord::Stale;
+                    return CarrierEmissionSettlement {
+                        record: CarrierEmissionRecord::Stale,
+                        owner: None,
+                    };
                 };
                 if carrier.resolved || carrier.accepted {
-                    return CarrierEmissionRecord::Stale;
+                    return CarrierEmissionSettlement {
+                        record: CarrierEmissionRecord::Stale,
+                        owner: None,
+                    };
                 }
                 carrier.accepted = true;
                 state.accepted = true;
@@ -2188,7 +2300,10 @@ impl NetworkState {
             } else {
                 let already_resolved = {
                     let Some(carrier) = state.carrier_mut(instance) else {
-                        return CarrierEmissionRecord::Stale;
+                        return CarrierEmissionSettlement {
+                            record: CarrierEmissionRecord::Stale,
+                            owner: None,
+                        };
                     };
                     if carrier.resolved || carrier.accepted {
                         true
@@ -2198,7 +2313,10 @@ impl NetworkState {
                     }
                 };
                 if already_resolved {
-                    return CarrierEmissionRecord::Stale;
+                    return CarrierEmissionSettlement {
+                        record: CarrierEmissionRecord::Stale,
+                        owner: None,
+                    };
                 }
                 state.resolved += 1;
                 if !state.accepted && state.resolved == state.expected {
@@ -2208,10 +2326,19 @@ impl NetworkState {
                 }
             }
         };
-        if accepted || result == CarrierEmissionRecord::FinalRefusal {
-            let _ = attempts.remove_emission(emission, attempt);
+        let terminal = result == CarrierEmissionRecord::Accepted
+            || result == CarrierEmissionRecord::FinalRefusal;
+        let owner = if terminal {
+            attempts
+                .remove_emission(emission, attempt)
+                .and_then(|node| node.owner.clone())
+        } else {
+            None
+        };
+        CarrierEmissionSettlement {
+            record: result,
+            owner,
         }
-        result
     }
 
     pub(crate) fn clear_carrier_attempt(&self, attempt: &str) {

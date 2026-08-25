@@ -30,7 +30,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
 
 use super::delivery::{
-    DeliveryProvider, DeliveryStore, DeliveryTerminal, RelaySessionId, UnmeteredDeliveryProvider,
+    AdmissionSource, DeliveryProvider, DeliveryStore, DeliveryTerminal, RelaySessionId,
+    UnmeteredDeliveryProvider,
 };
 use super::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
@@ -375,6 +376,19 @@ impl NostrDriverHandle {
     /// Finish all live emissions carrying one existing attempt correlation.
     pub fn finish_attempt(&self, attempt: &str, terminal: DeliveryTerminal) -> usize {
         self.delivery.finish_attempt(attempt, terminal)
+    }
+
+    /// Settle a relay entry only for the exact process-local source admission
+    /// that owns it. The source never enters the Nostr wire protocol.
+    pub fn settle_source(
+        &self,
+        source: AdmissionSource,
+        session: &RelaySessionId,
+        event_id: &str,
+        terminal: DeliveryTerminal,
+    ) -> bool {
+        self.delivery
+            .settle_source(source, session, event_id, terminal)
     }
 
     pub fn stop(self) {
@@ -1223,6 +1237,7 @@ async fn run_outbound_pump_v2(
             let report = shared.delivery.admit(attempt.clone(), owned);
             if let Some(refusal) = report.attempt_refusal.clone() {
                 let refusal_record = AttemptRefusal {
+                    source: report.source,
                     attempt: attempt.clone(),
                     event_id: report.event_id.clone(),
                     refusal: refusal.into_negotiation(),

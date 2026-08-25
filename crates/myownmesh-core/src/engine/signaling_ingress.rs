@@ -45,6 +45,7 @@ use std::sync::{Arc, Weak};
 use parking_lot::Mutex;
 use tracing::{trace, warn};
 
+use myownmesh_signaling::nostr::AdmissionSource;
 use myownmesh_signaling::SignalingMessage;
 
 use crate::resource::{
@@ -148,6 +149,7 @@ struct GuardedAttempt {
     emission: SignalingEmissionId,
     attempt: String,
     claimed: bool,
+    source: Option<AdmissionSource>,
     event_id: Option<[u8; 32]>,
     _lease: ResourceLease,
     next: Option<Box<GuardedAttempt>>,
@@ -222,6 +224,7 @@ impl CarrierInstanceGuard {
             emission,
             attempt: attempt.to_owned(),
             claimed: false,
+            source: None,
             event_id: None,
             _lease: lease,
             next: None,
@@ -295,13 +298,12 @@ impl CarrierInstanceGuard {
         let mut candidate = None;
         let mut cursor = attempts.as_deref_mut();
         while let Some(known) = cursor {
-            if known.attempt == attempt && known.claimed {
-                if known.event_id == Some(key) {
-                    return Some(known.emission);
-                }
-                if known.event_id.is_none() {
-                    candidate = Some(known.emission);
-                }
+            if known.attempt == attempt && known.claimed && known.event_id.is_none() {
+                // The same Nostr event id may be observed for two
+                // process-local emissions.  Never return an already
+                // bound node: the next unbound node gets its own exact
+                // custody and remains independently settleable.
+                candidate = Some(known.emission);
             }
             cursor = known.next.as_deref_mut();
         }
@@ -317,6 +319,46 @@ impl CarrierInstanceGuard {
         None
     }
 
+    pub(crate) fn bind_admission_source(&self, source: AdmissionSource, attempt: &str) -> bool {
+        let mut attempts = self.attempts.lock();
+        let mut candidate = None;
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.attempt == attempt && known.claimed && known.source.is_none() {
+                candidate = Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        let Some(emission) = candidate else {
+            return false;
+        };
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.emission == emission && known.attempt == attempt {
+                known.source = Some(source);
+                return true;
+            }
+            cursor = known.next.as_deref_mut();
+        }
+        false
+    }
+
+    pub(crate) fn emission_for_source(
+        &self,
+        source: AdmissionSource,
+    ) -> Option<SignalingEmissionId> {
+        let attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.source == Some(source) {
+                return Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        None
+    }
+
+    #[cfg(test)]
     pub(crate) fn emission_for_event(
         &self,
         attempt: &str,
@@ -1585,11 +1627,13 @@ pub(super) mod tests {
                 device_id: "peer-a".into(),
                 attempt: "attempt-1".into(),
                 sdp: "sdp-1".into(),
+                owner: None,
             },
             SignalingOutbound::Answer {
                 device_id: "peer-a".into(),
                 attempt: "attempt-1".into(),
                 sdp: "sdp-1".into(),
+                owner: None,
             },
             SignalingOutbound::Candidate {
                 device_id: "peer-a".into(),
@@ -1600,6 +1644,7 @@ pub(super) mod tests {
                     sdp_mline_index: Some(0),
                     username_fragment: None,
                 },
+                owner: None,
             },
         ];
         for emission in &outbound {

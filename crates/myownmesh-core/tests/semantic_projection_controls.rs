@@ -109,7 +109,7 @@ fn incomparable_heads_fail_closed_until_full_head_resolution() {
         heads,
     );
     graph
-        .admit(resolution)
+        .admit(resolution.clone())
         .expect("full-head resolution admits");
     assert_eq!(graph.projection().value(&cell), Some(first.id));
     assert!(matches!(
@@ -406,6 +406,105 @@ fn resolution_requires_owner_for_owner_tier_but_controller_can_resolve_member_ti
         .admit(owner_resolution)
         .expect("owner resolves an owner-tier value");
     assert_eq!(graph.projection().value(&cell), Some(owner.id));
+}
+
+#[test]
+fn controller_can_resolve_member_revoke_using_its_candidate_causal_tier() {
+    let root_key = key(28);
+    let controller_key = key(29);
+    let bootstrap = bootstrap(28, 28);
+    let controller = author(&controller_key);
+    let subject = author(&key(30));
+    let unrelated_target = author(&key(31));
+    let controller_grant = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    let member_a = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let unrelated = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: unrelated_target,
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let member_b = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Member,
+        },
+        vec![unrelated.id],
+    );
+    let revoke = fact(
+        &bootstrap,
+        &controller_key,
+        FactBody::RoleRevoke {
+            target: subject.clone(),
+        },
+        vec![controller_grant.id, member_a.id],
+    );
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+    for candidate in [
+        controller_grant.clone(),
+        member_a.clone(),
+        unrelated.clone(),
+        member_b.clone(),
+    ] {
+        graph
+            .admit(candidate)
+            .expect("independent predecessor admits");
+    }
+    graph
+        .admit(revoke.clone())
+        .expect("controller can revoke the causal Member head");
+    let mut cited = vec![revoke.id, member_b.id];
+    cited.sort();
+    let resolution = authored(
+        &graph,
+        &controller_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(subject.clone()),
+            cited_heads: cited,
+            selected_head: revoke.id,
+        },
+        vec![controller_grant.id],
+    );
+    graph
+        .admit(resolution.clone())
+        .expect("controller resolves revoke plus concurrent Member sibling");
+    assert_eq!(
+        graph.evaluator().effective_role(&subject),
+        None,
+        "the selected revoke remains authority-negative"
+    );
+
+    let mut permuted = FactGraph::from_bootstrap(&bootstrap);
+    for candidate in [controller_grant, unrelated, member_b, member_a, revoke] {
+        permuted
+            .admit(candidate)
+            .expect("permuted predecessor order admits");
+    }
+    permuted
+        .admit(resolution)
+        .expect("permuted graph admits the same resolution");
+    assert_eq!(permuted.projection(), graph.projection());
 }
 
 #[test]

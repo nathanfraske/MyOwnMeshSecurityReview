@@ -723,7 +723,10 @@ impl<'a> SemanticEvaluator<'a> {
         match cell {
             ExclusiveCell::Role { subject } => cited_heads
                 .iter()
-                .filter_map(|head| self.resolution_candidate_tier(cell, head, subject, visited))
+                .filter_map(|head| {
+                    let mut branch_visited = visited.clone();
+                    self.resolution_candidate_tier(cell, head, subject, &mut branch_visited)
+                })
                 .max()
                 .unwrap_or_else(|| self.target_tier(subject)),
             ExclusiveCell::Membership { subject } => self.target_tier(subject),
@@ -749,7 +752,20 @@ impl<'a> SemanticEvaluator<'a> {
                 Role::Member | Role::Controller => Role::Controller,
                 Role::Owner => Role::Owner,
             }),
-            FactBody::RoleRevoke { target } if target == subject => Some(self.target_tier(subject)),
+            FactBody::RoleRevoke { target } if target == subject => {
+                let causal = self
+                    .graph
+                    .causal_past(fact)
+                    .ok()?
+                    .evaluator()
+                    .effective_role(subject);
+                Some(match causal {
+                    Some(Role::Owner) => Role::Owner,
+                    Some(Role::Controller) => Role::Controller,
+                    Some(Role::Member) => Role::Controller,
+                    None => Role::Owner,
+                })
+            }
             FactBody::Resolution {
                 cell: nested_cell,
                 cited_heads,
@@ -936,6 +952,93 @@ mod tests {
             evaluator.effective_role(&target),
             Some(Role::Member),
             "nested resolution selects the terminal same-cell head"
+        );
+    }
+
+    #[test]
+    fn shared_nested_controller_resolution_dag_is_path_local_and_accepted() {
+        let (bootstrap, root_key) = closed(67);
+        let controller_key = key(68);
+        let controller = device(&controller_key);
+        let target = device(&key(69));
+        let controller_grant = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let base_a = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            Vec::new(),
+        );
+        let base_b = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let mut base_heads = vec![base_a.id, base_b.id];
+        base_heads.sort();
+        let nested_a = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target.clone()),
+                cited_heads: base_heads.clone(),
+                selected_head: base_a.id,
+            },
+            base_heads.clone(),
+        );
+        let nested_b = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target.clone()),
+                cited_heads: base_heads,
+                selected_head: base_b.id,
+            },
+            vec![base_a.id, base_b.id],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        for fact in [
+            controller_grant.clone(),
+            base_a,
+            base_b,
+            nested_a.clone(),
+            nested_b.clone(),
+        ] {
+            graph.facts.insert(fact.id, fact);
+        }
+        let mut nested_heads = vec![nested_a.id, nested_b.id];
+        nested_heads.sort();
+        let top = fact(
+            &bootstrap,
+            &controller_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(target.clone()),
+                cited_heads: nested_heads.clone(),
+                selected_head: nested_a.id,
+            },
+            vec![controller_grant.id, nested_a.id, nested_b.id],
+        );
+        graph
+            .admit(top)
+            .expect("Controller may resolve shared nested Controller-tier branches");
+        assert_eq!(
+            graph.evaluator().effective_role(&target),
+            Some(Role::Member),
+            "the selected nested branch remains the effective proposition"
         );
     }
 

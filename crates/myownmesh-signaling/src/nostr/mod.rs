@@ -31,7 +31,7 @@ pub mod shuffle;
 // submodule remains public for compatibility, while adapters can depend on
 // these names without reaching through the Nostr implementation layout.
 pub use delivery::{
-    AdmissionRefusal, AdmissionReport, CarrierAggregate, DeliveryLease, DeliveryProvider,
-    DeliveryRefusal, DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId,
-    SessionRetention, UnmeteredDeliveryProvider,
+    AdmissionRefusal, AdmissionReport, AdmissionSource, CarrierAggregate, DeliveryLease,
+    DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryStore, DeliveryTerminal,
+    RelaySessionId, SessionRetention, UnmeteredDeliveryProvider,
 };

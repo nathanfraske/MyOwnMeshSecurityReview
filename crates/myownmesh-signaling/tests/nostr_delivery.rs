@@ -11,8 +11,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use myownmesh_signaling::nostr::delivery::{
-    DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryStore,
-    DeliveryTerminal, RelaySessionId, SessionRetention,
+    AdmissionRefusal, DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention,
+    DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
 };
 use myownmesh_signaling::nostr::driver::{
     start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
@@ -65,6 +65,13 @@ impl DeliveryLease for CountingLease {
 }
 
 impl DeliveryProvider for CountingProvider {
+    fn reserve_session_identity(
+        &self,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
     fn reserve_session_record(
         &self,
         _session: RelaySessionId,
@@ -417,6 +424,58 @@ fn partial_refusal_has_one_live_entry_and_exact_cancel_terminal() {
     );
     assert_eq!(stats.cancelled.load(Ordering::SeqCst), 1);
     assert_eq!(stats.finished.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn identical_live_event_same_attempt_is_source_scoped() {
+    let stats = Arc::new(DeliveryStats {
+        refuse_first_session: AtomicBool::new(false),
+        refused: AtomicUsize::new(0),
+        accepted: AtomicUsize::new(0),
+        finished: AtomicUsize::new(0),
+        accepted_terminal: AtomicUsize::new(0),
+        cancelled: AtomicUsize::new(0),
+        shutdown: AtomicUsize::new(0),
+    });
+    let store = DeliveryStore::new(Arc::new(CountingProvider {
+        stats: Arc::clone(&stats),
+    }));
+    let (session, _) = store.open_session();
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        21077,
+        Vec::new(),
+        "same-attempt".into(),
+        1,
+    );
+    let event_id = event.id.clone();
+    let first = store.admit(
+        "same-attempt".into(),
+        OwnedSignal::new(event.clone(), Box::new(()) as ErasedOwner),
+    );
+    let second = store.admit(
+        "same-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+    assert_ne!(first.source, second.source);
+    assert_eq!(
+        second.attempt_refusal,
+        Some(AdmissionRefusal::DuplicateLiveEvent)
+    );
+    assert_eq!(store.pending(&session), vec![event_id.clone()]);
+    assert!(!store.settle_source(
+        second.source,
+        &session,
+        &event_id,
+        DeliveryTerminal::Accepted,
+    ));
+    assert!(store.settle_source(
+        first.source,
+        &session,
+        &event_id,
+        DeliveryTerminal::Accepted,
+    ));
+    assert_eq!(stats.accepted_terminal.load(Ordering::SeqCst), 1);
 }
 
 #[test]
