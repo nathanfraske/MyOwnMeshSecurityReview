@@ -184,7 +184,7 @@ struct CarrierAttemptNode {
     emission: SignalingEmissionId,
     attempt: String,
     owner: Option<PeerOwnerToken>,
-    _entry_lease: ResourceLease,
+    _entry_lease: Option<ResourceLease>,
     carriers: Option<Box<CarrierAttemptCarrier>>,
     expected: usize,
     resolved: usize,
@@ -278,9 +278,14 @@ impl CarrierAttemptList {
     fn fence_attempt(&mut self, attempt: &str) {
         let mut cursor = self.head.as_deref_mut();
         while let Some(node) = cursor {
-            if node.attempt == attempt && node.claimed {
+            if node.attempt == attempt {
                 node.fenced = true;
                 node.terminal = Some(CarrierEmissionRecord::Stale);
+                // Retain only the bounded stale witness. Provider bytes and
+                // the peer owner belong to the lifecycle terminal, not the
+                // delayed-callback tombstone.
+                node.owner = None;
+                node._entry_lease.take();
             }
             cursor = node.next.as_deref_mut();
         }
@@ -2301,7 +2306,7 @@ impl NetworkState {
             emission,
             attempt: attempt.to_string(),
             owner,
-            _entry_lease: entry_lease,
+            _entry_lease: Some(entry_lease),
             carriers,
             expected,
             resolved: 0,

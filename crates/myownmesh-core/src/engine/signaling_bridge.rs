@@ -269,13 +269,42 @@ impl CoreAttemptRefusalSink {
         let Some(owner) = owner else {
             return;
         };
-        let _ = state.cmd_tx.send(NetworkCmd::DropPeerIfCurrent {
+        let fallback_owner = owner.clone();
+        let fallback_correlation = attempt.clone();
+        let command = NetworkCmd::DropPeerIfCurrent {
             owner,
             attempt,
             reason: DropReason::TransportError {
                 message: reason.into(),
             },
-        });
+        };
+        if state.cmd_tx.send(command).is_err() {
+            // The refusal effect is exact-owner work, not a best-effort
+            // mailbox notification. If the funded command queue is already
+            // closed or pressured, retire the speculative candidate directly;
+            // never fall back to a device-id removal or broad attempt settle.
+            retire_unqueued_speculative(&state, &fallback_owner, &fallback_correlation);
+        }
+    }
+}
+
+fn retire_unqueued_speculative(
+    state: &Arc<NetworkState>,
+    owner: &super::peer_registry::PeerOwnerToken,
+    correlation: &str,
+) {
+    let Some(candidate) = owner.worker().cloned() else {
+        return;
+    };
+    if let Some(retired) = state
+        .peers
+        .take_speculative_exact(owner, correlation, &candidate)
+    {
+        let _ = owner.connection().start_exact_retired_worker(
+            &retired.worker,
+            retired.dedup,
+            retired.additional_dedup.drain_tokens(),
+        );
     }
 }
 
@@ -629,73 +658,63 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 | SignalingOutbound::Candidate { owner, .. } => owner.clone(),
                 _ => None,
             };
+            let attempt_state = self.recovery_state.as_ref().and_then(Weak::upgrade);
+            let mut preadmission = None;
             let emission = if let Some(attempt) = attempt.as_deref() {
                 // Fan-out guards precreate one funded node per physical copy.
                 // A missing node there is a stale/terminal delivery and must
                 // not mint a fresh aggregate; direct single-carrier sources
                 // retain their explicit untracked admission path.
-                match self.guard.claim_attempt(attempt) {
-                    Some(emission) => Some(emission),
-                    None if self.allow_untracked_emission => Some(SignalingEmissionId::next()),
-                    None => continue,
-                }
-            } else {
-                None
-            };
-            let attempt_state = self.recovery_state.as_ref().and_then(Weak::upgrade);
-            if let (Some(state), Some(attempt), Some(instance), Some(emission)) = (
-                attempt_state.as_ref(),
-                attempt.as_deref(),
-                self.recovery_instance,
-                emission,
-            ) {
-                let admission =
-                    outbound_owner
-                        .clone()
-                        .map_or(CarrierEmissionAdmission::Refused, |owner| {
-                            state.begin_carrier_emission_for_owner_result(
+                if let (Some(state), Some(instance), Some(owner)) = (
+                    attempt_state.as_ref(),
+                    self.recovery_instance,
+                    outbound_owner.clone(),
+                ) {
+                    let Some((emission, (admission, fenced))) =
+                        self.guard.claim_attempt_with(attempt, |emission| {
+                            let admission = state.begin_carrier_emission_for_owner_result(
                                 emission,
                                 attempt,
                                 owner,
                                 [instance],
-                            )
-                        });
-                if admission == CarrierEmissionAdmission::Stale {
-                    if state.carrier_emission_is_fenced(emission, attempt) {
+                            );
+                            if admission.is_admitted() {
+                                state.mark_carrier_emission_claimed(emission, attempt);
+                            }
+                            let fenced = state.carrier_emission_is_fenced(emission, attempt);
+                            (admission, fenced)
+                        })
+                    else {
+                        continue;
+                    };
+                    preadmission = Some((admission, fenced));
+                    Some(emission)
+                } else {
+                    match self.guard.claim_attempt(attempt) {
+                        Some(emission) => Some(emission),
+                        None if self.allow_untracked_emission => Some(SignalingEmissionId::next()),
+                        None => continue,
+                    }
+                }
+            } else {
+                None
+            };
+            if let (Some(state), Some(attempt), Some(emission), Some((admission, fenced))) = (
+                attempt_state.as_ref(),
+                attempt.as_deref(),
+                emission,
+                preadmission,
+            ) {
+                if admission == CarrierEmissionAdmission::Stale || fenced {
+                    if fenced {
                         state.acknowledge_fenced_carrier_emission(emission, attempt);
                     }
                     self.guard.settle_attempt(emission);
                     continue;
                 }
-                let tracked = if admission.is_admitted() {
-                    state.mark_carrier_emission_claimed(emission, attempt);
-                    !state.carrier_emission_is_fenced(emission, attempt)
-                        && self.guard.track_attempt(emission, attempt)
-                } else {
-                    false
-                };
-                if !tracked {
-                    let final_refusal = if admission.is_admitted() {
-                        state.record_carrier_emission(emission, attempt, instance, false)
-                            == CarrierEmissionRecord::FinalRefusal
-                    } else {
-                        false
-                    };
+                if !admission.is_admitted() {
                     if state.carrier_emission_is_fenced(emission, attempt) {
                         state.acknowledge_fenced_carrier_emission(emission, attempt);
-                    }
-                    if final_refusal && self.refusal_sink.is_some() {
-                        CoreAttemptRefusalSink {
-                            state: Arc::downgrade(state),
-                            instance: self.recovery_instance,
-                            guard: Arc::clone(&self.guard),
-                        }
-                        .drop_unadmitted(
-                            Some(emission),
-                            outbound_owner.clone(),
-                            attempt.to_string(),
-                            "carrier emission admission refused",
-                        );
                     }
                     self.guard.settle_attempt(emission);
                     continue;
@@ -2734,6 +2753,72 @@ mod tests {
             crate::engine::state::CarrierEmissionRecord::Stale,
             "Accepted remains a delayed-callback tombstone after detach"
         );
+    }
+
+    #[test]
+    fn accepted_terminal_releases_entry_custody_but_keeps_stale_fence() {
+        let state = crate::engine::build_test_state("accepted-tombstone-custody");
+        let first = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+
+        let one_copy = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(one_copy, "accepted-one", [first]));
+        state.mark_carrier_emission_claimed(one_copy, "accepted-one");
+        assert_eq!(
+            state.record_carrier_emission(one_copy, "accepted-one", first, true),
+            CarrierEmissionRecord::Accepted
+        );
+        state.settle_attempt(
+            "accepted-one",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        assert!(!state.begin_carrier_emission(one_copy, "accepted-one", [first]));
+        assert!(state.begin_carrier_emission(SignalingEmissionId::next(), "accepted-one", [first]));
+
+        let two_copy = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
+        state.mark_carrier_emission_claimed(two_copy, "accepted-two");
+        assert_eq!(
+            state.record_carrier_emission(two_copy, "accepted-two", first, true),
+            CarrierEmissionRecord::Accepted
+        );
+        state.settle_attempt(
+            "accepted-two",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        assert!(!state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
+        assert!(state.begin_carrier_emission(
+            SignalingEmissionId::next(),
+            "accepted-two",
+            [first, second]
+        ));
+    }
+
+    #[test]
+    fn claimed_copy_cannot_recreate_across_settlement_interleave() {
+        let state = crate::engine::build_test_state("claim-settle-interleave");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "interleave", [instance]));
+        assert!(guard.track_attempt(emission, "interleave"));
+
+        let observed = guard.claim_attempt_with("interleave", |claimed| {
+            assert_eq!(claimed, emission);
+            state.settle_attempt(
+                "interleave",
+                myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+            );
+            assert!(!state.begin_carrier_emission(claimed, "interleave", [instance]));
+            claimed
+        });
+        assert_eq!(observed, Some((emission, emission)));
     }
 
     #[test]

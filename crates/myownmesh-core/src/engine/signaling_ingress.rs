@@ -290,6 +290,43 @@ impl CarrierInstanceGuard {
         None
     }
 
+    /// Claim one physical copy while running the state-side admission under
+    /// the same guard lock.  Lifecycle fencing waits on this lock, so a
+    /// carrier cannot observe a claim, pause before state admission, and then
+    /// recreate or publish that copy after settlement.
+    pub(crate) fn claim_attempt_with<R>(
+        &self,
+        attempt: &str,
+        admit: impl FnOnce(SignalingEmissionId) -> R,
+    ) -> Option<(SignalingEmissionId, R)> {
+        if self.detached.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut attempts = self.attempts.lock();
+        if self.detached.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut candidate = None;
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.attempt == attempt && !known.claimed && !known.fenced {
+                candidate = Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        let emission = candidate?;
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.emission == emission && known.attempt == attempt {
+                known.claimed = true;
+                let result = admit(emission);
+                return Some((emission, result));
+            }
+            cursor = known.next.as_deref_mut();
+        }
+        None
+    }
+
     pub(crate) fn fence_attempt(&self, attempt: &str) {
         let mut attempts = self.attempts.lock();
         let mut cursor = attempts.as_deref_mut();
