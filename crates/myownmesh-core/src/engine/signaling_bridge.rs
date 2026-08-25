@@ -106,7 +106,6 @@ struct TranslatedOutbound<T> {
     rx: ResourceMailboxReceiver<SignalingOutbound>,
     scope: LocalApplicationResourceScope,
     translate: Box<dyn Fn(&SignalingOutbound) -> T + Send>,
-    refusal_sink: Option<Arc<dyn AttemptRefusalSink>>,
     recovery_state: Option<Weak<NetworkState>>,
     recovery_instance: Option<RecoveryCarrierInstance>,
     guard: Arc<CarrierInstanceGuard>,
@@ -808,9 +807,8 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             }
                             false
                         };
-                    if let (true, true, Some(attempt), Some(state), Some(instance)) = (
+                    if let (true, Some(attempt), Some(state), Some(instance)) = (
                         final_refusal,
-                        self.refusal_sink.is_some(),
                         attempt.clone(),
                         attempt_state.as_ref(),
                         self.recovery_instance,
@@ -1064,7 +1062,6 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
                     },
                 },
             }),
-            refusal_sink: None,
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard,
@@ -1353,11 +1350,6 @@ fn attach_nostr_with(
                     },
                 },
             }),
-            refusal_sink: Some(Arc::new(CoreAttemptRefusalSink {
-                state: Arc::downgrade(state),
-                instance: recovery_instance,
-                guard: Arc::clone(&guard),
-            })),
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard: Arc::clone(&guard),
@@ -1529,11 +1521,6 @@ fn attach_mdns_with(
                     },
                 },
             }),
-            refusal_sink: Some(Arc::new(CoreAttemptRefusalSink {
-                state: Arc::downgrade(state),
-                instance: recovery_instance,
-                guard: Arc::clone(&guard),
-            })),
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard: Arc::clone(&guard),
@@ -2142,7 +2129,6 @@ mod tests {
                     other => unreachable!("this control only emits offers, not {other:?}"),
                 }
             }),
-            refusal_sink: None,
             recovery_state: None,
             recovery_instance: None,
             guard: CarrierInstanceGuard::noop(None),
@@ -2764,7 +2750,6 @@ mod tests {
             rx: first_rx,
             scope: scope.clone(),
             translate: Box::new(|_| "first".to_string()),
-            refusal_sink: None,
             recovery_state: Some(Arc::downgrade(&state)),
             recovery_instance: Some(first_instance),
             guard: first_guard,
@@ -2776,7 +2761,6 @@ mod tests {
             rx: second_rx,
             scope,
             translate: Box::new(|_| "second".to_string()),
-            refusal_sink: None,
             recovery_state: Some(Arc::downgrade(&state)),
             recovery_instance: Some(second_instance),
             guard: second_guard,
@@ -3362,6 +3346,79 @@ mod tests {
             provider.in_use(),
             baseline,
             "late sibling failure releases exact Accepted carrier custody"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "native connector fixture; exercises the LocalBroker-shaped derived-pressure path"]
+    async fn local_broker_derived_pressure_routes_exact_final_refusal_without_sink() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered("local-derived-pressure", None, 5, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
+        let fixture = super::super::insert_promoted_peer(&state, "local-derived-peer").await;
+        let attempt = "local-derived-pressure";
+        fixture.peer.adopt_attempt(attempt);
+        let owner = state
+            .peers
+            .owner("local-derived-peer")
+            .expect("the local owner is current");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("local carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let emission = SignalingEmissionId::next();
+        assert!(state
+            .begin_carrier_emission_for_owner_result(emission, attempt, owner.clone(), [instance],)
+            .is_admitted());
+        assert!(guard.track_attempt(emission, attempt));
+        let scope = state
+            .local_application_resource_scope()
+            .expect("local application scope");
+        let (tx, rx) =
+            crate::resource::resource_mailbox(scope.clone()).expect("local outbound mailbox");
+        tx.send(SignalingOutbound::Offer {
+            device_id: "local-derived-peer".to_string(),
+            attempt: attempt.to_string(),
+            sdp: "local-derived-sdp".to_string(),
+            owner: Some(owner),
+        })
+        .expect("the local broker-shaped source accepts the offer");
+        drop(tx);
+        // Force the exact derived claim to refuse, and close the command
+        // mailbox so DropPeerIfCurrent must take the synchronous exact-owner
+        // cleanup path rather than enqueueing behind a parked receiver.
+        provider.script_pressure(crate::resource::ResourceClass::OpaqueDependencyResidual);
+        state.cmd_tx.close();
+        let source = TranslatedOutbound {
+            first: None,
+            rx,
+            scope,
+            translate: Box::new(|_| LocalOutbound::Leave {
+                device_id: "local-derived-peer".to_string(),
+            }),
+            recovery_state: Some(Arc::downgrade(&state)),
+            recovery_instance: Some(instance),
+            guard,
+            allow_untracked_emission: false,
+            defer_attempt_acceptance: false,
+        };
+        let broker = LocalBroker::new();
+        let forwarder = broker.join_with_sink(
+            "local-derived-room",
+            "local-derived-peer",
+            Box::new(source),
+            InboundSink::new(|_| true),
+        );
+        forwarder
+            .await
+            .expect("LocalBroker forwarder completes after the refused source");
+        state.shutdown().await;
+        drop(fixture);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "LocalBroker-shaped final refusal returns exact owner/provider custody"
         );
     }
 
