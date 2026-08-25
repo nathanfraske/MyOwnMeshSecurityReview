@@ -216,6 +216,64 @@ impl CarrierAttemptNode {
         }
         None
     }
+
+    fn remove_carrier(&mut self, instance: RecoveryCarrierInstance) -> bool {
+        let mut link = &mut self.carriers;
+        loop {
+            if link
+                .as_ref()
+                .is_some_and(|carrier| carrier.instance == instance)
+            {
+                let mut removed = link.take().expect("matched carrier copy");
+                *link = removed.next.take();
+                return true;
+            }
+            match link.as_mut() {
+                Some(carrier) => link = &mut carrier.next,
+                None => return false,
+            }
+        }
+    }
+
+    fn remaining_carriers(&self) -> usize {
+        let mut count = 0usize;
+        let mut cursor = self.carriers.as_deref();
+        while let Some(carrier) = cursor {
+            count = count.saturating_add(1);
+            cursor = carrier.next.as_deref();
+        }
+        count
+    }
+
+    fn resize_tombstone_lease(&mut self) {
+        let remaining = self.remaining_carriers();
+        let Some(bytes) = std::mem::size_of::<CarrierAttemptNode>()
+            .checked_add(self.attempt.len())
+            .and_then(|bytes| {
+                bytes.checked_add(
+                    remaining.checked_mul(std::mem::size_of::<CarrierAttemptCarrier>())?,
+                )
+            })
+            .and_then(|bytes| u64::try_from(bytes).ok())
+        else {
+            return;
+        };
+        let Some(residuals) = remaining.checked_add(1).and_then(|n| u64::try_from(n).ok()) else {
+            return;
+        };
+        let Ok(claim) = ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, bytes),
+            (ResourceClass::OpaqueDependencyResidual, residuals),
+        ]) else {
+            return;
+        };
+        let Some(lease) = self._entry_lease.as_mut() else {
+            return;
+        };
+        // A reduction can only fail if the provider itself is inconsistent;
+        // retaining the larger already-funded lease is safe in that case.
+        let _ = lease.transition(claim);
+    }
 }
 
 impl Drop for CarrierAttemptNode {
@@ -281,13 +339,70 @@ impl CarrierAttemptList {
             if node.attempt == attempt {
                 node.fenced = true;
                 node.terminal = Some(CarrierEmissionRecord::Stale);
-                // Retain only the bounded stale witness. Provider bytes and
-                // the peer owner belong to the lifecycle terminal, not the
-                // delayed-callback tombstone.
+                // Retain only the bounded stale witness. The lease is reduced
+                // to the exact remaining physical carrier copies below; it is
+                // never dropped while one delayed copy can still acknowledge.
                 node.owner = None;
-                node._entry_lease.take();
+                node.resize_tombstone_lease();
             }
             cursor = node.next.as_deref_mut();
+        }
+        self.remove_empty_fenced();
+    }
+
+    fn acknowledge_terminal(
+        &mut self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        instance: RecoveryCarrierInstance,
+    ) -> bool {
+        let mut link = &mut self.head;
+        loop {
+            let matches = link.as_ref().is_some_and(|node| {
+                node.emission == emission && node.attempt == attempt && node.terminal.is_some()
+            });
+            if matches {
+                let remove = {
+                    let node = link.as_mut().expect("matched terminal emission");
+                    if !node.remove_carrier(instance) {
+                        return false;
+                    }
+                    if node.carriers.is_none() && node.fenced {
+                        true
+                    } else {
+                        node.resize_tombstone_lease();
+                        false
+                    }
+                };
+                if remove {
+                    let mut removed = link.take().expect("matched fenced emission");
+                    *link = removed.next.take();
+                    return true;
+                }
+                return false;
+            }
+            match link.as_mut() {
+                Some(node) => link = &mut node.next,
+                None => return false,
+            }
+        }
+    }
+
+    fn remove_empty_fenced(&mut self) {
+        let mut link = &mut self.head;
+        loop {
+            let remove = link
+                .as_ref()
+                .is_some_and(|node| node.fenced && node.carriers.is_none());
+            if remove {
+                let mut removed = link.take().expect("matched empty fenced emission");
+                *link = removed.next.take();
+                continue;
+            }
+            match link.as_mut() {
+                Some(node) => link = &mut node.next,
+                None => return,
+            }
         }
     }
 
@@ -2439,14 +2554,15 @@ impl NetworkState {
             .is_some_and(|node| node.fenced)
     }
 
-    pub(crate) fn acknowledge_fenced_carrier_emission(
+    pub(crate) fn acknowledge_terminal_carrier_emission(
         &self,
         emission: SignalingEmissionId,
         attempt: &str,
+        instance: RecoveryCarrierInstance,
     ) {
         self.carrier_attempts
             .lock()
-            .remove_emission(emission, attempt);
+            .acknowledge_terminal(emission, attempt, instance);
     }
 
     /// Release one carrier copy after its exact carrier set has reached the

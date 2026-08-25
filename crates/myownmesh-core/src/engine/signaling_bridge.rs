@@ -35,6 +35,9 @@
 
 use std::sync::{Arc, Weak};
 
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
+
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
@@ -225,7 +228,7 @@ impl CoreAttemptRefusalSink {
         let settlement =
             state.record_carrier_emission_with_owner(emission, &refusal.attempt, instance, false);
         if state.carrier_emission_is_fenced(emission, &refusal.attempt) {
-            state.acknowledge_fenced_carrier_emission(emission, &refusal.attempt);
+            state.acknowledge_terminal_carrier_emission(emission, &refusal.attempt, instance);
         }
         self.guard.settle_attempt(emission);
         if settlement.record != CarrierEmissionRecord::FinalRefusal {
@@ -248,9 +251,20 @@ impl CoreAttemptRefusalSink {
         if !owner_matches_attempt {
             return;
         }
-        let _ = state
+        let fallback_owner = owner.clone();
+        let fallback_attempt = refusal.attempt.clone();
+        if state
             .cmd_tx
-            .send(NetworkCmd::AttemptRefused { owner, refusal });
+            .send(NetworkCmd::AttemptRefused { owner, refusal })
+            .is_err()
+        {
+            schedule_exact_terminal_cleanup(
+                &state,
+                fallback_owner,
+                fallback_attempt,
+                "Nostr attempt refusal command was not accepted",
+            );
+        }
     }
 
     fn drop_unadmitted(
@@ -281,31 +295,37 @@ impl CoreAttemptRefusalSink {
         if state.cmd_tx.send(command).is_err() {
             // The refusal effect is exact-owner work, not a best-effort
             // mailbox notification. If the funded command queue is already
-            // closed or pressured, retire the speculative candidate directly;
-            // never fall back to a device-id removal or broad attempt settle.
-            retire_unqueued_speculative(&state, &fallback_owner, &fallback_correlation);
+            // closed or pressured, run the same exact candidate/promoted
+            // terminal coordinator as the command arm; never fall back to a
+            // device-id removal or broad attempt settle.
+            schedule_exact_terminal_cleanup(
+                &state,
+                fallback_owner,
+                fallback_correlation,
+                "exact refusal cleanup command was not accepted",
+            );
         }
     }
 }
 
-fn retire_unqueued_speculative(
+fn schedule_exact_terminal_cleanup(
     state: &Arc<NetworkState>,
-    owner: &super::peer_registry::PeerOwnerToken,
-    correlation: &str,
+    owner: super::peer_registry::PeerOwnerToken,
+    correlation: String,
+    message: &'static str,
 ) {
-    let Some(candidate) = owner.worker().cloned() else {
-        return;
-    };
-    if let Some(retired) = state
-        .peers
-        .take_speculative_exact(owner, correlation, &candidate)
-    {
-        let _ = owner.connection().start_exact_retired_worker(
-            &retired.worker,
-            retired.dedup,
-            retired.additional_dedup.drain_tokens(),
-        );
-    }
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        super::drop_carrier_if_current_with_correlation(
+            &state,
+            &owner,
+            DropReason::TransportError {
+                message: message.to_string(),
+            },
+            correlation.as_str(),
+        )
+        .await;
+    });
 }
 
 impl AttemptRefusalSink for CoreAttemptRefusalSink {
@@ -351,7 +371,7 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
             accepted,
         );
         if state.carrier_emission_is_fenced(emission, &outcome.attempt) {
-            state.acknowledge_fenced_carrier_emission(emission, &outcome.attempt);
+            state.acknowledge_terminal_carrier_emission(emission, &outcome.attempt, instance);
         }
         self.guard.settle_attempt(emission);
         if !outcome_record_is_routable(&outcome.kind, settlement.record) {
@@ -376,9 +396,26 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
         if !owner_matches_attempt {
             return;
         }
-        let _ = state
+        let refusal_terminal = matches!(
+            &outcome.kind,
+            myownmesh_signaling::AttemptOutcomeKind::TypedRefused(_)
+                | myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable
+        );
+        let fallback_owner = owner.clone();
+        let fallback_attempt = outcome.attempt.clone();
+        if state
             .cmd_tx
-            .send(NetworkCmd::AttemptOutcome { owner, outcome });
+            .send(NetworkCmd::AttemptOutcome { owner, outcome })
+            .is_err()
+            && refusal_terminal
+        {
+            schedule_exact_terminal_cleanup(
+                &state,
+                fallback_owner,
+                fallback_attempt,
+                "Nostr attempt outcome command was not accepted",
+            );
+        }
     }
 }
 
@@ -685,6 +722,14 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             (admission, fenced)
                         })
                     else {
+                        if let Some(fenced_emission) = self.guard.fenced_emission_for(attempt) {
+                            state.acknowledge_terminal_carrier_emission(
+                                fenced_emission,
+                                attempt,
+                                instance,
+                            );
+                            self.guard.settle_attempt(fenced_emission);
+                        }
                         continue;
                     };
                     preadmission = Some((admission, fenced));
@@ -693,7 +738,24 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                     match self.guard.claim_attempt(attempt) {
                         Some(emission) => Some(emission),
                         None if self.allow_untracked_emission => Some(SignalingEmissionId::next()),
-                        None => continue,
+                        None => {
+                            // Lifecycle settlement fences a queued physical
+                            // copy but intentionally leaves its exact guard
+                            // node until this carrier pull observes it.  Ack
+                            // that token here; never recreate an aggregate by
+                            // attempt name and never consume a successor.
+                            if let (Some(state), Some(instance), Some(emission)) = (
+                                attempt_state.as_ref(),
+                                self.recovery_instance,
+                                self.guard.fenced_emission_for(attempt),
+                            ) {
+                                state.acknowledge_terminal_carrier_emission(
+                                    emission, attempt, instance,
+                                );
+                                self.guard.settle_attempt(emission);
+                            }
+                            continue;
+                        }
                     }
                 }
             } else {
@@ -706,15 +768,18 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 preadmission,
             ) {
                 if admission == CarrierEmissionAdmission::Stale || fenced {
-                    if fenced {
-                        state.acknowledge_fenced_carrier_emission(emission, attempt);
+                    if let Some(instance) = self.recovery_instance {
+                        state.acknowledge_terminal_carrier_emission(emission, attempt, instance);
                     }
                     self.guard.settle_attempt(emission);
                     continue;
                 }
                 if !admission.is_admitted() {
                     if state.carrier_emission_is_fenced(emission, attempt) {
-                        state.acknowledge_fenced_carrier_emission(emission, attempt);
+                        if let Some(instance) = self.recovery_instance {
+                            state
+                                .acknowledge_terminal_carrier_emission(emission, attempt, instance);
+                        }
                     }
                     self.guard.settle_attempt(emission);
                     continue;
@@ -920,12 +985,15 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
         return;
     };
     let recovery_instance = state.next_recovery_carrier_instance();
-    let attach = SignalingRuntime::attach_for_state(
+    let Some(attach) = SignalingRuntime::attach_for_state(
         &runtime,
         SignalingCarrier::Local,
         state,
         recovery_instance,
-    );
+    ) else {
+        warn!(network = %state.network_id, "local signaling not attached: guard index unfunded");
+        return;
+    };
     let guard = attach.guard();
     let Ok((local_tx, local_rx)) = crate::resource::resource_mailbox(scope.clone()) else {
         return;
@@ -1173,7 +1241,7 @@ pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
         SignalingCarrier::Nostr,
         state,
         recovery_instance,
-    );
+    )?;
     let guard = attach.guard();
     let handle = attach_nostr_with(state, nostr_rx, attach, recovery_instance, false)?;
     let fanout = spawn_fanout(
@@ -1374,7 +1442,7 @@ pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
         SignalingCarrier::Mdns,
         state,
         recovery_instance,
-    );
+    )?;
     let guard = attach.guard();
     let handle = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false)?;
     let fanout = spawn_fanout(
@@ -1616,18 +1684,23 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let nostr_instance = state.next_recovery_carrier_instance();
             let mdns_instance = state.next_recovery_carrier_instance();
-            let nostr_attach = SignalingRuntime::attach_for_state(
+            let Some(nostr_attach) = SignalingRuntime::attach_for_state(
                 &runtime,
                 SignalingCarrier::Nostr,
                 state,
                 nostr_instance,
-            );
-            let mdns_attach = SignalingRuntime::attach_for_state(
+            ) else {
+                return Err(crate::Error::Network("nostr guard index unfunded".into()));
+            };
+            let Some(mdns_attach) = SignalingRuntime::attach_for_state(
                 &runtime,
                 SignalingCarrier::Mdns,
                 state,
                 mdns_instance,
-            );
+            ) else {
+                runtime.detach_guards();
+                return Err(crate::Error::Network("mdns guard index unfunded".into()));
+            };
             let fanout = spawn_fanout(
                 state.clone(),
                 outbound_rx,
@@ -1648,12 +1721,14 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             let (nostr_tx, nostr_rx) =
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let recovery_instance = state.next_recovery_carrier_instance();
-            let attach = SignalingRuntime::attach_for_state(
+            let Some(attach) = SignalingRuntime::attach_for_state(
                 &runtime,
                 SignalingCarrier::Nostr,
                 state,
                 recovery_instance,
-            );
+            ) else {
+                return Err(crate::Error::Network("nostr guard index unfunded".into()));
+            };
             let fanout = spawn_fanout(
                 state.clone(),
                 outbound_rx,
@@ -1669,12 +1744,14 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             let (mdns_tx, mdns_rx) =
                 crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let recovery_instance = state.next_recovery_carrier_instance();
-            let attach = SignalingRuntime::attach_for_state(
+            let Some(attach) = SignalingRuntime::attach_for_state(
                 &runtime,
                 SignalingCarrier::Mdns,
                 state,
                 recovery_instance,
-            );
+            ) else {
+                return Err(crate::Error::Network("mdns guard index unfunded".into()));
+            };
             let fanout = spawn_fanout(
                 state.clone(),
                 outbound_rx,
@@ -1807,8 +1884,32 @@ fn spawn_fanout(
             };
             let emission = attempt.as_deref().map(|_| SignalingEmissionId::next());
             if let Some(attempt) = attempt.as_deref() {
-                let instances = driver_txs.iter().filter_map(|(instance, _, _)| *instance);
                 if let Some(emission) = emission {
+                    // Register every physical copy before activating the
+                    // state-side aggregate. A detached first guard must not
+                    // leave a live state node for a later queued copy, and a
+                    // partial registration is not a fan-out publication.
+                    let all_tracked = driver_txs
+                        .iter()
+                        .all(|(_, _, guard)| guard.track_attempt(emission, attempt));
+                    if !all_tracked {
+                        for (_, _, guard) in &driver_txs {
+                            guard.settle_attempt(emission);
+                        }
+                        CoreAttemptRefusalSink {
+                            state: Arc::downgrade(&state),
+                            instance: None,
+                            guard: CarrierInstanceGuard::noop(None),
+                        }
+                        .drop_unadmitted(
+                            None,
+                            outbound_owner.clone(),
+                            attempt.to_string(),
+                            "carrier emission custody refused",
+                        );
+                        continue;
+                    }
+                    let instances = driver_txs.iter().filter_map(|(instance, _, _)| *instance);
                     let admission =
                         outbound_owner
                             .clone()
@@ -1827,6 +1928,9 @@ fn spawn_fanout(
                         continue;
                     }
                     if !admission.is_admitted() {
+                        for (_, _, guard) in &driver_txs {
+                            guard.settle_attempt(emission);
+                        }
                         CoreAttemptRefusalSink {
                             state: Arc::downgrade(&state),
                             instance: None,
@@ -1840,40 +1944,20 @@ fn spawn_fanout(
                         );
                         continue;
                     }
-                    let all_tracked = driver_txs
-                        .iter()
-                        .all(|(_, _, guard)| guard.track_attempt(emission, attempt));
-                    if !all_tracked {
-                        let mut final_refusal = false;
-                        let mut final_owner = None;
-                        for (instance, _, guard) in &driver_txs {
-                            guard.settle_attempt(emission);
-                            if let Some(instance) = instance {
-                                let settlement = state.record_carrier_emission_with_owner(
-                                    emission, attempt, *instance, false,
-                                );
-                                if settlement.record == CarrierEmissionRecord::FinalRefusal {
-                                    final_refusal = true;
-                                    final_owner = settlement.owner;
-                                }
-                            }
-                        }
-                        if final_refusal {
-                            CoreAttemptRefusalSink {
-                                state: Arc::downgrade(&state),
-                                instance: None,
-                                guard: CarrierInstanceGuard::noop(None),
-                            }
-                            .drop_unadmitted(
-                                Some(emission),
-                                final_owner,
-                                attempt.to_string(),
-                                "carrier emission custody refused",
-                            );
-                        }
-                        continue;
-                    }
                 }
+            }
+            #[cfg(test)]
+            let fanout_gate = {
+                FANOUT_AFTER_ADMISSION
+                    .get_or_init(|| Mutex::new(None))
+                    .lock()
+                    .expect("fanout test hook mutex is not poisoned")
+                    .clone()
+            };
+            #[cfg(test)]
+            if let Some(gate) = fanout_gate {
+                gate.entered.notify_waiters();
+                gate.release.notified().await;
             }
             let mut delivered = false;
             let mut final_refusal = false;
@@ -1983,6 +2067,15 @@ fn spawn_fanout(
         trace!("signaling fan-out exiting");
     })
 }
+
+#[cfg(test)]
+struct FanoutTestGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static FANOUT_AFTER_ADMISSION: OnceLock<Mutex<Option<Arc<FanoutTestGate>>>> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {
@@ -2562,7 +2655,8 @@ mod tests {
             SignalingCarrier::Nostr,
             &state,
             Some(instance),
-        );
+        )
+        .expect("test guard index is funded");
         let guard = attach.guard();
         let emission = SignalingEmissionId::next();
         assert!(state.begin_carrier_emission(emission, "queued-attempt", [instance]));
@@ -2573,13 +2667,375 @@ mod tests {
         state.settle_attempt("queued-attempt", DeliveryTerminal::Cancelled);
 
         assert!(!state.begin_carrier_emission(emission, "queued-attempt", [instance]));
-        state.acknowledge_fenced_carrier_emission(emission, "queued-attempt");
+        state.acknowledge_terminal_carrier_emission(emission, "queued-attempt", instance);
         let successor = SignalingEmissionId::next();
         assert!(state.begin_carrier_emission(successor, "queued-attempt", [instance]));
         assert_eq!(
             guard.claim_attempt("queued-attempt"),
             None,
             "a delayed pull cannot recreate custody after lifecycle settlement"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "native connector fixture; exercises the production fanout and pull path"]
+    async fn production_fanout_fence_waits_for_each_physical_copy_ack() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered("fanout-copy-fence", None, 2, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
+        let _fixture = super::super::insert_promoted_peer(&state, "fanout-peer").await;
+        let owner = state.peers.owner("fanout-peer").expect("installed owner");
+        let scope = state
+            .local_application_resource_scope()
+            .expect("test state local scope");
+        let (out_tx, out_rx) =
+            crate::resource::resource_mailbox(scope.clone()).expect("fanout source mailbox");
+        let (first_tx, first_rx) =
+            crate::resource::resource_mailbox(scope.clone()).expect("first carrier mailbox");
+        let (second_tx, second_rx) =
+            crate::resource::resource_mailbox(scope.clone()).expect("second carrier mailbox");
+        let runtime = SignalingRuntime::new(state.signaling_inbound_tx.clone(), scope.clone());
+        state.publish_signaling_runtime(&runtime);
+        let first_instance = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second_instance = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+        let first_attach = SignalingRuntime::attach_for_state(
+            &runtime,
+            SignalingCarrier::Nostr,
+            &state,
+            Some(first_instance),
+        )
+        .expect("first guard index is funded");
+        let second_attach = SignalingRuntime::attach_for_state(
+            &runtime,
+            SignalingCarrier::Mdns,
+            &state,
+            Some(second_instance),
+        )
+        .expect("second guard index is funded");
+        let first_guard = first_attach.guard();
+        let second_guard = second_attach.guard();
+        let fanout = spawn_fanout(
+            state.clone(),
+            out_rx,
+            vec![
+                (Some(first_instance), first_tx, first_guard.clone()),
+                (Some(second_instance), second_tx, second_guard.clone()),
+            ],
+        );
+        let gate = Arc::new(FanoutTestGate {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        *FANOUT_AFTER_ADMISSION
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("fanout test hook mutex is not poisoned") = Some(gate.clone());
+        let attempt = "fanout-copy-fence".to_string();
+        let entered = gate.entered.notified();
+        tokio::pin!(entered);
+        entered.as_mut().enable();
+        let release = gate.release.notified();
+        tokio::pin!(release);
+        release.as_mut().enable();
+        out_tx
+            .send(SignalingOutbound::Offer {
+                device_id: "fanout-peer".to_string(),
+                attempt: attempt.clone(),
+                sdp: "sdp".to_string(),
+                owner: Some(owner.clone()),
+            })
+            .expect("fanout source accepts the offer");
+        drop(out_tx);
+        entered.await;
+
+        // The real fanout has registered both physical copies, but has not yet
+        // handed either one to a carrier.  Lifecycle settlement in this window
+        // is the interleave that used to erase the second copy's fence.
+        state.settle_attempt(&attempt, DeliveryTerminal::Cancelled);
+        gate.release.notify_waiters();
+        release.await;
+        let mut first_source = TranslatedOutbound {
+            first: None,
+            rx: first_rx,
+            scope: scope.clone(),
+            translate: Box::new(|_| "first".to_string()),
+            refusal_sink: None,
+            recovery_state: Some(Arc::downgrade(&state)),
+            recovery_instance: Some(first_instance),
+            guard: first_guard,
+            allow_untracked_emission: false,
+            defer_attempt_acceptance: false,
+        };
+        let mut second_source = TranslatedOutbound {
+            first: None,
+            rx: second_rx,
+            scope,
+            translate: Box::new(|_| "second".to_string()),
+            refusal_sink: None,
+            recovery_state: Some(Arc::downgrade(&state)),
+            recovery_instance: Some(second_instance),
+            guard: second_guard,
+            allow_untracked_emission: false,
+            defer_attempt_acceptance: false,
+        };
+        assert!(
+            first_source.recv().await.is_none(),
+            "first physical copy is stale"
+        );
+        let successor = SignalingEmissionId::next();
+        assert!(
+            state.begin_carrier_emission(successor, &attempt, [first_instance, second_instance]),
+            "the first stale acknowledgment preserves the second-copy fence while allowing a fresh successor"
+        );
+        assert!(
+            second_source.recv().await.is_none(),
+            "second physical copy is stale"
+        );
+        state.settle_attempt(&attempt, DeliveryTerminal::Cancelled);
+        state.acknowledge_terminal_carrier_emission(successor, &attempt, first_instance);
+        state.acknowledge_terminal_carrier_emission(successor, &attempt, second_instance);
+        // The translated sources own the two carrier mailbox roots.  Release
+        // them before measuring the provider baseline; the exact carrier
+        // acknowledgments above have already completed their stale-fence work.
+        drop(first_source);
+        drop(second_source);
+
+        drop(first_attach);
+        drop(second_attach);
+        drop(runtime);
+        fanout.abort();
+        let _ = fanout.await;
+        *FANOUT_AFTER_ADMISSION
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("fanout test hook mutex is not poisoned") = None;
+        state.shutdown().await;
+        drop(owner);
+        drop(_fixture);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "physical fanout and both exact carrier nodes release to the provider baseline"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "native connector fixture; exercises closed command-mailbox cleanup"]
+    async fn closed_command_mailbox_keeps_candidate_and_promoted_sink_cleanup_exact() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered("sink-pressure", None, 5, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
+        let broad_settlements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broad_settlements_clone = Arc::clone(&broad_settlements);
+        state.set_attempt_settlement(Arc::new(move |_, _| {
+            broad_settlements_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0
+        }));
+        let fixture = super::super::insert_promoted_peer(&state, "sink-pressure-peer").await;
+        let peer = Arc::clone(&fixture.peer);
+        let base_owner = state
+            .peers
+            .owner("sink-pressure-peer")
+            .expect("the promoted owner is current");
+        let (candidate, _candidate_events) = state
+            .transport
+            .open_connector_peer(
+                crate::transport::Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the fixture admits a speculative connector");
+        let candidate = Arc::new(candidate);
+        let candidate_attempt = "candidate-pressure".to_string();
+        let candidate_lease = candidate
+            .reserve_attempt_work(
+                crate::engine::connection::PeerConnection::speculative_attempt_claim(
+                    &candidate_attempt,
+                ),
+            )
+            .expect("the candidate attempt is funded");
+        assert!(peer.install_speculative(
+            candidate_attempt.clone(),
+            Arc::clone(&candidate),
+            candidate_lease,
+        ));
+        let candidate_owner = base_owner.for_worker(Arc::clone(&candidate));
+        let candidate_instance = state
+            .next_recovery_carrier_instance()
+            .expect("candidate carrier instance");
+        let candidate_guard = CarrierInstanceGuard::for_state(&state, Some(candidate_instance));
+        let candidate_emission = SignalingEmissionId::next();
+        assert!(state
+            .begin_carrier_emission_for_owner_result(
+                candidate_emission,
+                &candidate_attempt,
+                candidate_owner,
+                [candidate_instance],
+            )
+            .is_admitted());
+        assert!(candidate_guard.track_attempt(candidate_emission, &candidate_attempt));
+        assert_eq!(
+            candidate_guard.claim_attempt(&candidate_attempt),
+            Some(candidate_emission)
+        );
+        state.mark_carrier_emission_claimed(candidate_emission, &candidate_attempt);
+        let candidate_source = AdmissionSource::fresh();
+        assert!(candidate_guard.bind_admission_source(candidate_source, &candidate_attempt));
+
+        // A closed command mailbox forces the exact sink to use the same
+        // candidate/promoted coordinator as the command arm.  The candidate
+        // refusal must retire W1 only and must not broad-settle the attempt.
+        state.cmd_tx.close();
+        CoreAttemptRefusalSink {
+            state: Arc::downgrade(&state),
+            instance: Some(candidate_instance),
+            guard: candidate_guard,
+        }
+        .refused(AttemptRefusal {
+            source: candidate_source,
+            attempt: candidate_attempt.clone(),
+            event_id: "candidate-pressure-event".to_string(),
+            refusal: myownmesh_signaling::NegotiationRefusal::Provider(
+                "mailbox closed".to_string(),
+            ),
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !peer.speculative_is_exact(&candidate_attempt, &candidate),
+            "candidate-first refusal retires only W1 under command pressure"
+        );
+        assert!(
+            state.peers.get_if_current(&base_owner).is_some(),
+            "candidate cleanup leaves the promoted predecessor current"
+        );
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "carrier-local refusal never broad-settles the shared attempt"
+        );
+
+        let (drop_candidate, _drop_events) = state
+            .transport
+            .open_connector_peer(
+                crate::transport::Role::Offerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the fixture admits a second speculative connector");
+        let drop_candidate = Arc::new(drop_candidate);
+        let drop_attempt = "drop-peer-pressure".to_string();
+        let drop_lease = drop_candidate
+            .reserve_attempt_work(
+                crate::engine::connection::PeerConnection::speculative_attempt_claim(&drop_attempt),
+            )
+            .expect("the second candidate attempt is funded");
+        assert!(peer.install_speculative(
+            drop_attempt.clone(),
+            Arc::clone(&drop_candidate),
+            drop_lease,
+        ));
+        let drop_owner = base_owner.for_worker(Arc::clone(&drop_candidate));
+        CoreAttemptRefusalSink {
+            state: Arc::downgrade(&state),
+            instance: None,
+            guard: CarrierInstanceGuard::noop(None),
+        }
+        .drop_unadmitted(
+            None,
+            Some(drop_owner),
+            drop_attempt.clone(),
+            "DropPeerIfCurrent mailbox closed",
+        );
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !peer.speculative_is_exact(&drop_attempt, &drop_candidate),
+            "closed DropPeerIfCurrent cleanup retires only the exact candidate"
+        );
+        assert!(
+            state.peers.get_if_current(&base_owner).is_some(),
+            "direct command-send refusal leaves W0 current"
+        );
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "direct command-send refusal does not broad-settle"
+        );
+
+        // Promotion-first uses the same closed mailbox, but its exact owner
+        // terminal removes the promoted installation rather than a successor
+        // selected by device id or attempt name.
+        peer.adopt_attempt("promoted-pressure");
+        let promoted_instance = state
+            .next_recovery_carrier_instance()
+            .expect("promoted carrier instance");
+        let promoted_guard = CarrierInstanceGuard::for_state(&state, Some(promoted_instance));
+        let promoted_emission = SignalingEmissionId::next();
+        assert!(state
+            .begin_carrier_emission_for_owner_result(
+                promoted_emission,
+                "promoted-pressure",
+                base_owner.clone(),
+                [promoted_instance],
+            )
+            .is_admitted());
+        assert!(promoted_guard.track_attempt(promoted_emission, "promoted-pressure"));
+        assert_eq!(
+            promoted_guard.claim_attempt("promoted-pressure"),
+            Some(promoted_emission)
+        );
+        state.mark_carrier_emission_claimed(promoted_emission, "promoted-pressure");
+        let promoted_source = AdmissionSource::fresh();
+        assert!(promoted_guard.bind_admission_source(promoted_source, "promoted-pressure"));
+        CoreAttemptOutcomeSink {
+            state: Arc::downgrade(&state),
+            instance: Some(promoted_instance),
+            guard: promoted_guard,
+        }
+        .outcome(AttemptOutcome {
+            source: promoted_source,
+            attempt: "promoted-pressure".to_string(),
+            event_id: "promoted-pressure-event".to_string(),
+            kind: myownmesh_signaling::AttemptOutcomeKind::TypedRefused(
+                "mailbox closed".to_string(),
+            ),
+        });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.peers.get_if_current(&base_owner).is_none(),
+            "promotion-first refusal retires the exact promoted owner"
+        );
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "promotion cleanup remains exact and does not broad-settle"
+        );
+        state.shutdown().await;
+        drop(candidate);
+        drop(drop_candidate);
+        drop(_candidate_events);
+        drop(_drop_events);
+        drop(base_owner);
+        drop(fixture);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "candidate/promoted command-pressure cleanup returns provider custody to baseline"
         );
     }
 

@@ -290,6 +290,28 @@ impl CarrierInstanceGuard {
         None
     }
 
+    /// Return one exact fenced physical copy for a delayed carrier pull.
+    ///
+    /// Lifecycle settlement deliberately leaves fenced records in the guard
+    /// until the carrier observes its queued value.  This is the only lookup
+    /// permitted on that delayed path: it is still an opaque emission token,
+    /// never an attempt-name re-admission or a successor selection.
+    pub(crate) fn fenced_emission_for(&self, attempt: &str) -> Option<SignalingEmissionId> {
+        let attempts = self.attempts.lock();
+        let mut candidate = None;
+        let mut cursor = attempts.as_deref();
+        while let Some(known) = cursor {
+            if known.attempt == attempt && known.fenced {
+                // Nodes are newest-first; a FIFO carrier pull must consume the
+                // oldest delayed copy before the newer one, just like
+                // claim_attempt does for live copies.
+                candidate = Some(known.emission);
+            }
+            cursor = known.next.as_deref();
+        }
+        candidate
+    }
+
     /// Claim one physical copy while running the state-side admission under
     /// the same guard lock.  Lifecycle fencing waits on this lock, so a
     /// carrier cannot observe a claim, pause before state admission, and then
@@ -339,20 +361,11 @@ impl CarrierInstanceGuard {
     }
 
     pub(crate) fn clear_attempt(&self, attempt: &str) {
-        let mut attempts = self.attempts.lock();
-        let mut link = &mut *attempts;
-        loop {
-            let remove = link.as_ref().is_some_and(|known| known.attempt == attempt);
-            if remove {
-                let mut removed = link.take().expect("matched fenced attempt custody");
-                *link = removed.next.take();
-                continue;
-            }
-            match link.as_mut() {
-                Some(known) => link = &mut known.next,
-                None => return,
-            }
-        }
+        // Do not erase a queued carrier's exact record here.  The state-side
+        // fence has already happened; retaining this funded node until the
+        // delayed physical pull acknowledges it is what releases the matching
+        // carrier-instance custody without allowing a fresh admission.
+        self.fence_attempt(attempt);
     }
 
     pub(crate) fn bind_event_id(
@@ -531,6 +544,12 @@ impl CarrierInstanceGuard {
                 );
                 if record == crate::engine::state::CarrierEmissionRecord::FinalRefusal {
                     state.settle_final_refusal_carrier(attempt.emission, &attempt.attempt);
+                } else if record == crate::engine::state::CarrierEmissionRecord::Stale {
+                    state.acknowledge_terminal_carrier_emission(
+                        attempt.emission,
+                        &attempt.attempt,
+                        instance,
+                    );
                 }
             }
         }
@@ -1083,13 +1102,28 @@ struct SeenKey {
 /// exact funded guard used for carrier-emission and recovery settlement.
 pub(crate) struct SignalingRuntime {
     tx: ResourceMailboxSender<EphemeralIngress>,
-    /// Funds every retained de-duplication key. The provider is the bound; this
-    /// module names no count.
+    /// Funds every retained de-duplication key and every weak guard index. The
+    /// provider is the bound; this module names no count.
     scope: LocalApplicationResourceScope,
     instances: AtomicU64,
     dedup_instances: AtomicU64,
     seen: Mutex<VecDeque<SeenKey>>,
-    guards: Mutex<Vec<Weak<CarrierInstanceGuard>>>,
+    guards: Mutex<Option<Box<GuardIndex>>>,
+}
+
+struct GuardIndex {
+    guard: Weak<CarrierInstanceGuard>,
+    _lease: ResourceLease,
+    next: Option<Box<GuardIndex>>,
+}
+
+fn guard_index_claim() -> Option<ResourceClaim> {
+    let bytes = u64::try_from(std::mem::size_of::<GuardIndex>()).ok()?;
+    ResourceClaim::try_from_entries([
+        (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+        (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+    .ok()
 }
 
 /// What one remembered de-duplication key costs.
@@ -1112,7 +1146,7 @@ impl SignalingRuntime {
             instances: AtomicU64::new(0),
             dedup_instances: AtomicU64::new(0),
             seen: Mutex::new(VecDeque::new()),
-            guards: Mutex::new(Vec::new()),
+            guards: Mutex::new(None),
         })
     }
 
@@ -1131,57 +1165,86 @@ impl SignalingRuntime {
         carrier: SignalingCarrier,
         state: &Arc<NetworkState>,
         recovery_instance: Option<RecoveryCarrierInstance>,
-    ) -> CarrierAttach {
+    ) -> Option<CarrierAttach> {
         let instance = CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed));
         let guard = CarrierInstanceGuard::for_state(state, recovery_instance);
-        runtime.guards.lock().push(Arc::downgrade(&guard));
-        CarrierAttach {
+        let lease = runtime.scope.acquire(guard_index_claim()?).ok()?;
+        let mut index = Box::new(GuardIndex {
+            guard: Arc::downgrade(&guard),
+            _lease: lease,
+            next: None,
+        });
+        let mut guards = runtime.guards.lock();
+        index.next = guards.take();
+        *guards = Some(index);
+        Some(CarrierAttach {
             carrier,
             instance,
             runtime: Arc::clone(runtime),
             guard,
-        }
+        })
     }
 
-    /// Detach all current carrier guards synchronously.  The weak registry is
-    /// only an index; each guard still owns and settles its exact intrusive
-    /// records, so a later task/drop cannot touch a successor generation.
+    /// Detach all current carrier guards synchronously. The weak registry is
+    /// a provider-funded index; each guard still owns and settles its exact
+    /// intrusive records, so a later task/drop cannot touch a successor
+    /// generation.
     pub(crate) fn detach_guards(&self) {
-        let guards = self
-            .guards
-            .lock()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        for guard in guards {
-            guard.detach();
+        {
+            let guards = self.guards.lock();
+            let mut cursor = guards.as_deref();
+            while let Some(entry) = cursor {
+                if let Some(guard) = Weak::upgrade(&entry.guard) {
+                    guard.detach();
+                }
+                cursor = entry.next.as_deref();
+            }
         }
-        self.guards.lock().retain(|guard| guard.strong_count() != 0);
+        self.prune_guard_index();
     }
 
     pub(crate) fn fence_attempt(&self, attempt: &str) {
-        let guards = self
-            .guards
-            .lock()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        for guard in guards {
-            guard.fence_attempt(attempt);
+        let guards = self.guards.lock();
+        let mut cursor = guards.as_deref();
+        while let Some(entry) = cursor {
+            if let Some(guard) = Weak::upgrade(&entry.guard) {
+                guard.fence_attempt(attempt);
+            }
+            cursor = entry.next.as_deref();
         }
     }
 
     pub(crate) fn clear_attempt(&self, attempt: &str) {
-        let guards = self
-            .guards
-            .lock()
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        for guard in guards {
-            guard.clear_attempt(attempt);
+        {
+            let guards = self.guards.lock();
+            let mut cursor = guards.as_deref();
+            while let Some(entry) = cursor {
+                if let Some(guard) = Weak::upgrade(&entry.guard) {
+                    guard.clear_attempt(attempt);
+                }
+                cursor = entry.next.as_deref();
+            }
         }
-        self.guards.lock().retain(|guard| guard.strong_count() != 0);
+        self.prune_guard_index();
+    }
+
+    fn prune_guard_index(&self) {
+        let mut guards = self.guards.lock();
+        let mut link = &mut *guards;
+        loop {
+            let remove = link
+                .as_ref()
+                .is_some_and(|entry| entry.guard.strong_count() == 0);
+            if remove {
+                let mut removed = link.take().expect("matched stale guard index");
+                *link = removed.next.take();
+                continue;
+            }
+            match link.as_mut() {
+                Some(entry) => link = &mut entry.next,
+                None => return,
+            }
+        }
     }
 
     #[cfg(test)]

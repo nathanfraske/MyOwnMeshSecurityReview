@@ -7909,6 +7909,105 @@ async fn drop_peer_if_current_with_correlation(
     }
 }
 
+/// Retire one carrier-scoped terminal without ending the whole delivery
+/// correlation.  Provider callbacks may share an attempt with another live
+/// emission, so their closed-mailbox fallback must bypass logical-session
+/// admission and the broad lifecycle settlement path above.
+pub(super) async fn drop_carrier_if_current_with_correlation(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    reason: DropReason,
+    correlation: &str,
+) {
+    let recovery = prepare_answerer_recovery(state, owner, &reason);
+    let Some(worker) = owner
+        .worker()
+        .cloned()
+        .or_else(|| owner.connection().current_worker())
+    else {
+        cancel_recovery_demand(recovery);
+        return;
+    };
+    let exact_correlation = owner
+        .connection()
+        .speculative_is_exact(correlation, &worker)
+        || owner.connection().attempt_for_worker(&worker).as_deref() == Some(correlation)
+        || (owner.worker().is_none() && owner.connection().attempt() == correlation);
+    if !exact_correlation {
+        cancel_recovery_demand(recovery);
+        return;
+    }
+    match state
+        .peers
+        .terminal_speculative_cleanup(owner, correlation, &worker)
+    {
+        Some(peer_registry::SpeculativeTerminalCleanup::Candidate(retired)) => {
+            let started = owner.connection().start_exact_retired_worker(
+                &retired.worker,
+                retired.dedup,
+                retired.additional_dedup.drain_tokens(),
+            );
+            if !started {
+                warn!("carrier candidate close custody was already settled");
+            }
+            cancel_recovery_demand(recovery);
+        }
+        Some(peer_registry::SpeculativeTerminalCleanup::Promoted { peer, removed }) => {
+            let recovery = if removed.session_empty {
+                publish_terminal_recovery(state, recovery)
+            } else {
+                cancel_recovery_demand(recovery);
+                None
+            };
+            let started = owner.connection().start_exact_retired_worker(
+                &removed.worker,
+                removed.dedup,
+                removed.additional_dedup.drain_tokens(),
+            );
+            if !started {
+                warn!("carrier promoted close custody was already settled");
+            }
+            if removed.session_empty {
+                peer.start_all_retired_workers();
+                if let Err(error) = peer.retire_and_close().await {
+                    warn!(%error, "carrier promoted cleanup did not complete");
+                }
+                state.peers.complete_removed_close(&peer);
+                if recovery.is_none() {
+                    state.clear_reconnect_intent(owner.device_id());
+                }
+            }
+        }
+        None => {
+            // A control-only authenticated installation may have the exact
+            // current worker without a promoted-session slot.  It is still a
+            // carrier-owned terminal, but the promoted-channel reducer cannot
+            // remove it.  Recheck the same worker before the registry fence,
+            // then remove only this exact installation; never broad-settle its
+            // correlation or redirect to a device successor.
+            let exact_current = owner
+                .connection()
+                .current_worker()
+                .is_some_and(|current| Arc::ptr_eq(&current, &worker));
+            if exact_current && !owner.connection().holds_promoted_session() {
+                if let Some(peer) = state.peers.remove_if_current_unpromoted(owner) {
+                    let recovery = publish_terminal_recovery(state, recovery);
+                    peer.start_all_retired_workers();
+                    if let Err(error) = peer.retire_and_close().await {
+                        warn!(%error, "carrier current-worker cleanup did not complete");
+                    }
+                    state.peers.complete_removed_close(&peer);
+                    if recovery.is_none() {
+                        state.clear_reconnect_intent(owner.device_id());
+                    }
+                    return;
+                }
+            }
+            cancel_recovery_demand(recovery);
+        }
+    }
+}
+
 /// Retire an unpromoted Offer only when both the installation token and the
 /// attempt correlation captured by its producer still match. A refusal from
 /// an old Offer must not fall through to a device-id removal and take a newer
