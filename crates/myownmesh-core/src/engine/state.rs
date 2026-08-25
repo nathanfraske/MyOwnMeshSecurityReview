@@ -189,6 +189,8 @@ struct CarrierAttemptNode {
     expected: usize,
     resolved: usize,
     accepted: bool,
+    claimed: bool,
+    fenced: bool,
     terminal: Option<CarrierEmissionRecord>,
     next: Option<Box<CarrierAttemptNode>>,
 }
@@ -251,11 +253,18 @@ impl CarrierAttemptList {
         self.head = Some(node);
     }
 
-    fn remove(&mut self, attempt: &str) -> Option<Box<CarrierAttemptNode>> {
+    fn remove_emission(
+        &mut self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) -> Option<Box<CarrierAttemptNode>> {
         let mut link = &mut self.head;
         loop {
-            if link.as_ref().is_some_and(|node| node.attempt == attempt) {
-                let mut removed = link.take().expect("matched attempt node");
+            if link
+                .as_ref()
+                .is_some_and(|node| node.emission == emission && node.attempt == attempt)
+            {
+                let mut removed = link.take().expect("matched emission node");
                 *link = removed.next.take();
                 return Some(removed);
             }
@@ -266,8 +275,33 @@ impl CarrierAttemptList {
         }
     }
 
-    fn remove_all(&mut self, attempt: &str) {
-        while self.remove(attempt).is_some() {}
+    fn fence_attempt(&mut self, attempt: &str) {
+        let mut cursor = self.head.as_deref_mut();
+        while let Some(node) = cursor {
+            if node.attempt == attempt && node.claimed {
+                node.fenced = true;
+                node.terminal = Some(CarrierEmissionRecord::Stale);
+            }
+            cursor = node.next.as_deref_mut();
+        }
+    }
+
+    fn remove_unfenced(&mut self, attempt: &str) {
+        let mut link = &mut self.head;
+        loop {
+            let remove = link
+                .as_ref()
+                .is_some_and(|node| node.attempt == attempt && !node.fenced);
+            if remove {
+                let mut removed = link.take().expect("matched unfenced attempt node");
+                *link = removed.next.take();
+                continue;
+            }
+            match link.as_mut() {
+                Some(node) => link = &mut node.next,
+                None => return,
+            }
+        }
     }
 }
 
@@ -551,6 +585,10 @@ pub enum NetworkCmd {
     /// it must never resolve the owner by its device id.
     DropPeerIfCurrent {
         owner: super::peer_registry::PeerOwnerToken,
+        /// The exact outbound attempt that produced the refusal.  This is
+        /// mandatory because a speculative worker is not an authenticated
+        /// worker and therefore cannot be reverse-resolved to its attempt.
+        attempt: String,
         reason: DropReason,
     },
     /// A Nostr provider refused this exact outbound attempt before it could
@@ -689,7 +727,9 @@ impl ResourceMailboxItem for NetworkCmd {
                 };
                 strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
             }
-            Self::DropPeerIfCurrent { reason, .. } => {
+            Self::DropPeerIfCurrent {
+                attempt, reason, ..
+            } => {
                 let reason = match reason {
                     DropReason::TransportError { message } => Some(message.as_str()),
                     DropReason::Denied
@@ -699,7 +739,7 @@ impl ResourceMailboxItem for NetworkCmd {
                     | DropReason::TopologyPruned
                     | DropReason::HeartbeatTimeout => None,
                 };
-                strings_measure([reason].into_iter().flatten())?
+                strings_measure([Some(attempt.as_str()), reason].into_iter().flatten())?
             }
             Self::AttemptRefused { refusal, .. } => {
                 let reason = match &refusal.refusal {
@@ -2266,6 +2306,8 @@ impl NetworkState {
             expected,
             resolved: 0,
             accepted: false,
+            claimed: false,
+            fenced: false,
             terminal: None,
             next: None,
         }));
@@ -2370,8 +2412,61 @@ impl NetworkState {
         }
     }
 
+    pub(crate) fn mark_carrier_emission_claimed(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) {
+        let mut attempts = self.carrier_attempts.lock();
+        if let Some(node) = attempts.find_emission_mut(emission, attempt) {
+            node.claimed = true;
+        }
+    }
+
+    pub(crate) fn carrier_emission_is_fenced(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) -> bool {
+        self.carrier_attempts
+            .lock()
+            .find_emission_mut(emission, attempt)
+            .is_some_and(|node| node.fenced)
+    }
+
+    pub(crate) fn acknowledge_fenced_carrier_emission(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) {
+        self.carrier_attempts
+            .lock()
+            .remove_emission(emission, attempt);
+    }
+
+    /// Release one carrier copy after its exact carrier set has reached the
+    /// terminal refusal.  This is deliberately narrower than
+    /// [`Self::settle_attempt`]: a carrier refusal must not finish the whole
+    /// Nostr attempt, because another emission may share the same attempt
+    /// correlation and still own live provider custody.  Accepted terminals
+    /// remain as stale tombstones for delayed carrier callbacks.
+    pub(crate) fn settle_final_refusal_carrier(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) -> bool {
+        let mut attempts = self.carrier_attempts.lock();
+        let is_final_refusal = attempts
+            .find_emission_mut(emission, attempt)
+            .is_some_and(|node| node.terminal == Some(CarrierEmissionRecord::FinalRefusal));
+        if !is_final_refusal {
+            return false;
+        }
+        attempts.remove_emission(emission, attempt).is_some()
+    }
+
     pub(crate) fn clear_carrier_attempt(&self, attempt: &str) {
-        self.carrier_attempts.lock().remove_all(attempt);
+        self.carrier_attempts.lock().remove_unfenced(attempt);
     }
 
     pub(crate) fn settle_attempt(
@@ -2379,9 +2474,17 @@ impl NetworkState {
         attempt: &str,
         terminal: myownmesh_signaling::nostr::delivery::DeliveryTerminal,
     ) -> usize {
+        let runtime = self.signaling_runtime();
+        if let Some(runtime) = runtime.as_ref() {
+            runtime.fence_attempt(attempt);
+        }
+        self.carrier_attempts.lock().fence_attempt(attempt);
         let settlement = self.attempt_settlement.lock().clone();
         let settled = settlement.map_or(0, |settlement| settlement(attempt, terminal));
         self.clear_carrier_attempt(attempt);
+        if let Some(runtime) = runtime {
+            runtime.clear_attempt(attempt);
+        }
         settled
     }
 

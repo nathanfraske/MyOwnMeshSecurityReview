@@ -149,6 +149,7 @@ struct GuardedAttempt {
     emission: SignalingEmissionId,
     attempt: String,
     claimed: bool,
+    fenced: bool,
     source: Option<AdmissionSource>,
     event_id: Option<[u8; 32]>,
     _lease: ResourceLease,
@@ -224,6 +225,7 @@ impl CarrierInstanceGuard {
             emission,
             attempt: attempt.to_owned(),
             claimed: false,
+            fenced: false,
             source: None,
             event_id: None,
             _lease: lease,
@@ -271,7 +273,7 @@ impl CarrierInstanceGuard {
         let mut candidate = None;
         let mut cursor = attempts.as_deref();
         while let Some(known) = cursor {
-            if known.attempt == attempt && !known.claimed {
+            if known.attempt == attempt && !known.claimed && !known.fenced {
                 candidate = Some(known.emission);
             }
             cursor = known.next.as_deref();
@@ -286,6 +288,34 @@ impl CarrierInstanceGuard {
             cursor = known.next.as_deref_mut();
         }
         None
+    }
+
+    pub(crate) fn fence_attempt(&self, attempt: &str) {
+        let mut attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.attempt == attempt {
+                known.fenced = true;
+            }
+            cursor = known.next.as_deref_mut();
+        }
+    }
+
+    pub(crate) fn clear_attempt(&self, attempt: &str) {
+        let mut attempts = self.attempts.lock();
+        let mut link = &mut *attempts;
+        loop {
+            let remove = link.as_ref().is_some_and(|known| known.attempt == attempt);
+            if remove {
+                let mut removed = link.take().expect("matched fenced attempt custody");
+                *link = removed.next.take();
+                continue;
+            }
+            match link.as_mut() {
+                Some(known) => link = &mut known.next,
+                None => return,
+            }
+        }
     }
 
     pub(crate) fn bind_event_id(
@@ -456,7 +486,15 @@ impl CarrierInstanceGuard {
         while let Some(mut attempt) = attempts {
             attempts = attempt.next.take();
             if let Some(instance) = self.instance {
-                state.record_carrier_emission(attempt.emission, &attempt.attempt, instance, false);
+                let record = state.record_carrier_emission(
+                    attempt.emission,
+                    &attempt.attempt,
+                    instance,
+                    false,
+                );
+                if record == crate::engine::state::CarrierEmissionRecord::FinalRefusal {
+                    state.settle_final_refusal_carrier(attempt.emission, &attempt.attempt);
+                }
             }
         }
     }
@@ -1080,6 +1118,31 @@ impl SignalingRuntime {
             .collect::<Vec<_>>();
         for guard in guards {
             guard.detach();
+        }
+        self.guards.lock().retain(|guard| guard.strong_count() != 0);
+    }
+
+    pub(crate) fn fence_attempt(&self, attempt: &str) {
+        let guards = self
+            .guards
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for guard in guards {
+            guard.fence_attempt(attempt);
+        }
+    }
+
+    pub(crate) fn clear_attempt(&self, attempt: &str) {
+        let guards = self
+            .guards
+            .lock()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        for guard in guards {
+            guard.clear_attempt(attempt);
         }
         self.guards.lock().retain(|guard| guard.strong_count() != 0);
     }

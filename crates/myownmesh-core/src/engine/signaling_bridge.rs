@@ -224,14 +224,28 @@ impl CoreAttemptRefusalSink {
         };
         let settlement =
             state.record_carrier_emission_with_owner(emission, &refusal.attempt, instance, false);
+        if state.carrier_emission_is_fenced(emission, &refusal.attempt) {
+            state.acknowledge_fenced_carrier_emission(emission, &refusal.attempt);
+        }
         self.guard.settle_attempt(emission);
         if settlement.record != CarrierEmissionRecord::FinalRefusal {
+            return;
+        }
+        if !state.settle_final_refusal_carrier(emission, &refusal.attempt) {
             return;
         }
         let Some(owner) = settlement.owner else {
             return;
         };
-        if owner.connection().attempt() != refusal.attempt {
+        let owner_matches_attempt = owner.connection().attempt() == refusal.attempt
+            || owner.worker().is_some_and(|worker| {
+                owner.connection().attempt_for_worker(worker).as_deref()
+                    == Some(refusal.attempt.as_str())
+                    || owner
+                        .connection()
+                        .speculative_is_exact(&refusal.attempt, worker)
+            });
+        if !owner_matches_attempt {
             return;
         }
         let _ = state
@@ -241,17 +255,23 @@ impl CoreAttemptRefusalSink {
 
     fn drop_unadmitted(
         &self,
+        emission: Option<SignalingEmissionId>,
         owner: Option<super::peer_registry::PeerOwnerToken>,
+        attempt: String,
         reason: impl Into<String>,
     ) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
+        if let Some(emission) = emission {
+            let _ = state.settle_final_refusal_carrier(emission, &attempt);
+        }
         let Some(owner) = owner else {
             return;
         };
         let _ = state.cmd_tx.send(NetworkCmd::DropPeerIfCurrent {
             owner,
+            attempt,
             reason: DropReason::TransportError {
                 message: reason.into(),
             },
@@ -301,14 +321,30 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
             instance,
             accepted,
         );
+        if state.carrier_emission_is_fenced(emission, &outcome.attempt) {
+            state.acknowledge_fenced_carrier_emission(emission, &outcome.attempt);
+        }
         self.guard.settle_attempt(emission);
         if !outcome_record_is_routable(&outcome.kind, settlement.record) {
+            return;
+        }
+        if settlement.record == CarrierEmissionRecord::FinalRefusal
+            && !state.settle_final_refusal_carrier(emission, &outcome.attempt)
+        {
             return;
         }
         let Some(owner) = settlement.owner else {
             return;
         };
-        if owner.connection().attempt() != outcome.attempt {
+        let owner_matches_attempt = owner.connection().attempt() == outcome.attempt
+            || owner.worker().is_some_and(|worker| {
+                owner.connection().attempt_for_worker(worker).as_deref()
+                    == Some(outcome.attempt.as_str())
+                    || owner
+                        .connection()
+                        .speculative_is_exact(&outcome.attempt, worker)
+            });
+        if !owner_matches_attempt {
             return;
         }
         let _ = state
@@ -625,26 +661,43 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             )
                         });
                 if admission == CarrierEmissionAdmission::Stale {
+                    if state.carrier_emission_is_fenced(emission, attempt) {
+                        state.acknowledge_fenced_carrier_emission(emission, attempt);
+                    }
                     self.guard.settle_attempt(emission);
                     continue;
                 }
-                if admission.is_admitted() && self.guard.track_attempt(emission, attempt) {
-                    // The exact attempt and emission are now both funded.
+                let tracked = if admission.is_admitted() {
+                    state.mark_carrier_emission_claimed(emission, attempt);
+                    !state.carrier_emission_is_fenced(emission, attempt)
+                        && self.guard.track_attempt(emission, attempt)
                 } else {
-                    if self.refusal_sink.is_some() {
+                    false
+                };
+                if !tracked {
+                    let final_refusal = if admission.is_admitted() {
+                        state.record_carrier_emission(emission, attempt, instance, false)
+                            == CarrierEmissionRecord::FinalRefusal
+                    } else {
+                        false
+                    };
+                    if state.carrier_emission_is_fenced(emission, attempt) {
+                        state.acknowledge_fenced_carrier_emission(emission, attempt);
+                    }
+                    if final_refusal && self.refusal_sink.is_some() {
                         CoreAttemptRefusalSink {
                             state: Arc::downgrade(state),
                             instance: self.recovery_instance,
                             guard: Arc::clone(&self.guard),
                         }
                         .drop_unadmitted(
+                            Some(emission),
                             outbound_owner.clone(),
+                            attempt.to_string(),
                             "carrier emission admission refused",
                         );
-                    } else {
-                        self.guard.settle_attempt(emission);
-                        state.record_carrier_emission(emission, attempt, instance, false);
                     }
+                    self.guard.settle_attempt(emission);
                     continue;
                 }
             }
@@ -661,28 +714,25 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                         state.record_recovery_carrier(id, instance, false);
                         self.guard.settle_recovery(id);
                     }
-                    if self.refusal_sink.is_none() {
-                        if let (Some(state), Some(attempt), Some(instance)) = (
+                    let final_refusal =
+                        if let (Some(state), Some(attempt), Some(instance), Some(emission)) = (
                             attempt_state.as_ref(),
                             attempt.as_deref(),
                             self.recovery_instance,
+                            emission,
                         ) {
-                            state.record_carrier_emission(
-                                emission.expect("attempt emission"),
-                                attempt,
-                                instance,
-                                false,
-                            );
-                        }
+                            state.record_carrier_emission(emission, attempt, instance, false)
+                                == CarrierEmissionRecord::FinalRefusal
+                        } else {
+                            false
+                        };
+                    if let Some(emission) = emission {
+                        self.guard.settle_attempt(emission);
                     }
-                    if self.refusal_sink.is_none() {
-                        if let Some(emission) = emission {
-                            self.guard.settle_attempt(emission);
-                        }
-                    }
-                    if let (true, true, Some(state), Some(instance)) = (
+                    if let (true, true, Some(attempt), Some(state), Some(instance)) = (
+                        final_refusal,
                         self.refusal_sink.is_some(),
-                        outbound_attempt(delivery.value()).is_some(),
+                        attempt.clone(),
                         attempt_state.as_ref(),
                         self.recovery_instance,
                     ) {
@@ -691,7 +741,12 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             instance: Some(instance),
                             guard: Arc::clone(&self.guard),
                         }
-                        .drop_unadmitted(outbound_owner.clone(), error.to_string());
+                        .drop_unadmitted(
+                            emission,
+                            outbound_owner.clone(),
+                            attempt,
+                            error.to_string(),
+                        );
                     }
                     // This emission is dropped, and only this emission. The
                     // delivery falls out of scope at the end of the iteration,
@@ -853,11 +908,25 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
         recovery_instance,
     );
     let guard = attach.guard();
+    let Ok((local_tx, local_rx)) = crate::resource::resource_mailbox(scope.clone()) else {
+        return;
+    };
+    let fanout = spawn_fanout(
+        state.clone(),
+        outbound_rx,
+        vec![(recovery_instance, local_tx, Arc::clone(&guard))],
+    );
+    if state
+        .with_local_signaling_forwarder(|| ((), fanout))
+        .is_none()
+    {
+        return;
+    }
     let device_id_for_out = device_id.clone();
     let outbound: Box<dyn OutboundSource<LocalOutbound, Owner = CoreOutboundOwner>> =
         Box::new(TranslatedOutbound {
             first: Some(first),
-            rx: outbound_rx,
+            rx: local_rx,
             scope,
             translate: Box::new(move |outbound| match outbound {
                 SignalingOutbound::Announce | SignalingOutbound::RecoveryAnnounce { .. } => {
@@ -915,7 +984,7 @@ pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
             recovery_state: Some(Arc::downgrade(state)),
             recovery_instance,
             guard,
-            allow_untracked_emission: true,
+            allow_untracked_emission: false,
             defer_attempt_acceptance: false,
         });
     let _ = state.with_local_signaling_forwarder(|| {
@@ -1077,19 +1146,24 @@ fn resolve_app_id() -> String {
 pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
     let outbound_rx = state.take_signaling_outbound_rx()?;
     let runtime = signaling_runtime(state, "nostr")?;
+    let (nostr_tx, nostr_rx) =
+        crate::resource::resource_mailbox(state.local_application_resource_scope().ok()?).ok()?;
     let recovery_instance = state.next_recovery_carrier_instance();
-    attach_nostr_with(
+    let attach = SignalingRuntime::attach_for_state(
+        &runtime,
+        SignalingCarrier::Nostr,
         state,
-        outbound_rx,
-        SignalingRuntime::attach_for_state(
-            &runtime,
-            SignalingCarrier::Nostr,
-            state,
-            recovery_instance,
-        ),
         recovery_instance,
-        true,
-    )
+    );
+    let guard = attach.guard();
+    let handle = attach_nostr_with(state, nostr_rx, attach, recovery_instance, false)?;
+    let fanout = spawn_fanout(
+        state.clone(),
+        outbound_rx,
+        vec![(recovery_instance, nostr_tx, guard)],
+    );
+    let handle = state.with_local_signaling_forwarder(|| (handle, fanout))?;
+    Some(handle)
 }
 
 /// [`attach_nostr`] with an explicit outbound receiver + carrier
@@ -1273,19 +1347,24 @@ fn attach_nostr_shared(
 pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
     let outbound_rx = state.take_signaling_outbound_rx()?;
     let runtime = signaling_runtime(state, "mdns")?;
+    let (mdns_tx, mdns_rx) =
+        crate::resource::resource_mailbox(state.local_application_resource_scope().ok()?).ok()?;
     let recovery_instance = state.next_recovery_carrier_instance();
-    attach_mdns_with(
+    let attach = SignalingRuntime::attach_for_state(
+        &runtime,
+        SignalingCarrier::Mdns,
         state,
-        outbound_rx,
-        SignalingRuntime::attach_for_state(
-            &runtime,
-            SignalingCarrier::Mdns,
-            state,
-            recovery_instance,
-        ),
         recovery_instance,
-        true,
-    )
+    );
+    let guard = attach.guard();
+    let handle = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false)?;
+    let fanout = spawn_fanout(
+        state.clone(),
+        outbound_rx,
+        vec![(recovery_instance, mdns_tx, guard)],
+    );
+    let handle = state.with_local_signaling_forwarder(|| (handle, fanout))?;
+    Some(handle)
 }
 
 /// [`attach_mdns`] with an explicit outbound receiver + carrier
@@ -1547,6 +1626,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             }
         }
         (true, false) => {
+            let (nostr_tx, nostr_rx) =
+                crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let recovery_instance = state.next_recovery_carrier_instance();
             let attach = SignalingRuntime::attach_for_state(
                 &runtime,
@@ -1554,13 +1635,20 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 state,
                 recovery_instance,
             );
+            let fanout = spawn_fanout(
+                state.clone(),
+                outbound_rx,
+                vec![(recovery_instance, nostr_tx, attach.guard())],
+            );
             SignalingDrivers {
-                nostr: attach_nostr_shared(state, outbound_rx, attach, recovery_instance, true),
+                nostr: attach_nostr_shared(state, nostr_rx, attach, recovery_instance, false),
                 mdns: None,
-                fanout: None,
+                fanout: Some(fanout),
             }
         }
         (false, true) => {
+            let (mdns_tx, mdns_rx) =
+                crate::resource::resource_mailbox(state.local_application_resource_scope()?)?;
             let recovery_instance = state.next_recovery_carrier_instance();
             let attach = SignalingRuntime::attach_for_state(
                 &runtime,
@@ -1568,7 +1656,12 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 state,
                 recovery_instance,
             );
-            let mdns = attach_mdns_with(state, outbound_rx, attach, recovery_instance, true);
+            let fanout = spawn_fanout(
+                state.clone(),
+                outbound_rx,
+                vec![(recovery_instance, mdns_tx, attach.guard())],
+            );
+            let mdns = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false);
             if mdns.is_none() {
                 warn!(
                     network = %state.network_id,
@@ -1579,7 +1672,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             SignalingDrivers {
                 nostr: None,
                 mdns,
-                fanout: None,
+                fanout: Some(fanout),
             }
         }
         (false, false) => {
@@ -1721,7 +1814,9 @@ fn spawn_fanout(
                             guard: CarrierInstanceGuard::noop(None),
                         }
                         .drop_unadmitted(
+                            Some(emission),
                             outbound_owner.clone(),
+                            attempt.to_string(),
                             "signaling emission cohort refused",
                         );
                         continue;
@@ -1750,7 +1845,12 @@ fn spawn_fanout(
                                 instance: None,
                                 guard: CarrierInstanceGuard::noop(None),
                             }
-                            .drop_unadmitted(final_owner, "carrier emission custody refused");
+                            .drop_unadmitted(
+                                Some(emission),
+                                final_owner,
+                                attempt.to_string(),
+                                "carrier emission custody refused",
+                            );
                         }
                         continue;
                     }
@@ -1845,12 +1945,19 @@ fn spawn_fanout(
             }
             if final_refusal && !delivered && !driver_txs.is_empty() {
                 if let Some(reason) = refusal_reason {
-                    CoreAttemptRefusalSink {
-                        state: Arc::downgrade(&state),
-                        instance: None,
-                        guard: CarrierInstanceGuard::noop(None),
+                    if let Some(attempt) = attempt.clone() {
+                        CoreAttemptRefusalSink {
+                            state: Arc::downgrade(&state),
+                            instance: None,
+                            guard: CarrierInstanceGuard::noop(None),
+                        }
+                        .drop_unadmitted(
+                            emission,
+                            final_owner,
+                            attempt,
+                            reason,
+                        );
                     }
-                    .drop_unadmitted(final_owner, reason);
                 }
             }
         }
@@ -2382,6 +2489,82 @@ mod tests {
     }
 
     #[test]
+    fn one_carrier_terminal_and_cancellation_are_bounded_to_exact_copies() {
+        let state = crate::engine::build_test_state("one-carrier-fence");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("one carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let first = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(first, "bounded-attempt", [instance]));
+        assert!(guard.track_attempt(first, "bounded-attempt"));
+        assert_eq!(guard.claim_attempt("bounded-attempt"), Some(first));
+        assert_eq!(
+            state.record_carrier_emission(first, "bounded-attempt", instance, true),
+            crate::engine::state::CarrierEmissionRecord::Accepted
+        );
+        guard.settle_attempt(first);
+        assert!(!state.begin_carrier_emission(first, "bounded-attempt", [instance]));
+
+        let successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(successor, "bounded-attempt", [instance]));
+        assert!(guard.track_attempt(successor, "bounded-attempt"));
+        assert_eq!(
+            guard.claim_attempt("bounded-attempt"),
+            Some(successor),
+            "the same-correlation successor owns a distinct one-carrier copy"
+        );
+        guard.detach();
+        assert_eq!(
+            state.record_carrier_emission(successor, "bounded-attempt", instance, false),
+            crate::engine::state::CarrierEmissionRecord::Stale,
+            "detachment terminally fences only its exact successor copy"
+        );
+        assert!(!guard.track_attempt(SignalingEmissionId::next(), "bounded-attempt"));
+    }
+
+    #[test]
+    fn lifecycle_settlement_fences_queued_copy_before_state_clear() {
+        let state = crate::engine::build_test_state("queued-copy-fence");
+        let scope = state
+            .local_application_resource_scope()
+            .expect("test state local scope");
+        let (tx, _rx) = crate::resource::resource_mailbox::<
+            crate::engine::signaling_ingress::EphemeralIngress,
+        >(scope.clone())
+        .expect("test runtime mailbox");
+        let runtime = SignalingRuntime::new(tx, scope);
+        state.publish_signaling_runtime(&runtime);
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("queued carrier instance");
+        let attach = SignalingRuntime::attach_for_state(
+            &runtime,
+            SignalingCarrier::Nostr,
+            &state,
+            Some(instance),
+        );
+        let guard = attach.guard();
+        let emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(emission, "queued-attempt", [instance]));
+        assert!(guard.track_attempt(emission, "queued-attempt"));
+        assert_eq!(guard.claim_attempt("queued-attempt"), Some(emission));
+        state.mark_carrier_emission_claimed(emission, "queued-attempt");
+
+        state.settle_attempt("queued-attempt", DeliveryTerminal::Cancelled);
+
+        assert!(!state.begin_carrier_emission(emission, "queued-attempt", [instance]));
+        state.acknowledge_fenced_carrier_emission(emission, "queued-attempt");
+        let successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(successor, "queued-attempt", [instance]));
+        assert_eq!(
+            guard.claim_attempt("queued-attempt"),
+            None,
+            "a delayed pull cannot recreate custody after lifecycle settlement"
+        );
+    }
+
+    #[test]
     fn carrier_refusal_is_pending_until_the_exact_last_copy() {
         let state = crate::engine::build_test_state("emission-aggregate");
         let first = state
@@ -2408,6 +2591,82 @@ mod tests {
     }
 
     #[test]
+    fn carrier_refusal_does_not_finish_same_attempt_emissions() {
+        let state = crate::engine::build_test_state("emission-source-settlement");
+        let first = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(second));
+        let broad_settlements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broad_settlements_clone = Arc::clone(&broad_settlements);
+        state.set_attempt_settlement(Arc::new(move |_, _| {
+            broad_settlements_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0
+        }));
+
+        let first_emission = SignalingEmissionId::next();
+        let second_emission = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(first_emission, "shared-attempt", [first, second]));
+        assert!(state.begin_carrier_emission(second_emission, "shared-attempt", [second]));
+        assert!(guard.track_attempt(first_emission, "shared-attempt"));
+        assert!(guard.track_attempt(second_emission, "shared-attempt"));
+        assert_eq!(guard.claim_attempt("shared-attempt"), Some(first_emission));
+        assert_eq!(guard.claim_attempt("shared-attempt"), Some(second_emission));
+        let first_source = AdmissionSource::fresh();
+        let second_source = AdmissionSource::fresh();
+        assert!(guard.bind_admission_source(first_source, "shared-attempt"));
+        assert!(guard.bind_admission_source(second_source, "shared-attempt"));
+        state.mark_carrier_emission_claimed(first_emission, "shared-attempt");
+        state.mark_carrier_emission_claimed(second_emission, "shared-attempt");
+        assert_eq!(
+            state.record_carrier_emission(first_emission, "shared-attempt", first, false),
+            CarrierEmissionRecord::Pending
+        );
+        assert_eq!(
+            state.record_carrier_emission(second_emission, "shared-attempt", second, false),
+            CarrierEmissionRecord::FinalRefusal
+        );
+        assert!(state.settle_final_refusal_carrier(second_emission, "shared-attempt"));
+        guard.settle_attempt(second_emission);
+        assert_eq!(
+            guard.emission_for_source(first_source),
+            Some(first_emission)
+        );
+        assert_eq!(guard.emission_for_source(second_source), None);
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        // The first source remains provider-live after the second source's
+        // carrier refusal and can reach its own terminal independently.
+        assert_eq!(
+            state.record_carrier_emission(first_emission, "shared-attempt", second, false),
+            CarrierEmissionRecord::FinalRefusal
+        );
+        assert!(state.settle_final_refusal_carrier(first_emission, "shared-attempt"));
+        guard.settle_attempt(first_emission);
+        assert_eq!(guard.emission_for_source(first_source), None);
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+
+        // Native lifecycle settlement still owns the broad attempt terminal.
+        state.settle_attempt(
+            "shared-attempt",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
     fn detached_carrier_guard_settles_its_exact_emission_once() {
         let state = crate::engine::build_test_state("emission-detach");
         let instance = state
@@ -2423,6 +2682,57 @@ mod tests {
         assert_eq!(
             state.record_carrier_emission(emission, "detach-attempt", instance, false),
             crate::engine::state::CarrierEmissionRecord::Stale
+        );
+
+        // Detach released the one-copy FinalRefusal node, so a fresh
+        // same-carrier emission can reacquire provider custody.
+        let successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(successor, "detach-attempt", [instance]));
+        assert_eq!(
+            state.record_carrier_emission(successor, "detach-attempt", instance, false),
+            crate::engine::state::CarrierEmissionRecord::FinalRefusal
+        );
+        assert!(state.settle_final_refusal_carrier(successor, "detach-attempt"));
+    }
+
+    #[test]
+    fn detached_last_copy_releases_refusal_but_preserves_accepted_tombstone() {
+        let state = crate::engine::build_test_state("emission-detach-last-copy");
+        let first = state
+            .next_recovery_carrier_instance()
+            .expect("first carrier instance");
+        let second = state
+            .next_recovery_carrier_instance()
+            .expect("second carrier instance");
+
+        let refusal = SignalingEmissionId::next();
+        let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
+        let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
+        assert!(state.begin_carrier_emission(refusal, "detach-last-copy", [first, second]));
+        assert!(first_guard.track_attempt(refusal, "detach-last-copy"));
+        assert!(second_guard.track_attempt(refusal, "detach-last-copy"));
+        first_guard.detach();
+        second_guard.detach();
+        assert_eq!(
+            state.record_carrier_emission(refusal, "detach-last-copy", second, false),
+            crate::engine::state::CarrierEmissionRecord::Stale,
+            "the last detach releases the exact FinalRefusal node"
+        );
+
+        let accepted = SignalingEmissionId::next();
+        let accepted_guard = CarrierInstanceGuard::for_state(&state, Some(first));
+        assert!(state.begin_carrier_emission(accepted, "detach-accepted", [first]));
+        assert!(accepted_guard.track_attempt(accepted, "detach-accepted"));
+        assert_eq!(
+            state.record_carrier_emission(accepted, "detach-accepted", first, true),
+            crate::engine::state::CarrierEmissionRecord::Accepted
+        );
+        accepted_guard.detach();
+        assert!(!state.begin_carrier_emission(accepted, "detach-accepted", [first]));
+        assert_eq!(
+            state.record_carrier_emission(accepted, "detach-accepted", first, false),
+            crate::engine::state::CarrierEmissionRecord::Stale,
+            "Accepted remains a delayed-callback tombstone after detach"
         );
     }
 

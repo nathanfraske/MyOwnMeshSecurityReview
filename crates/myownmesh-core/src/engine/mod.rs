@@ -753,10 +753,18 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         NetworkCmd::DropPeer { device_id, reason } => {
             drop_peer(state, &device_id, reason).await;
         }
-        NetworkCmd::DropPeerIfCurrent { owner, reason } => {
-            drop_peer_if_current(state, &owner, reason).await;
+        NetworkCmd::DropPeerIfCurrent {
+            owner,
+            attempt,
+            reason,
+        } => {
+            dispatch_drop_peer_if_current(state, owner, reason, attempt).await;
         }
         NetworkCmd::AttemptRefused { owner, refusal } => {
+            if retire_speculative_carrier_attempt_if_current(state, &owner, &refusal.attempt).await
+            {
+                return;
+            }
             let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
                 owner.worker().map_or_else(
                     || peer.attempt() == refusal.attempt,
@@ -781,6 +789,15 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             }
         }
         NetworkCmd::AttemptOutcome { owner, outcome } => {
+            if matches!(
+                &outcome.kind,
+                myownmesh_signaling::AttemptOutcomeKind::TypedRefused(_)
+                    | myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable
+            ) && retire_speculative_carrier_attempt_if_current(state, &owner, &outcome.attempt)
+                .await
+            {
+                return;
+            }
             let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
                 owner.worker().map_or_else(
                     || peer.attempt() == outcome.attempt,
@@ -2770,13 +2787,17 @@ async fn start_speculative_local_offer(
             reason: "reserving the speculative attempt failed",
         });
     };
-    if !peer.install_speculative(correlation.clone(), session.clone(), attempt_lease) {
+    let installed = state.peers.with_current(owner, |current| {
+        current.install_speculative(correlation.clone(), session.clone(), attempt_lease)
+    }) == Some(true);
+    if !installed {
         session.retire();
         return Err(SpeculativeLocalOfferStartError {
             correlation,
             reason: "installing the speculative attempt failed",
         });
     }
+    let speculative_owner = owner.for_worker(Arc::clone(&session));
     let offer = match session.create_offer().await {
         Ok(offer) => offer,
         Err(_) => {
@@ -2787,8 +2808,9 @@ async fn start_speculative_local_offer(
             });
         }
     };
-    if state.peers.get_if_current(owner).is_none()
-        || !peer.speculative_is_exact(&correlation, &session)
+    if state.peers.with_current(owner, |current| {
+        current.speculative_is_exact(&correlation, &session)
+    }) != Some(true)
     {
         if let Some(candidate) = state
             .peers
@@ -2803,16 +2825,21 @@ async fn start_speculative_local_offer(
             reason: "the speculative attempt became stale before enqueue",
         });
     }
-    if state
-        .signaling_tx
-        .send(SignalingOutbound::Offer {
-            device_id: owner.device_id().to_string(),
-            attempt: correlation.clone(),
-            sdp: offer.sdp,
-            owner: Some(owner.clone()),
-        })
-        .is_err()
-    {
+    let enqueued = state.peers.with_current(owner, |current| {
+        if !current.speculative_is_exact(&correlation, &session) {
+            return false;
+        }
+        state
+            .signaling_tx
+            .send(SignalingOutbound::Offer {
+                device_id: owner.device_id().to_string(),
+                attempt: correlation.clone(),
+                sdp: offer.sdp,
+                owner: Some(speculative_owner.clone()),
+            })
+            .is_ok()
+    }) == Some(true);
+    if !enqueued {
         retire_speculative_exact(state, owner, &correlation, &session).await;
         return Err(SpeculativeLocalOfferStartError {
             correlation,
@@ -2911,18 +2938,20 @@ async fn start_speculative_offer(
         forget_dedup_owned(state, dedup.take());
         return;
     };
-    if state.peers.get_if_current(&owner).is_none()
-        || !owner.connection().install_speculative_with_dedup(
+    let installed = state.peers.with_current(&owner, |current| {
+        current.install_speculative_with_dedup(
             correlation.to_string(),
             session.clone(),
             attempt_lease,
             &mut dedup,
         )
-    {
+    }) == Some(true);
+    if !installed {
         session.retire();
         forget_dedup_owned(state, dedup.take());
         return;
     }
+    let speculative_owner = owner.for_worker(Arc::clone(&session));
     if session
         .apply_remote_sdp(RTCSdpType::Offer, sdp)
         .await
@@ -2938,24 +2967,28 @@ async fn start_speculative_offer(
             return;
         }
     };
-    if state.peers.get_if_current(&owner).is_none()
-        || !owner
-            .connection()
-            .speculative_is_exact(correlation, &session)
+    if state.peers.with_current(&owner, |current| {
+        current.speculative_is_exact(correlation, &session)
+    }) != Some(true)
     {
         retire_speculative_exact(state, &owner, correlation, &session).await;
         return;
     }
-    if state
-        .signaling_tx
-        .send(SignalingOutbound::Answer {
-            device_id: device_id.to_string(),
-            attempt: correlation.to_string(),
-            sdp: answer.sdp,
-            owner: Some(owner.clone()),
-        })
-        .is_err()
-    {
+    let enqueued = state.peers.with_current(&owner, |current| {
+        if !current.speculative_is_exact(correlation, &session) {
+            return false;
+        }
+        state
+            .signaling_tx
+            .send(SignalingOutbound::Answer {
+                device_id: device_id.to_string(),
+                attempt: correlation.to_string(),
+                sdp: answer.sdp,
+                owner: Some(speculative_owner.clone()),
+            })
+            .is_ok()
+    }) == Some(true);
+    if !enqueued {
         retire_speculative_exact(state, &owner, correlation, &session).await;
         return;
     }
@@ -3028,6 +3061,66 @@ async fn retire_speculative_exact(
             warn!("speculative candidate close custody was already settled");
         }
     }
+}
+
+/// Retire a speculative candidate after a carrier-local refusal.  Unlike a
+/// native transport terminal, this must not finish the whole delivery
+/// attempt: another signaling emission may share the same correlation.
+async fn retire_speculative_carrier_exact(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    correlation: &str,
+    candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+) {
+    // A speculative worker is not yet an authenticated worker, so the
+    // registry's promoted-worker fence intentionally rejects the stamped
+    // owner token.  First fence the exact installation/candidate, then take
+    // from that same peer object; promotion races on the peer's speculative
+    // slot and therefore either wins before this take or sees it gone.
+    if !matches!(
+        state
+            .peers
+            .speculative_worker_route(owner, correlation, candidate),
+        peer_registry::SpeculativeWorkerRoute::Speculative
+    ) {
+        return;
+    }
+    if let Some(retired) = owner
+        .connection()
+        .take_speculative_exact(correlation, candidate)
+    {
+        let started = owner.connection().start_exact_retired_worker(
+            &retired.worker,
+            retired.dedup,
+            retired.additional_dedup.drain_tokens(),
+        );
+        if !started {
+            warn!("speculative candidate close custody was already settled");
+        }
+    }
+}
+
+async fn retire_speculative_carrier_attempt_if_current(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    correlation: &str,
+) -> bool {
+    if let Some(candidate) = owner.worker() {
+        if !owner
+            .connection()
+            .speculative_is_exact(correlation, candidate)
+        {
+            return false;
+        }
+        retire_speculative_carrier_exact(state, owner, correlation, candidate).await;
+        return true;
+    }
+    let candidates = owner.connection().speculative_workers_for(correlation);
+    if candidates.len() != 1 {
+        return false;
+    }
+    retire_speculative_carrier_exact(state, owner, correlation, &candidates[0]).await;
+    true
 }
 
 async fn retire_speculative_terminal(
@@ -3134,11 +3227,12 @@ async fn handle_speculative_transport_event(
     let (event, _resources) = event.into_parts();
     match event {
         TransportEvent::LocalIceCandidate(Some(candidate)) => {
+            let speculative_owner = owner.for_worker(Arc::clone(&worker));
             let _ = state.signaling_tx.send(SignalingOutbound::Candidate {
                 device_id,
                 attempt: correlation,
                 candidate,
-                owner: Some(owner.clone()),
+                owner: Some(speculative_owner),
             });
         }
         TransportEvent::IceConnectionStateChanged(RTCIceConnectionState::Failed) => {
@@ -7649,9 +7743,52 @@ pub(crate) async fn drop_peer_if_current(
     owner: &peer_registry::PeerOwnerToken,
     reason: DropReason,
 ) {
+    drop_peer_if_current_with_correlation(state, owner, reason, None).await;
+}
+
+async fn dispatch_drop_peer_if_current(
+    state: &Arc<NetworkState>,
+    owner: peer_registry::PeerOwnerToken,
+    reason: DropReason,
+    correlation: String,
+) {
+    drop_peer_if_current_with_correlation(state, &owner, reason, Some(&correlation)).await;
+}
+
+/// Drop one exact owner, optionally carrying the source attempt correlation.
+///
+/// The optional correlation is the only way to retire a speculative candidate:
+/// a candidate is not an authenticated worker, so `attempt_for_worker` cannot
+/// discover its correlation.  `DropPeerIfCurrent` carries this value from the
+/// refusal source; the compatibility wrapper above keeps existing
+/// device/worker terminal callers unchanged.
+async fn drop_peer_if_current_with_correlation(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    reason: DropReason,
+    explicit_correlation: Option<&str>,
+) {
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     if let Some(worker) = owner.worker().cloned() {
-        let Some(correlation) = owner.connection().attempt_for_worker(&worker) else {
+        if let Some(correlation) = explicit_correlation.filter(|correlation| {
+            owner
+                .connection()
+                .speculative_is_exact(correlation, &worker)
+        }) {
+            retire_speculative_carrier_exact(state, owner, correlation, &worker).await;
+            cancel_recovery_demand(recovery);
+            return;
+        }
+        if explicit_correlation.is_some_and(|correlation| {
+            owner.connection().attempt_for_worker(&worker).as_deref() != Some(correlation)
+        }) {
+            cancel_recovery_demand(recovery);
+            return;
+        }
+        let Some(correlation) = explicit_correlation
+            .map(str::to_owned)
+            .or_else(|| owner.connection().attempt_for_worker(&worker))
+        else {
             cancel_recovery_demand(recovery);
             return;
         };
@@ -7754,6 +7891,13 @@ pub(crate) async fn drop_peer_if_current(
                 cancel_recovery_demand(recovery);
             }
         }
+    } else if explicit_correlation.is_some_and(|correlation| {
+        state
+            .peers
+            .with_current(owner, |peer| peer.attempt() == correlation)
+            != Some(true)
+    }) {
+        cancel_recovery_demand(recovery);
     } else if let Some(dispatch) = admit_logical_terminal_dispatch(state, owner) {
         cancel_recovery_demand(recovery);
         retire_admitted_logical_session(state, &dispatch).await;
@@ -19852,6 +19996,174 @@ mod tests {
             candidate.live_connector_incarnation().is_none(),
             "the candidate native worker is released after the refused insertion"
         );
+        state.shutdown().await;
+    }
+
+    /// A refusal names the exact speculative W1 attempt.  It may retire W1,
+    /// but it must never fall through to the live W0 connector; Accepted is
+    /// observation only and therefore leaves W1 installed for promotion.
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_speculative_refusal_is_exact_and_accepted_is_nonterminal() {
+        let state = build_test_state_with_connector_slots("b2-speculative-refusal", 5);
+        let broad_settlements = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let broad_settlements_clone = Arc::clone(&broad_settlements);
+        state.set_attempt_settlement(Arc::new(move |_, _| {
+            broad_settlements_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0
+        }));
+        let (primary, _primary_events) = state
+            .transport
+            .open_connector_peer(
+                Role::Answerer,
+                &[],
+                &[],
+                state.peer_connection_resource_scope(),
+            )
+            .await
+            .expect("the fixture Mesh grant admits the live W0 connector");
+        let primary = Arc::new(primary);
+        let peer = Arc::new(PeerConnection::new(
+            "b2-speculative-refusal-target".to_string(),
+            Some(Arc::clone(&primary)),
+        ));
+        install_peer(&state.peers, Arc::clone(&peer));
+        let target = peer.device_id.clone();
+
+        let candidate_state = Arc::clone(&state);
+        let candidate_peer = Arc::clone(&peer);
+        let open_candidate = move |label: String| {
+            let state = Arc::clone(&candidate_state);
+            let peer = Arc::clone(&candidate_peer);
+            async move {
+                let (candidate, events) = state
+                    .transport
+                    .open_connector_peer(
+                        Role::Offerer,
+                        &[],
+                        &[],
+                        state.peer_connection_resource_scope(),
+                    )
+                    .await
+                    .expect("the fixture Mesh grant admits the speculative connector");
+                let candidate = Arc::new(candidate);
+                let correlation = format!("{label}-attempt");
+                let lease = candidate
+                    .reserve_attempt_work(PeerConnection::speculative_attempt_claim(&correlation))
+                    .expect("the speculative attempt is provider-funded");
+                assert!(peer.install_speculative(
+                    correlation.clone(),
+                    Arc::clone(&candidate),
+                    lease,
+                ));
+                (candidate, events, correlation)
+            }
+        };
+
+        let (pre_candidate, _pre_events, pre_attempt) = open_candidate("pre".to_string()).await;
+        let base_owner = state
+            .peers
+            .owner(&target)
+            .expect("the W0 owner is installed");
+        let pre_owner = base_owner.for_worker(Arc::clone(&pre_candidate));
+        handle_command(
+            &state,
+            NetworkCmd::DropPeerIfCurrent {
+                owner: pre_owner,
+                attempt: pre_attempt,
+                reason: DropReason::TransportError {
+                    message: "pre-admission refusal".to_string(),
+                },
+            },
+        )
+        .await;
+        assert!(
+            !peer.speculative_is_exact("pre-attempt", &pre_candidate),
+            "the exact pre-admission candidate is retired"
+        );
+        assert!(
+            primary.live_connector_incarnation().is_some(),
+            "pre-admission refusal does not retire live W0"
+        );
+        assert_eq!(
+            broad_settlements.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "pre-admission carrier refusal does not finish the shared attempt"
+        );
+
+        let (accepted_candidate, _accepted_events, accepted_attempt) =
+            open_candidate("accepted".to_string()).await;
+        let accepted_owner = base_owner.for_worker(Arc::clone(&accepted_candidate));
+        handle_command(
+            &state,
+            NetworkCmd::AttemptOutcome {
+                owner: accepted_owner,
+                outcome: myownmesh_signaling::AttemptOutcome {
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    attempt: accepted_attempt.clone(),
+                    event_id: "accepted-event".to_string(),
+                    kind: myownmesh_signaling::AttemptOutcomeKind::Accepted { session: None },
+                },
+            },
+        )
+        .await;
+        assert!(
+            peer.speculative_is_exact(&accepted_attempt, &accepted_candidate),
+            "Accepted is non-terminal and preserves W1"
+        );
+
+        let (typed_candidate, _typed_events, typed_attempt) =
+            open_candidate("typed".to_string()).await;
+        let typed_owner = base_owner.for_worker(Arc::clone(&typed_candidate));
+        handle_command(
+            &state,
+            NetworkCmd::AttemptOutcome {
+                owner: typed_owner,
+                outcome: myownmesh_signaling::AttemptOutcome {
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    attempt: typed_attempt.clone(),
+                    event_id: "typed-event".to_string(),
+                    kind: myownmesh_signaling::AttemptOutcomeKind::TypedRefused(
+                        "typed refusal".to_string(),
+                    ),
+                },
+            },
+        )
+        .await;
+        assert!(
+            !peer.speculative_is_exact(&typed_attempt, &typed_candidate),
+            "TypedRefused retires only exact W1"
+        );
+        assert!(
+            primary.live_connector_incarnation().is_some(),
+            "TypedRefused does not retire live W0"
+        );
+
+        let (unavailable_candidate, _unavailable_events, unavailable_attempt) =
+            open_candidate("unavailable".to_string()).await;
+        let unavailable_owner = base_owner.for_worker(Arc::clone(&unavailable_candidate));
+        handle_command(
+            &state,
+            NetworkCmd::AttemptOutcome {
+                owner: unavailable_owner,
+                outcome: myownmesh_signaling::AttemptOutcome {
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    attempt: unavailable_attempt.clone(),
+                    event_id: "unavailable-event".to_string(),
+                    kind: myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable,
+                },
+            },
+        )
+        .await;
+        assert!(
+            !peer.speculative_is_exact(&unavailable_attempt, &unavailable_candidate),
+            "CarrierUnavailable retires only exact W1"
+        );
+        assert!(
+            primary.live_connector_incarnation().is_some(),
+            "CarrierUnavailable does not retire live W0"
+        );
+
         state.shutdown().await;
     }
 
