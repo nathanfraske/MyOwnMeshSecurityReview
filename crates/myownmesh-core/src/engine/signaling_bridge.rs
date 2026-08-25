@@ -227,10 +227,8 @@ impl CoreAttemptRefusalSink {
         };
         let settlement =
             state.record_carrier_emission_with_owner(emission, &refusal.attempt, instance, false);
-        if state.carrier_emission_is_fenced(emission, &refusal.attempt) {
-            state.acknowledge_terminal_carrier_emission(emission, &refusal.attempt, instance);
-        }
-        self.guard.settle_attempt(emission);
+        self.guard
+            .settle_attempt_and_acknowledge(&state, emission, &refusal.attempt, instance);
         if settlement.record != CarrierEmissionRecord::FinalRefusal {
             return;
         }
@@ -314,18 +312,14 @@ fn schedule_exact_terminal_cleanup(
     correlation: String,
     message: &'static str,
 ) {
-    let state = Arc::clone(state);
-    tokio::spawn(async move {
-        super::drop_carrier_if_current_with_correlation(
-            &state,
-            &owner,
-            DropReason::TransportError {
-                message: message.to_string(),
-            },
-            correlation.as_str(),
-        )
-        .await;
-    });
+    super::drop_carrier_if_current_now(
+        state,
+        &owner,
+        DropReason::TransportError {
+            message: message.to_string(),
+        },
+        correlation.as_str(),
+    );
 }
 
 impl AttemptRefusalSink for CoreAttemptRefusalSink {
@@ -370,10 +364,8 @@ impl AttemptOutcomeSink for CoreAttemptOutcomeSink {
             instance,
             accepted,
         );
-        if state.carrier_emission_is_fenced(emission, &outcome.attempt) {
-            state.acknowledge_terminal_carrier_emission(emission, &outcome.attempt, instance);
-        }
-        self.guard.settle_attempt(emission);
+        self.guard
+            .settle_attempt_and_acknowledge(&state, emission, &outcome.attempt, instance);
         if !outcome_record_is_routable(&outcome.kind, settlement.record) {
             return;
         }
@@ -723,12 +715,12 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                         })
                     else {
                         if let Some(fenced_emission) = self.guard.fenced_emission_for(attempt) {
-                            state.acknowledge_terminal_carrier_emission(
+                            self.guard.settle_attempt_and_acknowledge(
+                                state,
                                 fenced_emission,
                                 attempt,
                                 instance,
                             );
-                            self.guard.settle_attempt(fenced_emission);
                         }
                         continue;
                     };
@@ -749,10 +741,9 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                                 self.recovery_instance,
                                 self.guard.fenced_emission_for(attempt),
                             ) {
-                                state.acknowledge_terminal_carrier_emission(
-                                    emission, attempt, instance,
+                                self.guard.settle_attempt_and_acknowledge(
+                                    state, emission, attempt, instance,
                                 );
-                                self.guard.settle_attempt(emission);
                             }
                             continue;
                         }
@@ -769,19 +760,20 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             ) {
                 if admission == CarrierEmissionAdmission::Stale || fenced {
                     if let Some(instance) = self.recovery_instance {
-                        state.acknowledge_terminal_carrier_emission(emission, attempt, instance);
+                        self.guard
+                            .settle_attempt_and_acknowledge(state, emission, attempt, instance);
+                    } else {
+                        self.guard.settle_attempt(emission);
                     }
-                    self.guard.settle_attempt(emission);
                     continue;
                 }
                 if !admission.is_admitted() {
-                    if state.carrier_emission_is_fenced(emission, attempt) {
-                        if let Some(instance) = self.recovery_instance {
-                            state
-                                .acknowledge_terminal_carrier_emission(emission, attempt, instance);
-                        }
+                    if let Some(instance) = self.recovery_instance {
+                        self.guard
+                            .settle_attempt_and_acknowledge(state, emission, attempt, instance);
+                    } else {
+                        self.guard.settle_attempt(emission);
                     }
-                    self.guard.settle_attempt(emission);
                     continue;
                 }
             }
@@ -867,15 +859,17 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                     attempt.as_deref(),
                     self.recovery_instance,
                 ) {
-                    state.record_carrier_emission(
-                        emission.expect("attempt emission"),
-                        attempt,
-                        instance,
-                        true,
-                    );
+                    let emission = emission.expect("attempt emission");
+                    state.record_carrier_emission(emission, attempt, instance, true);
+                    self.guard
+                        .settle_attempt_and_acknowledge(state, emission, attempt, instance);
                 }
-                if let Some(emission) = emission {
-                    self.guard.settle_attempt(emission);
+                if (attempt_state.is_none() || self.recovery_instance.is_none())
+                    && emission.is_some()
+                {
+                    if let Some(emission) = emission {
+                        self.guard.settle_attempt(emission);
+                    }
                 }
             }
             // The box is allocated here, after the derived lease exists and
@@ -2825,7 +2819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "native connector fixture; exercises closed command-mailbox cleanup"]
+    #[ignore = "native connector fixture; exercises pressured command-mailbox cleanup"]
     async fn closed_command_mailbox_keeps_candidate_and_promoted_sink_cleanup_exact() {
         let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
             super::super::build_test_state_parts_metered("sink-pressure", None, 5, None);
@@ -2890,10 +2884,10 @@ mod tests {
         let candidate_source = AdmissionSource::fresh();
         assert!(candidate_guard.bind_admission_source(candidate_source, &candidate_attempt));
 
-        // A closed command mailbox forces the exact sink to use the same
-        // candidate/promoted coordinator as the command arm.  The candidate
-        // refusal must retire W1 only and must not broad-settle the attempt.
-        state.cmd_tx.close();
+        // Script one real provider pressure before the command send.  This
+        // exercises the same synchronous exact-owner fallback as a pressured
+        // mailbox; each later command send scripts its own pressure as well.
+        provider.script_pressure(crate::resource::ResourceClass::CallbackOrScheduledWork);
         CoreAttemptRefusalSink {
             state: Arc::downgrade(&state),
             instance: Some(candidate_instance),
@@ -2904,7 +2898,7 @@ mod tests {
             attempt: candidate_attempt.clone(),
             event_id: "candidate-pressure-event".to_string(),
             refusal: myownmesh_signaling::NegotiationRefusal::Provider(
-                "mailbox closed".to_string(),
+                "mailbox pressure".to_string(),
             ),
         });
         for _ in 0..32 {
@@ -2947,6 +2941,7 @@ mod tests {
             drop_lease,
         ));
         let drop_owner = base_owner.for_worker(Arc::clone(&drop_candidate));
+        provider.script_pressure(crate::resource::ResourceClass::CallbackOrScheduledWork);
         CoreAttemptRefusalSink {
             state: Arc::downgrade(&state),
             instance: None,
@@ -2975,9 +2970,9 @@ mod tests {
             "direct command-send refusal does not broad-settle"
         );
 
-        // Promotion-first uses the same closed mailbox, but its exact owner
-        // terminal removes the promoted installation rather than a successor
-        // selected by device id or attempt name.
+        // Promotion-first uses a separately scripted pressure, but its exact
+        // owner terminal removes the promoted installation rather than a
+        // successor selected by device id or attempt name.
         peer.adopt_attempt("promoted-pressure");
         let promoted_instance = state
             .next_recovery_carrier_instance()
@@ -3000,6 +2995,7 @@ mod tests {
         state.mark_carrier_emission_claimed(promoted_emission, "promoted-pressure");
         let promoted_source = AdmissionSource::fresh();
         assert!(promoted_guard.bind_admission_source(promoted_source, "promoted-pressure"));
+        provider.script_pressure(crate::resource::ResourceClass::CallbackOrScheduledWork);
         CoreAttemptOutcomeSink {
             state: Arc::downgrade(&state),
             instance: Some(promoted_instance),
@@ -3010,7 +3006,7 @@ mod tests {
             attempt: "promoted-pressure".to_string(),
             event_id: "promoted-pressure-event".to_string(),
             kind: myownmesh_signaling::AttemptOutcomeKind::TypedRefused(
-                "mailbox closed".to_string(),
+                "mailbox pressure".to_string(),
             ),
         });
         for _ in 0..32 {
@@ -3211,9 +3207,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn accepted_terminal_releases_entry_custody_but_keeps_stale_fence() {
-        let state = crate::engine::build_test_state("accepted-tombstone-custody");
+    #[tokio::test]
+    async fn accepted_terminal_releases_entry_custody_but_keeps_stale_fence() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered(
+                "accepted-tombstone-custody",
+                None,
+                5,
+                None,
+            );
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
         let first = state
             .next_recovery_carrier_instance()
             .expect("first carrier instance");
@@ -3222,36 +3226,132 @@ mod tests {
             .expect("second carrier instance");
 
         let one_copy = SignalingEmissionId::next();
+        let one_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         assert!(state.begin_carrier_emission(one_copy, "accepted-one", [first]));
+        assert!(one_guard.track_attempt(one_copy, "accepted-one"));
+        assert_eq!(one_guard.claim_attempt("accepted-one"), Some(one_copy));
         state.mark_carrier_emission_claimed(one_copy, "accepted-one");
         assert_eq!(
             state.record_carrier_emission(one_copy, "accepted-one", first, true),
             CarrierEmissionRecord::Accepted
         );
+        assert!(!state.begin_carrier_emission(one_copy, "accepted-one", [first]));
         state.settle_attempt(
             "accepted-one",
             myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
         );
-        assert!(!state.begin_carrier_emission(one_copy, "accepted-one", [first]));
-        assert!(state.begin_carrier_emission(SignalingEmissionId::next(), "accepted-one", [first]));
+        one_guard.settle_attempt(one_copy);
+        let one_successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(one_successor, "accepted-one", [first]));
+        state.settle_attempt(
+            "accepted-one",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        state.acknowledge_terminal_carrier_emission(one_successor, "accepted-one", first);
 
         let two_copy = SignalingEmissionId::next();
+        let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
+        let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
         assert!(state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
+        assert!(first_guard.track_attempt(two_copy, "accepted-two"));
+        assert!(second_guard.track_attempt(two_copy, "accepted-two"));
+        assert_eq!(first_guard.claim_attempt("accepted-two"), Some(two_copy));
+        assert_eq!(second_guard.claim_attempt("accepted-two"), Some(two_copy));
         state.mark_carrier_emission_claimed(two_copy, "accepted-two");
         assert_eq!(
+            state.record_carrier_emission(two_copy, "accepted-two", first, false),
+            CarrierEmissionRecord::Pending
+        );
+        assert_eq!(
             state.record_carrier_emission(two_copy, "accepted-two", first, true),
+            CarrierEmissionRecord::Stale
+        );
+        assert_eq!(
+            state.record_carrier_emission(two_copy, "accepted-two", second, true),
             CarrierEmissionRecord::Accepted
         );
+        first_guard.settle_attempt(two_copy);
+        second_guard.settle_attempt(two_copy);
+        assert!(!state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
         state.settle_attempt(
             "accepted-two",
             myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
         );
-        assert!(!state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
-        assert!(state.begin_carrier_emission(
-            SignalingEmissionId::next(),
+        let two_successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(two_successor, "accepted-two", [first, second]));
+        state.settle_attempt(
             "accepted-two",
-            [first, second]
-        ));
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        state.acknowledge_terminal_carrier_emission(two_successor, "accepted-two", first);
+        state.acknowledge_terminal_carrier_emission(two_successor, "accepted-two", second);
+        assert_eq!(first_guard.claim_attempt("accepted-two"), None);
+        assert_eq!(second_guard.claim_attempt("accepted-two"), None);
+        drop(one_guard);
+        drop(first_guard);
+        drop(second_guard);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "Accepted one-copy and Pending-to-Accepted two-copy custody return to baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn claimed_e0_queued_e1_uses_oldest_fenced_unclaimed_copy() {
+        let (state, _signaling_in_rx, cmd_rx, provider, _grant) =
+            super::super::build_test_state_parts_metered("claimed-queued-lane", None, 5, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let baseline = provider.in_use();
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("carrier instance");
+        let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
+        let e0 = SignalingEmissionId::next();
+        let e1 = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(e0, "same-lane", [instance]));
+        assert!(state.begin_carrier_emission(e1, "same-lane", [instance]));
+        assert!(guard.track_attempt(e0, "same-lane"));
+        assert!(guard.track_attempt(e1, "same-lane"));
+        assert_eq!(guard.claim_attempt("same-lane"), Some(e0));
+        state.mark_carrier_emission_claimed(e0, "same-lane");
+
+        // Lifecycle settlement fences both copies.  The claimed E0 remains
+        // tied to its already-running physical pull; only queued E1 is an
+        // eligible delayed lookup on this guard/lane.
+        guard.fence_attempt("same-lane");
+        state.settle_attempt(
+            "same-lane",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        assert_eq!(
+            guard.fenced_emission_for("same-lane"),
+            Some(e1),
+            "a delayed pull selects E1, never the already-claimed E0"
+        );
+        guard.settle_attempt(e1);
+        state.acknowledge_terminal_carrier_emission(e1, "same-lane", instance);
+        assert_eq!(guard.fenced_emission_for("same-lane"), None);
+        guard.settle_attempt(e0);
+        state.acknowledge_terminal_carrier_emission(e0, "same-lane", instance);
+
+        // The exact old copies are gone, so a fresh same-correlation emission
+        // can admit independently without being mistaken for a delayed E0/E1.
+        let successor = SignalingEmissionId::next();
+        assert!(state.begin_carrier_emission(successor, "same-lane", [instance]));
+        state.settle_attempt(
+            "same-lane",
+            myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
+        );
+        state.acknowledge_terminal_carrier_emission(successor, "same-lane", instance);
+        drop(guard);
+        state.shutdown().await;
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "claimed and queued lane custody returns to the metered baseline"
+        );
     }
 
     #[test]

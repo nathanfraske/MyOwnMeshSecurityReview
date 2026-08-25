@@ -255,6 +255,23 @@ impl CarrierInstanceGuard {
         }
     }
 
+    /// Settle the exact guard node, then notify state of a terminal carrier
+    /// copy after the guard lock is released.  The state call is exact and
+    /// idempotent: an outcome may already have removed its carrier node, while
+    /// a lifecycle-fenced late callback still needs the acknowledgement.
+    pub(crate) fn settle_attempt_and_acknowledge(
+        &self,
+        state: &NetworkState,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        instance: RecoveryCarrierInstance,
+    ) {
+        self.settle_attempt(emission);
+        if state.carrier_emission_is_terminal(emission, attempt) {
+            state.acknowledge_terminal_carrier_emission(emission, attempt, instance);
+        }
+    }
+
     /// Claim the exact physical copy being pulled from this carrier.
     ///
     /// Attempts are peer-visible strings and may be reused by independent
@@ -301,7 +318,7 @@ impl CarrierInstanceGuard {
         let mut candidate = None;
         let mut cursor = attempts.as_deref();
         while let Some(known) = cursor {
-            if known.attempt == attempt && known.fenced {
+            if known.attempt == attempt && known.fenced && !known.claimed {
                 // Nodes are newest-first; a FIFO carrier pull must consume the
                 // oldest delayed copy before the newer one, just like
                 // claim_attempt does for live copies.

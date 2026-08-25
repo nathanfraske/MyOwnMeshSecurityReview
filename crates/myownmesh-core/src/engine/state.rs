@@ -2520,10 +2520,31 @@ impl NetworkState {
             attempts
                 .find_emission_mut(emission, attempt)
                 .and_then(|node| {
+                    if result != CarrierEmissionRecord::Stale {
+                        // The callback has consumed this exact physical copy.
+                        // Remove only its carrier node now; the aggregate
+                        // counters remain authoritative for a later sibling
+                        // and the compact node remains as the late-callback
+                        // fence until lifecycle settlement.
+                        node.remove_carrier(instance);
+                        node.resize_tombstone_lease();
+                    }
                     node.terminal = Some(result);
-                    node.owner.clone()
+                    let owner = node.owner.clone();
+                    if result == CarrierEmissionRecord::Accepted {
+                        // Accepted is terminal for this exact carrier copy,
+                        // but other physical copies may still arrive late.
+                        // Keep only the compact funded node/attempt tombstone
+                        // until lifecycle settlement fences the aggregate.
+                        node.owner = None;
+                    }
+                    owner
                 })
         } else {
+            if let Some(node) = attempts.find_emission_mut(emission, attempt) {
+                node.remove_carrier(instance);
+                node.resize_tombstone_lease();
+            }
             None
         };
         CarrierEmissionSettlement {
@@ -2552,6 +2573,17 @@ impl NetworkState {
             .lock()
             .find_emission_mut(emission, attempt)
             .is_some_and(|node| node.fenced)
+    }
+
+    pub(crate) fn carrier_emission_is_terminal(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+    ) -> bool {
+        self.carrier_attempts
+            .lock()
+            .find_emission_mut(emission, attempt)
+            .is_some_and(|node| node.terminal.is_some())
     }
 
     pub(crate) fn acknowledge_terminal_carrier_emission(
