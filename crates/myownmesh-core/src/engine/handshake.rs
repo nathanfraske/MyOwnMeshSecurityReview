@@ -70,6 +70,42 @@ use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
 
+/// Snapshot the exact canonical facts needed for a peer to independently
+/// verify this network's current governance verdict.  This is deliberately a
+/// complete graph snapshot rather than a compatibility roster or a single
+/// eviction hint: dependencies and the signed authority chain must travel
+/// together, and the pending semantic reducer will verify every fact before
+/// projecting anything.  The graph lock is released before the transport
+/// await; the returned values are owned by this exact handshake attempt.
+fn canonical_proof_bundle(
+    state: &Arc<NetworkState>,
+    target: &str,
+) -> Vec<crate::semantic::SignedFact> {
+    let Ok(target) = crate::semantic::DeviceId::from_canonical_str(target) else {
+        return Vec::new();
+    };
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let mut pending = graph.cell_heads(&crate::semantic::ExclusiveCell::role(target.clone()));
+    pending.extend(graph.cell_heads(&crate::semantic::ExclusiveCell::membership(target.clone())));
+    if let Some(stand_down) = graph.projection().stand_down(&target) {
+        pending.push(stand_down.proof);
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !ids.insert(id) {
+            continue;
+        }
+        let Some(fact) = graph.get(&id) else {
+            continue;
+        };
+        pending.extend(crate::semantic::causal::dependencies(fact));
+    }
+    ids.into_iter()
+        .filter_map(|id| graph.get(&id).cloned())
+        .collect()
+}
+
 /// The Hello this node sends, built in exactly one place.
 ///
 /// No capability advertisement travels here. The local advert is sent after
@@ -594,6 +630,29 @@ pub async fn on_auth_response(
     // approval nudges at best, and on an auto-approve network (every
     // fleet mesh) auto-approve → mutual ACTIVE → `approve_roster` put it
     // straight back into the roster and gossiped it fleet-wide.
+    // Mark the exact authenticated installation pending before the governance
+    // gate. A denied peer may still receive the signed proof bundle over this
+    // owner; it is durable semantic input, not application admission.
+    if state
+        .peers
+        .with_current(owner, |peer| {
+            let mut data = peer.state.write();
+            data.authenticated = true;
+            data.status = PeerStatus::PendingApproval;
+        })
+        .is_none()
+    {
+        return;
+    }
+    // A Deny is only a session outcome. When the current signed projection
+    // evicts this peer, send the complete canonical graph first so the peer
+    // can independently verify the eviction and derive its own stand-down.
+    if super::governance::log_evicted(state, device_id) {
+        let proof = canonical_proof_bundle(state, device_id);
+        if !proof.is_empty() {
+            let _ = super::send_pending_open_participation(state, owner, &proof).await;
+        }
+    }
     if super::governance::deny_if_evicted(state, owner).await {
         return;
     }
@@ -606,21 +665,6 @@ pub async fn on_auth_response(
     let rostered = state.is_rostered(device_id);
     let policy_admits = canonical_policy_admits_both(state, device_id);
     let auto_approve = policy_admits && (state.config.read().auto_approve || rostered);
-    // The write itself linearizes against registry replacement rather than
-    // merely observing that the owner was current a moment ago. It is
-    // synchronous, has no await inside, and carries only owned values out.
-    if state
-        .peers
-        .with_current(owner, |peer| {
-            let mut data = peer.state.write();
-            data.authenticated = true;
-            data.status = PeerStatus::PendingApproval;
-        })
-        .is_none()
-    {
-        return;
-    }
-
     // The local lifecycle API owns the durable Open fact. Handshake may only
     // forward the already-admitted positive projection to this exact pending
     // owner; it never manufactures a join.
