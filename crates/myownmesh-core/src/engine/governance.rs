@@ -82,33 +82,75 @@ fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()
     Ok(())
 }
 
-/// Ensure this Open node has a durable, exact-context self-presence fact.
-/// Repeated startup/handshake calls are idempotent through FactGraph admission.
-fn ensure_open_self_participation(state: &Arc<EngineState>) -> Option<SignedFact> {
+/// Author one explicit Open participation lifecycle fact for this device.
+///
+/// Join and rejoin are durable `joined: true` facts; leave is a durable
+/// `joined: false` fact. The graph supplies the current participation/authority
+/// heads, so refresh and carrier observation can never manufacture a fresh
+/// presence fact with an empty causal witness.
+fn author_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<SignedFact> {
     if !matches!(
         state.verified_bootstrap().policy(),
         crate::semantic::VerifiedProjectPolicy::Open
     ) {
-        return None;
+        return Err(Error::Other(
+            "Open participation is unavailable on a Closed network".into(),
+        ));
     }
-    let device_id = canonical_device(state.identity.public_id()).ok()?;
-    let content =
-        FactContent::open_participation(state.mesh_context_id(), device_id, true, Vec::new());
-    let fact = SignedFact::sign(content, state.identity.signing_key()).ok()?;
-    let graph = state.authoritative_fact_graph();
-    let admission = graph.write().admit(fact.clone());
-    match admission {
-        Ok(crate::semantic::Admission::Inserted)
-        | Ok(crate::semantic::Admission::AlreadyPresent) => Some(fact),
-        Ok(crate::semantic::Admission::Quarantined { .. }) | Err(_) => None,
-    }
+    let device_id = canonical_device(state.identity.public_id())?;
+    signed_fact(
+        state,
+        FactBody::OpenParticipation { device_id, joined },
+        Vec::new(),
+    )
 }
 
-/// Send the local Open self-presence fact on the exact authenticated channel
-/// before promotion. The remote side can therefore satisfy its own durable
-/// participation gate without making carrier authentication an authority.
+async fn commit_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<FactId> {
+    let fact = author_open_self_participation(state, joined)?;
+    admit_authored_fact(state, &fact)?;
+    let _ = apply_canonical_projection(state).await;
+    broadcast_fact_inventory(state).await;
+    broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    broadcast_state(state).await;
+    Ok(fact.id)
+}
+
+/// Explicit local Open-network lifecycle join.
+pub(crate) async fn join_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
+    commit_open_self_participation(state, true).await
+}
+
+/// Explicit local Open-network lifecycle leave. Refresh, carrier loss,
+/// process death, and shutdown deliberately never call this function.
+pub(crate) async fn leave_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
+    commit_open_self_participation(state, false).await
+}
+
+/// Explicit local Open-network lifecycle rejoin, causally following the last
+/// participation head rather than manufacturing an independent presence fact.
+pub(crate) async fn rejoin_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
+    commit_open_self_participation(state, true).await
+}
+
+fn current_open_participation_fact(state: &Arc<EngineState>) -> Option<SignedFact> {
+    let device_id = canonical_device(state.identity.public_id()).ok()?;
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let cell = crate::semantic::ExclusiveCell::open_participation(device_id);
+    let id = graph.projection().value(&cell)?;
+    graph.get(&id).cloned().filter(|fact| {
+        matches!(
+            &fact.content.body,
+            FactBody::OpenParticipation { joined: true, .. }
+        )
+    })
+}
+
+/// Compatibility hook retained for the handshake module. Participation is an
+/// explicit local lifecycle operation now; handshake promotion may only forward
+/// an already-admitted positive fact and must never author a join.
 pub(super) async fn announce_open_participation(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
-    let Some(fact) = ensure_open_self_participation(state) else {
+    let Some(fact) = current_open_participation_fact(state) else {
         return;
     };
     let _ = super::send_pending_open_participation(state, owner, &fact).await;
@@ -488,7 +530,7 @@ async fn send_pending_role_grant(
 async fn request_pending_approval(
     state: &Arc<EngineState>,
     peer_id: &str,
-    echo_open_participation: bool,
+    _echo_open_participation: bool,
 ) {
     let Some(owner) = state.peers.owner(peer_id) else {
         return;
@@ -498,11 +540,6 @@ async fn request_pending_approval(
         data.authenticated && matches!(data.status, PeerStatus::PendingApproval)
     });
     if pending == Some(true) {
-        if echo_open_participation {
-            if let Some(fact) = ensure_open_self_participation(state) {
-                let _ = super::send_pending_open_participation(state, &owner, &fact).await;
-            }
-        }
         super::handshake::reevaluate_after_role_grant(state, &owner).await;
     }
 }
@@ -1499,7 +1536,6 @@ pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
 /// uses to tear down its fleet state cleanly.
 pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
     use std::sync::atomic::Ordering;
-    let _ = ensure_open_self_participation(state);
     let verdict = log_evicted(state, state.identity.public_id());
     let was = state.self_evicted.swap(verdict, Ordering::SeqCst);
     if verdict && !was {

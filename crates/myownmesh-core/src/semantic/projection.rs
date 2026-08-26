@@ -135,28 +135,7 @@ fn is_ancestor_within(
 impl Projection {
     pub(crate) fn from_graph(graph: &FactGraph) -> Self {
         let mut cells = BTreeMap::new();
-        let mut stand_down = BTreeMap::new();
-        for (id, fact) in &graph.facts {
-            match &fact.content.body {
-                FactBody::EvictionProof { target, .. } => {
-                    stand_down
-                        .entry(target.clone())
-                        .or_insert_with(|| StandDown {
-                            target: target.clone(),
-                            proof: *id,
-                        });
-                }
-                FactBody::SelfStandDown { device_id, .. } => {
-                    stand_down
-                        .entry(device_id.clone())
-                        .or_insert_with(|| StandDown {
-                            target: device_id.clone(),
-                            proof: *id,
-                        });
-                }
-                _ => {}
-            }
-        }
+        let stand_down = projected_stand_down(graph);
         let all_cells: std::collections::BTreeSet<_> = graph
             .facts
             .values()
@@ -223,4 +202,53 @@ impl Projection {
     pub fn stand_down_targets(&self) -> impl Iterator<Item = &DeviceId> {
         self.stand_down.keys()
     }
+}
+
+/// Project stand-down evidence independently of arrival order.  A signed
+/// MembershipAdmit is the only restoration operation; it must be the selected
+/// membership value and must causally descend from the active proof.  A
+/// concurrent or losing membership branch cannot clear a stand-down, so the
+/// result remains fail-closed.
+fn projected_stand_down(graph: &FactGraph) -> BTreeMap<DeviceId, StandDown> {
+    let mut evidence = BTreeMap::<DeviceId, Vec<FactId>>::new();
+    for (id, fact) in &graph.facts {
+        if graph.fact_is_authoritative(id) {
+            match &fact.content.body {
+                FactBody::EvictionProof { target, .. } => {
+                    evidence.entry(target.clone()).or_default().push(*id);
+                }
+                FactBody::SelfStandDown { device_id, .. } => {
+                    evidence.entry(device_id.clone()).or_default().push(*id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    for (target, proofs) in evidence {
+        let restoration = projected_membership_restoration(graph, &target);
+        let active = proofs.iter().copied().find(|proof| {
+            restoration
+                .is_none_or(|restored| *proof != restored && !graph.is_ancestor(proof, &restored))
+        });
+        if let Some(proof) = active {
+            result.insert(target.clone(), StandDown { target, proof });
+        }
+    }
+    result
+}
+
+fn projected_membership_restoration(graph: &FactGraph, target: &DeviceId) -> Option<FactId> {
+    let cell = ExclusiveCell::membership(target.clone());
+    let heads = graph.cell_heads(&cell);
+    let [head] = heads.as_slice() else {
+        return None;
+    };
+    let selected = resolve_effective_head(graph, &cell, *head, &mut BTreeSet::new())?;
+    matches!(
+        graph.facts.get(&selected).map(|fact| &fact.content.body),
+        Some(FactBody::MembershipAdmit { target: admitted }) if admitted == target
+    )
+    .then_some(selected)
 }

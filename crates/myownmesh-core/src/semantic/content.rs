@@ -41,6 +41,26 @@ pub struct DeviceId(String);
 
 pub type CanonicalDeviceId = DeviceId;
 
+/// Signed, typed authority lineage for one authority-bearing subject.  The
+/// predecessor list is part of FactContent (and therefore of FactId), so a
+/// receiver cannot silently substitute a later or unrelated role head.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AuthorityUse {
+    pub subject: DeviceId,
+    pub predecessors: Vec<FactId>,
+}
+
+impl AuthorityUse {
+    pub(crate) fn new(subject: DeviceId, mut predecessors: Vec<FactId>) -> Self {
+        predecessors.sort();
+        predecessors.dedup();
+        Self {
+            subject,
+            predecessors,
+        }
+    }
+}
+
 impl DeviceId {
     pub fn from_public_key_bytes(bytes: [u8; 32]) -> Result<Self, String> {
         VerifyingKey::from_bytes(&bytes)
@@ -316,6 +336,35 @@ impl FactBody {
         }
     }
 
+    pub(crate) fn authority_use_subjects(&self, author: &DeviceId) -> Vec<DeviceId> {
+        let mut subjects = match self {
+            Self::RoleGrant { target, .. }
+            | Self::RoleRevoke { target }
+            | Self::Evict { target } => vec![author.clone(), target.clone()],
+            Self::MembershipAdmit { target } | Self::EvictionProof { target, .. } => {
+                vec![author.clone(), target.clone()]
+            }
+            Self::SelfStandDown { device_id, .. } => vec![author.clone(), device_id.clone()],
+            Self::Attestation { .. } => vec![author.clone()],
+            Self::Resolution { cell, .. } => {
+                let mut subjects = vec![author.clone()];
+                match cell {
+                    ExclusiveCell::Role { subject }
+                    | ExclusiveCell::Membership { subject }
+                    | ExclusiveCell::OpenParticipation { subject } => {
+                        subjects.push(subject.clone())
+                    }
+                    ExclusiveCell::Decision { .. } => {}
+                }
+                subjects
+            }
+            _ => Vec::new(),
+        };
+        subjects.sort();
+        subjects.dedup();
+        subjects
+    }
+
     /// Return the non-cell facts that must be in the causal past of this
     /// body.  Exclusive-cell predecessors come from `FactGraph`'s
     /// authoring witness; evidence and cited heads are body-owned support and
@@ -474,6 +523,15 @@ impl Encoder {
             .extend_from_slice(&(values.len() as u64).to_be_bytes());
         for value in values {
             self.id(*value);
+        }
+    }
+
+    pub(crate) fn list_authority_uses(&mut self, values: &[AuthorityUse]) {
+        self.bytes
+            .extend_from_slice(&(values.len() as u64).to_be_bytes());
+        for value in values {
+            self.device(&value.subject);
+            self.list_ids(&value.predecessors);
         }
     }
 

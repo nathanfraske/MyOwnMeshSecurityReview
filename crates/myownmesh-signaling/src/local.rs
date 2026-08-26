@@ -169,6 +169,12 @@ impl LocalBroker {
                 // a peer, which is the whole invariant: nothing derived from
                 // this value exists after what funded it is gone.
                 let routed = route_outbound(&inner, &room, &device_id_for_task, out.value());
+                // The local carrier commits only after the synchronous route
+                // has transferred ownership to at least one live destination.
+                // A refused/closed sink drops the completion unit as refusal.
+                if routed > 0 {
+                    out.accept();
+                }
                 trace!(routed, "broker fanout");
                 drop(out);
             }
@@ -229,7 +235,7 @@ fn route_outbound(
                 attribution: CarrierAttribution::CarrierObserved,
             },
         };
-        if p.inbound.send(msg).is_ok() {
+        if matches!(p.inbound.offer(msg), crate::InboundOutcome::Accepted) {
             delivered += 1;
         }
     }

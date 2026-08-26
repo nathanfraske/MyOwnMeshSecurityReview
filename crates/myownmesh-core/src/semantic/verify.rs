@@ -64,6 +64,8 @@ pub enum SemanticError {
     InvalidEvictionEvidence,
     #[error("self-stand-down does not cite a valid same-target eviction proof")]
     InvalidStandDownProof,
+    #[error("fact carries invalid signed AuthorityUse lineage")]
+    InvalidAuthorityUse,
 }
 
 /// Verify canonical content, its content-derived identifier, and its signature.

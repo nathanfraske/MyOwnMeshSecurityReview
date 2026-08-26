@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -56,6 +56,13 @@ async fn in_place_reconnect_does_not_announce_a_leave() {
         spawn_network(fresh_network("bob"), bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
+
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -49,10 +49,16 @@ async fn silent_peers_are_sighted_but_do_not_connect_until_dialed() {
         spawn_network(silent_network("alice"), alice_id.clone(), transport.clone())
             .await
             .expect("alice engine");
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice open participation");
     let (bob_state, _bob_driver) =
         spawn_network(silent_network("bob"), bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob open participation");
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();

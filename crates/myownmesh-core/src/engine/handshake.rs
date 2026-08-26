@@ -621,12 +621,15 @@ pub async fn on_auth_response(
         return;
     }
 
-    // The exact pending owner must be visible before the first durable
-    // OpenParticipation send. The pending send admission binds this
-    // installation, worker, endpoint-auth task and context; announcing before
-    // this state transition would race a reciprocal fact against an endpoint
-    // that is still unauthenticated.
+    // The local lifecycle API owns the durable Open fact. Handshake may only
+    // forward the already-admitted positive projection to this exact pending
+    // owner; it never manufactures a join.
     super::governance::announce_open_participation(state, owner).await;
+    // The reciprocal fact may have arrived before this side finished endpoint
+    // authentication. Re-run the canonical gate against this exact owner now
+    // that it is pending; the recheck is what closes that ordering window and
+    // never manufactures remote consent.
+    reevaluate_after_role_grant(state, owner).await;
 
     state.log_diag_with(
         crate::events::DiagLevel::Debug,
@@ -658,10 +661,6 @@ pub async fn on_auth_response(
         verification_code,
         rostered,
     }));
-
-    if auto_approve {
-        send_local_approve_owner(state, owner).await;
-    }
 }
 
 pub async fn on_approve(state: &Arc<NetworkState>, owner: &PeerOwnerToken) {
@@ -1557,7 +1556,7 @@ mod tests {
         let remote_fact = crate::semantic::SignedFact::sign(
             crate::semantic::FactContent::open_participation(
                 state.mesh_context_id(),
-                remote_device_typed,
+                remote_device_typed.clone(),
                 true,
                 Vec::new(),
             ),
@@ -1618,6 +1617,154 @@ mod tests {
             assert!(data.remote_approve_seen);
             assert!(data.local_approve_sent);
             assert_eq!(data.status, PeerStatus::Active);
+        }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_open_policy_requires_exact_context_participation() {
+        let remote_identity = crate::identity::Identity::ephemeral();
+        let remote_device = remote_identity.public_id().to_string();
+        let state = crate::engine::build_test_state(&format!("open-context-fence-{remote_device}"));
+        let local_device =
+            crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+                .expect("the local fixture identity is canonical");
+        let remote_device_typed = crate::semantic::DeviceId::from_canonical_str(&remote_device)
+            .expect("the remote fixture identity is canonical");
+
+        assert!(
+            matches!(
+                state.verified_bootstrap().policy(),
+                crate::semantic::VerifiedProjectPolicy::Open
+            ),
+            "the control must exercise the founderless Open bootstrap"
+        );
+        assert_eq!(
+            state.verified_bootstrap().context_id(),
+            state.mesh_context_id(),
+            "the engine boundary retains the bootstrap's exact context identity"
+        );
+        assert!(
+            !canonical_policy_admits_both(&state, &remote_device),
+            "matching network_id and identities alone cannot authorize an Open peer"
+        );
+
+        super::super::admit_canonical_test_fact(
+            &state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: local_device,
+                joined: true,
+            },
+        );
+        let remote_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                state.mesh_context_id(),
+                remote_device_typed.clone(),
+                true,
+                Vec::new(),
+            ),
+            remote_identity.signing_key(),
+        )
+        .expect("the exact-context remote participation fact signs");
+        state
+            .authoritative_fact_graph()
+            .write()
+            .admit(remote_fact)
+            .expect("the exact-context remote participation fact admits");
+        assert!(
+            canonical_policy_admits_both(&state, &remote_device),
+            "both exact-context signed participation facts admit the Open pair"
+        );
+
+        let foreign_context = crate::semantic::VerifiedBootstrap::open(format!(
+            "foreign-open-context-{remote_device}"
+        ))
+        .expect("the foreign Open bootstrap is valid")
+        .context_id();
+        let foreign_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                foreign_context,
+                remote_device_typed,
+                true,
+                Vec::new(),
+            ),
+            remote_identity.signing_key(),
+        )
+        .expect("the foreign-context fact signs before graph admission");
+        let graph = state.authoritative_fact_graph();
+        let before = graph.read().len();
+        assert!(matches!(
+            graph.write().admit(foreign_fact),
+            Err(crate::semantic::SemanticError::ContextMismatch { .. })
+        ));
+        assert_eq!(
+            graph.read().len(),
+            before,
+            "a foreign-context fact is refused before projection mutation"
+        );
+
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_open_fact_recheck_cannot_cross_a_replaced_owner() {
+        let state = crate::engine::build_test_state("open-fact-owner-recheck");
+        state.config.write().auto_approve = true;
+        let remote_identity = crate::identity::Identity::ephemeral();
+        let remote_device = remote_identity.public_id().to_string();
+        super::super::admit_canonical_test_fact(
+            &state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: crate::semantic::DeviceId::from_canonical_str(
+                    state.identity.public_id(),
+                )
+                .expect("local identity is canonical"),
+                joined: true,
+            },
+        );
+        let remote_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                state.mesh_context_id(),
+                crate::semantic::DeviceId::from_canonical_str(&remote_device)
+                    .expect("remote identity is canonical"),
+                true,
+                Vec::new(),
+            ),
+            remote_identity.signing_key(),
+        )
+        .expect("remote participation fact signs");
+        state
+            .authoritative_fact_graph()
+            .write()
+            .admit(remote_fact)
+            .expect("remote participation fact admits");
+
+        crate::engine::insert_session_less_peer(&state, &remote_device, None);
+        let stale_owner = state
+            .peers
+            .owner(&remote_device)
+            .expect("stale owner exists");
+        state
+            .peers
+            .with_current(&stale_owner, |peer| {
+                let mut data = peer.state.write();
+                data.authenticated = true;
+                data.status = PeerStatus::PendingApproval;
+            })
+            .expect("stale owner is current before replacement");
+
+        crate::engine::insert_session_less_peer(&state, &remote_device, None);
+        reevaluate_after_role_grant(&state, &stale_owner).await;
+
+        let replacement = state
+            .peers
+            .get(&remote_device)
+            .expect("replacement remains installed");
+        {
+            let data = replacement.state.read();
+            assert!(!data.authenticated);
+            assert!(!data.local_approve_sent);
+            assert_eq!(data.status, PeerStatus::Sighted);
         }
         state.shutdown().await;
     }

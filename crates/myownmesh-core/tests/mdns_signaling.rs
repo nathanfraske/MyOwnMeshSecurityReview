@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::conn_trace::ConnTrace;
-use myownmesh_core::engine::{attach_signaling, spawn_network};
+use myownmesh_core::engine::{attach_signaling, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use tokio::time::Instant;
@@ -188,6 +188,13 @@ async fn two_peers_handshake_over_mdns_only() {
     .await
     .expect("bob engine");
 
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
+
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
     let mut alice_traces = alice_state.subscribe_conn_trace();
@@ -268,6 +275,13 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     )
     .await
     .expect("bob engine");
+
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();

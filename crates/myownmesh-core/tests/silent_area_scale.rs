@@ -33,7 +33,7 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::transport::Transport;
@@ -76,6 +76,9 @@ async fn spawn_node(label: &str, transport: &Transport, broker: &LocalBroker) ->
     let (state, driver) = spawn_network(silent_cfg(label), identity, transport.clone())
         .await
         .unwrap_or_else(|e| panic!("{label} engine: {e}"));
+    join_open_participation(&state)
+        .await
+        .unwrap_or_else(|e| panic!("{label} open participation: {e}"));
     attach_local(&state, broker);
     Node {
         state,

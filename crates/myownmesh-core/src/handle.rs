@@ -17,8 +17,8 @@ use crate::channels::Channel;
 use crate::config::{MeshConfig, NetworkConfig, TopologyMode};
 use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
-use crate::engine::spawn_network_in_mesh_scope;
 use crate::engine::state::{NetworkCmd, NetworkState};
+use crate::engine::{join_open_participation, spawn_network_in_mesh_scope};
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
@@ -224,6 +224,11 @@ impl MeshHandle {
             &self.mesh.inner.local_application_resources,
         )
         .await?;
+        if let Err(error) = join_open_participation(&state).await {
+            state.request_shutdown();
+            let _ = driver.await;
+            return Err(error);
+        }
         let rpc = Rpc::attach(&state)?;
 
         // Fan-out per-network events into the mesh-wide broadcaster.
@@ -780,6 +785,12 @@ impl JoinedNetwork {
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.
     pub async fn leave(self) -> Result<()> {
+        if matches!(
+            self.state.verified_bootstrap().policy(),
+            crate::semantic::VerifiedProjectPolicy::Open
+        ) {
+            crate::engine::governance::leave_open_participation(&self.state).await?;
+        }
         self.shutdown().await
     }
 

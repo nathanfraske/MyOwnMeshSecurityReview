@@ -11,8 +11,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 use myownmesh_signaling::nostr::delivery::{
-    AdmissionRefusal, DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention,
-    DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
+    AdmissionRefusal, AdmissionSource, DeliveryLease, DeliveryProvider, DeliveryRefusal,
+    DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
 };
 use myownmesh_signaling::nostr::driver::{
     start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
@@ -34,6 +34,7 @@ struct DeliveryStats {
 
 struct CountingProvider {
     stats: Arc<DeliveryStats>,
+    source_live: Arc<AtomicUsize>,
 }
 
 struct CountingLease {
@@ -42,8 +43,18 @@ struct CountingLease {
 
 struct NoopLease;
 
+struct SourceLease {
+    live: Arc<AtomicUsize>,
+}
+
 impl DeliveryLease for NoopLease {
     fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {}
+}
+
+impl DeliveryLease for SourceLease {
+    fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl DeliveryLease for CountingLease {
@@ -65,6 +76,18 @@ impl DeliveryLease for CountingLease {
 }
 
 impl DeliveryProvider for CountingProvider {
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.source_live.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(SourceLease {
+            live: Arc::clone(&self.source_live),
+        }))
+    }
+
     fn reserve_session_identity(
         &self,
         _retention: SessionRetention,
@@ -238,6 +261,7 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
         InboundSink::from_unbounded(in_tx),
         Arc::new(CountingProvider {
             stats: Arc::clone(&stats),
+            source_live: Arc::new(AtomicUsize::new(0)),
         }),
     );
     let reconnect = driver.reconnect_signal();
@@ -347,6 +371,7 @@ fn old_relay_session_cannot_settle_a_reconnected_attempt() {
     });
     let store = DeliveryStore::new(Arc::new(CountingProvider {
         stats: Arc::clone(&stats),
+        source_live: Arc::new(AtomicUsize::new(0)),
     }));
     let (old, _) = store.open_session();
     let (other, _) = store.open_session();
@@ -392,6 +417,7 @@ fn partial_refusal_has_one_live_entry_and_exact_cancel_terminal() {
     });
     let store = DeliveryStore::new(Arc::new(CountingProvider {
         stats: Arc::clone(&stats),
+        source_live: Arc::new(AtomicUsize::new(0)),
     }));
     let (first, _) = store.open_session();
     let (second, _) = store.open_session();
@@ -437,8 +463,10 @@ fn identical_live_event_same_attempt_is_source_scoped() {
         cancelled: AtomicUsize::new(0),
         shutdown: AtomicUsize::new(0),
     });
+    let source_live = Arc::new(AtomicUsize::new(0));
     let store = DeliveryStore::new(Arc::new(CountingProvider {
         stats: Arc::clone(&stats),
+        source_live: Arc::clone(&source_live),
     }));
     let (session, _) = store.open_session();
     let event = myownmesh_signaling::nostr::event::make_event(
@@ -453,6 +481,7 @@ fn identical_live_event_same_attempt_is_source_scoped() {
         "same-attempt".into(),
         OwnedSignal::new(event.clone(), Box::new(()) as ErasedOwner),
     );
+    assert_eq!(source_live.load(Ordering::SeqCst), 1);
     let second = store.admit(
         "same-attempt".into(),
         OwnedSignal::new(event, Box::new(()) as ErasedOwner),
@@ -461,6 +490,11 @@ fn identical_live_event_same_attempt_is_source_scoped() {
     assert_eq!(
         second.attempt_refusal,
         Some(AdmissionRefusal::DuplicateLiveEvent)
+    );
+    assert_eq!(
+        source_live.load(Ordering::SeqCst),
+        1,
+        "duplicate source custody is released immediately"
     );
     assert_eq!(store.pending(&session), vec![event_id.clone()]);
     assert!(!store.settle_source(
@@ -476,6 +510,13 @@ fn identical_live_event_same_attempt_is_source_scoped() {
         DeliveryTerminal::Accepted,
     ));
     assert_eq!(stats.accepted_terminal.load(Ordering::SeqCst), 1);
+    assert_eq!(source_live.load(Ordering::SeqCst), 0);
+    assert!(!store.settle_source(
+        AdmissionSource::Unavailable,
+        &session,
+        &event_id,
+        DeliveryTerminal::Accepted,
+    ));
 }
 
 #[test]

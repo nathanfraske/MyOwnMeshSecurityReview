@@ -5,7 +5,7 @@ use ed25519_dalek::SigningKey;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-use super::content::{DeviceId, Encoder, FactBody, FactDomain};
+use super::content::{AuthorityUse, DeviceId, Encoder, FactBody, FactDomain};
 use super::verify::SemanticError;
 use super::MeshContextId;
 
@@ -91,6 +91,8 @@ pub struct FactContent {
     pub body: FactBody,
     pub author: DeviceId,
     pub parents: Vec<FactId>,
+    #[serde(default)]
+    pub authority_uses: Vec<AuthorityUse>,
 }
 
 impl FactContent {
@@ -105,6 +107,11 @@ impl FactContent {
         parents.dedup();
         let mut body = body;
         body.normalize();
+        let authority_uses = body
+            .authority_use_subjects(&author)
+            .into_iter()
+            .map(|subject| AuthorityUse::new(subject, parents.clone()))
+            .collect();
         Self {
             version: super::SEMANTIC_SCHEMA_VERSION,
             domain,
@@ -112,6 +119,7 @@ impl FactContent {
             body,
             author,
             parents,
+            authority_uses,
         }
     }
 
@@ -148,13 +156,20 @@ impl FactContent {
         let mut parents = witness.clone().into_parents();
         parents.extend(body.causal_support());
         parents.extend(support);
-        Self::new(
+        let mut content = Self::new(
             body.domain(),
             graph.context_id(),
             body,
             witness.author().clone(),
             parents,
-        )
+        );
+        content.authority_uses = content
+            .body
+            .authority_use_subjects(&content.author)
+            .into_iter()
+            .map(|subject| AuthorityUse::new(subject.clone(), graph.authority_use_heads(&subject)))
+            .collect();
+        content
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -167,6 +182,8 @@ impl FactContent {
         out.device(&self.author);
         out.tag("parents");
         out.list_ids(&self.parents);
+        out.tag("authority_uses");
+        out.list_authority_uses(&self.authority_uses);
         out.tag("body");
         self.body.encode(&mut out);
         out.finish()
@@ -180,6 +197,31 @@ impl FactContent {
             return Err(SemanticError::DomainMismatch);
         }
         self.body.validate_canonical()?;
+        let expected = self.body.authority_use_subjects(&self.author);
+        let actual = self
+            .authority_uses
+            .iter()
+            .map(|use_| use_.subject.clone())
+            .collect::<Vec<_>>();
+        if actual != expected {
+            return Err(SemanticError::InvalidAuthorityUse);
+        }
+        for authority_use in &self.authority_uses {
+            if !authority_use
+                .predecessors
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            {
+                return Err(SemanticError::NonCanonicalSet("authority use predecessors"));
+            }
+            if !authority_use
+                .predecessors
+                .iter()
+                .all(|predecessor| self.parents.contains(predecessor))
+            {
+                return Err(SemanticError::InvalidAuthorityUse);
+            }
+        }
         for pair in self.parents.windows(2) {
             if pair[0] == pair[1] {
                 return Err(SemanticError::DuplicateParent);
@@ -214,6 +256,8 @@ struct WireFactContent {
     body: FactBody,
     author: DeviceId,
     parents: Vec<FactId>,
+    #[serde(default)]
+    authority_uses: Vec<AuthorityUse>,
 }
 
 impl<'de> Deserialize<'de> for FactContent {
@@ -229,6 +273,7 @@ impl<'de> Deserialize<'de> for FactContent {
             body: wire.body,
             author: wire.author,
             parents: wire.parents,
+            authority_uses: wire.authority_uses,
         };
         content.validate().map_err(D::Error::custom)?;
         Ok(content)

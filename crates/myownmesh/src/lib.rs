@@ -88,6 +88,14 @@ const TEST_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 #[cfg(test)]
 const TEST_IPC_CLIENT_MAILBOXES: u64 = 64;
 
+/// IPC task owners this daemon-wide fixture may hold concurrently.
+///
+/// This is a separately named cohort from connector workers. Its reservation
+/// is priced by the IPC task owner, so adding task headroom cannot silently
+/// enlarge the connector capacity.
+#[cfg(test)]
+const TEST_IPC_TASKS: u64 = 16;
+
 /// Outbound frames one fixture client may hold queued at once.
 ///
 /// The mailbox is count-unbounded by design — nothing in the daemon names a
@@ -286,6 +294,14 @@ fn test_resource_pair() -> (
                 TEST_IPC_REGISTRY_COORDINATE_BYTES,
             )
             .expect("daemon test IPC registry grant is representable");
+            // IPC watchdog and pump tasks are a separate finite cohort from
+            // connector workers. Charge the exact task reservation, including
+            // its provider bookkeeping record, through the owner module rather
+            // than restating its WorkerOrTask shape here.
+            let ipc_tasks = crate::ipc::clients::task_reservation_planning_charge_for_test()
+                .expect("daemon test IPC task reservation is representable")
+                .checked_scale(TEST_IPC_TASKS)
+                .expect("daemon test IPC task cohort grant is representable");
             // Inbound control frames, buffered and funded as they are read.
             let control_inbound = myownmesh_core::ResourceClaim::try_from_entries([(
                 myownmesh_core::ResourceClass::AccountedMemoryBytes,
@@ -299,6 +315,7 @@ fn test_resource_pair() -> (
                 .and_then(|claim| claim.checked_add(json_input_work))
                 .and_then(|claim| claim.checked_add(ipc_mailboxes))
                 .and_then(|claim| claim.checked_add(ipc_registry))
+                .and_then(|claim| claim.checked_add(ipc_tasks))
                 .and_then(|claim| claim.checked_add(control_inbound))
                 .expect("daemon test resource grant is representable");
             let provider = myownmesh_core::FiniteResourceProvider::new(claim);

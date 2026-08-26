@@ -50,8 +50,8 @@ use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
 };
 use myownmesh_signaling::{
-    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, InboundSink,
-    OutboundSource, OwnedSignal, SignalingMessage,
+    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierCommit,
+    CarrierCommitUnit, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
 };
 use tracing::{trace, warn};
 
@@ -67,7 +67,7 @@ use super::signaling_ingress::{
 };
 use super::state::{
     CarrierEmissionAdmission, CarrierEmissionRecord, NetworkCmd, NetworkState,
-    RecoveryCarrierInstance, SignalingEmissionId, SignalingOutbound,
+    RecoveryCarrierInstance, RecoveryPublishId, SignalingEmissionId, SignalingOutbound,
 };
 
 /// One driver's outbound side: the engine's admitted values, translated on the
@@ -178,6 +178,63 @@ enum CoreOutboundOwner {
     },
     /// The broker join announce: no delivery, because the engine never sent it.
     First { _derived: ResourceLease },
+}
+
+/// Exact recovery publication receipt carried with the translated signal.
+///
+/// A receipt is refusal-by-default: if translation, carrier enqueue, or
+/// detach drops it before the carrier commit boundary, the exact generation
+/// and instance are refused.  The carrier integration owns the explicit
+/// acceptance boundary; translation alone never calls the state Accepted API.
+struct RecoveryReceipt {
+    state: Weak<NetworkState>,
+    id: RecoveryPublishId,
+    instance: RecoveryCarrierInstance,
+    guard: Arc<CarrierInstanceGuard>,
+    settled: std::sync::atomic::AtomicBool,
+}
+
+impl RecoveryReceipt {
+    fn new(
+        state: &Arc<NetworkState>,
+        id: RecoveryPublishId,
+        instance: RecoveryCarrierInstance,
+        guard: &Arc<CarrierInstanceGuard>,
+    ) -> Self {
+        Self {
+            state: Arc::downgrade(state),
+            id,
+            instance,
+            guard: Arc::clone(guard),
+            settled: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn settle(&self, accepted: bool) {
+        if self.settled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        if let Some(state) = self.state.upgrade() {
+            state.record_recovery_carrier(self.id, self.instance, accepted);
+        }
+        self.guard.settle_recovery(self.id);
+    }
+}
+
+impl CarrierCommit for RecoveryReceipt {
+    fn accepted(&self) {
+        self.settle(true);
+    }
+
+    fn refused(&self) {
+        self.settle(false);
+    }
+}
+
+impl Drop for RecoveryReceipt {
+    fn drop(&mut self) {
+        self.refused();
+    }
 }
 
 /// Provider adapter for Church's attempt-owned Nostr delivery store.
@@ -666,7 +723,7 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                             .begin_recovery_for_carrier(recovery_id, instance)
                             .map(|id| {
                                 self.guard.track_recovery(id);
-                                (state, instance, id)
+                                RecoveryReceipt::new(&state, id, instance, &self.guard)
                             })
                     })
                 });
@@ -728,7 +785,27 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 } else {
                     match self.guard.claim_attempt(attempt) {
                         Some(emission) => Some(emission),
-                        None if self.allow_untracked_emission => Some(SignalingEmissionId::next()),
+                        None if self.allow_untracked_emission => {
+                            // An untracked source may mint an identity only
+                            // while the bounded process allocator has one.
+                            // Exhaustion is a closed path, never an implicit
+                            // wrap or an emission-less translation.
+                            match SignalingEmissionId::next() {
+                                Ok(emission) => Some(emission),
+                                Err(_) => {
+                                    if let (Some(state), Some(instance), Some(emission)) = (
+                                        attempt_state.as_ref(),
+                                        self.recovery_instance,
+                                        self.guard.fenced_emission_for(attempt),
+                                    ) {
+                                        self.guard.settle_attempt_and_acknowledge(
+                                            state, emission, attempt, instance,
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         None => {
                             // Lifecycle settlement fences a queued physical
                             // copy but intentionally leaves its exact guard
@@ -785,10 +862,7 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             let derived = match self.scope.acquire(DERIVED_OUTBOUND_CLAIM) {
                 Ok(lease) => lease,
                 Err(error) => {
-                    if let Some((state, instance, id)) = recovery {
-                        state.record_recovery_carrier(id, instance, false);
-                        self.guard.settle_recovery(id);
-                    }
+                    drop(recovery);
                     let final_refusal =
                         if let (Some(state), Some(attempt), Some(instance), Some(emission)) = (
                             attempt_state.as_ref(),
@@ -850,10 +924,7 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             // the result as its owner, alongside the lease that pays for the
             // result itself.
             let value = (self.translate)(delivery.value());
-            if let Some((state, instance, id)) = recovery {
-                state.record_recovery_carrier(id, instance, true);
-                self.guard.settle_recovery(id);
-            }
+            let recovery = recovery;
             if !self.defer_attempt_acceptance {
                 if let (Some(state), Some(attempt), Some(instance)) = (
                     attempt_state.as_ref(),
@@ -877,13 +948,18 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
             // after the translation it pays for — never before the funding. The
             // delivery moves into it whole; nothing is read out of it, then or
             // ever.
-            return Some(OwnedSignal::new(
-                value,
-                CoreOutboundOwner::Delivery {
-                    _source: Box::new(delivery),
-                    _derived: derived,
-                },
-            ));
+            let owner = CoreOutboundOwner::Delivery {
+                _source: Box::new(delivery),
+                _derived: derived,
+            };
+            if let Some(receipt) = recovery {
+                return Some(OwnedSignal::with_commit(
+                    value,
+                    owner,
+                    CarrierCommitUnit::new(receipt),
+                ));
+            }
+            return Some(OwnedSignal::new(value, owner));
         }
     }
 }
@@ -1866,7 +1942,27 @@ fn spawn_fanout(
                 | SignalingOutbound::Candidate { owner, .. } => owner.clone(),
                 _ => None,
             };
-            let emission = attempt.as_deref().map(|_| SignalingEmissionId::next());
+            let emission = if attempt.is_some() {
+                match SignalingEmissionId::next() {
+                    Ok(emission) => Some(emission),
+                    Err(_) => {
+                        CoreAttemptRefusalSink {
+                            state: Arc::downgrade(&state),
+                            instance: None,
+                            guard: CarrierInstanceGuard::noop(None),
+                        }
+                        .drop_unadmitted(
+                            None,
+                            outbound_owner.clone(),
+                            attempt.clone().expect("attempt exists"),
+                            "signaling emission identity exhausted".to_string(),
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             if let Some(attempt) = attempt.as_deref() {
                 if let Some(emission) = emission {
                     // Register every physical copy before activating the
@@ -2323,8 +2419,8 @@ mod tests {
 
     #[test]
     fn emissions_are_distinct_even_when_attempts_are_reused() {
-        let first = SignalingEmissionId::next();
-        let second = SignalingEmissionId::next();
+        let first = SignalingEmissionId::next().expect("emission id");
+        let second = SignalingEmissionId::next().expect("emission id");
         assert_ne!(first, second);
     }
 
@@ -2375,8 +2471,8 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("the isolated state mints one carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let emission = SignalingEmissionId::next();
-        let duplicate_emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
+        let duplicate_emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "ledger-attempt", [instance]));
         assert!(state.begin_carrier_emission(duplicate_emission, "ledger-attempt", [instance]));
         assert!(guard.track_attempt(emission, "ledger-attempt"));
@@ -2503,8 +2599,8 @@ mod tests {
     fn same_attempt_event_ids_settle_out_of_order() {
         let state = crate::engine::build_test_state("emission-events");
         let guard = CarrierInstanceGuard::for_state(&state, state.next_recovery_carrier_instance());
-        let first = SignalingEmissionId::next();
-        let second = SignalingEmissionId::next();
+        let first = SignalingEmissionId::next().expect("emission id");
+        let second = SignalingEmissionId::next().expect("emission id");
         assert!(guard.track_attempt(first, "same-attempt"));
         assert!(guard.track_attempt(second, "same-attempt"));
         assert_eq!(guard.claim_attempt("same-attempt"), Some(first));
@@ -2536,8 +2632,8 @@ mod tests {
         let state = crate::engine::build_test_state("duplicate-event-id");
         let instance = state.next_recovery_carrier_instance().unwrap();
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let first = SignalingEmissionId::next();
-        let second = SignalingEmissionId::next();
+        let first = SignalingEmissionId::next().expect("emission id");
+        let second = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(first, "same-attempt", [instance]));
         assert!(state.begin_carrier_emission(second, "same-attempt", [instance]));
         assert!(guard.track_attempt(first, "same-attempt"));
@@ -2567,7 +2663,7 @@ mod tests {
         let second = state
             .next_recovery_carrier_instance()
             .expect("second test carrier instance");
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "late-attempt", [first, second]));
         assert_eq!(
             state.record_carrier_emission(emission, "late-attempt", first, true),
@@ -2578,7 +2674,7 @@ mod tests {
             state.record_carrier_emission(emission, "late-attempt", second, false),
             crate::engine::state::CarrierEmissionRecord::Stale
         );
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(successor, "late-attempt", [second]));
         assert_eq!(
             state.record_carrier_emission(successor, "late-attempt", second, false),
@@ -2593,7 +2689,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("one carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let first = SignalingEmissionId::next();
+        let first = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(first, "bounded-attempt", [instance]));
         assert!(guard.track_attempt(first, "bounded-attempt"));
         assert_eq!(guard.claim_attempt("bounded-attempt"), Some(first));
@@ -2604,7 +2700,7 @@ mod tests {
         guard.settle_attempt(first);
         assert!(!state.begin_carrier_emission(first, "bounded-attempt", [instance]));
 
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(successor, "bounded-attempt", [instance]));
         assert!(guard.track_attempt(successor, "bounded-attempt"));
         assert_eq!(
@@ -2618,7 +2714,10 @@ mod tests {
             crate::engine::state::CarrierEmissionRecord::Stale,
             "detachment terminally fences only its exact successor copy"
         );
-        assert!(!guard.track_attempt(SignalingEmissionId::next(), "bounded-attempt"));
+        assert!(!guard.track_attempt(
+            SignalingEmissionId::next().expect("emission id"),
+            "bounded-attempt"
+        ));
     }
 
     #[test]
@@ -2644,7 +2743,7 @@ mod tests {
         )
         .expect("test guard index is funded");
         let guard = attach.guard();
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "queued-attempt", [instance]));
         assert!(guard.track_attempt(emission, "queued-attempt"));
         assert_eq!(guard.claim_attempt("queued-attempt"), Some(emission));
@@ -2654,7 +2753,7 @@ mod tests {
 
         assert!(!state.begin_carrier_emission(emission, "queued-attempt", [instance]));
         state.acknowledge_terminal_carrier_emission(emission, "queued-attempt", instance);
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(successor, "queued-attempt", [instance]));
         assert_eq!(
             guard.claim_attempt("queued-attempt"),
@@ -2771,7 +2870,7 @@ mod tests {
             first_source.recv().await.is_none(),
             "first physical copy is stale"
         );
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(
             state.begin_carrier_emission(successor, &attempt, [first_instance, second_instance]),
             "the first stale acknowledgment preserves the second-copy fence while allowing a fresh successor"
@@ -2856,7 +2955,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("candidate carrier instance");
         let candidate_guard = CarrierInstanceGuard::for_state(&state, Some(candidate_instance));
-        let candidate_emission = SignalingEmissionId::next();
+        let candidate_emission = SignalingEmissionId::next().expect("emission id");
         assert!(state
             .begin_carrier_emission_for_owner_result(
                 candidate_emission,
@@ -2968,7 +3067,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("promoted carrier instance");
         let promoted_guard = CarrierInstanceGuard::for_state(&state, Some(promoted_instance));
-        let promoted_emission = SignalingEmissionId::next();
+        let promoted_emission = SignalingEmissionId::next().expect("emission id");
         assert!(state
             .begin_carrier_emission_for_owner_result(
                 promoted_emission,
@@ -3034,7 +3133,7 @@ mod tests {
         let second = state
             .next_recovery_carrier_instance()
             .expect("second carrier instance");
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "aggregate-attempt", [first, second]));
         assert!(state.begin_carrier_emission(emission, "aggregate-attempt", [first, second]));
         assert_eq!(
@@ -3068,8 +3167,8 @@ mod tests {
             0
         }));
 
-        let first_emission = SignalingEmissionId::next();
-        let second_emission = SignalingEmissionId::next();
+        let first_emission = SignalingEmissionId::next().expect("emission id");
+        let second_emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(first_emission, "shared-attempt", [first, second]));
         assert!(state.begin_carrier_emission(second_emission, "shared-attempt", [second]));
         assert!(guard.track_attempt(first_emission, "shared-attempt"));
@@ -3134,12 +3233,15 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("test carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "detach-attempt", [instance]));
         assert!(guard.track_attempt(emission, "detach-attempt"));
         guard.detach();
         guard.detach();
-        assert!(!guard.track_attempt(SignalingEmissionId::next(), "stale-attempt"));
+        assert!(!guard.track_attempt(
+            SignalingEmissionId::next().expect("emission id"),
+            "stale-attempt"
+        ));
         assert_eq!(
             state.record_carrier_emission(emission, "detach-attempt", instance, false),
             crate::engine::state::CarrierEmissionRecord::Stale
@@ -3147,7 +3249,7 @@ mod tests {
 
         // Detach released the one-copy FinalRefusal node, so a fresh
         // same-carrier emission can reacquire provider custody.
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(successor, "detach-attempt", [instance]));
         assert_eq!(
             state.record_carrier_emission(successor, "detach-attempt", instance, false),
@@ -3166,7 +3268,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("second carrier instance");
 
-        let refusal = SignalingEmissionId::next();
+        let refusal = SignalingEmissionId::next().expect("emission id");
         let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
         assert!(state.begin_carrier_emission(refusal, "detach-last-copy", [first, second]));
@@ -3180,7 +3282,7 @@ mod tests {
             "the last detach releases the exact FinalRefusal node"
         );
 
-        let accepted = SignalingEmissionId::next();
+        let accepted = SignalingEmissionId::next().expect("emission id");
         let accepted_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         assert!(state.begin_carrier_emission(accepted, "detach-accepted", [first]));
         assert!(accepted_guard.track_attempt(accepted, "detach-accepted"));
@@ -3215,7 +3317,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("second carrier instance");
 
-        let one_copy = SignalingEmissionId::next();
+        let one_copy = SignalingEmissionId::next().expect("emission id");
         let one_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         assert!(state.begin_carrier_emission(one_copy, "accepted-one", [first]));
         assert!(one_guard.track_attempt(one_copy, "accepted-one"));
@@ -3231,7 +3333,7 @@ mod tests {
             myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
         );
         one_guard.settle_attempt_and_acknowledge(&state, one_copy, "accepted-one", first);
-        let one_successor = SignalingEmissionId::next();
+        let one_successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(one_successor, "accepted-one", [first]));
         state.settle_attempt(
             "accepted-one",
@@ -3239,7 +3341,7 @@ mod tests {
         );
         state.acknowledge_terminal_carrier_emission(one_successor, "accepted-one", first);
 
-        let two_copy = SignalingEmissionId::next();
+        let two_copy = SignalingEmissionId::next().expect("emission id");
         let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
         assert!(state.begin_carrier_emission(two_copy, "accepted-two", [first, second]));
@@ -3267,7 +3369,7 @@ mod tests {
             "accepted-two",
             myownmesh_signaling::nostr::delivery::DeliveryTerminal::Cancelled,
         );
-        let two_successor = SignalingEmissionId::next();
+        let two_successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(two_successor, "accepted-two", [first, second]));
         state.settle_attempt(
             "accepted-two",
@@ -3302,7 +3404,7 @@ mod tests {
             .expect("second carrier instance");
         let first_guard = CarrierInstanceGuard::for_state(&state, Some(first));
         let second_guard = CarrierInstanceGuard::for_state(&state, Some(second));
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "accepted-late-sibling", [first, second]));
         assert!(first_guard.track_attempt(emission, "accepted-late-sibling"));
         assert!(second_guard.track_attempt(emission, "accepted-late-sibling"));
@@ -3374,7 +3476,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("local carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state
             .begin_carrier_emission_for_owner_result(emission, attempt, owner.clone(), [instance],)
             .is_admitted());
@@ -3457,8 +3559,8 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let e0 = SignalingEmissionId::next();
-        let e1 = SignalingEmissionId::next();
+        let e0 = SignalingEmissionId::next().expect("emission id");
+        let e1 = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(e0, "same-lane", [instance]));
         assert!(state.begin_carrier_emission(e1, "same-lane", [instance]));
         assert!(guard.track_attempt(e0, "same-lane"));
@@ -3487,7 +3589,7 @@ mod tests {
 
         // The exact old copies are gone, so a fresh same-correlation emission
         // can admit independently without being mistaken for a delayed E0/E1.
-        let successor = SignalingEmissionId::next();
+        let successor = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(successor, "same-lane", [instance]));
         state.settle_attempt(
             "same-lane",
@@ -3510,7 +3612,7 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("carrier instance");
         let guard = CarrierInstanceGuard::for_state(&state, Some(instance));
-        let emission = SignalingEmissionId::next();
+        let emission = SignalingEmissionId::next().expect("emission id");
         assert!(state.begin_carrier_emission(emission, "interleave", [instance]));
         assert!(guard.track_attempt(emission, "interleave"));
 

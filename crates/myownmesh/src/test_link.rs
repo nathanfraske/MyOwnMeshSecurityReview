@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::events::{MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -150,6 +150,12 @@ pub(crate) async fn two_peer_rpc(
     let (bob_state, bob_driver) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
         .await
         .expect("bob engine");
+    join_open_participation(&alice_state)
+        .await
+        .expect("Alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("Bob joins Open participation");
     let alice_rpc = Arc::new(
         myownmesh_core::rpc::Rpc::attach(&alice_state)
             .expect("Alice's live gateway admits its RPC owner"),

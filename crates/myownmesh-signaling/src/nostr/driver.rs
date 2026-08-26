@@ -41,7 +41,7 @@ use super::shuffle::select_top_n;
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
 use crate::{
     AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierAttribution,
-    ErasedOwner, ErasedSource, InboundSink, OutboundSource, SignalingMessage,
+    ErasedOwner, ErasedSource, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
 };
 
 struct UnmeteredAttemptRefusalSink;
@@ -253,7 +253,8 @@ where
     };
 
     let delivery = DeliveryStore::new_with_outcome_sink(provider, outcome_sink);
-    let (presence_tx, _) = watch::channel::<Option<Arc<NostrEvent>>>(None);
+    let (presence_tx, _) =
+        watch::channel::<Option<Arc<OwnedSignal<NostrEvent, ErasedOwner>>>>(None);
     // Force-reconnect signal. A bumped generation tells every relay
     // task to drop its current socket and redial *now*, skipping the
     // backoff wait — see `run_relay` / `run_relay_session`. The engine
@@ -434,7 +435,7 @@ struct DriverShared {
         tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>>>,
     delivery: Arc<DeliveryStore>,
     refusal_sink: Arc<dyn AttemptRefusalSink>,
-    presence_tx: watch::Sender<Option<Arc<NostrEvent>>>,
+    presence_tx: watch::Sender<Option<Arc<OwnedSignal<NostrEvent, ErasedOwner>>>>,
     /// Generation counter for forced reconnects. Bumping it wakes
     /// every relay task's `watch::Receiver` so it drops its socket
     /// and redials without waiting out the backoff. See the comment
@@ -952,10 +953,13 @@ async fn run_relay_session(
                 }
                 let event = presence_rx.borrow().clone();
                 if let Some(event) = event {
-                    let frame = serde_json::json!(["EVENT", event.as_ref()]).to_string();
+                    let frame = serde_json::json!(["EVENT", event.value()]).to_string();
                     if let Err(e) = write.send(WsMessage::Text(frame)).await {
                         return RelaySessionOutcome::Error(format!("send presence: {e}"));
                     }
+                    // The relay socket has synchronously accepted the frame;
+                    // commit the exact retained watch record now.
+                    event.accept();
                 }
             }
             // Forced reconnect — the engine bumped the generation
@@ -993,7 +997,7 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         if cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        let event = build_announce_event(&shared);
+        let event = OwnedSignal::new(build_announce_event(&shared), Box::new(()) as ErasedOwner);
         // Each connected relay observes this latest best-effort presence
         // value independently; negotiation never enters this path.
         let _ = shared.presence_tx.send(Some(Arc::new(event)));
@@ -1259,9 +1263,11 @@ async fn run_outbound_pump_v2(
                 );
             }
         } else {
-            let _ = shared
-                .presence_tx
-                .send(Some(Arc::new(owned.value().clone())));
+            let record = Arc::new(owned);
+            if shared.presence_tx.send(Some(record.clone())).is_ok() {
+                // The driver-owned watch now retains the funded event record.
+                record.accept();
+            }
         }
     }
     shared.delivery.shutdown();

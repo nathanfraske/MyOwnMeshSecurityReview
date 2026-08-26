@@ -23,8 +23,8 @@ use std::time::Duration;
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::{
     attach_local, depart_for_lab, departure_receipt_gate_arrival_for_lab,
-    install_departure_receipt_gate_for_lab, pending_departure_count_for_lab,
-    release_departure_receipt_gate_for_lab, spawn_network,
+    install_departure_receipt_gate_for_lab, join_open_participation,
+    pending_departure_count_for_lab, release_departure_receipt_gate_for_lab, spawn_network,
 };
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
@@ -101,6 +101,13 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
         spawn_network(fresh_network("bob"), bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
+
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
@@ -238,6 +245,12 @@ async fn bilateral_departures_are_observed_once_on_both_exact_sessions() {
     )
     .await
     .expect("bob engine");
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
     attach_local(&alice_state, &broker);
@@ -359,6 +372,12 @@ async fn authenticated_departure_withheld_receipt_cancels_on_shutdown() {
     )
     .await
     .expect("bob engine");
+    join_open_participation(&alice_state)
+        .await
+        .expect("alice joins Open participation");
+    join_open_participation(&bob_state)
+        .await
+        .expect("bob joins Open participation");
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
     attach_local(&alice_state, &broker);

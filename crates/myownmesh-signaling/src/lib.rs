@@ -127,6 +127,70 @@ pub trait AttemptOutcomeSink: Send + Sync {
     fn outcome(&self, outcome: AttemptOutcome);
 }
 
+/// Result of offering one decoded carrier report to its consumer.
+///
+/// `Refused` is recoverable pressure: the consumer remains alive and the
+/// driver must continue reading later reports. `Closed` is terminal. Keeping
+/// these states distinct prevents a transient admission refusal from tearing
+/// down a carrier and incorrectly settling recovery publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundOutcome {
+    Accepted,
+    Refused,
+    Closed,
+}
+
+/// An opaque carrier-boundary completion unit.
+///
+/// Dropping an uncommitted unit reports refusal. A carrier calls [`Self::accept`]
+/// only after it has synchronously admitted the value into its own ownership
+/// boundary. The callback is consumed exactly once, so replacing a retained
+/// watch value or dropping a queued copy cannot settle a later generation.
+pub trait CarrierCommit: Send + Sync {
+    fn accepted(&self);
+    fn refused(&self);
+}
+
+#[derive(Clone)]
+pub struct CarrierCommitUnit {
+    hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn CarrierCommit>>>>,
+}
+
+impl CarrierCommitUnit {
+    pub fn new(hook: impl CarrierCommit + 'static) -> Self {
+        Self {
+            hook: std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(hook)))),
+        }
+    }
+
+    /// Mark the exact carrier copy accepted. Repeated calls are stale no-ops.
+    pub fn accept(&self) {
+        let hook = self.hook.lock().ok().and_then(|mut hook| hook.take());
+        if let Some(hook) = hook {
+            hook.accepted();
+        }
+    }
+
+    /// Clone the opaque completion handle before transferring the signal into
+    /// a carrier-owned queue.
+    pub fn clone_handle(&self) -> Self {
+        self.clone()
+    }
+
+    fn refuse(&self) {
+        let hook = self.hook.lock().ok().and_then(|mut hook| hook.take());
+        if let Some(hook) = hook {
+            hook.refused();
+        }
+    }
+}
+
+impl Drop for CarrierCommitUnit {
+    fn drop(&mut self) {
+        self.refuse();
+    }
+}
+
 /// Where a driver pulls the engine events it is meant to publish.
 ///
 /// # Why a driver no longer owns an outbound queue either
@@ -209,6 +273,7 @@ pub trait OutboundSource<T>: Send {
 pub struct OwnedSignal<T, O> {
     value: T,
     owner: O,
+    commit: Option<CarrierCommitUnit>,
 }
 
 impl<T, O> OwnedSignal<T, O> {
@@ -220,7 +285,20 @@ impl<T, O> OwnedSignal<T, O> {
     /// acquire-then-translate sequence does, and every producer in this
     /// workspace does it that way.
     pub fn new(value: T, owner: O) -> Self {
-        Self { value, owner }
+        Self {
+            value,
+            owner,
+            commit: None,
+        }
+    }
+
+    /// Pair a value with an opaque carrier completion unit.
+    pub fn with_commit(value: T, owner: O, commit: CarrierCommitUnit) -> Self {
+        Self {
+            value,
+            owner,
+            commit: Some(commit),
+        }
     }
 
     /// Borrow the value. The only way to read it.
@@ -239,7 +317,21 @@ impl<T, O> OwnedSignal<T, O> {
         OwnedSignal {
             value: f(self.value),
             owner: self.owner,
+            commit: self.commit,
         }
+    }
+
+    /// Commit after the carrier has admitted/retained this exact value.
+    pub fn accept(&self) {
+        if let Some(commit) = &self.commit {
+            commit.accept();
+        }
+    }
+
+    /// Obtain the completion handle before moving this signal into a carrier
+    /// queue. The handle shares the exact once-only callback.
+    pub fn commit_unit(&self) -> Option<CarrierCommitUnit> {
+        self.commit.as_ref().map(CarrierCommitUnit::clone_handle)
     }
 }
 
@@ -281,6 +373,7 @@ impl<T, O: Send + Sync + 'static> OwnedSignal<T, O> {
         OwnedSignal {
             value: self.value,
             owner: Box::new(self.owner),
+            commit: self.commit,
         }
     }
 }
@@ -400,7 +493,7 @@ impl<T: Send> OutboundSource<T> for UnboundedSource<T> {
 /// tore down its relays over one would turn a full queue into an outage. Only a
 /// gone consumer is [`SinkClosed`], and that is a driver's signal to stop.
 pub struct InboundSink<T> {
-    offer: std::sync::Arc<dyn Fn(T) -> bool + Send + Sync>,
+    offer: std::sync::Arc<dyn Fn(T) -> InboundOutcome + Send + Sync>,
 }
 
 /// The consumer is gone. Every other outcome is `Ok(())`.
@@ -411,6 +504,18 @@ impl<T> InboundSink<T> {
     /// Build a sink from the consumer's admission. `false` = the consumer is
     /// gone for good; every recoverable outcome is `true`.
     pub fn new(offer: impl Fn(T) -> bool + Send + Sync + 'static) -> Self {
+        Self::new_typed(move |value| {
+            if offer(value) {
+                InboundOutcome::Accepted
+            } else {
+                InboundOutcome::Closed
+            }
+        })
+    }
+
+    /// Build a sink with an explicit admission result. `Refused` keeps the
+    /// carrier alive while reporting that this value was not retained.
+    pub fn new_typed(offer: impl Fn(T) -> InboundOutcome + Send + Sync + 'static) -> Self {
         Self {
             offer: std::sync::Arc::new(offer),
         }
@@ -432,11 +537,15 @@ impl<T> InboundSink<T> {
 
     /// Offer one value. `Err(SinkClosed)` means stop.
     pub fn send(&self, value: T) -> std::result::Result<(), SinkClosed> {
-        if (self.offer)(value) {
-            Ok(())
-        } else {
-            Err(SinkClosed)
+        match self.offer(value) {
+            InboundOutcome::Closed => Err(SinkClosed),
+            InboundOutcome::Accepted | InboundOutcome::Refused => Ok(()),
         }
+    }
+
+    /// Offer one value and preserve the consumer's typed result.
+    pub fn offer(&self, value: T) -> InboundOutcome {
+        (self.offer)(value)
     }
 }
 

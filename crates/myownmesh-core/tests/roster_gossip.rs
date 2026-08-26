@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{attach_local, spawn_network, NetworkCmd};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network, NetworkCmd};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -105,6 +105,9 @@ async fn bring_up_pair(
     )
     .await
     .expect("spawn a");
+    join_open_participation(&a_state)
+        .await
+        .expect("a open participation");
     let (b_state, b_driver) = spawn_network(
         fresh_network("b", network_id),
         b_id.clone(),
@@ -112,6 +115,9 @@ async fn bring_up_pair(
     )
     .await
     .expect("spawn b");
+    join_open_participation(&b_state)
+        .await
+        .expect("b open participation");
 
     let mut a_events = a_state.events_tx.subscribe();
     let mut b_events = b_state.events_tx.subscribe();

@@ -36,9 +36,7 @@
 //! no retry, timer, poll, or acknowledgement, and it changes no eviction
 //! behaviour. Nothing here can grant, revoke, or record membership.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -1052,16 +1050,21 @@ fn parse_directed(from: String, message: SignalingMessage) -> SignalingInbound {
 
 /// What became of one value offered to the engine.
 ///
-/// Three outcomes and not a bool, because two of them mean "keep the driver
-/// running" and only one of them means the engine *has* the value — and
-/// conflating those is exactly how a de-duplication key gets committed for a
-/// message nobody received.
-enum Delivered {
+/// Typed outcomes rather than a bool distinguish provider refusal, mailbox
+/// pressure, duplicates, shutdown, and the one case where the engine has the value.
+/// No downstream reducer effect occurs for any non-accepted outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Delivered {
     /// The engine's mailbox took it and will hand it to the handler.
     Accepted,
-    /// Refused under local pressure, or unrepresentable. Nothing downstream
-    /// happened; a later copy is the recovery, so it must find no history.
-    Dropped,
+    /// The mailbox refused the value under local pressure or because it was
+    /// unrepresentable. Nothing downstream happened; a later copy may recover.
+    Refused,
+    /// Provider custody could not be preclaimed, so no allocation, key
+    /// retention, or reducer dispatch was attempted.
+    Unavailable,
+    /// The exact key is already live on another carrier instance.
+    Duplicate,
     /// The engine is gone. The driver's pump exits.
     Closed,
 }
@@ -1073,17 +1076,43 @@ enum Delivered {
 /// by the same `Drop` that forgets it, so the ring cannot outlive what pays for
 /// it. `_lease` is never read: holding it *is* the effect.
 ///
-/// `attempt` is what makes the key mean something. Without it the key was pure
-/// content, and two different questions hashed the same: "is this the second
-/// relay's copy of the offer I already took?" and "is this the same host
-/// candidate again, on the attempt that replaced the one I retired?". The first
-/// must be dropped and the second must be delivered, and a content-only key
-/// answered both with "drop it".
+/// `attempt` is what makes the key mean something. Without it the key would be
+/// pure content, and two different questions would be indistinguishable: "is
+/// this the second relay's copy of the offer I already took?" and "is this the
+/// same host candidate again, on the attempt that replaced the one I retired?".
+/// The first must be dropped and the second must be delivered.
 struct SeenKey {
-    attempt: u64,
-    key: u64,
+    key: DedupKey,
     token: std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
     _lease: ResourceLease,
+}
+
+/// Exact, length-framed bytes for one duplicate-sensitive signal.
+///
+/// Hashes are intentionally not used here.  A collision in a de-duplication
+/// key is a false refusal of live signaling, so equality must compare the
+/// complete attempt and payload identity.  Length framing also prevents field
+/// boundary ambiguity (for example, `ab` + `c` versus `a` + `bc`).
+#[derive(Clone, PartialEq, Eq)]
+struct DedupKey {
+    attempt: Box<str>,
+    payload: Box<[u8]>,
+}
+
+struct DedupKeyPlan<'a> {
+    attempt: &'a str,
+    payload_bytes: usize,
+}
+
+impl DedupKeyPlan<'_> {
+    fn retained_bytes(&self) -> Option<u64> {
+        u64::try_from(
+            std::mem::size_of::<SeenKey>()
+                .checked_add(self.attempt.len())?
+                .checked_add(self.payload_bytes)?,
+        )
+        .ok()
+    }
 }
 
 /// The Signaling Node's runtime owner for one network.
@@ -1143,14 +1172,13 @@ fn guard_index_claim() -> Option<ResourceClaim> {
     .ok()
 }
 
-/// What one remembered de-duplication key costs.
-///
-/// A structural charge for one retained record, not a magnitude: it says that
-/// remembering a key is a thing the accountant knows about, and the finite
-/// provider decides how many of them exist. Nothing here reads it as a peer
-/// limit, a mesh size, or a capacity.
-const SEEN_KEY_CLAIM: ResourceClaim =
-    ResourceClaim::single(crate::resource::ResourceClass::OpaqueDependencyResidual, 1);
+fn next_non_wrapping(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .ok()
+}
 
 impl SignalingRuntime {
     pub(crate) fn new(
@@ -1183,7 +1211,7 @@ impl SignalingRuntime {
         state: &Arc<NetworkState>,
         recovery_instance: Option<RecoveryCarrierInstance>,
     ) -> Option<CarrierAttach> {
-        let instance = CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed));
+        let instance = CarrierInstance(next_non_wrapping(&runtime.instances)?);
         let guard = CarrierInstanceGuard::for_state(state, recovery_instance);
         let lease = runtime.scope.acquire(guard_index_claim()?).ok()?;
         let mut index = Box::new(GuardIndex {
@@ -1278,7 +1306,10 @@ impl SignalingRuntime {
     ) -> CarrierAttach {
         CarrierAttach {
             carrier,
-            instance: CarrierInstance(runtime.instances.fetch_add(1, Ordering::Relaxed)),
+            instance: CarrierInstance(
+                next_non_wrapping(&runtime.instances)
+                    .expect("test carrier-instance counter must not be exhausted"),
+            ),
             runtime: Arc::clone(runtime),
             guard,
         }
@@ -1292,50 +1323,71 @@ impl SignalingRuntime {
     /// lossy under local resource pressure, and a dropped observation leaves a
     /// later bounded one to recover the connection.
     ///
-    /// # A key is remembered only after the engine has actually accepted it
+    /// # A key is retained only after its full claim is funded
     ///
-    /// The obvious order — remember, then send — poisons the boundary under
-    /// pressure: a first offer refused by the engine's mailbox would leave its
-    /// key behind, and the retransmission that was supposed to rescue the
-    /// attempt would be discarded as a duplicate of something the engine never
-    /// received. So the send happens first and the key is committed only on
-    /// `Ok`. A refused or unrepresentable value leaves no de-duplication
-    /// history at all.
+    /// The full key claim is acquired before allocation and retention. If the
+    /// mailbox then refuses the value, the retained key is removed immediately
+    /// and its lease is released, so a retransmission can recover.
     ///
     /// "Accepted" is the mailbox taking it and nothing weaker. A send refused
     /// under pressure, or as unrepresentable, still returns the driver to its
     /// loop — signaling ingress is lossy on purpose — but it leaves no key,
     /// because nothing downstream happened for a later copy to be a duplicate
-    /// of. That distinction is why [`Delivered`] has three variants and `send`
+    /// of. That distinction is why [`Delivered`] is typed and `send`
     /// does not return a bool: the bool read "keep pumping" as "the engine has
-    /// it", and committed a key for a message that was dropped.
+    /// it"; typed outcomes preserve whether dispatch happened.
     ///
-    /// The whole check-send-commit runs under the `seen` lock. `send` is
+    /// The key-check-and-retain step runs under the `seen` lock. `send` is
     /// synchronous and nothing is awaited, so holding it is cheap and it makes
     /// the sequence atomic: two identical copies arriving on two carriers at
     /// once cannot both pass the check, which is the exact case a reservation
     /// would otherwise be needed for.
-    fn deliver(&self, observation: CarrierObservation) -> bool {
+    fn deliver(&self, observation: CarrierObservation) -> Delivered {
         let ingress = observation.into_ingress();
-        let key = ingress
-            .carrier
-            .restamps_duplicates()
-            .then(|| dedup_key(&ingress))
-            .flatten();
-        let Some((attempt, key)) = key else {
+        if attempt_is_empty(&ingress) {
+            trace!(
+                kind = ingress.kind_name(),
+                "empty attempt refused before reducer"
+            );
+            return Delivered::Refused;
+        }
+        let key_plan = if ingress.carrier.restamps_duplicates() {
+            match dedup_key_plan(&ingress) {
+                Ok(key_plan) => key_plan,
+                Err(()) => {
+                    trace!(kind = ingress.kind_name(), "invalid duplicate key refused");
+                    return Delivered::Refused;
+                }
+            }
+        } else {
+            None
+        };
+        let Some(key_plan) = key_plan else {
             // Nothing to remember, so only the engine being gone matters.
-            return !matches!(self.send(ingress), Delivered::Closed);
+            return self.send(ingress);
         };
 
-        let Some(token) = DedupToken::try_new(
-            self.dedup_instances.fetch_add(1, Ordering::Relaxed),
-            &self.scope,
-        ) else {
-            // A lifecycle token is itself provider-funded. Under pressure the
-            // observation may still pass through, but it carries no custody
-            // and therefore cannot leave an unfunded token in the engine.
+        let Some(key_lease) = self.reserve_key(&key_plan) else {
+            trace!(kind = ingress.kind_name(), "dedup key unfunded");
+            return Delivered::Unavailable;
+        };
+        let Some(key) = dedup_key(&ingress, &key_plan) else {
+            drop(key_lease);
+            trace!(kind = ingress.kind_name(), "dedup key construction failed");
+            return Delivered::Unavailable;
+        };
+        let Some(dedup_id) = next_non_wrapping(&self.dedup_instances) else {
+            drop(key_lease);
+            trace!(kind = ingress.kind_name(), "dedup id exhausted");
+            return Delivered::Unavailable;
+        };
+        let Some(token) = DedupToken::try_new(dedup_id, &self.scope) else {
+            // Duplicate-sensitive traffic cannot be admitted without its
+            // lifecycle token: forwarding it would make the engine observe a
+            // value that cannot later be fenced or forgotten exactly.
+            drop(key_lease);
             trace!(kind = ingress.kind_name(), "dedup token unfunded");
-            return !matches!(self.send(ingress), Delivered::Closed);
+            return Delivered::Unavailable;
         };
         let weak_token = token.weak();
         let ingress = ingress.with_dedup_token(token);
@@ -1345,28 +1397,42 @@ impl SignalingRuntime {
         // dropped its token, release the lease before considering this copy;
         // the ingress ring must never become a peer-lifetime tombstone.
         seen.retain(|entry| entry.token.strong_count() != 0);
-        if seen
-            .iter()
-            .any(|entry| entry.attempt == attempt && entry.key == key)
-        {
+        if seen.iter().any(|entry| entry.key == key) {
+            drop(key_lease);
             trace!(
                 kind = ingress.kind_name(),
                 "cross-carrier duplicate dropped"
             );
-            return true;
+            return Delivered::Duplicate;
         }
+        seen.push_back(SeenKey {
+            key,
+            token: weak_token.clone(),
+            _lease: key_lease,
+        });
+        drop(seen);
         let kind = ingress.kind_name();
         match self.send(ingress) {
-            Delivered::Closed => return false,
+            Delivered::Closed => {
+                self.remove_key_for_token(&weak_token);
+                return Delivered::Closed;
+            }
+            Delivered::Unavailable => {
+                self.remove_key_for_token(&weak_token);
+                trace!(kind, "unavailable after preclaim; exact key released");
+                return Delivered::Unavailable;
+            }
             // Refused, so there is nothing for a later copy to be a duplicate
             // *of*. No key is committed, and the retransmission that rescues
             // this attempt finds a clean slate — which is the whole reason the
-            // send happens before the commit.
-            Delivered::Dropped => {
-                trace!(kind, "refused before commit; no de-duplication history");
-                return true;
+            // The key was preclaimed before dispatch; refusal removes it.
+            Delivered::Refused => {
+                self.remove_key_for_token(&weak_token);
+                trace!(kind, "refused after preclaim; exact key released");
+                return Delivered::Refused;
             }
             Delivered::Accepted => {}
+            Delivered::Duplicate => unreachable!("mailbox send cannot produce duplicate"),
         }
         // Accepted, and only now. Remembering it is an optimization, and an
         // optimization the provider may decline to fund: if it does, the key is
@@ -1375,17 +1441,14 @@ impl SignalingRuntime {
         // refusing traffic, and it is the only thing pressure is allowed to
         // change here — it never strengthens a withdrawal and never alters
         // authority.
-        let funded = self.retain_key(&mut seen);
-        match funded {
-            Some(lease) => seen.push_back(SeenKey {
-                attempt,
-                key,
-                token: weak_token,
-                _lease: lease,
-            }),
-            None => trace!(kind, "de-duplication key unfunded; duplicates will pass"),
-        }
-        true
+        Delivered::Accepted
+    }
+
+    fn remove_key_for_token(
+        &self,
+        token: &std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
+    ) {
+        self.seen.lock().retain(|entry| !entry.token.ptr_eq(token));
     }
 
     /// Forget exactly one retained ingress key.
@@ -1415,27 +1478,25 @@ impl SignalingRuntime {
 
     #[cfg(test)]
     pub(crate) fn remembers_attempt_for_test(&self, attempt: &str) -> bool {
-        let attempt = hash_attempt(attempt);
         self.seen
             .lock()
             .iter()
-            .any(|entry| entry.attempt == attempt)
+            .any(|entry| entry.key.attempt.as_ref() == attempt)
     }
 
-    /// Fund one more remembered key, evicting the oldest once if that is what it
-    /// takes.
+    /// Fund one remembered key without evicting any live key.
     ///
     /// No capacity constant: the ring is exactly as long as the provider will
     /// pay for, which is the bound `TRANSITION-PLAYBOOK.md` asks for and an
-    /// invented count is not. One eviction and one retry, because the eviction
-    /// releases exactly one lease and a second refusal means the shortage is not
-    /// this ring's to solve.
-    fn retain_key(&self, seen: &mut VecDeque<SeenKey>) -> Option<ResourceLease> {
-        if let Ok(lease) = self.scope.acquire(SEEN_KEY_CLAIM) {
-            return Some(lease);
-        }
-        seen.pop_front()?;
-        self.scope.acquire(SEEN_KEY_CLAIM).ok()
+    /// invented count is not.
+    fn reserve_key(&self, key: &DedupKeyPlan<'_>) -> Option<ResourceLease> {
+        let bytes = key.retained_bytes()?;
+        let claim = ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .ok()?;
+        self.scope.acquire(claim).ok()
     }
 
     /// Hand one admitted value to the engine.
@@ -1454,11 +1515,11 @@ impl SignalingRuntime {
                     ?error,
                     "inbound signaling dropped under declared resource pressure"
                 );
-                Delivered::Dropped
+                Delivered::Refused
             }
             Err(ResourceMailboxSendError::Claim { error, .. }) => {
                 warn!(kind, %error, "unrepresentable inbound signaling dropped");
-                Delivered::Dropped
+                Delivered::Refused
             }
         }
     }
@@ -1534,6 +1595,13 @@ impl CarrierAttach {
 
     /// Hand an observation to the runtime. `false` once the engine side is gone.
     pub(crate) fn deliver(&self, observation: CarrierObservation) -> bool {
+        !matches!(self.admit(observation), Delivered::Closed)
+    }
+
+    /// Admit one carrier observation and preserve the exact typed result for
+    /// production consumers that need to distinguish refusal, unavailability,
+    /// duplicate suppression, acceptance, and shutdown.
+    pub(crate) fn admit(&self, observation: CarrierObservation) -> Delivered {
         self.runtime.deliver(observation)
     }
 
@@ -1542,19 +1610,18 @@ impl CarrierAttach {
     }
 }
 
-/// Hash one attempt correlation into the opaque value the ring compares.
-///
-/// The correlation itself is a peer-supplied string and is deliberately not
-/// retained: a hash is all the ring needs to group and forget by, and it keeps
-/// the retained record free of anything a sender chose the length of.
-fn hash_attempt(attempt: &str) -> u64 {
-    let mut h = DefaultHasher::new();
-    attempt.hash(&mut h);
-    h.finish()
+fn attempt_is_empty(ingress: &EphemeralIngress) -> bool {
+    match ingress.inbound() {
+        SignalingInbound::Offer { attempt, .. }
+        | SignalingInbound::Answer { attempt, .. }
+        | SignalingInbound::Candidate { attempt, .. } => attempt.is_empty(),
+        SignalingInbound::PeerAnnounced { .. } | SignalingInbound::PeerLeft { .. } => false,
+    }
 }
 
 /// De-duplication key: which attempt, and which message within it. `None` =
-/// never deduped.
+/// never deduped. `Err` means a duplicate-sensitive message carried an empty
+/// attempt and must be refused before it reaches the engine reducer.
 ///
 /// **Content, and deliberately not the carrier.** The duplicate this exists to
 /// catch is one engine emission that fanned out to Nostr and mDNS and came back
@@ -1565,33 +1632,37 @@ fn hash_attempt(attempt: &str) -> u64 {
 /// **Scoped to the attempt, and that is the correction.** Content alone was not
 /// enough in the other direction: a host candidate carries no `username_fragment`
 /// on many stacks, so the same candidate recurs byte-identically on the attempt
-/// that replaces a retired one and hashed to the retired one's key. The live
-/// copy was dropped as a duplicate of something that no longer existed. The
-/// attempt correlation is what tells those two apart, and it is why the engine
-/// mints one per attempt instead of each carrier inventing its own.
+/// that replaces a retired one. The live copy was dropped as a duplicate of
+/// something that no longer existed. The attempt correlation is what tells
+/// those two apart, and it is why the engine mints one per attempt instead of
+/// each carrier inventing its own.
 ///
 /// **An unstamped signal is not de-duplicated at all.** That is the honest
 /// outcome rather than a fallback to the old content-only key: without a
 /// correlation there is nothing that distinguishes a relay copy from a fresh
 /// attempt, and delivering twice is recoverable where suppressing a live attempt
 /// is not.
-fn dedup_key(ingress: &EphemeralIngress) -> Option<(u64, u64)> {
-    let mut h = DefaultHasher::new();
+fn add_framed_len(total: &mut usize, len: usize) -> Option<()> {
+    *total = total.checked_add(std::mem::size_of::<u64>())?;
+    *total = total.checked_add(len)?;
+    Some(())
+}
+
+fn dedup_key_plan(ingress: &EphemeralIngress) -> Result<Option<DedupKeyPlan<'_>>, ()> {
+    let mut payload_bytes = 1usize;
     let attempt = match ingress.inbound() {
         SignalingInbound::Offer {
             device_id,
             attempt,
             sdp,
-        } => {
-            (1u8, device_id, sdp).hash(&mut h);
-            attempt
         }
-        SignalingInbound::Answer {
+        | SignalingInbound::Answer {
             device_id,
             attempt,
             sdp,
         } => {
-            (2u8, device_id, sdp).hash(&mut h);
+            add_framed_len(&mut payload_bytes, device_id.len()).ok_or(())?;
+            add_framed_len(&mut payload_bytes, sdp.len()).ok_or(())?;
             attempt
         }
         SignalingInbound::Candidate {
@@ -1599,23 +1670,103 @@ fn dedup_key(ingress: &EphemeralIngress) -> Option<(u64, u64)> {
             attempt,
             candidate,
         } => {
-            (
-                3u8,
-                device_id,
-                &candidate.candidate,
-                &candidate.sdp_mid,
-                &candidate.sdp_mline_index,
-                &candidate.username_fragment,
-            )
-                .hash(&mut h);
+            add_framed_len(&mut payload_bytes, device_id.len()).ok_or(())?;
+            add_framed_len(&mut payload_bytes, candidate.candidate.len()).ok_or(())?;
+            payload_bytes = payload_bytes.checked_add(1).ok_or(())?;
+            if let Some(mid) = &candidate.sdp_mid {
+                add_framed_len(&mut payload_bytes, mid.len()).ok_or(())?;
+            }
+            payload_bytes = payload_bytes.checked_add(1).ok_or(())?;
+            if candidate.sdp_mline_index.is_some() {
+                payload_bytes = payload_bytes.checked_add(2).ok_or(())?;
+            }
+            payload_bytes = payload_bytes.checked_add(1).ok_or(())?;
+            if let Some(fragment) = &candidate.username_fragment {
+                add_framed_len(&mut payload_bytes, fragment.len()).ok_or(())?;
+            }
+            attempt
+        }
+        SignalingInbound::PeerAnnounced { .. } | SignalingInbound::PeerLeft { .. } => {
+            return Ok(None)
+        }
+    };
+    if attempt.is_empty() {
+        return Err(());
+    }
+    Ok(Some(DedupKeyPlan {
+        attempt,
+        payload_bytes,
+    }))
+}
+
+fn dedup_key(ingress: &EphemeralIngress, plan: &DedupKeyPlan<'_>) -> Option<DedupKey> {
+    let mut payload = Vec::new();
+    let append = |payload: &mut Vec<u8>, bytes: &[u8]| -> Option<()> {
+        payload.extend_from_slice(&u64::try_from(bytes.len()).ok()?.to_le_bytes());
+        payload.extend_from_slice(bytes);
+        Some(())
+    };
+    let attempt = match ingress.inbound() {
+        SignalingInbound::Offer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
+            payload.push(1);
+            append(&mut payload, device_id.as_bytes())?;
+            append(&mut payload, sdp.as_bytes())?;
+            attempt
+        }
+        SignalingInbound::Answer {
+            device_id,
+            attempt,
+            sdp,
+        } => {
+            payload.push(2);
+            append(&mut payload, device_id.as_bytes())?;
+            append(&mut payload, sdp.as_bytes())?;
+            attempt
+        }
+        SignalingInbound::Candidate {
+            device_id,
+            attempt,
+            candidate,
+        } => {
+            payload.push(3);
+            append(&mut payload, device_id.as_bytes())?;
+            append(&mut payload, candidate.candidate.as_bytes())?;
+            match &candidate.sdp_mid {
+                Some(mid) => {
+                    payload.push(1);
+                    append(&mut payload, mid.as_bytes())?;
+                }
+                None => payload.push(0),
+            }
+            match candidate.sdp_mline_index {
+                Some(index) => {
+                    payload.push(1);
+                    payload.extend_from_slice(&index.to_le_bytes());
+                }
+                None => payload.push(0),
+            }
+            match &candidate.username_fragment {
+                Some(fragment) => {
+                    payload.push(1);
+                    append(&mut payload, fragment.as_bytes())?;
+                }
+                None => payload.push(0),
+            }
             attempt
         }
         SignalingInbound::PeerAnnounced { .. } | SignalingInbound::PeerLeft { .. } => return None,
     };
-    if attempt.is_empty() {
-        return None;
-    }
-    Some((hash_attempt(attempt), h.finish()))
+    let key = DedupKey {
+        attempt: attempt.as_str().into(),
+        payload: payload.into_boxed_slice(),
+    };
+    debug_assert_eq!(key.attempt.as_ref(), plan.attempt);
+    debug_assert_eq!(key.payload.len(), plan.payload_bytes);
+    Some(key)
 }
 
 #[cfg(test)]
@@ -1629,9 +1780,13 @@ pub(super) mod tests {
     ];
 
     fn offer(sdp: &str) -> SignalingMessage {
+        offer_with_id("offer-1", sdp)
+    }
+
+    fn offer_with_id(offer_id: &str, sdp: &str) -> SignalingMessage {
         SignalingMessage::Offer {
             peer_id: "body-claimed-id".into(),
-            offer_id: "offer-1".into(),
+            offer_id: offer_id.into(),
             sdp: sdp.into(),
         }
     }
@@ -2224,9 +2379,10 @@ pub(super) mod tests {
             "the control never took any funding away"
         );
 
-        assert!(
-            relay.deliver(relay.directed("peer-a".into(), offer("sdp-1"))),
-            "a refused offer is not a closed engine"
+        assert_eq!(
+            relay.admit(relay.directed("peer-a".into(), offer("sdp-1"))),
+            Delivered::Refused,
+            "a pressure refusal is typed as refused, not closed"
         );
         assert!(
             rx.try_recv().is_none(),
@@ -2244,6 +2400,183 @@ pub(super) mod tests {
             [EphemeralSignal::ConnectIntent],
             "the retransmission of a refused offer must reach the engine exactly once"
         );
+    }
+
+    #[test]
+    fn key_pressure_drops_new_key_without_evicting_a_live_key() {
+        let Funded {
+            runtime,
+            mut rx,
+            scope,
+        } = funded(|_| 1_000_000);
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("live"))));
+        let live_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the live key owns a token");
+        assert!(runtime.remembers_attempt_for_test("offer-1"));
+
+        let mut holds = Vec::new();
+        while let Ok(lease) = scope.acquire(ResourceClaim::single(
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            1,
+        )) {
+            holds.push(lease);
+        }
+        assert!(
+            !holds.is_empty(),
+            "the control exhausted remaining key funding"
+        );
+        assert_eq!(
+            relay.admit(relay.directed("peer-b".into(), offer("new"))),
+            Delivered::Unavailable,
+            "a new key is refused when its full lease cannot be preclaimed"
+        );
+        assert!(
+            rx.try_recv().is_none(),
+            "an unfunded key must not reach the reducer mailbox"
+        );
+        assert!(runtime.remembers_attempt_for_test("offer-1"));
+
+        drop(holds);
+        assert!(relay.deliver(relay.directed("peer-b".into(), offer("new"))));
+        let recovered = rx
+            .try_recv()
+            .expect("the refused key is recoverable after pressure clears");
+        assert!(
+            rx.try_recv().is_none(),
+            "the recovered copy is admitted exactly once"
+        );
+        drop(recovered);
+        assert!(
+            relay.deliver(relay.directed("peer-a".into(), offer("live"))),
+            "the original live key remains a normal duplicate decision"
+        );
+        assert!(rx.try_recv().is_none(), "the live key was not evicted");
+        drop(live_token);
+        assert!(relay
+            .deliver(relay.directed("peer-c".into(), offer_with_id("cleanup", "sdp-cleanup"),)));
+        drop(
+            rx.try_recv()
+                .expect("cleanup admission reaches the mailbox"),
+        );
+        assert!(
+            !runtime.remembers_attempt_for_test("offer-1"),
+            "settled live and refused keys release their exact custody"
+        );
+    }
+
+    #[test]
+    fn duplicate_sensitive_traffic_is_refused_when_token_funding_fails() {
+        let Funded {
+            runtime,
+            mut rx,
+            scope,
+        } = funded(|_| 1_000_000);
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        let mut holds = Vec::new();
+        while let Ok(lease) = scope.acquire(ResourceClaim::single(
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            1,
+        )) {
+            holds.push(lease);
+        }
+        assert!(!holds.is_empty(), "the control exhausted token funding");
+
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-1"))));
+        assert!(
+            rx.try_recv().is_none(),
+            "duplicate-sensitive traffic is not forwarded without lifecycle custody"
+        );
+
+        drop(holds);
+        assert!(relay.deliver(relay.directed("peer-a".into(), offer("sdp-1"))));
+        assert!(
+            rx.try_recv().is_some(),
+            "the same offer can recover after token funding returns"
+        );
+    }
+
+    #[test]
+    fn empty_attempt_offer_answer_and_candidate_are_refused_before_reducer() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        let messages = [
+            SignalingMessage::Offer {
+                peer_id: "peer-a".into(),
+                offer_id: String::new(),
+                sdp: "sdp".into(),
+            },
+            SignalingMessage::Answer {
+                peer_id: "peer-a".into(),
+                offer_id: String::new(),
+                sdp: "sdp".into(),
+            },
+            SignalingMessage::Candidate {
+                peer_id: "peer-a".into(),
+                offer_id: String::new(),
+                candidate: "candidate:1 1 UDP 1 10.0.0.1 5000 typ host".into(),
+                sdp_mid: Some("0".into()),
+                sdp_mline_index: Some(0),
+                username_fragment: None,
+            },
+        ];
+
+        for message in messages {
+            assert!(relay.deliver(relay.directed("peer-a".into(), message)));
+            assert!(
+                rx.try_recv().is_none(),
+                "an empty attempt must not reach the engine mailbox"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_framed_keys_distinguish_field_boundary_variants() {
+        let (runtime, mut rx) = runtime_with_rx();
+        let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
+        let first = SignalingMessage::Offer {
+            peer_id: "ignored".into(),
+            offer_id: "same-attempt".into(),
+            sdp: "c".into(),
+        };
+        let second = SignalingMessage::Offer {
+            peer_id: "ignored".into(),
+            offer_id: "same-attempt".into(),
+            sdp: "bc".into(),
+        };
+
+        assert!(relay.deliver(relay.directed("ab".into(), first.clone())));
+        assert!(relay.deliver(relay.directed("a".into(), second.clone())));
+        let first_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the first exact key carries lifecycle custody");
+        let second_token = rx
+            .try_recv()
+            .and_then(|delivery| delivery.value().dedup_token())
+            .expect("the second exact key carries lifecycle custody");
+
+        assert!(relay.deliver(relay.directed("ab".into(), first)));
+        assert!(
+            rx.try_recv().is_none(),
+            "an exact duplicate is still suppressed"
+        );
+        drop(first_token);
+        drop(second_token);
+    }
+
+    #[test]
+    fn carrier_and_dedup_ids_fail_closed_at_their_maximum_without_wrapping() {
+        let (runtime, _rx) = runtime_with_rx();
+        runtime.instances.store(u64::MAX, Ordering::Relaxed);
+        runtime.dedup_instances.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(next_non_wrapping(&runtime.instances), None);
+        assert_eq!(next_non_wrapping(&runtime.dedup_instances), None);
+        assert_eq!(runtime.instances.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(runtime.dedup_instances.load(Ordering::Relaxed), u64::MAX);
     }
 
     /// **The `Debug` output carries the diagnostic fields and none of the

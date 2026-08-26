@@ -97,8 +97,8 @@ use crate::resource::{
     LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
 };
 use crate::semantic::{
-    BootstrapRecord, ClosedProfileId, ExpectedMeshContext, MeshContextId, VerifiedBootstrap,
-    VerifiedProjectPolicy,
+    BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId,
+    VerifiedBootstrap, VerifiedProjectPolicy,
 };
 use crate::transport::{
     DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
@@ -410,6 +410,112 @@ async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
         run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;
     });
     Ok((state, handle))
+}
+
+/// Explicitly join the local Open lifecycle at the low-level engine seam.
+///
+/// Authentication and carrier presence never author participation. A fresh
+/// Open network joins once; a persisted negative participation head re-enters
+/// through the causal rejoin API; an already-positive head is left untouched.
+/// Closed networks have no local Open lifecycle fact to manufacture.
+pub async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
+    if !matches!(
+        state.verified_bootstrap().policy(),
+        VerifiedProjectPolicy::Open
+    ) {
+        return Ok(());
+    }
+    let local = DeviceId::from_canonical_str(state.identity.public_id())
+        .map_err(|error| Error::Other(format!("local Open identity is not canonical: {error}")))?;
+    let participation = {
+        let graph = state.authoritative_fact_graph();
+        let graph = graph.read();
+        graph.evaluator().effective_open_participation(&local)
+    };
+    match participation {
+        Some(true) => Ok(()),
+        Some(false) => governance::rejoin_open_participation(state)
+            .await
+            .map(|_| ()),
+        None => governance::join_open_participation(state).await.map(|_| ()),
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn v4_open_local_join_leave_rejoin_is_causal_and_shutdown_is_not_leave() {
+    let state = build_test_state("open-local-lifecycle-engine-seam");
+    join_open_participation(&state)
+        .await
+        .expect("the explicit engine join admits the local Open fact");
+
+    let local = DeviceId::from_canonical_str(state.identity.public_id())
+        .expect("the local fixture identity is canonical");
+    let cell = crate::semantic::ExclusiveCell::open_participation(local.clone());
+    let graph = state.authoritative_fact_graph();
+    let joined_id = graph
+        .read()
+        .projection()
+        .value(&cell)
+        .expect("the explicit join projects a local participation head");
+    let joined = graph
+        .read()
+        .get(&joined_id)
+        .cloned()
+        .expect("the projected join remains in the graph");
+    assert!(matches!(
+        joined.content.body,
+        crate::semantic::FactBody::OpenParticipation { joined: true, .. }
+    ));
+
+    let left_id = governance::leave_open_participation(&state)
+        .await
+        .expect("the explicit local leave admits");
+    let left = graph
+        .read()
+        .get(&left_id)
+        .cloned()
+        .expect("the projected leave remains in the graph");
+    assert!(left.content.parents.contains(&joined.id));
+    assert!(matches!(
+        left.content.body,
+        crate::semantic::FactBody::OpenParticipation { joined: false, .. }
+    ));
+
+    join_open_participation(&state)
+        .await
+        .expect("the explicit engine rejoin admits the negative participation head");
+    let rejoined_id = graph
+        .read()
+        .projection()
+        .value(&cell)
+        .expect("the explicit rejoin projects a local participation head");
+    let rejoined = graph
+        .read()
+        .get(&rejoined_id)
+        .cloned()
+        .expect("the projected rejoin remains in the graph");
+    assert!(rejoined.content.parents.contains(&left.id));
+    assert!(matches!(
+        rejoined.content.body,
+        crate::semantic::FactBody::OpenParticipation { joined: true, .. }
+    ));
+
+    let before_shutdown = graph.read().len();
+    state.shutdown().await;
+    assert_eq!(
+        graph.read().len(),
+        before_shutdown,
+        "engine shutdown must not manufacture a durable leave"
+    );
+    assert_eq!(
+        graph
+            .read()
+            .evaluator()
+            .effective_open_participation(&local),
+        Some(true),
+        "shutdown preserves the explicit rejoin projection"
+    );
 }
 
 fn bootstrap_root(instance_root: Option<&Path>) -> Result<PathBuf> {

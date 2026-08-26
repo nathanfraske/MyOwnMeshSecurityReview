@@ -5,6 +5,9 @@
 
 use std::sync::Arc;
 
+static NEXT_SIGNALING_EMISSION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
 use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
@@ -62,11 +65,59 @@ pub(crate) struct RecoveryCarrierInstance(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SignalingEmissionId(u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SignalingEmissionIdExhausted;
+
 impl SignalingEmissionId {
-    pub(crate) fn next() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    /// Reserve one process-local emission identity without wrapping.
+    ///
+    /// Zero is an internal exhausted sentinel and is never returned. MAX is
+    /// returned once, then the allocator enters the sentinel state; every
+    /// later call reports typed exhaustion rather than aliasing an earlier
+    /// live emission.
+    pub(crate) fn next() -> std::result::Result<Self, SignalingEmissionIdExhausted> {
+        use std::sync::atomic::Ordering;
+        let mut current = NEXT_SIGNALING_EMISSION_ID.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return Err(SignalingEmissionIdExhausted);
+            }
+            let next = if current == u64::MAX { 0 } else { current + 1 };
+            match NEXT_SIGNALING_EMISSION_ID.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(Self(current)),
+                Err(observed) => current = observed,
+            }
+        }
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_next_for_test(next: u64) {
+        NEXT_SIGNALING_EMISSION_ID.store(next, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn signaling_emission_id_exhaustion_is_typed_and_nonwrapping() {
+    SignalingEmissionId::set_next_for_test(u64::MAX);
+    assert_eq!(
+        SignalingEmissionId::next(),
+        Ok(SignalingEmissionId(u64::MAX))
+    );
+    assert_eq!(
+        SignalingEmissionId::next(),
+        Err(SignalingEmissionIdExhausted)
+    );
+    assert_eq!(
+        SignalingEmissionId::next(),
+        Err(SignalingEmissionIdExhausted)
+    );
+    SignalingEmissionId::set_next_for_test(1);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

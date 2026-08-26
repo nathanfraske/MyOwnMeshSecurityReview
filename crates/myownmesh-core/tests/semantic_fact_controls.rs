@@ -75,7 +75,7 @@ fn canonical_field_mutation_is_refused() {
     };
     assert!(matches!(
         signed.verify(),
-        Err(SemanticError::FactIdMismatch)
+        Err(SemanticError::InvalidAuthorityUse)
     ));
 }
 
@@ -272,6 +272,14 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
         },
         Vec::new(),
     );
+    graph
+        .admit(attestation.clone())
+        .expect("eviction attestation admits");
+    let cells_before_proof = graph
+        .projection()
+        .cells()
+        .map(|(cell, projection)| (cell.clone(), projection.clone()))
+        .collect::<Vec<_>>();
     let proof = authored(
         &graph,
         &signing_key,
@@ -283,29 +291,51 @@ fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
     );
     graph
         .admit(proof)
-        .expect("eviction proof quarantines until evidence arrives");
-    assert!(!graph.projection().is_stood_down(&eviction_target));
-    graph
-        .admit(attestation)
-        .expect("eviction attestation admits");
-    let cells_before_proof_retry = graph
-        .projection()
-        .cells()
-        .map(|(cell, projection)| (cell.clone(), projection.clone()))
-        .collect::<Vec<_>>();
-    graph
-        .retry_quarantined()
-        .expect("eviction proof retries after evidence");
+        .expect("eviction proof admits after evidence");
     assert!(graph.projection().is_stood_down(&eviction_target));
-    let cells_after_proof_retry = graph
+    let cells_after_proof = graph
         .projection()
         .cells()
         .map(|(cell, projection)| (cell.clone(), projection.clone()))
         .collect::<Vec<_>>();
     assert!(
-        cells_before_proof_retry == cells_after_proof_retry,
-        "proof evidence cannot itself mutate an exclusive semantic cell"
+        cells_before_proof == cells_after_proof,
+        "proof evidence does not mutate ordinary exclusive cells"
     );
+
+    let restoration = authored(
+        &graph,
+        &signing_key,
+        FactBody::MembershipAdmit {
+            target: eviction_target.clone(),
+        },
+        Vec::new(),
+    );
+    assert!(
+        restoration
+            .content
+            .parents
+            .contains(&proof_id_for(&graph, &eviction_target)),
+        "stand-down restoration must carry the active proof lineage"
+    );
+    graph.admit(restoration).expect("owner restoration admits");
+    assert!(
+        !graph.projection().is_stood_down(&eviction_target),
+        "an effective causal MembershipAdmit supersedes stand-down evidence"
+    );
+}
+
+fn proof_id_for(graph: &FactGraph, target: &DeviceId) -> FactId {
+    graph
+        .ids()
+        .copied()
+        .find(|id| {
+            matches!(
+                graph.get(id).map(|fact| &fact.content.body),
+                Some(FactBody::EvictionProof { target: found, .. }) if found == target
+            )
+        })
+        .expect("the graph contains the active eviction proof")
 }
 
 #[test]
@@ -534,6 +564,11 @@ fn authoring_witness_makes_ids_and_projection_arrival_order_independent() {
     right
         .admit(member_right)
         .expect("reverse member branch admits");
+    assert_eq!(
+        left.ids().copied().collect::<Vec<_>>(),
+        right.ids().copied().collect::<Vec<_>>(),
+        "the same signed branch set has identical accepted FactIds"
+    );
     assert_eq!(left.projection(), right.projection());
     assert!(left
         .projection()
@@ -598,7 +633,7 @@ fn missing_authority_predecessor_does_not_become_valid_after_late_grant() {
 }
 
 #[test]
-fn causally_valid_operation_survives_revoke_arriving_first() {
+fn stale_operation_is_explicit_but_arrival_order_independent() {
     let root_key = key(25);
     let controller_key = key(26);
     let bootstrap = closed_bootstrap(25, 25);
@@ -635,6 +670,13 @@ fn causally_valid_operation_survives_revoke_arriving_first() {
         Vec::new(),
     );
 
+    source
+        .admit(earlier_operation.clone())
+        .expect("the operation is valid in its signed causal profile");
+    source
+        .admit(later_revoke.clone())
+        .expect("the revoke admits after the shared controller grant");
+
     let mut reverse = FactGraph::from_bootstrap(&bootstrap);
     assert!(matches!(
         reverse.admit(earlier_operation.clone()),
@@ -647,12 +689,178 @@ fn causally_valid_operation_survives_revoke_arriving_first() {
     reverse
         .admit(controller_grant)
         .expect("shared causal predecessor admits");
-    reverse
+    let retried = reverse
         .retry_quarantined()
-        .expect("both causally supported operations retry");
+        .expect("the same signed facts admit independent of delivery order");
     assert_eq!(
-        reverse.evaluator().effective_role(&target),
-        Some(Role::Member)
+        retried
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [earlier_operation.id, later_revoke.id]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
     );
+    assert_eq!(
+        source.ids().copied().collect::<Vec<_>>(),
+        reverse.ids().copied().collect::<Vec<_>>(),
+        "accepted FactIds are permutation-independent"
+    );
+    assert_eq!(source.projection(), reverse.projection());
+    assert_eq!(reverse.evaluator().effective_role(&target), None);
     assert_eq!(reverse.evaluator().effective_role(&controller), None);
+}
+
+#[test]
+fn omitted_concurrent_root_lineage_is_explicit_conflict_not_arrival_order_authority() {
+    let root_key = key(67);
+    let bootstrap = closed_bootstrap(67, 67);
+    let root = author(&root_key);
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+    let revoke = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: root.clone(),
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(revoke)
+        .expect("root revoke advances its role cell");
+
+    let omitted = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: author(&key(68)),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(omitted)
+        .expect("a candidate-relative fork may be admitted without seeing the concurrent revoke");
+    assert_eq!(graph.authority_use_heads(&root).len(), 2);
+    assert_eq!(
+        graph.evaluator().effective_role(&author(&key(68))),
+        None,
+        "the concurrent signed AuthorityUse fork fails closed"
+    );
+}
+
+#[test]
+fn signed_authority_use_omission_is_rejected_when_the_candidate_cites_a_predecessor() {
+    let root_key = key(74);
+    let controller_key = key(75);
+    let bootstrap = closed_bootstrap(74, 74);
+    let controller = author(&controller_key);
+    let target = author(&key(76));
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+    let grant = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    graph.admit(grant.clone()).expect("controller grant admits");
+    let honest = authored(
+        &graph,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let mut malformed_content = honest.content.clone();
+    malformed_content
+        .authority_uses
+        .iter_mut()
+        .find(|use_| use_.subject == controller)
+        .expect("author AuthorityUse is present")
+        .predecessors
+        .clear();
+    let malformed = SignedFact::sign(malformed_content, &controller_key)
+        .expect("malformed content remains internally signed");
+    assert_eq!(
+        graph.admit(malformed),
+        Err(SemanticError::UnauthorizedRoleGrant),
+        "the candidate must carry the exact signed authority predecessor"
+    );
+}
+
+#[test]
+fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
+    let root_key = key(69);
+    let controller_key = key(70);
+    let member_key = key(71);
+    let bootstrap = closed_bootstrap(69, 69);
+    let controller = author(&controller_key);
+    let member = author(&member_key);
+    let target = author(&key(72));
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+
+    let controller_grant = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(controller_grant)
+        .expect("root controller grant admits");
+    let member_grant = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::RoleGrant {
+            target: member.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    graph.admit(member_grant).expect("root member grant admits");
+
+    let controller_admit = authored(
+        &graph,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: target.clone(),
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(controller_admit)
+        .expect("Controller may sign a member admission");
+
+    let member_admit = authored(
+        &graph,
+        &member_key,
+        FactBody::MembershipAdmit {
+            target: author(&key(73)),
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        graph.admit(member_admit),
+        Err(SemanticError::UnauthorizedMembershipAdmit),
+        "a plain Member cannot author a member-log admission"
+    );
+
+    let owner_admit = authored(
+        &graph,
+        &root_key,
+        FactBody::MembershipAdmit {
+            target: target.clone(),
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(owner_admit)
+        .expect("Owner remains a valid higher-tier member-admission signer");
 }

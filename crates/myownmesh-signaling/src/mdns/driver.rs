@@ -356,10 +356,16 @@ async fn run_outbound(
         // funding instead of becoming an unowned allocation beside it. The two
         // registration arms build nothing and drop the signal — and its owner —
         // at the end of the iteration.
-        match outbound.value() {
+        if matches!(outbound.value(), MdnsOutbound::DirectedToPeer { .. }) {
+            let _ = send_directed(&shared, outbound).await;
+            continue;
+        }
+        let accepted = match outbound.value() {
             MdnsOutbound::Announce => {
                 if !shared.registered.load(Ordering::SeqCst) {
-                    register(&shared);
+                    register(&shared)
+                } else {
+                    true
                 }
                 // Already registered: the daemon re-announces and
                 // answers queries on its own — nothing to do.
@@ -368,19 +374,23 @@ async fn run_outbound(
                 if shared.registered.swap(false, Ordering::SeqCst) {
                     shared.discovery.unregister();
                 }
+                true
             }
-            MdnsOutbound::DirectedToPeer { .. } => {
-                send_directed(&shared, outbound).await;
-            }
+            MdnsOutbound::DirectedToPeer { .. } => unreachable!("directed arm handled above"),
+        };
+        if accepted {
+            outbound.accept();
         }
     }
 }
 
-fn register(shared: &Shared) {
+fn register(shared: &Shared) -> bool {
     if shared.discovery.register() {
         shared.registered.store(true, Ordering::SeqCst);
+        true
     } else {
         debug!("mdns register retry failed");
+        false
     }
 }
 
@@ -398,9 +408,12 @@ fn register(shared: &Shared) {
 /// `OwnedSignal<String, ErasedOwner>` and drops an entry only once the write has
 /// completed or the connection is gone, so a parked writer keeps its funding
 /// live for exactly as long as it keeps the bytes.
-async fn send_directed(shared: &Arc<Shared>, outbound: OwnedSignal<MdnsOutbound, ErasedOwner>) {
+async fn send_directed(
+    shared: &Arc<Shared>,
+    outbound: OwnedSignal<MdnsOutbound, ErasedOwner>,
+) -> bool {
     let MdnsOutbound::DirectedToPeer { to, .. } = outbound.value() else {
-        return;
+        return false;
     };
     let to = to.clone();
     let room_handle = shared.room_handle.clone();
@@ -426,10 +439,16 @@ async fn send_directed(shared: &Arc<Shared>, outbound: OwnedSignal<MdnsOutbound,
     // `send` gives the value back when the writer is gone, so a dead connection
     // returns the line *and its owner* here rather than dropping either: the
     // dial below reuses the same allocation and the same funding.
+    let commit = line.commit_unit();
     let existing = shared.conns.lock().get(&to).cloned();
     let line = match existing {
         Some(handle) => match handle.tx.send(line) {
-            Ok(()) => return,
+            Ok(()) => {
+                if let Some(commit) = &commit {
+                    commit.accept();
+                }
+                return true;
+            }
             Err(returned) => returned.0,
         },
         None => line,
@@ -438,7 +457,7 @@ async fn send_directed(shared: &Arc<Shared>, outbound: OwnedSignal<MdnsOutbound,
     // Dial. Snapshot the endpoint before awaiting anything.
     let Some(entry) = shared.peers.lock().get(&to).cloned() else {
         debug!(peer = %&to[..to.len().min(16)], "mdns directed message for unknown peer dropped");
-        return;
+        return false;
     };
     // All advertised addresses race concurrently and the first
     // connect wins — a host advertises every interface (docker
@@ -463,13 +482,22 @@ async fn send_directed(shared: &Arc<Shared>, outbound: OwnedSignal<MdnsOutbound,
     match futures::future::select_ok(attempts).await {
         Ok((stream, _rest)) => {
             let tx = adopt_stream(shared, stream, Some(to));
-            let _ = tx.send(line);
+            match tx.send(line) {
+                Ok(()) => {
+                    if let Some(commit) = &commit {
+                        commit.accept();
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
         }
         Err(e) => {
             debug!(
                 peer = %&to[..to.len().min(16)],
                 "mdns peer unreachable on every advertised address: {e}"
             );
+            false
         }
     }
 }
