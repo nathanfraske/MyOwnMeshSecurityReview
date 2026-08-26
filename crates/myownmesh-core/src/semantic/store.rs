@@ -11,20 +11,30 @@
 //! module's context, basis, and root-signature checks.
 
 use std::borrow::Borrow;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+
 use data_encoding::BASE32_NOPAD;
+use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
-    BootstrapError, BootstrapRecord, ExpectedMeshContext, MeshContextId, VerifiedBootstrap,
+    BootstrapError, BootstrapRecord, ExpectedMeshContext, FactGraph, FactId, MeshContextId,
+    Projection, SignedFact, VerifiedBootstrap,
 };
 
 const BOOTSTRAP_DIRECTORY: &str = "bootstrap";
+const SEMANTIC_DIRECTORY: &str = "semantic";
+const SEMANTIC_SNAPSHOT_FILE: &str = "snapshot.json";
+const SEMANTIC_LOCK_FILE: &str = ".writer.lock";
+const SEMANTIC_SNAPSHOT_VERSION: u16 = 1;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A local store for one bootstrap record.
@@ -34,6 +44,178 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct BootstrapStore {
     path: PathBuf,
+}
+
+/// One process-local provisional custody claim carried by a durable semantic
+/// snapshot. It is bookkeeping only: the fact identity and owner are stored
+/// together so an interrupted write cannot publish one without the other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvisionalCustody {
+    pub fact_id: FactId,
+    pub owner: String,
+}
+
+impl ProvisionalCustody {
+    pub fn new(fact_id: FactId, owner: impl Into<String>) -> Self {
+        Self {
+            fact_id,
+            owner: owner.into(),
+        }
+    }
+}
+
+/// The verified result of reopening a durable semantic snapshot.
+#[derive(Debug, Clone)]
+pub struct RestoredSemanticState {
+    graph: FactGraph,
+    projection_commitment: [u8; 32],
+    provisional: Vec<ProvisionalCustody>,
+}
+
+impl RestoredSemanticState {
+    pub fn graph(&self) -> &FactGraph {
+        &self.graph
+    }
+
+    pub fn projection_commitment(&self) -> [u8; 32] {
+        self.projection_commitment
+    }
+
+    pub fn provisional_custody(&self) -> &[ProvisionalCustody] {
+        &self.provisional
+    }
+}
+
+/// A single atomic durable fact/projection/custody store.
+///
+/// The snapshot is self-checksummed and written through `persist::write_atomic`.
+/// A create-new sidecar lease serializes writers across processes; readers do
+/// not hold it and therefore always observe either the old complete snapshot
+/// or the new complete snapshot after a reopen.
+#[derive(Debug, Clone)]
+pub struct DurableSemanticStore {
+    root: PathBuf,
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableSnapshot {
+    version: u16,
+    context_id: MeshContextId,
+    facts: Vec<SignedFact>,
+    projection_commitment: [u8; 32],
+    provisional: Vec<ProvisionalCustody>,
+    checksum: [u8; 32],
+}
+
+#[derive(Debug, Serialize)]
+struct SnapshotPayload<'a> {
+    version: u16,
+    context_id: MeshContextId,
+    facts: &'a [SignedFact],
+    projection_commitment: [u8; 32],
+    provisional: &'a [ProvisionalCustody],
+}
+
+#[derive(Debug)]
+struct WriterLease {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl WriterLease {
+    fn acquire(path: &Path) -> Result<Self, DurableStoreError> {
+        #[cfg(unix)]
+        {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            let mut file = options.open(path).map_err(|source| DurableStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            // LOCK_NB keeps a competing process fail-closed rather than
+            // waiting behind an unbounded writer. The kernel releases this
+            // advisory lease if its process is interrupted.
+            const LOCK_EX: std::os::raw::c_int = 2;
+            const LOCK_NB: std::os::raw::c_int = 4;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+                return Err(DurableStoreError::WriterBusy {
+                    path: path.to_path_buf(),
+                });
+            }
+            file.set_len(0).map_err(|source| DurableStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            writeln!(file, "pid={}", std::process::id()).map_err(|source| {
+                DurableStoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+            file.sync_all().map_err(|source| DurableStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            return Ok(Self {
+                path: path.to_path_buf(),
+                file,
+            });
+        }
+
+        #[cfg(not(unix))]
+        {
+            let mut file = OpenOptions::new();
+            file.write(true).create_new(true);
+            let mut file = file.open(path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    DurableStoreError::WriterBusy {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    DurableStoreError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                }
+            })?;
+            if let Err(source) = writeln!(file, "pid={}", std::process::id()) {
+                let _ = std::fs::remove_file(path);
+                return Err(DurableStoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+            if let Err(source) = file.sync_all() {
+                let _ = std::fs::remove_file(path);
+                return Err(DurableStoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+            Ok(Self {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            const LOCK_UN: std::os::raw::c_int = 8;
+            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl BootstrapStore {
@@ -244,6 +426,308 @@ impl BootstrapStore {
     }
 }
 
+impl DurableSemanticStore {
+    pub fn new(instance_root: impl Into<PathBuf>, local_slot: impl AsRef<str>) -> Self {
+        let root = instance_root.into();
+        let digest = Sha256::digest(local_slot.as_ref().as_bytes());
+        let slot = BASE32_NOPAD.encode(&digest).to_lowercase();
+        let directory = root.join(SEMANTIC_DIRECTORY);
+        Self {
+            root,
+            path: directory.join(format!("{slot}-{SEMANTIC_SNAPSHOT_FILE}")),
+            lock_path: directory.join(format!("{slot}.lock")),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The resolved snapshot path, exposed for diagnostics and interruption
+    /// controls only.
+    #[cfg(test)]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Commit facts, their derived projection commitment, and provisional
+    /// custody as one durable record. The writer lease covers validation and
+    /// publication, so a competing process cannot interleave a partial state.
+    pub fn commit<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
+    where
+        I: IntoIterator<Item = ProvisionalCustody>,
+    {
+        let lease = self.begin_write()?;
+        lease.commit(graph, provisional)
+    }
+
+    /// Acquire the cross-process writer lease and hold it until commit or
+    /// drop. Readers remain lock-free and only consume complete snapshots.
+    pub fn begin_write(&self) -> Result<DurableSemanticWriter, DurableStoreError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| DurableStoreError::InvalidPath(self.path.clone()))?;
+        std::fs::create_dir_all(parent).map_err(|source| DurableStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lease = WriterLease::acquire(&self.lock_path)?;
+        Ok(DurableSemanticWriter {
+            store: self.clone(),
+            lease,
+        })
+    }
+
+    /// Reopen, verify, and rebuild the exact graph and projection commitment.
+    /// A stale temporary file from an interrupted writer is ignored because
+    /// the published snapshot itself is never truncated.
+    pub fn restore(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        self.restore_unlocked(bootstrap)
+    }
+
+    /// Rewrite the canonical sorted representation under the writer lease.
+    /// Compaction has no separate correctness path: it first verifies the
+    /// existing snapshot, then atomically republishes the same state.
+    pub fn compact(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let lease = self.begin_write()?;
+        let state = self.restore_unlocked(bootstrap)?;
+        lease
+            .store
+            .store_snapshot(&state.graph, state.provisional.clone())?;
+        Ok(state)
+    }
+
+    fn restore_unlocked(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DurableStoreError::Missing {
+                    path: self.path.clone(),
+                })
+            }
+            Err(source) => {
+                return Err(DurableStoreError::Io {
+                    path: self.path.clone(),
+                    source,
+                })
+            }
+        };
+        let snapshot: DurableSnapshot =
+            serde_json::from_slice(&bytes).map_err(|source| DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: source.to_string(),
+            })?;
+        snapshot.verify(self.path.as_path())?;
+        if snapshot.context_id != bootstrap.context_id() {
+            return Err(DurableStoreError::ContextMismatch {
+                expected: bootstrap.context_id(),
+                actual: snapshot.context_id,
+            });
+        }
+
+        let expected_facts = snapshot.facts.len();
+        let mut graph = FactGraph::from_bootstrap(bootstrap);
+        for fact in snapshot.facts {
+            graph
+                .admit(fact)
+                .map_err(|error| DurableStoreError::Rebuild {
+                    path: self.path.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        graph
+            .retry_quarantined()
+            .map_err(|error| DurableStoreError::Rebuild {
+                path: self.path.clone(),
+                reason: error.to_string(),
+            })?;
+        if graph.len() != expected_facts || graph.quarantined().next().is_some() {
+            return Err(DurableStoreError::Rebuild {
+                path: self.path.clone(),
+                reason: "snapshot contains unresolved fact dependencies".into(),
+            });
+        }
+        let actual_projection = projection_commitment(&graph.projection());
+        if actual_projection != snapshot.projection_commitment {
+            return Err(DurableStoreError::ProjectionMismatch {
+                path: self.path.clone(),
+            });
+        }
+        Ok(RestoredSemanticState {
+            graph,
+            projection_commitment: snapshot.projection_commitment,
+            provisional: snapshot.provisional,
+        })
+    }
+}
+
+/// A held durable writer lease. Dropping without commit is an explicit abort;
+/// the previously published snapshot remains untouched.
+pub struct DurableSemanticWriter {
+    store: DurableSemanticStore,
+    lease: WriterLease,
+}
+
+impl DurableSemanticWriter {
+    pub fn commit<I>(self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
+    where
+        I: IntoIterator<Item = ProvisionalCustody>,
+    {
+        let result = self.store.store_snapshot(graph, provisional);
+        drop(self.lease);
+        result
+    }
+}
+
+impl DurableSemanticStore {
+    fn store_snapshot<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
+    where
+        I: IntoIterator<Item = ProvisionalCustody>,
+    {
+        if graph.quarantined().next().is_some() {
+            return Err(DurableStoreError::UnsettledDependencies {
+                path: self.path.clone(),
+            });
+        }
+        let mut facts: Vec<_> = graph.facts.values().cloned().collect();
+        facts.sort_by_key(|fact| fact.id);
+        let provisional = canonical_provisional(provisional)?;
+        let projection_commitment = projection_commitment(&graph.projection());
+        let snapshot = DurableSnapshot::new(
+            graph.context_id(),
+            facts,
+            projection_commitment,
+            provisional,
+        )?;
+        let bytes = serde_json::to_vec(&snapshot)?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| DurableStoreError::InvalidPath(self.path.clone()))?;
+        std::fs::create_dir_all(parent).map_err(|source| DurableStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        crate::persist::write_atomic(&self.path, &bytes).map_err(|source| DurableStoreError::Io {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+impl DurableSnapshot {
+    fn new(
+        context_id: MeshContextId,
+        facts: Vec<SignedFact>,
+        projection_commitment: [u8; 32],
+        provisional: Vec<ProvisionalCustody>,
+    ) -> Result<Self, DurableStoreError> {
+        let mut snapshot = Self {
+            version: SEMANTIC_SNAPSHOT_VERSION,
+            context_id,
+            facts,
+            projection_commitment,
+            provisional,
+            checksum: [0; 32],
+        };
+        snapshot.checksum = snapshot.calculate_checksum()?;
+        Ok(snapshot)
+    }
+
+    fn calculate_checksum(&self) -> Result<[u8; 32], DurableStoreError> {
+        let payload = SnapshotPayload {
+            version: self.version,
+            context_id: self.context_id,
+            facts: &self.facts,
+            projection_commitment: self.projection_commitment,
+            provisional: &self.provisional,
+        };
+        let bytes = serde_json::to_vec(&payload)?;
+        let digest = Sha256::digest(bytes);
+        let mut checksum = [0; 32];
+        checksum.copy_from_slice(&digest);
+        Ok(checksum)
+    }
+
+    fn verify(&self, path: &Path) -> Result<(), DurableStoreError> {
+        if self.version != SEMANTIC_SNAPSHOT_VERSION {
+            return Err(DurableStoreError::UnsupportedVersion {
+                path: path.to_path_buf(),
+                version: self.version,
+            });
+        }
+        if self.checksum != self.calculate_checksum()? {
+            return Err(DurableStoreError::ChecksumMismatch {
+                path: path.to_path_buf(),
+            });
+        }
+        canonical_provisional(self.provisional.clone())?;
+        Ok(())
+    }
+}
+
+fn canonical_provisional<I>(values: I) -> Result<Vec<ProvisionalCustody>, DurableStoreError>
+where
+    I: IntoIterator<Item = ProvisionalCustody>,
+{
+    let mut values: Vec<_> = values.into_iter().collect();
+    if values.iter().any(|claim| claim.owner.is_empty()) {
+        return Err(DurableStoreError::InvalidCustody);
+    }
+    values.sort_by(|left, right| {
+        left.fact_id
+            .cmp(&right.fact_id)
+            .then_with(|| left.owner.cmp(&right.owner))
+    });
+    if values.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(DurableStoreError::DuplicateCustody);
+    }
+    Ok(values)
+}
+
+fn projection_commitment(projection: &Projection) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    for (cell, value) in projection.cells() {
+        bytes.extend_from_slice(cell.to_string().as_bytes());
+        bytes.push(0);
+        match value {
+            super::CellProjection::Value(id) => {
+                bytes.push(1);
+                bytes.extend_from_slice(id.as_bytes());
+            }
+            super::CellProjection::Conflict(ids) => {
+                bytes.push(2);
+                for id in ids {
+                    bytes.extend_from_slice(id.as_bytes());
+                }
+            }
+        }
+        bytes.push(0xff);
+    }
+    for target in projection.stand_down_targets() {
+        bytes.extend_from_slice(b"stand_down:");
+        bytes.extend_from_slice(target.to_string().as_bytes());
+        if let Some(stand_down) = projection.stand_down(target) {
+            bytes.extend_from_slice(stand_down.proof.as_bytes());
+        }
+        bytes.push(0xfe);
+    }
+    let digest = Sha256::digest(bytes);
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(&digest);
+    commitment
+}
+
 /// Create a missing directory hierarchy one component at a time. Each newly
 /// created child is followed by a sync of its containing directory, so a
 /// first install does not rely on `create_dir_all`'s unsignaled hierarchy.
@@ -396,9 +880,50 @@ pub enum BootstrapStoreError {
     Serialization(#[from] JsonError),
 }
 
+/// Fail-closed errors for the atomic semantic snapshot store.
+#[derive(Debug, Error)]
+pub enum DurableStoreError {
+    #[error("semantic snapshot is missing: {path}")]
+    Missing { path: PathBuf },
+    #[error("semantic snapshot is corrupt at {path}: {reason}")]
+    Corrupt { path: PathBuf, reason: String },
+    #[error("semantic snapshot has unsupported version {version} at {path}")]
+    UnsupportedVersion { path: PathBuf, version: u16 },
+    #[error("semantic snapshot checksum mismatch at {path}")]
+    ChecksumMismatch { path: PathBuf },
+    #[error("semantic snapshot context mismatch: expected {expected}, found {actual}")]
+    ContextMismatch {
+        expected: MeshContextId,
+        actual: MeshContextId,
+    },
+    #[error("semantic snapshot projection commitment mismatch at {path}")]
+    ProjectionMismatch { path: PathBuf },
+    #[error("semantic snapshot cannot rebuild at {path}: {reason}")]
+    Rebuild { path: PathBuf, reason: String },
+    #[error("semantic snapshot has unresolved fact dependencies at {path}")]
+    UnsettledDependencies { path: PathBuf },
+    #[error("semantic snapshot writer is busy: {path}")]
+    WriterBusy { path: PathBuf },
+    #[error("semantic snapshot path has no parent: {0}")]
+    InvalidPath(PathBuf),
+    #[error("semantic snapshot I/O at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("semantic snapshot contains invalid provisional custody")]
+    InvalidCustody,
+    #[error("semantic snapshot contains duplicate provisional custody")]
+    DuplicateCustody,
+    #[error("semantic snapshot serialization failed: {0}")]
+    Serialization(#[from] JsonError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::semantic::{FactBody, FactContent, FactDomain};
     use ed25519_dalek::SigningKey;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -431,6 +956,26 @@ mod tests {
     fn principal() -> crate::application_gateway::LocalPrincipalCapability {
         let runtime = crate::runtime::runtime_for_test();
         crate::application_gateway::LocalPrincipalCapability::for_test(runtime)
+    }
+
+    fn root_fact(bootstrap: &VerifiedBootstrap, signing_key: &SigningKey) -> SignedFact {
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("test root id");
+        SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target: author.clone(),
+                    role: super::super::Role::Member,
+                },
+                author,
+                Vec::new(),
+            ),
+            signing_key,
+        )
+        .expect("test root fact")
     }
 
     #[test]
@@ -622,6 +1167,95 @@ mod tests {
         assert_eq!(left.is_err(), right.is_ok());
         let restored = store.restore().expect("one established record remains");
         assert!(restored == first || restored == second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn semantic_snapshot_round_trips_projection_and_provisional_custody() {
+        let root = root();
+        let signing_key = key(12);
+        let bootstrap = closed("scope-a", 12, [12; 32]);
+        let fact = root_fact(&bootstrap, &signing_key);
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(fact.clone()).expect("root fact admits");
+        let store = DurableSemanticStore::new(&root, "semantic-slot");
+        let custody = ProvisionalCustody::new(fact.id, "writer-a");
+        store
+            .commit(&graph, vec![custody.clone()])
+            .expect("atomic semantic commit");
+        let restored = store.restore(&bootstrap).expect("semantic reopen");
+        assert_eq!(restored.graph().len(), 1);
+        assert_eq!(restored.provisional_custody(), &[custody]);
+        assert_eq!(
+            restored.projection_commitment(),
+            projection_commitment(&graph.projection())
+        );
+        let compacted = store.compact(&bootstrap).expect("compact and reopen");
+        assert_eq!(compacted.graph().len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_lease_excludes_a_competing_process_and_releases_on_drop() {
+        let root = root();
+        let store = DurableSemanticStore::new(&root, "lease-slot");
+        let lease = store.begin_write().expect("first writer lease");
+        assert!(matches!(
+            store.begin_write(),
+            Err(DurableStoreError::WriterBusy { .. })
+        ));
+        drop(lease);
+        store.begin_write().expect("lease released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn interrupted_temporary_write_does_not_hide_the_last_complete_snapshot() {
+        let root = root();
+        let bootstrap = closed("scope-a", 13, [13; 32]);
+        let graph = FactGraph::from_bootstrap(&bootstrap);
+        let store = DurableSemanticStore::new(&root, "restart-slot");
+        store.commit(&graph, Vec::new()).expect("initial snapshot");
+        std::fs::write(
+            store.path().with_extension("json.tmp"),
+            b"interrupted replacement",
+        )
+        .expect("interrupted temp");
+        assert_eq!(
+            store
+                .restore(&bootstrap)
+                .expect("reopen old snapshot")
+                .graph()
+                .len(),
+            0
+        );
+        store
+            .commit(&graph, Vec::new())
+            .expect("next commit replaces interrupted temp");
+        assert!(!store.path().with_extension("json.tmp").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tampered_projection_or_custody_envelope_is_rejected_by_checksum() {
+        let root = root();
+        let bootstrap = closed("scope-a", 14, [14; 32]);
+        let graph = FactGraph::from_bootstrap(&bootstrap);
+        let store = DurableSemanticStore::new(&root, "checksum-slot");
+        store.commit(&graph, Vec::new()).expect("initial snapshot");
+        let mut snapshot: DurableSnapshot =
+            serde_json::from_slice(&std::fs::read(store.path()).expect("snapshot bytes"))
+                .expect("snapshot envelope");
+        snapshot.projection_commitment[0] ^= 1;
+        std::fs::write(
+            store.path(),
+            serde_json::to_vec(&snapshot).expect("tampered envelope"),
+        )
+        .expect("tampered snapshot");
+        assert!(matches!(
+            store.restore(&bootstrap),
+            Err(DurableStoreError::ChecksumMismatch { .. })
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 }
