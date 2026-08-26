@@ -132,28 +132,78 @@ pub(crate) async fn rejoin_open_participation(state: &Arc<EngineState>) -> Resul
     commit_open_self_participation(state, true).await
 }
 
-fn current_open_participation_fact(state: &Arc<EngineState>) -> Option<SignedFact> {
+/// Return the complete proof material for the currently effective positive
+/// Open-participation value. A projection value may be a `Resolution`, not the
+/// terminal `OpenParticipation` fact itself, so forwarding only that value
+/// leaves a fresh peer unable to validate the decision.
+fn current_open_participation_bundle(state: &Arc<EngineState>) -> Option<Vec<SignedFact>> {
     let device_id = canonical_device(state.identity.public_id()).ok()?;
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
-    let cell = crate::semantic::ExclusiveCell::open_participation(device_id);
-    let id = graph.projection().value(&cell)?;
-    graph.get(&id).cloned().filter(|fact| {
-        matches!(
-            &fact.content.body,
-            FactBody::OpenParticipation { joined: true, .. }
-        )
-    })
+    let cell = crate::semantic::ExclusiveCell::open_participation(device_id.clone());
+    let heads = graph.cell_heads(&cell);
+    let [head] = heads.as_slice() else {
+        return None;
+    };
+    let head = *head;
+    if graph.evaluator().effective_open_participation(&device_id) != Some(true) {
+        return None;
+    }
+
+    // Follow the effective resolution chain to prove that the projected value
+    // terminates at this device's positive participation fact.
+    let mut terminal = head;
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(terminal) {
+            return None;
+        }
+        let fact = graph.get(&terminal)?;
+        match &fact.content.body {
+            FactBody::Resolution {
+                cell: resolution_cell,
+                selected_head,
+                ..
+            } if resolution_cell == &cell => terminal = *selected_head,
+            FactBody::OpenParticipation {
+                device_id: subject,
+                joined: true,
+            } if subject == &device_id => break,
+            _ => return None,
+        }
+    }
+
+    let mut ids = BTreeSet::new();
+    let mut pending = vec![head];
+    while let Some(id) = pending.pop() {
+        if !ids.insert(id) {
+            continue;
+        }
+        let fact = graph.get(&id)?;
+        pending.extend(crate::semantic::causal::dependencies(fact));
+        if let FactBody::Resolution {
+            cell: resolution_cell,
+            cited_heads,
+            selected_head,
+        } = &fact.content.body
+        {
+            if resolution_cell == &cell {
+                pending.extend(cited_heads.iter().copied());
+                pending.push(*selected_head);
+            }
+        }
+    }
+    ids.into_iter().map(|id| graph.get(&id).cloned()).collect()
 }
 
 /// Compatibility hook retained for the handshake module. Participation is an
 /// explicit local lifecycle operation now; handshake promotion may only forward
 /// an already-admitted positive fact and must never author a join.
 pub(super) async fn announce_open_participation(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
-    let Some(fact) = current_open_participation_fact(state) else {
+    let Some(bundle) = current_open_participation_bundle(state) else {
         return;
     };
-    let _ = super::send_pending_open_participation(state, owner, &fact).await;
+    let _ = super::send_pending_open_participation(state, owner, &bundle).await;
 }
 
 /// Strip the display suffix (`-XXXXX`) from a Device ID. The
@@ -2163,6 +2213,99 @@ pub(super) async fn broadcast_state_for_owner(
 #[cfg(test)]
 mod governance_projection_controls {
     use super::*;
+
+    /// The pending-peer path carries a real causal proof, not whichever
+    /// terminal body happens to be visible at the sender.  A fork is refused
+    /// until the local author resolves it; once resolved, a fresh graph can
+    /// admit the complete bundle and project the same positive value.
+    #[tokio::test]
+    async fn open_participation_forwards_conflict_resolution_to_a_fresh_graph() {
+        let state = crate::engine::build_test_state("open-proof-forwarding");
+        crate::engine::join_open_participation(&state)
+            .await
+            .expect("explicit local join admits");
+        let local = DeviceId::from_canonical_str(state.identity.public_id())
+            .expect("fixture identity is canonical");
+        let cell = crate::semantic::ExclusiveCell::open_participation(local.clone());
+        let initial = {
+            let graph = state.authoritative_fact_graph();
+            let graph = graph.read();
+            let id = graph
+                .projection()
+                .value(&cell)
+                .expect("join projects a value");
+            graph.get(&id).cloned().expect("join remains stored")
+        };
+
+        let branch = |joined: bool| {
+            let content = FactContent::open_participation(
+                state.mesh_context_id(),
+                local.clone(),
+                joined,
+                vec![initial.id],
+            );
+            SignedFact::sign(content, state.identity.signing_key())
+                .expect("self-authored branch signs")
+        };
+        let left = branch(false);
+        let right = branch(true);
+        {
+            let graph = state.authoritative_fact_graph();
+            let mut graph = graph.write();
+            graph.admit(left.clone()).expect("negative branch admits");
+            graph.admit(right.clone()).expect("positive branch admits");
+        }
+        assert!(
+            current_open_participation_bundle(&state).is_none(),
+            "a joined true/false conflict has no forwardable value"
+        );
+
+        let mut cited = vec![left.id, right.id];
+        cited.sort();
+        let resolution = {
+            let graph = state.authoritative_fact_graph();
+            let graph = graph.read();
+            let body = FactBody::Resolution {
+                cell: cell.clone(),
+                cited_heads: cited.clone(),
+                selected_head: right.id,
+            };
+            let witness = graph.authoring_witness(&body, &local);
+            let content =
+                FactContent::from_authoring_witness(&graph, body, &witness, std::iter::empty());
+            SignedFact::sign(content, state.identity.signing_key())
+                .expect("self-authored resolution signs")
+        };
+        state
+            .authoritative_fact_graph()
+            .write()
+            .admit(resolution.clone())
+            .expect("self resolution admits");
+
+        let bundle = current_open_participation_bundle(&state)
+            .expect("resolved positive value has a forwardable proof");
+        let bundle_ids: BTreeSet<_> = bundle.iter().map(|fact| fact.id).collect();
+        assert!(bundle_ids.contains(&resolution.id));
+        assert!(bundle_ids.contains(&left.id));
+        assert!(bundle_ids.contains(&right.id));
+        assert!(bundle_ids.contains(&initial.id));
+        assert!(bundle
+            .iter()
+            .all(|fact| { fact.content.mesh_context == state.mesh_context_id() }));
+
+        let mut fresh = crate::semantic::FactGraph::from_bootstrap(state.verified_bootstrap());
+        for fact in bundle {
+            fresh
+                .admit(fact)
+                .expect("fresh graph accepts proof material");
+            let _ = fresh.retry_quarantined();
+        }
+        assert_eq!(
+            fresh.evaluator().effective_open_participation(&local),
+            Some(true),
+            "the proof bundle alone reconstructs the resolved joined value"
+        );
+    }
 
     /// A root-signed canonical member grant survives the compatibility mirror.
     ///

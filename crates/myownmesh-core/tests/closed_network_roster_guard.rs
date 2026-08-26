@@ -166,6 +166,8 @@ async fn roster_membership_authority_gate() {
     assert!(!rostered(&alice, frank.public_id()));
 
     // ---- Scenario 2: OPEN is founderless, but carriers stay inert --------
+    // Deliberately do not join Open participation: this negative control
+    // proves that unsigned carriers cannot bootstrap a founderless roster.
     let alice2_id = Arc::new(Identity::ephemeral());
     let (alice2, alice2_driver) = spawn_network_in_instance_root(
         fresh_network("alice-open", "open-roster-guard", NetworkKind::Open),

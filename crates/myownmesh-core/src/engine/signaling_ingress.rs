@@ -26,9 +26,11 @@
 //! [`SignalingRuntime`] is the owner on this side of the boundary: it mints one
 //! opaque [`CarrierInstance`] per attach and owns cross-carrier de-duplication,
 //! whose every retained key is funded by the finite provider rather than capped
-//! by a constant. It retains no untrusted record — see its own documentation for
-//! the availability map that used to live there and why it was removed rather
-//! than repaired.
+//! by a constant. It retains no unfunded availability record: the only retained
+//! carrier-supplied data is an exact duplicate key paired with weak lifecycle
+//! custody, and the provider funds both the key and its guard index. The
+//! availability map that used to live here is described in the runtime docs,
+//! along with why it was removed rather than repaired.
 //!
 //! # What this boundary is not
 //!
@@ -1318,10 +1320,11 @@ impl SignalingRuntime {
     /// Deliver an admitted observation, unless it is a duplicate the engine has
     /// already been handed.
     ///
-    /// Returns `false` once the engine side is gone, which is the pump's signal
-    /// to exit. Every other outcome is `true`: signaling ingress is explicitly
-    /// lossy under local resource pressure, and a dropped observation leaves a
-    /// later bounded one to recover the connection.
+    /// Returns a typed outcome. [`Delivered::Closed`] is the pump's signal to
+    /// exit; [`Delivered::Refused`] and [`Delivered::Unavailable`] are
+    /// fail-closed pressure outcomes that leave no reducer-visible value and
+    /// allow a later copy to recover the connection. [`Delivered::Duplicate`]
+    /// means an equal attempt-and-payload key is already live.
     ///
     /// # A key is retained only after its full claim is funded
     ///
@@ -1423,9 +1426,9 @@ impl SignalingRuntime {
                 return Delivered::Unavailable;
             }
             // Refused, so there is nothing for a later copy to be a duplicate
-            // *of*. No key is committed, and the retransmission that rescues
-            // this attempt finds a clean slate — which is the whole reason the
-            // The key was preclaimed before dispatch; refusal removes it.
+            // *of*. No key remains committed, and the retransmission that rescues
+            // this attempt finds a clean slate because the preclaimed key is
+            // removed before the retransmission can be admitted.
             Delivered::Refused => {
                 self.remove_key_for_token(&weak_token);
                 trace!(kind, "refused after preclaim; exact key released");
@@ -1434,13 +1437,11 @@ impl SignalingRuntime {
             Delivered::Accepted => {}
             Delivered::Duplicate => unreachable!("mailbox send cannot produce duplicate"),
         }
-        // Accepted, and only now. Remembering it is an optimization, and an
-        // optimization the provider may decline to fund: if it does, the key is
-        // simply not remembered and a later duplicate reaches the engine twice.
-        // That is a worse outcome than de-duplication and a much better one than
-        // refusing traffic, and it is the only thing pressure is allowed to
-        // change here — it never strengthens a withdrawal and never alters
-        // authority.
+        // Accepted, and only now. The exact key and lifecycle token were
+        // pre-funded before dispatch, so pressure can never turn
+        // duplicate-sensitive traffic into an untracked reducer delivery. A
+        // key that cannot be funded returned `Unavailable` above; it was never
+        // forwarded and never entered the remembered set.
         Delivered::Accepted
     }
 
@@ -1637,11 +1638,12 @@ fn attempt_is_empty(ingress: &EphemeralIngress) -> bool {
 /// those two apart, and it is why the engine mints one per attempt instead of
 /// each carrier inventing its own.
 ///
-/// **An unstamped signal is not de-duplicated at all.** That is the honest
-/// outcome rather than a fallback to the old content-only key: without a
-/// correlation there is nothing that distinguishes a relay copy from a fresh
-/// attempt, and delivering twice is recoverable where suppressing a live attempt
-/// is not.
+/// **Presence and withdrawal signals are not de-duplicated.** They carry no
+/// attempt and are intentionally handled as reachability evidence. In
+/// contrast, an Offer, Answer, or Candidate without an attempt is refused
+/// before the reducer: without a correlation there is nothing that distinguishes
+/// a relay copy from a fresh attempt, so duplicate-sensitive traffic never
+/// proceeds without exact lifecycle custody.
 fn add_framed_len(total: &mut usize, len: usize) -> Option<()> {
     *total = total.checked_add(std::mem::size_of::<u64>())?;
     *total = total.checked_add(len)?;
@@ -2280,17 +2282,18 @@ pub(super) mod tests {
         );
     }
 
-    /// **The de-duplication ring is bounded by the provider, and running out of
-    /// funding costs nothing but de-duplication.**
+    /// **The de-duplication ring is bounded by the provider, and unfunded
+    /// duplicate-sensitive traffic fails closed.**
     ///
     /// The bound is not a constant in this module, so the control cannot assert
     /// one: what it asserts is the two properties a constant was standing in for.
-    /// The ring stops well short of the number of distinct values pushed through
-    /// it, and every one of those values still reaches the engine — an unfunded
-    /// key means a later duplicate is delivered twice, never that traffic is
-    /// refused and never that a withdrawal counts for more.
+    /// The ring stops well short of the number of distinct values offered to it.
+    /// When pressure prevents either the exact key claim or the mailbox claim,
+    /// the typed `Unavailable` or `Refused` result fails closed and the next
+    /// copy can retry after pressure clears. No duplicate-sensitive value
+    /// proceeds untracked, and a postclaim refusal rolls back exact custody.
     #[test]
-    fn the_dedup_ring_is_bounded_by_its_funding_and_never_by_refusing_traffic() {
+    fn the_dedup_ring_is_provider_bounded_and_unfunded_traffic_refuses() {
         const PUSHED: usize = 512;
         const RESIDUALS: u64 = 32;
 
@@ -2302,23 +2305,32 @@ pub(super) mod tests {
         });
         let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
 
-        let mut delivered = 0usize;
+        let mut accepted = 0usize;
+        let mut unavailable = 0usize;
+        let mut refused = 0usize;
+        let mut retained_deliveries = Vec::new();
         for i in 0..PUSHED {
-            assert!(
-                relay.deliver(relay.directed("peer-a".into(), offer(&format!("sdp-{i}")))),
-                "pressure on an optional record must never look like a closed engine"
-            );
-            // Drained each time so the mailbox's own residual is released and the
-            // only lasting competition for it is the ring itself.
-            while rx.try_recv().is_some() {
-                delivered += 1;
+            match relay.admit(relay.directed("peer-a".into(), offer(&format!("sdp-{i}")))) {
+                Delivered::Accepted => {
+                    accepted += 1;
+                    // Retain each accepted value so its mailbox, key, and
+                    // lifecycle token custody remains live while pressure is
+                    // exercised. This makes the provider bound observable.
+                    retained_deliveries
+                        .push(rx.try_recv().expect("accepted value reaches the engine"));
+                }
+                Delivered::Unavailable => unavailable += 1,
+                Delivered::Refused => refused += 1,
+                other => panic!("distinct pressure offer had unexpected outcome: {other:?}"),
             }
         }
 
-        assert_eq!(
-            delivered, PUSHED,
-            "every distinct value reached the engine, funded ring or not"
+        assert!(accepted > 0, "the control admitted some funded values");
+        assert!(
+            unavailable + refused > 0,
+            "the control exercised typed provider or mailbox pressure"
         );
+        assert_eq!(accepted + unavailable + refused, PUSHED);
         let retained = runtime.seen.lock().len();
         assert!(
             retained <= usize::try_from(RESIDUALS).expect("small"),
@@ -2328,16 +2340,32 @@ pub(super) mod tests {
             retained < PUSHED,
             "the ring grew with the traffic instead of with its funding: {retained}"
         );
+
+        drop(retained_deliveries);
+        // Dropping the last accepted owner releases its exact leases. A fresh
+        // admission performs the weak-entry prune and proves that old offers
+        // no longer occupy the remembered set before the retry is retained.
+        assert_eq!(
+            relay.admit(relay.directed("peer-a".into(), offer_with_id("cleanup", "sdp-cleanup"),)),
+            Delivered::Accepted,
+            "funding returns after accepted custody is released"
+        );
+        drop(rx.try_recv().expect("cleanup retry reaches the engine"));
+        assert!(
+            !runtime.remembers_attempt_for_test("offer-1"),
+            "released accepted offers no longer retain exact key custody"
+        );
     }
 
     /// **An offer the engine refused leaves no de-duplication history, and the
     /// identical retransmission lands.**
     ///
-    /// The exact failure the commit-after-accept ordering exists for. Remembering
-    /// a key before the send would make this the worst possible outcome: the
-    /// engine never receives the offer, and the retransmission that was supposed
-    /// to rescue the connection is discarded as a duplicate of something that was
-    /// never delivered — a permanently wedged attempt from one moment of local
+    /// The exact failure the preclaim-and-remove ordering exists for. A key is
+    /// installed before the send so concurrent copies are serialized, but a
+    /// refusal removes that key before returning. The engine therefore never
+    /// receives an unfunded offer, and its retransmission can rescue the
+    /// connection instead of being discarded as a duplicate of something that
+    /// never arrived — a permanently wedged attempt from one moment of local
     /// pressure.
     ///
     /// The refusal is produced by taking the funding away rather than by sizing a

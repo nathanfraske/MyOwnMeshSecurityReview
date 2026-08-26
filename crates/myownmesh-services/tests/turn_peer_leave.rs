@@ -9,7 +9,9 @@ use myownmesh_core::config::{
     NetworkConfig, SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer,
     TurnServiceConfig,
 };
-use myownmesh_core::engine::{attach_local, depart_for_lab, spawn_network};
+use myownmesh_core::engine::{
+    attach_local, depart_for_lab, join_open_participation, spawn_network,
+};
 use myownmesh_core::events::{DropReason, MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -218,9 +220,15 @@ async fn authenticated_depart_observed_over_actual_turn() {
     )
     .await
     .expect("alice engine starts");
+    join_open_participation(&alice)
+        .await
+        .expect("Alice joins Open participation");
     let (bob, bob_driver) = spawn_network(config("bob", turn_url), bob_id.clone(), transport)
         .await
         .expect("bob engine starts");
+    join_open_participation(&bob)
+        .await
+        .expect("Bob joins Open participation");
     let mut alice_events = alice.events_tx.subscribe();
     let mut bob_events = bob.events_tx.subscribe();
     let broker = LocalBroker::new();

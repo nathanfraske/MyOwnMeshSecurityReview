@@ -151,23 +151,64 @@ pub trait CarrierCommit: Send + Sync {
     fn refused(&self);
 }
 
+enum CarrierCommitState {
+    Pending(Box<dyn CarrierCommit>),
+    Accepted,
+    Refused,
+}
+
+struct CarrierCommitInner {
+    state: std::sync::Mutex<CarrierCommitState>,
+}
+
+fn refuse_pending(state: &mut CarrierCommitState) {
+    let callback = match std::mem::replace(state, CarrierCommitState::Refused) {
+        CarrierCommitState::Pending(callback) => Some(callback),
+        CarrierCommitState::Accepted | CarrierCommitState::Refused => None,
+    };
+    if let Some(callback) = callback {
+        callback.refused();
+    }
+}
+
+impl Drop for CarrierCommitInner {
+    fn drop(&mut self) {
+        let state = match self.state.get_mut() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        refuse_pending(state);
+    }
+}
+
 #[derive(Clone)]
 pub struct CarrierCommitUnit {
-    hook: std::sync::Arc<std::sync::Mutex<Option<Box<dyn CarrierCommit>>>>,
+    inner: std::sync::Arc<CarrierCommitInner>,
 }
 
 impl CarrierCommitUnit {
     pub fn new(hook: impl CarrierCommit + 'static) -> Self {
         Self {
-            hook: std::sync::Arc::new(std::sync::Mutex::new(Some(Box::new(hook)))),
+            inner: std::sync::Arc::new(CarrierCommitInner {
+                state: std::sync::Mutex::new(CarrierCommitState::Pending(Box::new(hook))),
+            }),
         }
     }
 
     /// Mark the exact carrier copy accepted. Repeated calls are stale no-ops.
     pub fn accept(&self) {
-        let hook = self.hook.lock().ok().and_then(|mut hook| hook.take());
-        if let Some(hook) = hook {
-            hook.accepted();
+        let callback = {
+            let mut state = match self.inner.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match std::mem::replace(&mut *state, CarrierCommitState::Accepted) {
+                CarrierCommitState::Pending(callback) => Some(callback),
+                CarrierCommitState::Accepted | CarrierCommitState::Refused => None,
+            }
+        };
+        if let Some(callback) = callback {
+            callback.accepted();
         }
     }
 
@@ -175,19 +216,6 @@ impl CarrierCommitUnit {
     /// a carrier-owned queue.
     pub fn clone_handle(&self) -> Self {
         self.clone()
-    }
-
-    fn refuse(&self) {
-        let hook = self.hook.lock().ok().and_then(|mut hook| hook.take());
-        if let Some(hook) = hook {
-            hook.refused();
-        }
-    }
-}
-
-impl Drop for CarrierCommitUnit {
-    fn drop(&mut self) {
-        self.refuse();
     }
 }
 
@@ -456,6 +484,102 @@ impl<T: Send> OutboundSource<T> for UnboundedSource<T> {
 
     async fn recv(&mut self) -> Option<OwnedSignal<T, ()>> {
         Some(OwnedSignal::new(self.rx.recv().await?, ()))
+    }
+}
+
+#[cfg(test)]
+mod carrier_commit_tests {
+    use super::{CarrierCommit, CarrierCommitUnit, OwnedSignal};
+    use std::sync::{Arc, Mutex};
+
+    struct Counts {
+        accepted: Arc<Mutex<usize>>,
+        refused: Arc<Mutex<usize>>,
+    }
+
+    impl CarrierCommit for Counts {
+        fn accepted(&self) {
+            *self.accepted.lock().expect("accepted counter") += 1;
+        }
+
+        fn refused(&self) {
+            *self.refused.lock().expect("refused counter") += 1;
+        }
+    }
+
+    fn unit() -> (CarrierCommitUnit, Arc<Mutex<usize>>, Arc<Mutex<usize>>) {
+        let accepted = Arc::new(Mutex::new(0));
+        let refused = Arc::new(Mutex::new(0));
+        let commit = CarrierCommitUnit::new(Counts {
+            accepted: Arc::clone(&accepted),
+            refused: Arc::clone(&refused),
+        });
+        (commit, accepted, refused)
+    }
+
+    #[test]
+    fn cloned_handles_do_not_refuse_until_the_final_handle_drops() {
+        let (commit, accepted, refused) = unit();
+        let queued = commit.clone_handle();
+        drop(commit);
+        assert_eq!(*refused.lock().expect("refused counter"), 0);
+        queued.accept();
+        drop(queued);
+        assert_eq!(*accepted.lock().expect("accepted counter"), 1);
+        assert_eq!(*refused.lock().expect("refused counter"), 0);
+    }
+
+    #[test]
+    fn final_uncommitted_handle_refuses_once() {
+        let (commit, accepted, refused) = unit();
+        let queued = commit.clone_handle();
+        drop(commit);
+        drop(queued);
+        assert_eq!(*accepted.lock().expect("accepted counter"), 0);
+        assert_eq!(*refused.lock().expect("refused counter"), 1);
+    }
+
+    #[test]
+    fn concurrent_handle_drops_refuse_on_final_inner_release() {
+        let (commit, accepted, refused) = unit();
+        let queued = commit.clone_handle();
+        // Pin the inner allocation while both visible carrier handles drop.
+        // This makes the old strong-count check deterministic: each handle
+        // sees another strong reference and skips refusal, while the final
+        // inner destruction below must settle it exactly once.
+        let inner_pin = Arc::clone(&commit.inner);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let commit_barrier = Arc::clone(&barrier);
+        let queued_barrier = Arc::clone(&barrier);
+        let commit_thread = std::thread::spawn(move || {
+            commit_barrier.wait();
+            drop(commit);
+        });
+        let queued_thread = std::thread::spawn(move || {
+            queued_barrier.wait();
+            drop(queued);
+        });
+        barrier.wait();
+        commit_thread.join().expect("first carrier handle drops");
+        queued_thread.join().expect("second carrier handle drops");
+
+        assert_eq!(*accepted.lock().expect("accepted counter"), 0);
+        assert_eq!(*refused.lock().expect("refused counter"), 0);
+        drop(inner_pin);
+        assert_eq!(*refused.lock().expect("refused counter"), 1);
+    }
+
+    #[test]
+    fn owned_signal_queue_handle_keeps_commit_alive_during_consumption() {
+        let (commit, accepted, refused) = unit();
+        let signal = OwnedSignal::with_commit((), (), commit);
+        let queued = signal.commit_unit().expect("queue completion handle");
+        drop(signal);
+        assert_eq!(*refused.lock().expect("refused counter"), 0);
+        queued.accept();
+        drop(queued);
+        assert_eq!(*accepted.lock().expect("accepted counter"), 1);
+        assert_eq!(*refused.lock().expect("refused counter"), 0);
     }
 }
 

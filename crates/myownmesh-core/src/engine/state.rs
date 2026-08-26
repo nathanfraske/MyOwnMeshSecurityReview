@@ -3,10 +3,60 @@
 //! engine; all per-peer state mutation is funneled through the
 //! command queue so the driver loop owns serial access.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-static NEXT_SIGNALING_EMISSION_ID: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
+struct SignalingEmissionAllocator {
+    next: AtomicU64,
+}
+
+impl SignalingEmissionAllocator {
+    const fn new(next: u64) -> Self {
+        Self {
+            next: AtomicU64::new(next),
+        }
+    }
+
+    fn next(&self) -> std::result::Result<u64, SignalingEmissionIdExhausted> {
+        let mut current = self.next.load(Ordering::Acquire);
+        loop {
+            if current == 0 {
+                return Err(SignalingEmissionIdExhausted);
+            }
+            let next = if current == u64::MAX { 0 } else { current + 1 };
+            match self.next.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+static NEXT_SIGNALING_EMISSION_ID: SignalingEmissionAllocator = SignalingEmissionAllocator::new(1);
+
+/// Allocate the current value and advance to a permanent zero sentinel.
+///
+/// `MAX` is a valid final identity.  The following call observes zero and
+/// refuses, so an exhausted counter cannot wrap into an identity that could
+/// alias a still-live fence.
+fn next_non_wrapping(counter: &AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            if value == 0 {
+                None
+            } else if value == u64::MAX {
+                Some(0)
+            } else {
+                Some(value + 1)
+            }
+        })
+        .ok()
+}
 
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
@@ -76,48 +126,35 @@ impl SignalingEmissionId {
     /// later call reports typed exhaustion rather than aliasing an earlier
     /// live emission.
     pub(crate) fn next() -> std::result::Result<Self, SignalingEmissionIdExhausted> {
-        use std::sync::atomic::Ordering;
-        let mut current = NEXT_SIGNALING_EMISSION_ID.load(Ordering::Relaxed);
-        loop {
-            if current == 0 {
-                return Err(SignalingEmissionIdExhausted);
-            }
-            let next = if current == u64::MAX { 0 } else { current + 1 };
-            match NEXT_SIGNALING_EMISSION_ID.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(Self(current)),
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_next_for_test(next: u64) {
-        NEXT_SIGNALING_EMISSION_ID.store(next, std::sync::atomic::Ordering::Relaxed);
+        NEXT_SIGNALING_EMISSION_ID.next().map(Self)
     }
 }
 
 #[cfg(test)]
 #[test]
 fn signaling_emission_id_exhaustion_is_typed_and_nonwrapping() {
-    SignalingEmissionId::set_next_for_test(u64::MAX);
+    let allocator = SignalingEmissionAllocator::new(u64::MAX);
     assert_eq!(
-        SignalingEmissionId::next(),
+        allocator.next().map(SignalingEmissionId),
         Ok(SignalingEmissionId(u64::MAX))
     );
     assert_eq!(
-        SignalingEmissionId::next(),
+        allocator.next().map(SignalingEmissionId),
         Err(SignalingEmissionIdExhausted)
     );
     assert_eq!(
-        SignalingEmissionId::next(),
+        allocator.next().map(SignalingEmissionId),
         Err(SignalingEmissionIdExhausted)
     );
-    SignalingEmissionId::set_next_for_test(1);
+}
+
+#[cfg(test)]
+#[test]
+fn checked_local_id_exhaustion_does_not_reuse_the_last_value() {
+    let counter = AtomicU64::new(u64::MAX);
+    assert_eq!(next_non_wrapping(&counter), Some(u64::MAX));
+    assert_eq!(next_non_wrapping(&counter), None);
+    assert_eq!(next_non_wrapping(&counter), None);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3096,13 +3133,7 @@ impl NetworkState {
 
     pub(crate) fn next_recovery_carrier_instance(&self) -> Option<RecoveryCarrierInstance> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        NEXT.fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |value| value.checked_add(1),
-        )
-        .ok()
-        .map(RecoveryCarrierInstance)
+        next_non_wrapping(&NEXT).map(RecoveryCarrierInstance)
     }
 
     /// Apply one provider outcome only to the exact captured generation.
@@ -4296,10 +4327,9 @@ impl NetworkState {
     /// on a Silent network. The returned future is bounded only by the
     /// caller's own timeout.
     pub async fn connect_peer_wait(&self, device_id: &str, sticky: bool) -> Result<()> {
+        let id = next_non_wrapping(&self.next_connect_waiter)
+            .ok_or_else(|| Error::Network("connect waiter identity exhausted".into()))?;
         let (reply, rx) = oneshot::channel();
-        let id = self
-            .next_connect_waiter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.cmd_tx
             .send(NetworkCmd::ConnectPeer {

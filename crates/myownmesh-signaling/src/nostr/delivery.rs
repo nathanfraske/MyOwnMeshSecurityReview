@@ -507,27 +507,31 @@ impl AdmissionSource {
     /// CAS sequence never wraps or reuses an identity; exhaustion is a typed
     /// absence rather than an ABA-prone wrapped value.
     pub fn try_fresh() -> Option<Self> {
-        let mut current = NEXT_ADMISSION_SOURCE.load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            let (source, next) = Self::checked_value(current)?;
-            match NEXT_ADMISSION_SOURCE.compare_exchange_weak(
-                current,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(source),
-                Err(observed) => current = observed,
-            }
-        }
+        try_fresh_from(&NEXT_ADMISSION_SOURCE)
     }
 
-    /// Mint a process-local source for an exact emission. The value is never
-    /// serialized and carries no authority beyond this process. If the
-    /// finite checked identity space is exhausted, fail closed rather than
-    /// return a wrapped identity that could settle a prior admission.
+    /// Compatibility constructor for test/control callers that need a value
+    /// directly. Exhaustion is represented by the non-live sentinel rather
+    /// than a process-wide panic; admission code must use [`Self::try_fresh`]
+    /// when it requires a live source.
     pub fn fresh() -> Self {
-        Self::try_fresh().expect("AdmissionSource identity space exhausted")
+        Self::try_fresh().unwrap_or(Self::Unavailable)
+    }
+}
+
+fn try_fresh_from(counter: &AtomicU64) -> Option<AdmissionSource> {
+    let mut current = counter.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        let (source, next) = AdmissionSource::checked_value(current)?;
+        match counter.compare_exchange_weak(
+            current,
+            next,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(source),
+            Err(observed) => current = observed,
+        }
     }
 }
 
@@ -1973,6 +1977,18 @@ mod tests {
             .expect("the final nonzero identity is still usable");
         assert_eq!(exhausted, 0, "zero is the permanent exhausted sentinel");
         assert!(AdmissionSource::checked_value(0).is_none());
+        assert_ne!(AdmissionSource::fresh(), AdmissionSource::fresh());
+    }
+
+    #[test]
+    fn local_admission_source_exhaustion_is_typed_without_rewinding_global_state() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert_eq!(
+            try_fresh_from(&counter),
+            Some(AdmissionSource::Live(NonZeroU64::new(u64::MAX).unwrap()))
+        );
+        assert_eq!(try_fresh_from(&counter), None);
+        assert_eq!(try_fresh_from(&counter), None);
         assert_ne!(AdmissionSource::fresh(), AdmissionSource::fresh());
     }
 

@@ -6970,24 +6970,23 @@ pub(crate) async fn send_to_peer(
 /// Send the one semantic fact permitted while an exact peer is awaiting
 /// approval.  This is deliberately separate from [`send_to_peer_owner`]: a
 /// pending peer has no promoted application capability, but an authenticated
-/// endpoint may still receive its owner's exact-context `OpenParticipation`
-/// fact.  The registry admission binds installation, worker, endpoint-auth
+/// endpoint may still receive its owner's exact-context Open participation
+/// proof. The registry admission binds installation, worker, endpoint-auth
 /// task, context and bounded accounting before this function awaits; no device
 /// re-resolution or legacy fallback is possible.
 pub(super) async fn send_pending_open_participation(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
-    fact: &crate::semantic::SignedFact,
+    facts: &[crate::semantic::SignedFact],
 ) -> Result<()> {
-    if !matches!(
-        &fact.content.body,
-        crate::semantic::FactBody::OpenParticipation { .. }
-    ) {
+    if facts.is_empty() {
         return Err(Error::Network(
-            "pending semantic send requires OpenParticipation fact".into(),
+            "pending semantic send requires a non-empty proof bundle".into(),
         ));
     }
-    let message = MeshMessage::Fact(fact.clone());
+    let message = MeshMessage::FactBundle(crate::protocol::FactBundleMessage {
+        facts: facts.to_vec(),
+    });
     let bytes = Bytes::from(serde_json::to_vec(&message).map_err(Error::Serde)?);
     let mesh_context = state.mesh_context_id().to_string();
     let operation = state

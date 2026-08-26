@@ -8,7 +8,7 @@ use myownmesh_core::config::{
     TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
@@ -295,6 +295,9 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Alice engine starts");
+    join_open_participation(&alice)
+        .await
+        .expect("Alice joins Open participation");
     let (bob, bob_driver) = spawn_network(
         network_config("bob", turn_url.clone(), true),
         Arc::clone(&bob_id),
@@ -302,6 +305,9 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Bob engine starts");
+    join_open_participation(&bob)
+        .await
+        .expect("Bob joins Open participation");
 
     let mut alice_events = alice.events_tx.subscribe();
     let mut bob_events = bob.events_tx.subscribe();
@@ -400,6 +406,9 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Carol engine starts");
+    join_open_participation(&carol)
+        .await
+        .expect("Carol joins Open participation");
     let (dave, dave_driver) = spawn_network(
         network_config("dave", turn_url, false),
         Arc::clone(&dave_id),
@@ -407,6 +416,9 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Dave engine starts");
+    join_open_participation(&dave)
+        .await
+        .expect("Dave joins Open participation");
     let mut carol_events = carol.events_tx.subscribe();
     let mut dave_events = dave.events_tx.subscribe();
     let negative_broker = LocalBroker::new();

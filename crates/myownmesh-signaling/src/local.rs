@@ -245,7 +245,8 @@ fn route_outbound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OwnedSignal;
+    use crate::{CarrierCommit, OwnedSignal};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// An owner that records its own release — see the mDNS control of the same
     /// shape.
@@ -254,6 +255,21 @@ mod tests {
     impl Drop for ReleaseFlag {
         fn drop(&mut self) {
             self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct CommitCounts {
+        accepted: Arc<AtomicUsize>,
+        refused: Arc<AtomicUsize>,
+    }
+
+    impl CarrierCommit for CommitCounts {
+        fn accepted(&self) {
+            self.accepted.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn refused(&self) {
+            self.refused.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -344,6 +360,84 @@ mod tests {
         alice_task
             .await
             .expect("finite outbound source forwarder joined");
+    }
+
+    #[tokio::test]
+    async fn local_carrier_commits_after_route_admission() {
+        let broker = LocalBroker::new();
+        let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
+            Box::new(crate::UnboundedSource::new(bob_rx));
+        drop(broker.join_with_sink(
+            "commit-room",
+            "bob",
+            bob_outbound,
+            InboundSink::new_typed(|_| crate::InboundOutcome::Accepted),
+        ));
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let signal = OwnedSignal::with_commit(
+            LocalOutbound::DirectedToPeer {
+                to: "bob".to_string(),
+                msg: SignalingMessage::Announce {
+                    peer_id: "alice".to_string(),
+                },
+            },
+            ReleaseFlag(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            crate::CarrierCommitUnit::new(CommitCounts {
+                accepted: Arc::clone(&accepted),
+                refused: Arc::clone(&refused),
+            }),
+        );
+        let source: Box<dyn OutboundSource<LocalOutbound, Owner = ReleaseFlag>> =
+            Box::new(ScriptedSource(std::collections::VecDeque::from([signal])));
+        broker
+            .join_with_sink(
+                "commit-room",
+                "alice",
+                source,
+                InboundSink::new_typed(|_| crate::InboundOutcome::Accepted),
+            )
+            .await
+            .expect("local carrier forwarder joined");
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_carrier_refuses_when_route_has_no_live_destination() {
+        let broker = LocalBroker::new();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let signal = OwnedSignal::with_commit(
+            LocalOutbound::DirectedToPeer {
+                to: "absent".to_string(),
+                msg: SignalingMessage::Announce {
+                    peer_id: "alice".to_string(),
+                },
+            },
+            ReleaseFlag(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+            crate::CarrierCommitUnit::new(CommitCounts {
+                accepted: Arc::clone(&accepted),
+                refused: Arc::clone(&refused),
+            }),
+        );
+        let source: Box<dyn OutboundSource<LocalOutbound, Owner = ReleaseFlag>> =
+            Box::new(ScriptedSource(std::collections::VecDeque::from([signal])));
+        broker
+            .join_with_sink(
+                "empty-commit-room",
+                "alice",
+                source,
+                InboundSink::new_typed(|_| crate::InboundOutcome::Accepted),
+            )
+            .await
+            .expect("local carrier forwarder joined");
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+        assert_eq!(refused.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

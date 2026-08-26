@@ -437,13 +437,16 @@ fn recursive_resolution_selects_a_terminal_head() {
     let third = authored(
         &successor_base,
         &first_controller_key,
-        FactBody::RoleGrant {
-            target: subject.clone(),
-            role: Role::Member,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: vec![first.id, second.id],
+            selected_head: first.id,
         },
         Vec::new(),
     );
-    graph.admit(third).expect("independent successor admits");
+    graph
+        .admit(third)
+        .expect("independent successor carries an explicit signer selection");
     let mut nested_heads = graph.cell_heads(&cell);
     nested_heads.sort();
     let nested_resolution = authored(

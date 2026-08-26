@@ -8,8 +8,8 @@ use ed25519_dalek::SigningKey;
 
 use myownmesh_core::protocol::FactBundleMessage;
 use myownmesh_core::semantic::{
-    Admission, AttestationDecision, DeviceId, FactBody, FactContent, FactDomain, FactGraph, FactId,
-    Role, SemanticError, SignedFact, VerifiedBootstrap,
+    Admission, AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactDomain,
+    FactGraph, FactId, Role, SemanticError, SignedFact, VerifiedBootstrap,
 };
 
 fn key(seed: u8) -> SigningKey {
@@ -52,6 +52,31 @@ fn authored(
         key,
     )
     .expect("authoring witness fact signs")
+}
+
+fn fact_with_authority_predecessors(
+    bootstrap: &VerifiedBootstrap,
+    key: &SigningKey,
+    body: FactBody,
+    parents: Vec<FactId>,
+    overrides: &[(DeviceId, Vec<FactId>)],
+) -> SignedFact {
+    let mut content = FactContent::new(
+        body.domain(),
+        bootstrap.context_id(),
+        body,
+        author(key),
+        parents,
+    );
+    for authority_use in &mut content.authority_uses {
+        if let Some((_, predecessors)) = overrides
+            .iter()
+            .find(|(subject, _)| subject == &authority_use.subject)
+        {
+            authority_use.predecessors = predecessors.clone();
+        }
+    }
+    SignedFact::sign(content, key).expect("authority lineage fixture fact signs")
 }
 
 #[test]
@@ -178,7 +203,7 @@ fn ready_invalid_fact_does_not_starve_valid_sibling_in_either_arrival_order() {
         },
         vec![genesis.id],
     );
-    let good = fact(
+    let good = fact_with_authority_predecessors(
         &bootstrap,
         &root_key,
         FactBody::RoleGrant {
@@ -186,6 +211,10 @@ fn ready_invalid_fact_does_not_starve_valid_sibling_in_either_arrival_order() {
             role: Role::Member,
         },
         vec![genesis.id],
+        &[
+            (author(&root_key), vec![genesis.id]),
+            (good_target.clone(), vec![]),
+        ],
     );
 
     for reverse_order in [false, true] {
@@ -448,15 +477,15 @@ fn open_resolution_is_recursive_and_foreign_resolution_fails_closed() {
         .expect("left participation admits");
     let mut heads = graph.cell_heads(&cell);
     heads.sort();
-    let first_resolution = fact(
-        &bootstrap,
+    let first_resolution = authored(
+        &graph,
         &participant_key,
         FactBody::Resolution {
             cell: cell.clone(),
             cited_heads: heads.clone(),
             selected_head: joined.id,
         },
-        heads,
+        Vec::new(),
     );
     graph
         .admit(first_resolution.clone())
@@ -490,15 +519,15 @@ fn open_resolution_is_recursive_and_foreign_resolution_fails_closed() {
         Err(SemanticError::InvalidOpenAuthor)
     );
 
-    let nested_resolution = fact(
-        &bootstrap,
+    let nested_resolution = authored(
+        &graph,
         &participant_key,
         FactBody::Resolution {
             cell: cell.clone(),
             cited_heads: current_heads.clone(),
             selected_head: first_resolution.id,
         },
-        current_heads,
+        Vec::new(),
     );
     graph
         .admit(nested_resolution)
@@ -790,6 +819,171 @@ fn signed_authority_use_omission_is_rejected_when_the_candidate_cites_a_predeces
         Err(SemanticError::UnauthorizedRoleGrant),
         "the candidate must carry the exact signed authority predecessor"
     );
+
+    let mut supersets_content = honest.content.clone();
+    supersets_content
+        .authority_uses
+        .iter_mut()
+        .find(|use_| use_.subject == target)
+        .expect("target AuthorityUse is present")
+        .predecessors = vec![grant.id];
+    let supersets = SignedFact::sign(supersets_content, &controller_key)
+        .expect("superset content remains internally signed");
+    assert_eq!(
+        graph.admit(supersets),
+        Err(SemanticError::UnauthorizedRoleGrant),
+        "an authority predecessor superset cannot smuggle unrelated lineage"
+    );
+}
+
+#[test]
+fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() {
+    let root_key = key(77);
+    let controller_key = key(78);
+    let bootstrap = closed_bootstrap(77, 77);
+    let controller = author(&controller_key);
+    let target = author(&key(79));
+    let later_target = author(&key(80));
+
+    let mut seeded = FactGraph::from_bootstrap(&bootstrap);
+    let grant_controller = authored(
+        &seeded,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    seeded
+        .admit(grant_controller.clone())
+        .expect("the controller grant admits");
+
+    let operation = authored(
+        &seeded,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &seeded,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+
+    let mut forward = seeded.clone();
+    forward
+        .admit(operation.clone())
+        .expect("the controller branch admits");
+    forward
+        .admit(revoke.clone())
+        .expect("the root revoke branch admits");
+    let mut reverse = seeded;
+    reverse
+        .admit(revoke.clone())
+        .expect("the root revoke branch admits first");
+    reverse
+        .admit(operation.clone())
+        .expect("the controller branch admits second");
+
+    assert_eq!(
+        forward.authority_use_heads(&controller),
+        reverse.authority_use_heads(&controller),
+        "the concurrent AuthorityUse(C) fork is independent of arrival order"
+    );
+    assert_eq!(
+        forward.evaluator().effective_role(&target),
+        None,
+        "an unresolved AuthorityUse fork cannot authorize the controller branch"
+    );
+    assert_eq!(forward.projection(), reverse.projection());
+
+    let later = fact(
+        &bootstrap,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: later_target.clone(),
+            role: Role::Member,
+        },
+        vec![operation.id, revoke.id],
+    );
+    assert_eq!(
+        forward.admit(later),
+        Err(SemanticError::UnauthorizedRoleGrant),
+        "an ordinary later fact cannot resolve or revive the fork"
+    );
+
+    let mut malformed = FactContent::new(
+        FactDomain::Governance,
+        bootstrap.context_id(),
+        FactBody::RoleGrant {
+            target: later_target,
+            role: Role::Member,
+        },
+        controller.clone(),
+        vec![operation.id, revoke.id],
+    );
+    malformed
+        .authority_uses
+        .iter_mut()
+        .find(|use_| use_.subject == controller)
+        .expect("the direct candidate carries AuthorityUse(C)")
+        .predecessors = vec![operation.id];
+    let malformed = SignedFact::sign(malformed, &controller_key)
+        .expect("the malicious candidate remains internally signed");
+    assert_eq!(
+        reverse.admit(malformed),
+        Err(SemanticError::UnauthorizedRoleGrant),
+        "direct FactContent construction cannot omit the competing predecessor"
+    );
+
+    let make_selection = |graph: &FactGraph, selected_head| {
+        authored(
+            graph,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(controller.clone()),
+                cited_heads: vec![operation.id, revoke.id],
+                selected_head,
+            },
+            Vec::new(),
+        )
+    };
+    let selection_operation = make_selection(&forward, operation.id);
+    let selection_operation_reverse = make_selection(&reverse, operation.id);
+    assert_eq!(
+        selection_operation.id, selection_operation_reverse.id,
+        "typed AuthorityUse selection has one identity in either arrival order"
+    );
+    forward
+        .admit(selection_operation)
+        .expect("the typed selection of the controller branch admits");
+    assert_eq!(
+        forward.evaluator().effective_role(&target),
+        Some(Role::Member),
+        "the selected AuthorityUse branch is effective"
+    );
+
+    let selection_revoke = make_selection(&reverse, revoke.id);
+    reverse
+        .admit(selection_revoke)
+        .expect("the typed selection of the revoke branch admits");
+    assert_eq!(
+        reverse.evaluator().effective_role(&target),
+        None,
+        "the unselected controller branch remains permanently ineffective"
+    );
+    assert_eq!(
+        reverse.authority_use_heads(&controller).len(),
+        1,
+        "the explicit selection replaces, rather than preserves, the fork head set"
+    );
 }
 
 #[test]
@@ -815,8 +1009,8 @@ fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
     graph
         .admit(controller_grant)
         .expect("root controller grant admits");
-    let member_grant = fact(
-        &bootstrap,
+    let member_grant = authored(
+        &graph,
         &root_key,
         FactBody::RoleGrant {
             target: member.clone(),

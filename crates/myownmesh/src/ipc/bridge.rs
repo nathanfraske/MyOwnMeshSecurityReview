@@ -923,6 +923,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("MYOWNMESH_HOME", tmp.path());
         std::mem::forget(tmp); // leak — test scope only
+                               // This is intentionally an unjoined Open state: the control is
+                               // entirely local and exercises no peer promotion or carrier path.
         let (state, driver) = spawn_network(
             fresh_network("solo", wire_id),
             Arc::new(Identity::ephemeral()),

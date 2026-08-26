@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::rpc::Rpc;
 use myownmesh_core::transport::Transport;
@@ -51,9 +51,15 @@ async fn main() {
     let (server_net, _sd) = spawn_network(cfg("server"), server_id.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&server_net)
+        .await
+        .expect("server joins Open participation");
     let (client_net, _cd) = spawn_network(cfg("client"), client_id.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&client_net)
+        .await
+        .expect("client joins Open participation");
 
     let server_rpc = Rpc::attach(&server_net).expect("server RPC dispatcher");
     let client_rpc = Rpc::attach(&client_net).expect("client RPC dispatcher");

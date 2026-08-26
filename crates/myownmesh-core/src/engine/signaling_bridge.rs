@@ -2595,6 +2595,208 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "native connector fixture; exercises the recovery carrier commit boundary"]
+    async fn recovery_receipt_commits_only_at_the_exact_carrier_boundary() {
+        let (state, _signaling_in_rx, cmd_rx, _provider, _grant) =
+            super::super::build_test_state_parts_metered("recovery-carrier-commit", None, 5, None);
+        state.park_command_receiver_for_test(cmd_rx);
+        let mut signaling_out_rx = state
+            .take_signaling_outbound_rx()
+            .expect("the control takes the engine outbound receiver");
+
+        let local_device =
+            crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+                .expect("the fixture local identity is canonical");
+        super::super::admit_canonical_test_fact(
+            &state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: local_device,
+                joined: true,
+            },
+        );
+
+        let remote_identities = [
+            crate::identity::Identity::ephemeral(),
+            crate::identity::Identity::ephemeral(),
+            crate::identity::Identity::ephemeral(),
+        ];
+        let remote_devices: Vec<_> = remote_identities
+            .iter()
+            .map(|identity| identity.public_id().to_string())
+            .collect();
+        for identity in &remote_identities {
+            let device = crate::semantic::DeviceId::from_canonical_str(identity.public_id())
+                .expect("the fixture remote identity is canonical");
+            let fact = crate::semantic::SignedFact::sign(
+                crate::semantic::FactContent::open_participation(
+                    state.mesh_context_id(),
+                    device,
+                    true,
+                    Vec::new(),
+                ),
+                identity.signing_key(),
+            )
+            .expect("the fixture remote participation fact signs");
+            state
+                .authoritative_fact_graph()
+                .write()
+                .admit(fact)
+                .expect("the fixture remote participation fact admits");
+        }
+
+        let mut fixtures = Vec::new();
+        for device in &remote_devices {
+            fixtures.push(super::super::insert_promoted_peer(&state, device).await);
+            let owner = state
+                .peers
+                .owner(device)
+                .expect("the exact recovery fixture exposes its owner");
+            assert!(
+                state
+                    .peers
+                    .with_admitted_current(
+                        &owner,
+                        state.session_broker.as_ref(),
+                        &state.mesh_context_id_string(),
+                        |_| (),
+                    )
+                    .is_some(),
+                "the exact recovery fixture crosses the canonical promotion fence"
+            );
+        }
+
+        // Prepare and remove all three answerers before publishing any demand.
+        let mut recoveries = Vec::new();
+        for (device, fixture) in remote_devices.iter().zip(fixtures.iter()) {
+            let worker = fixture
+                .peer
+                .current_worker()
+                .expect("the recovery fixture exposes its worker");
+            let owner = state
+                .peers
+                .owner(device)
+                .expect("the recovery fixture exposes its owner")
+                .for_worker(Arc::clone(&worker));
+            let recovery =
+                super::super::prepare_answerer_recovery(&state, &owner, &DropReason::IceFailed)
+                    .expect("the exact answerer demand arms before removal");
+            let (removed, opened_as) = super::super::remove_peer(&state.peers, device)
+                .expect("the exact answerer is removed before publication");
+            assert!(opened_as.is_some_and(|opened_as| !opened_as.is_offerer()));
+            assert!(Arc::ptr_eq(&removed, owner.connection()));
+            drop(removed);
+            recoveries.push(recovery);
+        }
+
+        let first_recovery = recoveries.remove(0);
+        super::super::publish_terminal_recovery(&state, Some(first_recovery))
+            .expect("the first exact terminal demand is retained");
+        let first_id = state
+            .queue_recovery_announce()
+            .expect("the first recovery cause is queued");
+        let first_announcement = signaling_out_rx
+            .recv()
+            .await
+            .expect("the first recovery envelope is observable");
+        assert!(matches!(
+            first_announcement.value(),
+            SignalingOutbound::RecoveryAnnounce { id } if *id == first_id
+        ));
+        drop(first_announcement);
+        let first_instance = state
+            .next_recovery_carrier_instance()
+            .expect("the first carrier instance is funded");
+        assert_eq!(
+            state.begin_recovery_for_carrier(first_id, first_instance),
+            Some(first_id),
+            "the source admits the exact queued generation"
+        );
+        let first_guard = CarrierInstanceGuard::for_state(&state, Some(first_instance));
+        assert!(first_guard.track_recovery(first_id));
+        let first_receipt = RecoveryReceipt::new(&state, first_id, first_instance, &first_guard);
+        let first_signal = OwnedSignal::with_commit((), (), CarrierCommitUnit::new(first_receipt));
+        // The translated value is not retained by a carrier. Its final
+        // completion handle therefore refuses the exact first generation,
+        // returning its cause to pending rather than manufacturing Accepted.
+        drop(first_signal);
+        assert_eq!(
+            state.recovery_custody_snapshot_for_test(),
+            (true, false, false, false),
+            "a dropped translated value refuses and returns the captured cause"
+        );
+
+        let second_recovery = recoveries.remove(0);
+        super::super::publish_terminal_recovery(&state, Some(second_recovery))
+            .expect("the second exact terminal demand is retained");
+        let second_id = state
+            .queue_recovery_announce()
+            .expect("the refused cause is captured in a fresh generation");
+        assert_ne!(second_id, first_id);
+        let second_announcement = signaling_out_rx
+            .recv()
+            .await
+            .expect("the second recovery envelope is observable");
+        assert!(matches!(
+            second_announcement.value(),
+            SignalingOutbound::RecoveryAnnounce { id } if *id == second_id
+        ));
+        drop(second_announcement);
+        let second_instance = state
+            .next_recovery_carrier_instance()
+            .expect("the second carrier instance is funded");
+        assert_eq!(
+            state.begin_recovery_for_carrier(second_id, second_instance),
+            Some(second_id)
+        );
+        let second_guard = CarrierInstanceGuard::for_state(&state, Some(second_instance));
+        assert!(second_guard.track_recovery(second_id));
+
+        // The remaining cause arrives after carrier retention and therefore
+        // must not be consumed by the captured second generation.
+        let later = recoveries
+            .pop()
+            .expect("the later cause remains available for the in-flight test");
+        super::super::publish_terminal_recovery(&state, Some(later))
+            .expect("the later exact terminal demand is retained");
+        assert_eq!(
+            state.recovery_custody_snapshot_for_test(),
+            (true, true, false, true),
+            "a later cause stays pending while the captured publication is in flight"
+        );
+        let second_receipt =
+            RecoveryReceipt::new(&state, second_id, second_instance, &second_guard);
+        let second_signal =
+            OwnedSignal::with_commit((), (), CarrierCommitUnit::new(second_receipt));
+        second_signal.accept();
+        second_signal.accept();
+        drop(second_signal);
+        assert_eq!(
+            state.recovery_custody_snapshot_for_test(),
+            (true, false, false, false),
+            "one exact carrier acceptance consumes only the captured cohort"
+        );
+        let third_id = state
+            .queue_recovery_announce()
+            .expect("the later cause forms the next generation");
+        assert_ne!(third_id, second_id);
+        let third_announcement = signaling_out_rx
+            .recv()
+            .await
+            .expect("the later generation envelope is observable");
+        assert!(matches!(
+            third_announcement.value(),
+            SignalingOutbound::RecoveryAnnounce { id } if *id == third_id
+        ));
+        drop(third_announcement);
+
+        state.cancel_all_recovery_demands();
+        drop(first_guard);
+        drop(second_guard);
+        state.shutdown().await;
+        drop(fixtures);
+    }
+
     #[test]
     fn same_attempt_event_ids_settle_out_of_order() {
         let state = crate::engine::build_test_state("emission-events");

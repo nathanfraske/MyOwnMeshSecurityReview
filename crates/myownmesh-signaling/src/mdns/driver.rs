@@ -176,7 +176,9 @@ where
         peers: Mutex::new(HashMap::new()),
         key_to_peer: Mutex::new(HashMap::new()),
         conns: Mutex::new(HashMap::new()),
-        conn_gen: AtomicU64::new(0),
+        // Zero is the permanent exhausted sentinel; live connections start
+        // at the first nonzero generation so the first adoption is usable.
+        conn_gen: AtomicU64::new(1),
         inbound_tx,
     });
 
@@ -283,6 +285,23 @@ struct PeerEntry {
 struct ConnHandle {
     generation: u64,
     tx: mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>>,
+}
+
+fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
+    // MAX is the final valid generation.  Advance to zero only after handing
+    // it out; zero is the permanent exhausted sentinel and is never reused
+    // for a later connection fence.
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            if value == 0 {
+                None
+            } else if value == u64::MAX {
+                Some(0)
+            } else {
+                Some(value + 1)
+            }
+        })
+        .ok()
 }
 
 async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<DiscoveryEvent>) {
@@ -481,7 +500,10 @@ async fn send_directed(
         .collect();
     match futures::future::select_ok(attempts).await {
         Ok((stream, _rest)) => {
-            let tx = adopt_stream(shared, stream, Some(to));
+            let Some(tx) = adopt_stream(shared, stream, Some(to.clone())) else {
+                debug!(peer = %&to[..to.len().min(16)], "mdns connection identity space exhausted");
+                return false;
+            };
             match tx.send(line) {
                 Ok(()) => {
                     if let Some(commit) = &commit {
@@ -511,10 +533,10 @@ fn adopt_stream(
     shared: &Arc<Shared>,
     stream: TcpStream,
     known_peer: Option<String>,
-) -> mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>> {
+) -> Option<mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>>> {
+    let generation = next_connection_generation(&shared.conn_gen)?;
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::unbounded_channel::<OwnedSignal<String, ErasedOwner>>();
-    let generation = shared.conn_gen.fetch_add(1, Ordering::SeqCst);
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
     let registered_as = Arc::new(Mutex::new(None::<String>));
@@ -580,7 +602,7 @@ fn adopt_stream(
         });
     }
 
-    tx
+    Some(tx)
 }
 
 /// Drain the queue onto the socket.
@@ -623,7 +645,9 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
     loop {
         match listener.accept().await {
             Ok((stream, _remote)) => {
-                let _ = adopt_stream(&shared, stream, None);
+                if adopt_stream(&shared, stream, None).is_none() {
+                    debug!("mdns accepted connection identity space exhausted");
+                }
             }
             Err(e) => {
                 debug!("mdns accept error: {e}");
@@ -805,5 +829,17 @@ mod tests {
             "a torn-down connection releases the owners of the lines it never \
              managed to write"
         );
+    }
+
+    #[test]
+    fn connection_generation_exhaustion_never_reuses_an_exact_fence() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(next_connection_generation(&counter), Some(1));
+        assert_eq!(next_connection_generation(&counter), Some(2));
+
+        let counter = AtomicU64::new(u64::MAX);
+        assert_eq!(next_connection_generation(&counter), Some(u64::MAX));
+        assert_eq!(next_connection_generation(&counter), None);
+        assert_eq!(next_connection_generation(&counter), None);
     }
 }

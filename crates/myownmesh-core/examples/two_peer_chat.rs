@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{Channel, MeshEvent, PeerEvent};
@@ -59,9 +59,15 @@ async fn main() {
     let (alice_net, _ad) = spawn_network(cfg("alice"), alice.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&alice_net)
+        .await
+        .expect("Alice joins Open participation");
     let (bob_net, _bd) = spawn_network(cfg("bob"), bob.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&bob_net)
+        .await
+        .expect("Bob joins Open participation");
 
     let mut alice_events = alice_net.events_tx.subscribe();
     let mut bob_events = bob_net.events_tx.subscribe();

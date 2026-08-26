@@ -183,12 +183,35 @@ impl FactGraph {
                 if !fact.content.parents.contains(head) {
                     return Err(SemanticError::IncompleteResolution);
                 }
-                if !super::verify::body_advances_cell(&causal.facts[head].content.body, cell) {
-                    return Err(SemanticError::IncompleteResolution);
-                }
             }
-            if causal.raw_cell_heads(cell) != cited {
-                return Err(SemanticError::ResolutionNotCurrent);
+            let authority_subject = Self::resolution_authority_subject(cell);
+            let authority_fork = authority_subject.is_some_and(|subject| {
+                cited == causal.raw_authority_use_heads(subject)
+                    && cited.iter().all(|head| {
+                        causal.facts[head]
+                            .content
+                            .authority_uses
+                            .iter()
+                            .any(|use_| use_.subject == *subject)
+                    })
+            });
+            // A typed AuthorityUse fork may span multiple ordinary cells;
+            // its exact current lineage is checked above rather than through
+            // the ordinary same-cell projection rule.
+            if !authority_fork {
+                for head in &cited {
+                    if !super::verify::body_advances_cell(&causal.facts[head].content.body, cell) {
+                        return Err(SemanticError::IncompleteResolution);
+                    }
+                }
+                if causal.raw_cell_heads(cell) != cited {
+                    return Err(SemanticError::ResolutionNotCurrent);
+                }
+            } else {
+                // A typed AuthorityUse fork may span multiple ordinary cells;
+                // its cited set is checked against the exact current lineage
+                // above, while the selected branch is applied by authority
+                // projection rather than by an ordinary cell projection.
             }
         }
         if let Some(error) = Self::authorization_error(&fact.content.body) {
@@ -246,7 +269,7 @@ impl FactGraph {
             | FactBody::Attestation { .. }
                 if open =>
             {
-                return Err(SemanticError::DomainMismatch)
+                return Err(SemanticError::DomainMismatch);
             }
             _ => {}
         }
@@ -329,11 +352,39 @@ impl FactGraph {
                 return Err(error);
             };
             let expected = self.raw_authority_use_heads(&subject);
-            if !expected.iter().all(|head| use_.predecessors.contains(head)) {
+            let mut actual = use_.predecessors.clone();
+            actual.sort();
+            actual.dedup();
+            if actual != expected
+                || (expected.len() > 1
+                    && !Self::resolution_selects_authority_heads(&fact.content.body, &subject))
+            {
                 return Err(error);
             }
         }
         Ok(())
+    }
+
+    fn resolution_selects_authority_heads(body: &FactBody, subject: &DeviceId) -> bool {
+        let FactBody::Resolution { cell, .. } = body else {
+            return false;
+        };
+        Self::resolution_authority_subject(cell) == Some(subject)
+    }
+
+    fn resolution_authority_subject(cell: &ExclusiveCell) -> Option<&DeviceId> {
+        match cell {
+            ExclusiveCell::Role {
+                subject: cell_subject,
+            }
+            | ExclusiveCell::Membership {
+                subject: cell_subject,
+            }
+            | ExclusiveCell::OpenParticipation {
+                subject: cell_subject,
+            } => Some(cell_subject),
+            ExclusiveCell::Decision { .. } => None,
+        }
     }
 
     fn validate_self_stand_down(
@@ -585,11 +636,8 @@ impl FactGraph {
             else {
                 return false;
             };
-            if !self
-                .authority_use_heads_from_parents(fact, &subject)
-                .iter()
-                .all(|head| use_.predecessors.contains(head))
-            {
+            let expected = self.authority_use_heads_from_parents(fact, &subject);
+            if use_.predecessors != expected {
                 return false;
             }
         }
@@ -602,14 +650,25 @@ impl FactGraph {
                 continue;
             };
             let FactBody::Resolution {
-                cell:
-                    ExclusiveCell::Role {
-                        subject: cell_subject,
-                    },
+                cell,
                 selected_head,
                 ..
             } = &resolution.content.body
             else {
+                continue;
+            };
+            let Some(cell_subject) = (match cell {
+                ExclusiveCell::Role {
+                    subject: cell_subject,
+                }
+                | ExclusiveCell::Membership {
+                    subject: cell_subject,
+                }
+                | ExclusiveCell::OpenParticipation {
+                    subject: cell_subject,
+                } => Some(cell_subject),
+                ExclusiveCell::Decision { .. } => None,
+            }) else {
                 continue;
             };
             if cell_subject != subject || fact.id == head {
@@ -1043,6 +1102,34 @@ mod tests {
         .expect("test fact signs")
     }
 
+    fn fact_with_authority_predecessors(
+        bootstrap: &VerifiedBootstrap,
+        signing_key: &SigningKey,
+        body: FactBody,
+        parents: Vec<FactId>,
+        overrides: &[(DeviceId, Vec<FactId>)],
+    ) -> SignedFact {
+        let mut content = super::super::FactContent::new(
+            body.domain(),
+            bootstrap.context_id(),
+            body,
+            device(signing_key),
+            parents,
+        );
+        for authority_use in &mut content.authority_uses {
+            if let Some((_, predecessors)) = overrides
+                .iter()
+                .find(|(subject, _)| subject == &authority_use.subject)
+            {
+                let mut predecessors = predecessors.clone();
+                predecessors.sort();
+                predecessors.dedup();
+                authority_use.predecessors = predecessors;
+            }
+        }
+        SignedFact::sign(content, signing_key).expect("authority lineage fact signs")
+    }
+
     #[test]
     fn root_owner_fallback_stops_after_root_cell_advances() {
         let (bootstrap, root_key) = closed(41);
@@ -1264,7 +1351,7 @@ mod tests {
         }
         let mut nested_heads = vec![nested_a.id, nested_b.id];
         nested_heads.sort();
-        let top = fact(
+        let top = fact_with_authority_predecessors(
             &bootstrap,
             &controller_key,
             FactBody::Resolution {
@@ -1273,6 +1360,10 @@ mod tests {
                 selected_head: nested_a.id,
             },
             vec![controller_grant.id, nested_a.id, nested_b.id],
+            &[
+                (controller.clone(), vec![controller_grant.id]),
+                (target.clone(), nested_heads.clone()),
+            ],
         );
         graph
             .admit(top)
@@ -1337,7 +1428,7 @@ mod tests {
         graph
             .admit(grant_controller.clone())
             .expect("the root grants the controller tier");
-        let controller_grant = fact(
+        let controller_grant = fact_with_authority_predecessors(
             &bootstrap,
             &controller_key,
             FactBody::RoleGrant {
@@ -1345,6 +1436,10 @@ mod tests {
                 role: Role::Controller,
             },
             vec![grant_controller.id],
+            &[
+                (controller.clone(), vec![grant_controller.id]),
+                (target.clone(), vec![]),
+            ],
         );
         graph
             .admit(controller_grant.clone())
@@ -1371,6 +1466,7 @@ mod tests {
     #[test]
     fn authorization_uses_candidate_causal_past_not_later_target_role() {
         let (bootstrap, root_key) = closed(51);
+        let root = device(&root_key);
         let controller_key = key(52);
         let controller = device(&controller_key);
         let target_key = key(53);
@@ -1384,7 +1480,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let grant_member = fact(
+        let grant_member = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
             FactBody::RoleGrant {
@@ -1392,6 +1488,10 @@ mod tests {
                 role: Role::Member,
             },
             vec![grant_controller.id],
+            &[
+                (root.clone(), vec![grant_controller.id]),
+                (target.clone(), vec![]),
+            ],
         );
         let later_owner = fact(
             &bootstrap,
@@ -1402,13 +1502,17 @@ mod tests {
             },
             vec![grant_member.id],
         );
-        let revoke = fact(
+        let revoke = fact_with_authority_predecessors(
             &bootstrap,
             &controller_key,
             FactBody::RoleRevoke {
                 target: target.clone(),
             },
             vec![grant_controller.id, grant_member.id],
+            &[
+                (controller.clone(), vec![grant_controller.id]),
+                (target.clone(), vec![grant_member.id]),
+            ],
         );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph
@@ -1442,7 +1546,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let left_grant = fact(
+        let left_grant = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
             FactBody::RoleGrant {
@@ -1450,8 +1554,12 @@ mod tests {
                 role: Role::Controller,
             },
             vec![controller_grant.id],
+            &[
+                (device(&root_key), vec![controller_grant.id]),
+                (device(&left_key), vec![]),
+            ],
         );
-        let right_grant = fact(
+        let right_grant = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
             FactBody::RoleGrant {
@@ -1459,8 +1567,12 @@ mod tests {
                 role: Role::Controller,
             },
             vec![left_grant.id],
+            &[
+                (device(&root_key), vec![left_grant.id]),
+                (device(&right_key), vec![]),
+            ],
         );
-        let member_head = fact(
+        let member_head = fact_with_authority_predecessors(
             &bootstrap,
             &left_key,
             FactBody::RoleGrant {
@@ -1468,8 +1580,12 @@ mod tests {
                 role: Role::Member,
             },
             vec![left_grant.id],
+            &[
+                (device(&left_key), vec![left_grant.id]),
+                (target.clone(), vec![]),
+            ],
         );
-        let controller_head = fact(
+        let controller_head = fact_with_authority_predecessors(
             &bootstrap,
             &right_key,
             FactBody::RoleGrant {
@@ -1477,16 +1593,24 @@ mod tests {
                 role: Role::Controller,
             },
             vec![right_grant.id],
+            &[
+                (device(&right_key), vec![right_grant.id]),
+                (target.clone(), vec![]),
+            ],
         );
-        let resolution = fact(
+        let resolution = fact_with_authority_predecessors(
             &bootstrap,
             &controller_key,
             FactBody::Resolution {
-                cell: ExclusiveCell::role(target),
+                cell: ExclusiveCell::role(target.clone()),
                 cited_heads: vec![member_head.id, controller_head.id],
                 selected_head: controller_head.id,
             },
             vec![controller_grant.id, member_head.id, controller_head.id],
+            &[
+                (controller.clone(), vec![controller_grant.id]),
+                (target.clone(), vec![member_head.id, controller_head.id]),
+            ],
         );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph
@@ -1689,7 +1813,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let attestation = fact(
+        let attestation = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
             FactBody::Attestation {
@@ -1700,6 +1824,7 @@ mod tests {
                 contributions: Vec::new(),
             },
             vec![proposal.id],
+            &[(device(&root_key), vec![proposal.id])],
         );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.admit(proposal.clone()).expect("proposal admits");
@@ -1753,7 +1878,7 @@ mod tests {
         open_graph
             .admit(left.clone())
             .expect("second participation admits");
-        let participation_resolution = fact(
+        let participation_resolution = fact_with_authority_predecessors(
             &open,
             &participant_key,
             FactBody::Resolution {
@@ -1762,6 +1887,7 @@ mod tests {
                 selected_head: participation.id,
             },
             vec![participation.id, left.id],
+            &[(participant.clone(), Vec::new())],
         );
         open_graph
             .admit(participation_resolution)

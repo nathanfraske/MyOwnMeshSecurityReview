@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -53,9 +53,15 @@ async fn main() {
     let (host_net, _hd) = spawn_network(cfg("host", false), host.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&host_net)
+        .await
+        .expect("host joins Open participation");
     let (guest_net, _gd) = spawn_network(cfg("guest", true), guest.clone(), transport.clone())
         .await
         .unwrap();
+    join_open_participation(&guest_net)
+        .await
+        .expect("guest joins Open participation");
 
     let mut host_events = host_net.events_tx.subscribe();
     attach_local(&host_net, &broker);

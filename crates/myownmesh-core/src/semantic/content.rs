@@ -235,9 +235,9 @@ pub enum FactBody {
     Evict {
         target: DeviceId,
     },
-    /// Owner-authored Closed membership restoration. Role authority remains
-    /// a separate role-cell fact and must be carried causally when both are
-    /// needed to restore session admission.
+    /// Controller-authorized Closed membership restoration. Role authority
+    /// remains a separate role-cell fact and must be carried causally when
+    /// both are needed to restore session admission.
     MembershipAdmit {
         target: DeviceId,
     },
