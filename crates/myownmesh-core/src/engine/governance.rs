@@ -192,6 +192,39 @@ fn current_open_participation_bundle(state: &Arc<EngineState>) -> Option<Vec<Sig
     ids.into_iter().map(|id| graph.get(&id).cloned()).collect()
 }
 
+/// Return the complete causal proof for the current closed-network eviction of
+/// `target`.  The inventory/request exchange can discover these identifiers,
+/// but an evicted reconnect is denied before it can become an ordinary active
+/// peer, so that first delivery must carry the proof itself.  Starting from
+/// both exclusive cells is intentional: an eviction advances role and
+/// membership together, while a later causal restoration can advance only one
+/// of them.
+fn current_eviction_proof_bundle(
+    state: &Arc<EngineState>,
+    target: &str,
+) -> Option<Vec<SignedFact>> {
+    let target = canonical_device(target).ok()?;
+    if !canonical_projection_snapshot(state)
+        .evicted
+        .contains(&pk(target.as_ref()))
+    {
+        return None;
+    }
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let mut pending = graph.cell_heads(&crate::semantic::ExclusiveCell::role(target.clone()));
+    pending.extend(graph.cell_heads(&crate::semantic::ExclusiveCell::membership(target)));
+    let mut ids = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !ids.insert(id) {
+            continue;
+        }
+        let fact = graph.get(&id)?;
+        pending.extend(crate::semantic::causal::dependencies(fact));
+    }
+    ids.into_iter().map(|id| graph.get(&id).cloned()).collect()
+}
+
 /// Compatibility hook retained for the handshake module. Participation is an
 /// explicit local lifecycle operation now; handshake promotion may only forward
 /// an already-admitted positive fact and must never author a join.
@@ -517,6 +550,28 @@ pub(super) async fn on_fact_request(
             peer = %route.owner().device_id(),
             %error,
             "fact bundle reply send failed"
+        );
+    }
+}
+
+/// A FactBundle acknowledgement is the receiver's exact current inventory on
+/// the same logical route that requested the bundle.  It is deliberately an
+/// inventory rather than a new authority fact: the sender learns which signed
+/// facts actually entered our graph and can request any remaining causal
+/// dependencies, while the route only selects where the coordination reply is
+/// sent.  This also works for a disconnected/offline proof source when the
+/// next exact session is established; no heartbeat or carrier observation is
+/// treated as acknowledgement.
+pub(super) async fn acknowledge_fact_bundle(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+) {
+    let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
+    if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            %error,
+            "fact bundle acknowledgement send failed"
         );
     }
 }
@@ -1626,9 +1681,10 @@ pub(crate) fn refresh_self_evicted(state: &Arc<EngineState>) {
 /// our signed state and deny it.
 /// and drop the session. Returns true when the peer was denied — the
 /// caller must stop the admission flow (no pending-approval, no
-/// auto-approve; those were exactly the resurrection engine). The proof
-/// costs nothing to trust: the denied device verifies it independently
-/// through strict-extension adoption, so a spoofed deny changes nothing.
+/// auto-approve; those were exactly the resurrection engine). The signed
+/// eviction closure is sent over the durable semantic lane before the denial,
+/// so the denied device can verify it independently through causal admission;
+/// a spoofed transport deny still changes nothing.
 pub(super) async fn deny_if_evicted(
     state: &Arc<EngineState>,
     owner: &super::peer_registry::PeerOwnerToken,
@@ -1646,6 +1702,28 @@ pub(super) async fn deny_if_evicted(
         ),
         serde_json::json!({ "peer": device_id, "reason": "evicted" }),
     );
+    // Deliver the signed eviction closure before ending this installation.
+    // Pending peers use the narrow semantic lane; an already-active test/lab
+    // installation uses the ordinary application lane. Both are owner-bound,
+    // provider-funded writes, and either refusal leaves the proof available for
+    // the next inventory/request exchange rather than changing the decision.
+    if let Some(bundle) = current_eviction_proof_bundle(state, device_id) {
+        let message = MeshMessage::FactBundle(crate::protocol::FactBundleMessage {
+            facts: bundle.clone(),
+        });
+        let proof_result = match super::send_pending_open_participation(state, owner, &bundle).await
+        {
+            Ok(()) => Ok(()),
+            Err(_) => super::send_to_peer_owner(state, owner, &message).await,
+        };
+        if let Err(error) = proof_result {
+            tracing::debug!(
+                peer = %device_id,
+                %error,
+                "eviction proof bundle delivery failed"
+            );
+        }
+    }
     let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
         reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
     });
@@ -2448,6 +2526,36 @@ mod governance_projection_controls {
         assert_eq!(evaluator.effective_membership(&root), Some(false));
         assert!(!evaluator.is_stood_down(&root));
         assert!(!state.is_rostered(&root.to_string()));
+    }
+
+    #[tokio::test]
+    async fn eviction_proof_bundle_contains_the_exact_causal_closure() {
+        let state = crate::engine::build_test_closed_state("eviction-proof-bundle", [10; 32]);
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let evict_id = propose(
+            &state,
+            TransitionVariant::Evict {
+                target: target.clone(),
+            },
+            None,
+        )
+        .await
+        .expect("the verified root can author an eviction");
+
+        let bundle = current_eviction_proof_bundle(&state, &target)
+            .expect("a current eviction has a deliverable proof closure");
+        let bundle_ids: BTreeSet<_> = bundle.iter().map(|fact| fact.id).collect();
+        assert!(bundle_ids.contains(&evict_id));
+        assert!(
+            bundle.iter().all(|fact| {
+                crate::semantic::causal::dependencies(fact)
+                    .into_iter()
+                    .all(|dependency| bundle_ids.contains(&dependency))
+            }),
+            "an offline proof bundle must carry every causal dependency"
+        );
     }
 }
 

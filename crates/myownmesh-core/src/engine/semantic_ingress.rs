@@ -297,6 +297,14 @@ pub(super) async fn reduce(
             for fact in m.facts {
                 reduce_signed_fact(state, fact).await;
             }
+            // The inventory is a durable exchange acknowledgement: it is the
+            // receiver's exact post-admission fact set, sent back through the
+            // same logical operation that delivered this bundle. A carrier,
+            // heartbeat, or session observation cannot acknowledge a signed
+            // proof, and a replacement cannot steal this reply route.
+            if let Some(route) = reply {
+                governance::acknowledge_fact_bundle(state, route).await;
+            }
         }
         // Comparisons and questions. These are the ones with somebody to answer.
         Exchange::Inventory(inventory) => {
