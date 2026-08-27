@@ -3218,15 +3218,13 @@ impl NetworkState {
                         node.resize_tombstone_lease();
                     }
                     node.terminal = Some(result);
-                    let owner = node.owner.clone();
-                    if result == CarrierEmissionRecord::Accepted {
-                        // Accepted is terminal for this exact carrier copy,
-                        // but other physical copies may still arrive late.
-                        // Keep only the compact funded node/attempt tombstone
-                        // until lifecycle settlement fences the aggregate.
-                        node.owner = None;
-                    }
-                    owner
+                    // Accepted is terminal for this exact carrier copy, but
+                    // other physical copies may still arrive late. Keep the
+                    // immutable lifecycle owner on the compact funded
+                    // node/attempt tombstone until displacement or lifecycle
+                    // settlement can fence the aggregate by exact installation
+                    // and binding.
+                    node.owner.clone()
                 })
         } else {
             if let Some(node) = attempts.find_emission_mut(emission, attempt) {

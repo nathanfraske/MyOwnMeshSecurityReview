@@ -21218,6 +21218,18 @@ mod tests {
             ),
             state::CarrierEmissionAdmission::Admitted
         ));
+        assert_eq!(
+            state
+                .record_carrier_emission_with_owner(
+                    predecessor_emission,
+                    "shared-r3-attempt",
+                    predecessor_instance,
+                    true,
+                )
+                .record,
+            state::CarrierEmissionRecord::Accepted,
+            "the predecessor is an accepted tombstone, not a pending-only control"
+        );
 
         let successor = Arc::new(PeerConnection::new(target.clone(), None));
         let displaced = state
