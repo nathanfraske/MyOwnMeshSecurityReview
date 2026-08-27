@@ -29,8 +29,8 @@ pub async fn run(cmd: ConfigCmd) -> Result<()> {
                 std::fs::create_dir_all(parent).ok();
             }
             if !path.exists() {
-                let cfg = myownmesh_core::MeshConfig::default();
-                cfg.save().context("write default config")?;
+                myownmesh_core::MeshConfig::transaction_at(&path, |_| Ok(()))
+                    .context("write default config")?;
             }
             let editor = std::env::var("EDITOR")
                 .or_else(|_| std::env::var("VISUAL"))
