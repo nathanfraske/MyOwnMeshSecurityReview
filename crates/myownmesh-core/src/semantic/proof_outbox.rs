@@ -278,13 +278,24 @@ impl DurableProofOutbox {
                 "proof owner and binding are required".into(),
             ));
         }
+        match self
+            .proof_records(context_id)?
+            .into_iter()
+            .find(|record| record.delivery_id == delivery_id)
+            .ok_or(ProofOutboxError::NotFound)?
+            .state
+        {
+            ProofRecordState::Pending => {}
+            ProofRecordState::Settled => return Err(ProofOutboxError::AlreadySettled),
+            ProofRecordState::Superseded => return Err(ProofOutboxError::AlreadySuperseded),
+        }
         let mut rebound = None;
         self.mutate_proof_records(context_id, |records| {
             let record = records
                 .iter_mut()
                 .find(|record| record.delivery_id == delivery_id)
                 .ok_or(DurableStoreError::ProofNotFound)?;
-            if record.state == ProofRecordState::Settled {
+            if record.state != ProofRecordState::Pending {
                 return Err(DurableStoreError::ProofSettled);
             }
             if record.owner != expected_owner || record.binding != expected_binding {
@@ -412,6 +423,8 @@ pub enum ProofOutboxError {
     NotFound,
     #[error("proof delivery is already settled")]
     AlreadySettled,
+    #[error("proof delivery is already superseded")]
+    AlreadySuperseded,
     #[error("proof delivery binding is stale")]
     StaleBinding,
     #[error("proof delivery target is stale")]
@@ -611,6 +624,29 @@ mod tests {
             .expect("pending after supersede")
             .iter()
             .any(|record| record.delivery_id == obsolete.delivery_id));
+        assert!(matches!(
+            outbox.rebind(
+                bootstrap.context_id(),
+                obsolete.delivery_id,
+                &obsolete.owner,
+                &obsolete.binding,
+                "stale-owner",
+                "stale-binding",
+            ),
+            Err(ProofOutboxError::AlreadySuperseded)
+        ));
+        let superseded_reopen = DurableProofOutbox::new(&root, "slot");
+        let superseded_records = superseded_reopen
+            .proof_records(bootstrap.context_id())
+            .expect("superseded tombstone reopen");
+        let mut expected_obsolete = obsolete.clone();
+        expected_obsolete.state = ProofRecordState::Superseded;
+        assert_eq!(
+            superseded_records
+                .iter()
+                .find(|persisted| persisted.delivery_id == obsolete.delivery_id),
+            Some(&expected_obsolete)
+        );
         store
             .commit(&graph, Vec::new())
             .expect("graph commit preserves proof");
