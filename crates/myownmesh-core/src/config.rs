@@ -5,7 +5,14 @@
 //! Schema versioning uses one exact hard-alpha `version` field. This build
 //! refuses any other version rather than migrating or guessing compatibility.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +26,133 @@ use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 pub use myownmesh_signaling::server::Limits as SignalingLimits;
 
 pub const CONFIG_VERSION: u32 = 2;
+
+static CONFIG_TRANSACTION_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn config_transaction_gate() -> &'static Mutex<()> {
+    CONFIG_TRANSACTION_GATE.get_or_init(|| Mutex::new(()))
+}
+
+/// The cross-process half of the config transaction fence.
+///
+/// Unix keeps the lock pathname after release and relies on `flock`'s inode
+/// ownership, while Windows uses a delete-on-close handle. Other platforms
+/// fail closed because a portable crash-release primitive is unavailable.
+struct ConfigFileLease {
+    #[cfg(unix)]
+    _file: std::fs::File,
+    #[cfg(windows)]
+    _file: std::fs::File,
+}
+
+impl ConfigFileLease {
+    fn acquire(path: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(path)
+                .map_err(|error| {
+                    Error::Config(format!(
+                        "open config transaction lock {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            const LOCK_EX: std::os::raw::c_int = 2;
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+                return Err(Error::Config(format!(
+                    "config transaction is busy: {}",
+                    path.display()
+                )));
+            }
+            return Ok(Self { _file: file });
+        }
+
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .share_mode(0)
+                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+                    .open(path)
+                {
+                    Ok(file) => return Ok(Self { _file: file }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if Instant::now() >= deadline {
+                            return Err(Error::Config(format!(
+                                "timed out waiting for config transaction: {}",
+                                path.display()
+                            )));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        return Err(Error::Config(format!(
+                            "open config transaction lock {}: {error}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(Error::Config(format!(
+                "config transactions are unsupported on this platform: {}",
+                path.display()
+            )))
+        }
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+/// One in-process and cross-process config transaction lease.
+struct ConfigTransactionLease {
+    _file: ConfigFileLease,
+    _process: MutexGuard<'static, ()>,
+}
+
+impl ConfigTransactionLease {
+    fn acquire(config_path: &Path) -> Result<Self> {
+        let process = config_transaction_gate()
+            .lock()
+            .map_err(|_| Error::Config("config transaction gate was poisoned".to_string()))?;
+        let parent = config_path.parent().ok_or_else(|| {
+            Error::Config(format!(
+                "config path has no parent: {}",
+                config_path.display()
+            ))
+        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| Error::Config(format!("create {}: {error}", parent.display())))?;
+        let name = config_path.file_name().ok_or_else(|| {
+            Error::Config(format!(
+                "config path has no file name: {}",
+                config_path.display()
+            ))
+        })?;
+        let mut lock_name = name.to_os_string();
+        lock_name.push(".lock");
+        let lock_path = config_path.with_file_name(lock_name);
+        let file = ConfigFileLease::acquire(&lock_path)?;
+        Ok(Self {
+            _file: file,
+            _process: process,
+        })
+    }
+}
 
 /// Topology selector for a single network. Wire-form matches the
 /// JSON-tagged shape; embedders construct these directly.
@@ -640,6 +774,39 @@ fn parse_or_quarantine(raw: &str, path: &std::path::Path) -> Result<MeshConfig> 
     }
 }
 
+fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Config(format!("read {}: {error}", path.display()))),
+    }
+}
+
+/// Read one config while the transaction lease is held, returning the exact
+/// bytes used as the commit CAS witness. A corrupt file may be quarantined by
+/// parsing; in that case the post-quarantine absence is the baseline.
+fn load_config_locked(path: &Path) -> Result<(MeshConfig, Option<Vec<u8>>)> {
+    let Some(bytes) = read_config_bytes(path)? else {
+        return Ok((MeshConfig::default(), None));
+    };
+    let raw = String::from_utf8(bytes.clone())
+        .map_err(|error| Error::Config(format!("read {}: {error}", path.display())))?;
+    let config = parse_or_quarantine(&raw, path)?;
+    let baseline = if path.exists() { Some(bytes) } else { None };
+    Ok((config, baseline))
+}
+
+fn save_config_locked(path: &Path, config: &MeshConfig) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Config(format!("config path has no parent: {}", path.display())))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| Error::Config(format!("create {}: {error}", parent.display())))?;
+    let serialized = serde_json::to_string_pretty(config)?;
+    crate::persist::write_atomic(path, serialized.as_bytes())
+        .map_err(|error| Error::Config(format!("write {}: {error}", path.display())))
+}
+
 /// Where a prepared load will get its bytes.
 enum PreparedConfigSource {
     /// No file. The plan will produce [`MeshConfig::default`] and reads
@@ -861,12 +1028,9 @@ impl MeshConfig {
     /// [`MeshConfig::prepare_load`] instead; both share one parse.
     pub fn load() -> Result<Self> {
         let path = crate::dirs::config_path()?;
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read_to_string(&path)
-            .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
-        parse_or_quarantine(&raw, &path)
+        let _transaction = ConfigTransactionLease::acquire(&path)?;
+        let (config, _) = load_config_locked(&path)?;
+        Ok(config)
     }
 
     /// Measure a config load without performing it.
@@ -977,15 +1141,39 @@ impl MeshConfig {
     /// easy hand-editing; the file isn't on a hot path.
     pub fn save(&self) -> Result<()> {
         let path = crate::dirs::config_path()?;
-        let parent = path.parent().ok_or_else(|| {
-            Error::Config(format!("config path has no parent: {}", path.display()))
-        })?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| Error::Config(format!("create {}: {e}", parent.display())))?;
-        let serialized = serde_json::to_string_pretty(self)?;
-        crate::persist::write_atomic(&path, serialized.as_bytes())
-            .map_err(|e| Error::Config(format!("write {}: {e}", path.display())))?;
-        Ok(())
+        let _transaction = ConfigTransactionLease::acquire(&path)?;
+        save_config_locked(&path, self)
+    }
+
+    /// Atomically load, mutate, and persist the current configuration.
+    ///
+    /// The process-local gate and the adjacent OS lock serialize supported
+    /// writers. The exact pre-mutation file bytes are then checked again
+    /// immediately before the atomic replacement, so an uncoordinated writer
+    /// cannot silently erase a disjoint update.
+    pub fn transaction<R>(mutate: impl FnOnce(&mut MeshConfig) -> Result<R>) -> Result<R> {
+        let path = crate::dirs::config_path()?;
+        Self::transaction_at(path, mutate)
+    }
+
+    /// Path-parameterized form of [`MeshConfig::transaction`] for embedders
+    /// that keep more than one configuration file and for deterministic tests.
+    pub fn transaction_at<R>(
+        path: impl AsRef<Path>,
+        mutate: impl FnOnce(&mut MeshConfig) -> Result<R>,
+    ) -> Result<R> {
+        let path = path.as_ref();
+        let _transaction = ConfigTransactionLease::acquire(path)?;
+        let (mut config, baseline) = load_config_locked(path)?;
+        let result = mutate(&mut config)?;
+        if read_config_bytes(path)? != baseline {
+            return Err(Error::Config(format!(
+                "config changed during transaction: {}",
+                path.display()
+            )));
+        }
+        save_config_locked(path, &config)?;
+        Ok(result)
     }
 
     /// Find a network config by its local `id`.
@@ -997,6 +1185,59 @@ impl MeshConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Command, Stdio};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc, Arc,
+    };
+    use std::thread;
+
+    fn transaction_test_path(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "myownmesh-config-{}-{}-{}.json",
+            label,
+            std::process::id(),
+            id
+        ))
+    }
+
+    fn transaction_lock_path(path: &Path) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .expect("transaction test path has a file name")
+            .to_os_string();
+        name.push(".lock");
+        path.with_file_name(name)
+    }
+
+    fn remove_transaction_test_files(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(transaction_lock_path(path));
+    }
+
+    fn transaction_marker_path(path: &Path, marker: &str) -> PathBuf {
+        let mut name = path
+            .file_name()
+            .expect("transaction test path has a file name")
+            .to_os_string();
+        name.push(format!(".{marker}"));
+        path.with_file_name(name)
+    }
+
+    fn wait_for_transaction_marker(path: &Path) {
+        for _ in 0..200 {
+            if path.exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "timed out waiting for transaction marker {}",
+            path.display()
+        );
+    }
 
     #[test]
     fn default_is_current_with_defaults() {
@@ -1229,5 +1470,174 @@ mod tests {
         }"#;
         let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.stun_servers.is_empty());
+    }
+
+    #[test]
+    fn config_transaction_serializes_same_process_rmw_union() {
+        let path = transaction_test_path("union");
+        let active = Arc::new(AtomicBool::new(false));
+        let overlap = Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (first_completed_tx, first_completed_rx) = mpsc::channel();
+        let (second_attempt_tx, second_attempt_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let first_path = path.clone();
+        let first_active = Arc::clone(&active);
+        let first = thread::spawn(move || {
+            MeshConfig::transaction_at(&first_path, move |config| {
+                assert!(!first_active.swap(true, Ordering::SeqCst));
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                config
+                    .networks
+                    .push(NetworkConfig::from_network_id("first", "first-wire"));
+                first_active.store(false, Ordering::SeqCst);
+                first_completed_tx.send(()).unwrap();
+                Ok(())
+            })
+        });
+
+        entered_rx.recv().unwrap();
+        let second_path = path.clone();
+        let second_active = Arc::clone(&active);
+        let second_overlap = Arc::clone(&overlap);
+        let second = thread::spawn(move || {
+            second_attempt_tx.send(()).unwrap();
+            MeshConfig::transaction_at(&second_path, move |config| {
+                second_entered_tx.send(()).unwrap();
+                if second_active.swap(true, Ordering::SeqCst) {
+                    second_overlap.store(true, Ordering::SeqCst);
+                }
+                config.services.signaling.enabled = true;
+                second_active.store(false, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        second_attempt_rx.recv().unwrap();
+        assert!(second_entered_rx
+            .recv_timeout(Duration::from_millis(25))
+            .is_err());
+        release_tx.send(()).unwrap();
+        first_completed_rx.recv().unwrap();
+        second_entered_rx.recv().unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+
+        let final_config = MeshConfig::transaction_at(&path, |config| Ok(config.clone())).unwrap();
+        assert!(!overlap.load(Ordering::SeqCst));
+        assert!(final_config.services.signaling.enabled);
+        assert_eq!(final_config.networks.len(), 1);
+        assert_eq!(final_config.networks[0].id, "first");
+        remove_transaction_test_files(&path);
+    }
+
+    #[test]
+    fn config_transaction_subprocess_worker() {
+        let Some(path) = std::env::var_os("MYOWNMESH_CONFIG_TX_CHILD_PATH") else {
+            return;
+        };
+        let path = PathBuf::from(path);
+        let attempted = PathBuf::from(
+            std::env::var_os("MYOWNMESH_CONFIG_TX_CHILD_ATTEMPTED")
+                .expect("child attempted marker"),
+        );
+        let entered = PathBuf::from(
+            std::env::var_os("MYOWNMESH_CONFIG_TX_CHILD_ENTERED").expect("child entered marker"),
+        );
+        let completed = PathBuf::from(
+            std::env::var_os("MYOWNMESH_CONFIG_TX_CHILD_COMPLETED")
+                .expect("child completed marker"),
+        );
+        std::fs::write(&attempted, b"attempted").expect("child attempted marker write");
+        MeshConfig::transaction_at(&path, |config| {
+            std::fs::write(&entered, b"entered").expect("child entered marker write");
+            config.services.signaling.enabled = true;
+            Ok(())
+        })
+        .expect("child transaction");
+        std::fs::write(&completed, b"completed").expect("child completed marker write");
+    }
+
+    #[test]
+    fn config_transaction_serializes_cross_process_rmw_union() {
+        let path = transaction_test_path("subprocess");
+        let attempted = transaction_marker_path(&path, "attempted");
+        let entered = transaction_marker_path(&path, "entered");
+        let completed = transaction_marker_path(&path, "completed");
+        let (parent_entered_tx, parent_entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let parent_path = path.clone();
+        let parent = thread::spawn(move || {
+            MeshConfig::transaction_at(&parent_path, move |config| {
+                parent_entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                config
+                    .networks
+                    .push(NetworkConfig::from_network_id("parent", "parent-wire"));
+                Ok(())
+            })
+        });
+
+        parent_entered_rx.recv().unwrap();
+        let executable = std::env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("config::tests::config_transaction_subprocess_worker")
+            .arg("--nocapture")
+            .env("MYOWNMESH_CONFIG_TX_CHILD_PATH", path.as_os_str())
+            .env("MYOWNMESH_CONFIG_TX_CHILD_ATTEMPTED", attempted.as_os_str())
+            .env("MYOWNMESH_CONFIG_TX_CHILD_ENTERED", entered.as_os_str())
+            .env("MYOWNMESH_CONFIG_TX_CHILD_COMPLETED", completed.as_os_str())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn transaction child");
+
+        wait_for_transaction_marker(&attempted);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!entered.exists(), "child entered before parent release");
+        assert!(child.try_wait().unwrap().is_none(), "child completed early");
+        release_tx.send(()).unwrap();
+        parent.join().unwrap().unwrap();
+        wait_for_transaction_marker(&entered);
+        wait_for_transaction_marker(&completed);
+        assert!(child.wait().unwrap().success());
+
+        let final_config = MeshConfig::transaction_at(&path, |config| Ok(config.clone())).unwrap();
+        assert!(final_config.services.signaling.enabled);
+        assert_eq!(final_config.networks.len(), 1);
+        assert_eq!(final_config.networks[0].id, "parent");
+        remove_transaction_test_files(&path);
+        let _ = std::fs::remove_file(attempted);
+        let _ = std::fs::remove_file(entered);
+        let _ = std::fs::remove_file(completed);
+    }
+
+    #[test]
+    fn config_transaction_rejects_uncoordinated_replacement() {
+        let path = transaction_test_path("cas");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let transaction_path = path.clone();
+        let transaction = thread::spawn(move || {
+            MeshConfig::transaction_at(&transaction_path, move |config| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                config.services.signaling.enabled = true;
+                Ok(())
+            })
+        });
+
+        entered_rx.recv().unwrap();
+        let mut replacement = MeshConfig::default();
+        replacement.services.turn.enabled = true;
+        save_config_locked(&path, &replacement).unwrap();
+        release_tx.send(()).unwrap();
+        let error = transaction.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("changed during transaction"));
+        remove_transaction_test_files(&path);
     }
 }

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::transport_lab::{
-    admit_durable_proof, materialize_durable_proof_delivery, pending_durable_proofs,
-    proof_owner_for_device, rebind_durable_proof, settle_durable_proof_ack,
+    admit_durable_proof, durable_proof_records, materialize_durable_proof_delivery,
+    pending_durable_proofs, proof_owner_for_device, rebind_durable_proof, settle_durable_proof_ack,
     supersede_durable_proof,
 };
 use myownmesh_core::engine::{
@@ -369,42 +369,73 @@ async fn wait_for_no_proof_owner(
 
 async fn wait_for_replayed_proof(
     state: &Arc<myownmesh_core::engine::NetworkState>,
+    owner: &myownmesh_core::engine::transport_lab::ProofOwner,
     previous: &ProofRecord,
-) -> ProofRecord {
+) -> (ProofRecord, bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
-    let mut last = None;
     loop {
-        let current = pending_durable_proofs(state)
-            .expect("replay pending records")
+        let expected = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+            state,
+            owner,
+            &previous.fact_ids,
+        )
+        .expect("current owner proof identity");
+        assert_eq!(expected.context_id, previous.context_id);
+        assert_eq!(expected.target, previous.target);
+        assert_eq!(expected.delivery_id, previous.delivery_id);
+        assert_eq!(expected.fact_ids, previous.fact_ids);
+        assert_eq!(expected.owner, previous.owner);
+        assert_ne!(expected.binding, previous.binding);
+        let current = durable_proof_records(state)
+            .expect("replay durable records")
             .into_iter()
             .find(|record| record.delivery_id == previous.delivery_id);
         if let Some(current) = current {
-            // Replay/rebind changes only the exact installation binding. The
-            // durable identity and proof support remain stable while the
-            // owner coordinate advances.
-            let stable_metadata = current.context_id == previous.context_id
-                && current.target == previous.target
-                && current.delivery_id == previous.delivery_id
-                && current.fact_ids == previous.fact_ids
-                && current.owner == previous.owner
-                && current.binding != previous.binding;
-            if stable_metadata {
-                if last.as_ref() == Some(&current) {
-                    return current;
+            match current.state {
+                ProofRecordState::Pending => {
+                    if current == expected {
+                        return (current, true);
+                    }
                 }
-                last = Some(current);
-                sleep(Duration::from_millis(20)).await;
-                continue;
+                ProofRecordState::Settled => {
+                    assert_exact_delivery_metadata(&current, &expected);
+                    return (current, false);
+                }
+                ProofRecordState::Superseded => {
+                    panic!(
+                        "replayed delivery {} was Superseded before the test terminal",
+                        previous.delivery_id
+                    );
+                }
             }
         }
-        last = None;
         if Instant::now() > deadline {
-            panic!(
-                "production proof replay did not complete with stable identity and current binding"
-            );
+            panic!("production proof replay did not expose Pending or an exact Settled tombstone");
         }
         sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn assert_exact_delivery_metadata(actual: &ProofRecord, expected: &ProofRecord) {
+    assert_eq!(actual.context_id, expected.context_id);
+    assert_eq!(actual.target, expected.target);
+    assert_eq!(actual.delivery_id, expected.delivery_id);
+    assert_eq!(actual.fact_ids, expected.fact_ids);
+    assert_eq!(actual.owner, expected.owner);
+    assert_eq!(actual.binding, expected.binding);
+}
+
+fn assert_settled_tombstone(
+    state: &Arc<myownmesh_core::engine::NetworkState>,
+    expected: &ProofRecord,
+) {
+    let tombstone = durable_proof_records(state)
+        .expect("read exact durable terminal record")
+        .into_iter()
+        .find(|record| record.delivery_id == expected.delivery_id)
+        .expect("exact delivery tombstone remains persisted");
+    assert_exact_delivery_metadata(&tombstone, expected);
+    assert_eq!(tombstone.state, ProofRecordState::Settled);
 }
 
 #[tokio::test]
@@ -464,8 +495,16 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
     .expect("reopen after offline interval");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
-    let rebound = wait_for_replayed_proof(&reopened, &record).await;
-    assert_eq!(rebound.state, ProofRecordState::Pending);
+    let (rebound, replay_was_pending) =
+        wait_for_replayed_proof(&reopened, &reopened_owner, &record).await;
+    assert_eq!(
+        rebound.state,
+        if replay_was_pending {
+            ProofRecordState::Pending
+        } else {
+            ProofRecordState::Settled
+        }
+    );
     assert_eq!(rebound.delivery_id, delivery.delivery_id);
 
     let receiver = receiver_admits_delivery(reopened.verified_bootstrap(), &delivery);
@@ -475,14 +514,24 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
         ack.matches(&delivery),
         "ACK is typed to this exact delivery"
     );
-    assert!(
-        settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
-            .expect("settle exact delivery")
-    );
-    assert!(
-        !settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
-            .expect("duplicate ACK is an idempotent no-op")
-    );
+    if replay_was_pending {
+        let first_settle =
+            settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id)
+                .expect("settle exact delivery");
+        if !first_settle {
+            assert_settled_tombstone(&reopened, &rebound);
+        }
+    }
+    assert_settled_tombstone(&reopened, &rebound);
+    if replay_was_pending {
+        assert!(!settle_durable_proof_ack(
+            &reopened,
+            &reopened_owner,
+            &rebound,
+            record.delivery_id,
+        )
+        .expect("duplicate ACK is an idempotent no-op"));
+    }
     assert!(pending_durable_proofs(&reopened)
         .expect("settled records filter from replay")
         .is_empty());
@@ -538,13 +587,34 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     .expect("sender reconnects from the durable slot");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
-    let e0_rebound = wait_for_replayed_proof(&reopened, &e0).await;
-    assert_eq!(e0_rebound.state, ProofRecordState::Pending);
+    let (e0_rebound, e0_was_pending) =
+        wait_for_replayed_proof(&reopened, &reopened_owner, &e0).await;
+    assert_eq!(
+        e0_rebound.state,
+        if e0_was_pending {
+            ProofRecordState::Pending
+        } else {
+            ProofRecordState::Settled
+        }
+    );
     assert_eq!(e0_rebound.delivery_id, e0_delivery.delivery_id);
 
     // A causal regrant followed by a fresh eviction creates E1 with a new
     // canonical closure. The stale E0 is retired as Superseded, never as an
     // ACK, before the admitted reconnect can enumerate replayable records.
+    let e0_before_e1 = durable_proof_records(&reopened)
+        .expect("read E0 before constructing E1")
+        .into_iter()
+        .find(|record| record.delivery_id == e0.delivery_id)
+        .expect("E0 remains durably observable before E1");
+    assert_exact_delivery_metadata(&e0_before_e1, &e0_rebound);
+    let e0_pending_before_e1 = match e0_before_e1.state {
+        ProofRecordState::Pending => true,
+        ProofRecordState::Settled => false,
+        ProofRecordState::Superseded => {
+            panic!("E0 cannot be Superseded before E1 is constructed")
+        }
+    };
     let e1_facts = reissued_stand_down_facts(
         reopened.verified_bootstrap(),
         &e0_facts,
@@ -571,14 +641,50 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
         "E1 must not reuse E0 identity"
     );
     admit_durable_proof(&reopened, e1.clone()).expect("persist E1 closure");
-    assert!(
-        supersede_durable_proof(&reopened, &reopened_owner, &e0, Some(e1.delivery_id))
-            .expect("retire stale E0 without ACK")
-    );
-    assert!(
-        !supersede_durable_proof(&reopened, &reopened_owner, &e0, Some(e1.delivery_id))
-            .expect("repeated E0 supersession is idempotent")
-    );
+    let supersede_result = if e0_pending_before_e1 {
+        Some(supersede_durable_proof(
+            &reopened,
+            &reopened_owner,
+            &e0,
+            Some(e1.delivery_id),
+        ))
+    } else {
+        assert_settled_tombstone(&reopened, &e0_rebound);
+        None
+    };
+    let records = durable_proof_records(&reopened).expect("read E0/E1 terminal records");
+    let e0_tombstone = records
+        .iter()
+        .find(|record| record.delivery_id == e0.delivery_id)
+        .expect("exact E0 tombstone remains persisted");
+    assert_exact_delivery_metadata(e0_tombstone, &e0_rebound);
+    match supersede_result.as_ref() {
+        None => assert_eq!(e0_tombstone.state, ProofRecordState::Settled),
+        Some(Ok(true)) => assert_eq!(e0_tombstone.state, ProofRecordState::Superseded),
+        Some(Ok(false)) => assert_eq!(
+            e0_tombstone.state,
+            ProofRecordState::Superseded,
+            "an idempotent supersession is legal only with the exact Superseded tombstone"
+        ),
+        Some(Err(_)) => assert_eq!(
+            e0_tombstone.state,
+            ProofRecordState::Settled,
+            "a supersession error is legal only when the exact ACK won the race"
+        ),
+    }
+    assert_ne!(e0_tombstone.state, ProofRecordState::Pending);
+    let e1_pending = records
+        .iter()
+        .find(|record| record.delivery_id == e1.delivery_id)
+        .expect("exact E1 replacement remains persisted");
+    assert_exact_delivery_metadata(e1_pending, &e1);
+    assert_eq!(e1_pending.state, ProofRecordState::Pending);
+    if e0_tombstone.state == ProofRecordState::Superseded {
+        assert!(
+            !supersede_durable_proof(&reopened, &reopened_owner, &e0, Some(e1.delivery_id))
+                .expect("repeated E0 supersession is idempotent")
+        );
+    }
 
     let pending = pending_durable_proofs(&reopened).expect("enumerate reconnect replay");
     assert_eq!(
@@ -627,6 +733,8 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     )
     .expect("typed pending record");
     admit_durable_proof(&state, record.clone()).expect("enqueue typed record");
+    let delivery =
+        materialize_durable_proof_delivery(&state, &record).expect("complete delivery serializes");
 
     // Replace the target installation. The first witness is now stale, while
     // the replacement witness is the only one allowed to rebind the Pending
@@ -651,9 +759,17 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     .expect("replacement target lifecycle");
     attach_local(&replacement, &broker);
     let replacement_owner = wait_for_proof_owner(&state, target.public_id()).await;
-    let rebound = wait_for_replayed_proof(&state, &record).await;
+    let (rebound, replay_was_pending) =
+        wait_for_replayed_proof(&state, &replacement_owner, &record).await;
     assert!(!rebind_durable_proof(&state, &owner, &record).expect("stale owner refusal"));
-    assert_eq!(rebound.state, ProofRecordState::Pending);
+    assert_eq!(
+        rebound.state,
+        if replay_was_pending {
+            ProofRecordState::Pending
+        } else {
+            ProofRecordState::Settled
+        }
+    );
 
     let prefix = ProofDeliveryMessage::new(context, target_id.clone(), facts[..3].to_vec())
         .expect("prefix delivery serializes");
@@ -662,9 +778,6 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
         !prefix_receiver.projection().is_stood_down(&target_id),
         "a receiver cannot ACK before canonical proof evidence is admitted"
     );
-
-    let delivery =
-        materialize_durable_proof_delivery(&state, &rebound).expect("complete delivery serializes");
 
     // The receiver is a second durable NetworkState, not only an in-memory
     // reducer.  Its production ingress must adopt the exact proof facts before
@@ -698,10 +811,15 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     );
     let ack = ProofAckMessage::for_delivery(&delivery);
     assert!(ack.matches(&delivery));
-    assert!(
-        settle_durable_proof_ack(&state, &replacement_owner, &rebound, ack.delivery_id,)
-            .expect("exact ACK settles")
-    );
+    if replay_was_pending {
+        let first_settle =
+            settle_durable_proof_ack(&state, &replacement_owner, &rebound, ack.delivery_id)
+                .expect("exact ACK settles");
+        if !first_settle {
+            assert_settled_tombstone(&state, &rebound);
+        }
+    }
+    assert_settled_tombstone(&state, &rebound);
     assert!(pending_durable_proofs(&state)
         .expect("settled proof filters")
         .is_empty());
@@ -741,6 +859,8 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     )
     .expect("restart pending record");
     admit_durable_proof(&state, record.clone()).expect("persist restart receipt");
+    let delivery =
+        materialize_durable_proof_delivery(&state, &record).expect("restart replay delivery");
     state.request_shutdown();
     driver.await.expect("pre-restart shutdown");
     drop(owner);
@@ -756,7 +876,8 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     .expect("restart durable network");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
-    let rebound = wait_for_replayed_proof(&reopened, &record).await;
+    let (rebound, replay_was_pending) =
+        wait_for_replayed_proof(&reopened, &reopened_owner, &record).await;
     let snapshot = governance::snapshot(&reopened);
     assert!(
         snapshot.stood_down.contains(target.public_id()),
@@ -766,7 +887,14 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         reopened.semantic_fact_count() >= facts.len(),
         "restart preserves every adopted proof fact"
     );
-    assert_eq!(rebound.state, ProofRecordState::Pending);
+    assert_eq!(
+        rebound.state,
+        if replay_was_pending {
+            ProofRecordState::Pending
+        } else {
+            ProofRecordState::Settled
+        }
+    );
 
     // Reopen the same signed log as the evicted device.  This is the
     // self-eviction boundary: the receiver's own durable projection must
@@ -799,14 +927,17 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         "self-eviction remains active after receiver restart/adoption"
     );
 
-    let delivery =
-        materialize_durable_proof_delivery(&reopened, &rebound).expect("restart replay delivery");
     let ack = ProofAckMessage::for_delivery(&delivery);
     assert!(ack.matches(&delivery));
-    assert!(
-        settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
-            .expect("restart ACK settles")
-    );
+    if replay_was_pending {
+        let first_settle =
+            settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id)
+                .expect("restart ACK settles");
+        if !first_settle {
+            assert_settled_tombstone(&reopened, &rebound);
+        }
+    }
+    assert_settled_tombstone(&reopened, &rebound);
     assert!(pending_durable_proofs(&reopened)
         .expect("restart receipt settles")
         .is_empty());

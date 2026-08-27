@@ -2523,6 +2523,16 @@ impl NetworkState {
             .map_err(|error| Error::Network(format!("durable proof replay: {error}")))
     }
 
+    /// Observe every exact durable proof record, including terminal tombstones,
+    /// for this live mesh context. The owner/liveness fence prevents a stale
+    /// state facade from observing a released slot as if it were still live.
+    pub(crate) fn durable_proof_records(&self) -> Result<Vec<ProofRecord>> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .proof_records(self.mesh_context_id)
+            .map_err(|error| Error::Network(format!("durable proof records: {error}")))
+    }
+
     /// Build a record from facts already admitted by this network's
     /// authoritative graph and bind it to the exact current owner.
     pub(crate) fn new_durable_proof_outbox_record(

@@ -1245,6 +1245,57 @@ impl NetworkRegistry {
         Some(effect(&entry.joined))
     }
 
+    /// Tear down only the exact currently registered runtime.
+    ///
+    /// This is the compare-and-claim counterpart to [`Self::with_current`].
+    /// A caller holding a handle from before a removal or replacement must not
+    /// be able to retire whatever newer runtime happens to answer to the same
+    /// key. The identity check, `Running` check, and claim all happen while
+    /// the registry state lock is held; a stale caller therefore returns
+    /// `NotFound` without changing the successor. If the exact expected owner
+    /// is already in the closing set, the caller waits for that owner and gets
+    /// `AlreadyClosing` rather than racing a same-slot rejoin. A successful
+    /// claim goes through the same owned closing set and teardown path as
+    /// [`Self::remove`], including the test pause and stopped waiter semantics.
+    pub(crate) async fn remove_if_current(
+        &self,
+        key: &str,
+        expected: &Arc<JoinedNetwork>,
+    ) -> RemoveResult {
+        let claim = {
+            let mut state = self.state.lock();
+            if let Some(entry) = state.aliases.get(key).cloned() {
+                if entry.lifecycle.state() != RuntimeState::Running
+                    || !Arc::ptr_eq(&entry.joined, expected)
+                {
+                    return RemoveResult::NotFound;
+                }
+                let won = state.claim(&entry);
+                (entry, won)
+            } else if let Some(entry) = state
+                .closing
+                .iter()
+                .find(|entry| entry.holds(key) && Arc::ptr_eq(&entry.joined, expected))
+                .cloned()
+            {
+                // The exact owner may have been claimed by another caller
+                // between its lookup and this call. Wait for that owner; do
+                // not search by key once a successor has become visible.
+                (entry, false)
+            } else {
+                return RemoveResult::NotFound;
+            }
+        };
+        match claim {
+            (entry, true) => {
+                #[cfg(test)]
+                self.pause_after_claim_for_test().await;
+                RemoveResult::Removed(self.teardown(entry).await)
+            }
+            (entry, false) => RemoveResult::AlreadyClosing(Self::await_winner(&entry).await),
+        }
+    }
+
     /// The lifecycle state of the runtime under `key`, for a caller that needs
     /// to distinguish "never existed" from "on its way out".
     pub fn state(&self, key: &str) -> Option<RuntimeState> {
@@ -2473,6 +2524,188 @@ mod tests {
             }),
             Some("fence-stale-wire".to_string()),
             "the successor is accepted only with its own exact handle"
+        );
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_retires_exact_owner_and_allows_replacement() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let predecessor = mesh
+            .join(network("exact-remove-config", "exact-remove-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(predecessor, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let expected = registry
+            .get("exact-remove-config")
+            .expect("the exact owner exists before retirement");
+
+        assert!(matches!(
+            registry
+                .remove_if_current("exact-remove-config", &expected)
+                .await,
+            RemoveResult::Removed(Ok(()))
+        ));
+        assert!(
+            registry.get("exact-remove-config").is_none(),
+            "exact retirement removes the predecessor alias"
+        );
+
+        let successor = mesh
+            .join(network("exact-remove-config", "exact-remove-wire"))
+            .await
+            .expect("the successor joins after exact retirement");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs after the predecessor stops"
+        );
+        let current = registry
+            .get("exact-remove-config")
+            .expect("the successor is visible");
+        assert!(
+            !Arc::ptr_eq(&expected, &current),
+            "replacement has a distinct lifecycle owner"
+        );
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_waits_for_exact_claimed_owner() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("exact-closing-config", "exact-closing-wire"))
+            .await
+            .expect("the exact-closing fixture joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the exact-closing fixture installs"
+        );
+        let expected = registry
+            .get("exact-closing-config")
+            .expect("the exact owner exists before removal");
+        let pause = registry.install_claim_pause_for_test();
+        let removing = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.remove("exact-closing-config").await })
+        };
+        pause.reached.wait().await;
+        assert_eq!(
+            registry.state("exact-closing-config"),
+            Some(RuntimeState::Closing)
+        );
+
+        let waiting = {
+            let registry = Arc::clone(&registry);
+            let expected = Arc::clone(&expected);
+            tokio::spawn(async move {
+                registry
+                    .remove_if_current("exact-closing-config", &expected)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "the exact Closing owner is awaited before teardown settles"
+        );
+        pause.release.wait().await;
+
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+        assert!(matches!(
+            waiting.await.expect("the exact waiter does not panic"),
+            RemoveResult::AlreadyClosing(RuntimeState::Stopped)
+        ));
+        assert!(
+            registry.get("exact-closing-config").is_none(),
+            "the exact owner is gone after the shared teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_rejects_stale_owner_before_and_after_successor() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let predecessor = mesh
+            .join(network("stale-remove-config", "stale-remove-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(predecessor, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let predecessor = registry
+            .get("stale-remove-config")
+            .expect("the predecessor owner exists");
+
+        let unrelated = mesh
+            .join(network(
+                "stale-remove-unrelated",
+                "stale-remove-unrelated-wire",
+            ))
+            .await
+            .expect("the unrelated owner joins");
+        assert!(
+            registry.insert(unrelated, None).into_refusal().is_none(),
+            "the unrelated owner installs"
+        );
+        let unrelated = registry
+            .get("stale-remove-unrelated")
+            .expect("the unrelated owner is visible");
+        assert!(matches!(
+            registry
+                .remove_if_current("stale-remove-config", &unrelated)
+                .await,
+            RemoveResult::NotFound
+        ));
+        assert!(
+            registry.get("stale-remove-config").is_some(),
+            "a mismatched owner cannot retire the live predecessor"
+        );
+        assert!(matches!(
+            registry.remove("stale-remove-unrelated").await,
+            RemoveResult::Removed(Ok(()))
+        ));
+
+        assert!(matches!(
+            registry.remove("stale-remove-config").await,
+            RemoveResult::Removed(Ok(()))
+        ));
+        let successor = mesh
+            .join(network("stale-remove-config", "stale-remove-wire"))
+            .await
+            .expect("the successor joins after predecessor retirement");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs"
+        );
+        let current = registry
+            .get("stale-remove-config")
+            .expect("the successor owner exists");
+        assert!(matches!(
+            registry
+                .remove_if_current("stale-remove-config", &predecessor)
+                .await,
+            RemoveResult::NotFound
+        ));
+        assert!(
+            Arc::ptr_eq(
+                &current,
+                &registry
+                    .get("stale-remove-config")
+                    .expect("successor remains")
+            ),
+            "a stale predecessor cannot retire its successor"
         );
         let _ = registry.shutdown_all().await;
     }

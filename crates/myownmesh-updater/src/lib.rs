@@ -562,39 +562,54 @@ pub struct UpdatePrefs {
 /// settings. The daemon re-reads config each tick, so changes take effect
 /// without a restart.
 pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
-    let mut cfg = MeshConfig::load()?;
-    let au = &mut cfg.auto_update;
-    if let Some(v) = prefs.enabled {
-        au.enabled = v;
-    }
-    if let Some(v) = prefs.channel {
+    let UpdatePrefs {
+        enabled,
+        channel,
+        auto_apply,
+        check_interval_hours,
+        stable_url,
+        beta_url,
+    } = prefs;
+
+    if let Some(v) = channel.as_deref() {
         if v != "stable" && v != "beta" {
             return Err(Error::msg(format!(
                 "invalid update channel '{v}' (expected 'stable' or 'beta')"
             )));
         }
-        au.channel = v;
     }
-    if let Some(v) = prefs.auto_apply {
-        if ApplyPolicy::parse(&v).is_none() {
+    if let Some(v) = auto_apply.as_deref() {
+        if ApplyPolicy::parse(v).is_none() {
             return Err(Error::msg(format!(
                 "invalid auto_apply policy '{v}' (expected patch | minor | all | none)"
             )));
         }
-        au.auto_apply = v;
     }
-    if let Some(v) = prefs.check_interval_hours {
-        // Clamp to a sane floor so a fat-fingered 0 doesn't spin the
-        // background ticker hot.
-        au.check_interval_hours = v.max(1);
-    }
-    if let Some(v) = prefs.stable_url {
-        au.stable_url = normalise_url_override(v);
-    }
-    if let Some(v) = prefs.beta_url {
-        au.beta_url = normalise_url_override(v);
-    }
-    cfg.save()?;
+
+    MeshConfig::transaction(|cfg| {
+        let au = &mut cfg.auto_update;
+        if let Some(v) = enabled {
+            au.enabled = v;
+        }
+        if let Some(v) = channel {
+            au.channel = v;
+        }
+        if let Some(v) = auto_apply {
+            au.auto_apply = v;
+        }
+        if let Some(v) = check_interval_hours {
+            // Clamp to a sane floor so a fat-fingered 0 doesn't spin the
+            // background ticker hot.
+            au.check_interval_hours = v.max(1);
+        }
+        if let Some(v) = stable_url {
+            au.stable_url = normalise_url_override(v);
+        }
+        if let Some(v) = beta_url {
+            au.beta_url = normalise_url_override(v);
+        }
+        Ok(())
+    })?;
     status()
 }
 

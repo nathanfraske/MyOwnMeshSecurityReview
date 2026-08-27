@@ -387,6 +387,78 @@ async fn connect_peer_funded(
     })
 }
 
+/// Re-establish the exact predecessor after a replacement failed after the
+/// predecessor had already been removed. Every successful restoration is
+/// persisted under the restored runtime's exact registry owner; a successor
+/// or a lost owner never gets to overwrite the config record.
+async fn rollback_old_network(state: &Arc<ControlState>, old_config: &NetworkConfig) -> String {
+    let restored = match state.mesh.join(old_config.clone()).await {
+        Ok(restored) => restored,
+        Err(error) => {
+            warn!(network = %old_config.id, "network update rollback failed: {error:#}");
+            return " — AND rollback failed; re-add it from the Networks tab".to_string();
+        }
+    };
+    let attached = {
+        let net_state = restored.state();
+        myownmesh_core::engine::attach_signaling(&net_state)
+    };
+    let drivers = match attached {
+        Ok(drivers) => drivers,
+        Err(error) => {
+            let _ = restored.shutdown().await;
+            return format!(" — AND the rollback join could not attach signaling: {error}");
+        }
+    };
+    if let Some(refused) = state.registry.insert(restored, drivers).into_refusal() {
+        let refusal_state = refused.state;
+        drop(refused.drivers);
+        let _ = refused.joined.shutdown().await;
+        return format!(
+            " — rollback join was refused by a {refusal_state:?} runtime; config was not overwritten"
+        );
+    }
+
+    let restored_owner = match state.registry.get(&old_config.id) {
+        Some(owner) => owner,
+        None => {
+            return " — rollback runtime lost its lifecycle owner; config was not overwritten"
+                .to_string();
+        }
+    };
+    let persisted = state
+        .registry
+        .with_current(&old_config.id, &restored_owner, |_| {
+            persist_network_update(old_config)
+        });
+    match persisted {
+        Some(Ok(())) => {
+            state.services.on_network_added(&old_config.id).await;
+            " — restored the previous config".to_string()
+        }
+        Some(Err(error)) => {
+            state.services.on_network_added(&old_config.id).await;
+            format!(" — rollback runtime restored but config.json save failed: {error}")
+        }
+        None => {
+            " — rollback runtime lost its lifecycle owner; config was not overwritten".to_string()
+        }
+    }
+}
+
+/// Retire a replacement only when the registry still holds the exact Arc that
+/// failed its persistence commit. This intentionally does not fall back to a
+/// key-only remove: a stale update must never tear down a successor. The
+/// registry implementation owns the compare-and-claim fence and waits for an
+/// already-claimed exact owner to finish.
+async fn retire_failed_replacement(
+    state: &Arc<ControlState>,
+    key: &str,
+    expected: &Arc<myownmesh_core::JoinedNetwork>,
+) {
+    let _ = state.registry.remove_if_current(key, expected).await;
+}
+
 /// Update an already-joined network in place. Hot-reloadable edits
 /// (topology / label / auto_approve / roster path) apply without
 /// touching live sessions; transport edits (signaling / STUN / TURN /
@@ -401,20 +473,37 @@ pub(in crate::control) async fn network_update(
     owner: ResponseOwner,
 ) -> FundedVariableReply {
     let _mutation_guard = network_mutation_guard().await;
-    // This is update, not add: the network must already be joined.
-    let joined = match state
-        .registry
-        .get(&config.id)
-        .or_else(|| state.registry.get(&config.network_id))
-    {
-        Some(j) => j,
-        None => {
+    // This is update, not add: the network must already be joined. Resolve
+    // both aliases before teardown. If they name different live runtimes,
+    // this is an id collision rather than an update and the disk must remain
+    // untouched while both owners stay current.
+    let by_config_id = state.registry.get(&config.id);
+    let by_network_id = state.registry.get(&config.network_id);
+    let joined = match (by_config_id, by_network_id) {
+        (Some(config_owner), Some(network_owner)) if Arc::ptr_eq(&config_owner, &network_owner) => {
+            config_owner
+        }
+        (Some(_), Some(_)) => {
+            return owner.finish(Err(format!(
+                "network update refused: config id '{}' and network id '{}' belong to different live networks",
+                config.id, config.network_id
+            )));
+        }
+        (Some(owner), None) | (None, Some(owner)) => owner,
+        (None, None) => {
             return owner.finish(Err(format!(
                 "unknown network '{}' — join it with network_add first",
                 config.id
             )));
         }
     };
+    if joined.config_id() != config.id.as_str() {
+        return owner.finish(Err(format!(
+            "network update refused: config id '{}' does not match current owner '{}'",
+            config.id,
+            joined.config_id()
+        )));
+    }
 
     // Compare the incoming config against the engine's live config to
     // decide hot-apply vs. transport restart.
@@ -444,20 +533,30 @@ pub(in crate::control) async fn network_update(
         // place, no peers dropped. ICE servers are read fresh on the next
         // connect, so a credential rotation reaches new connections without
         // tearing down the live ones (see `reconcile::apply_hot`).
-        let hot_result = state.registry.with_current(&config.id, &joined, |current| {
-            let current_state = current.state();
-            myownmesh_core::engine::reconcile::apply_hot(&current_state, config.clone())?;
-            persist_network_update(&config)
-        });
-        let hot_result = match hot_result {
-            Some(result) => Some(result),
-            None => state
+        let hot_result =
+            state
                 .registry
-                .with_current(&config.network_id, &joined, |current| {
+                .with_current(&config.id, &joined, |current| -> Result<()> {
+                    persist_network_update(&config)?;
                     let current_state = current.state();
                     myownmesh_core::engine::reconcile::apply_hot(&current_state, config.clone())?;
-                    persist_network_update(&config)
-                }),
+                    Ok(())
+                });
+        let hot_result = match hot_result {
+            Some(result) => Some(result),
+            None => {
+                state
+                    .registry
+                    .with_current(&config.network_id, &joined, |current| -> Result<()> {
+                        persist_network_update(&config)?;
+                        let current_state = current.state();
+                        myownmesh_core::engine::reconcile::apply_hot(
+                            &current_state,
+                            config.clone(),
+                        )?;
+                        Ok(())
+                    })
+            }
         };
         match hot_result {
             None => {
@@ -490,7 +589,7 @@ pub(in crate::control) async fn network_update(
     // cancel a silent peer's DepartObserved waiter. The carrier hint remains
     // part of the departure future.
     let departure = joined.announce_leave();
-    let removal = state.registry.remove(&config.id);
+    let removal = state.registry.remove(&old_config.id);
     let (_, removal) = tokio::join!(departure, removal);
     drop(net_state);
     drop(joined);
@@ -498,7 +597,10 @@ pub(in crate::control) async fn network_update(
     match removal {
         RemoveResult::Removed(Ok(())) => {}
         RemoveResult::Removed(Err(error)) => {
-            return owner.finish(Err(format!("old runtime teardown failed: {error}")));
+            let rollback = rollback_old_network(state, &old_config).await;
+            return owner.finish(Err(format!(
+                "old runtime teardown failed: {error}{rollback}"
+            )));
         }
         RemoveResult::AlreadyClosing(runtime) => {
             return owner.finish(Err(format!(
@@ -506,11 +608,15 @@ pub(in crate::control) async fn network_update(
             )));
         }
         RemoveResult::NotFound => {
-            if let Some(runtime) = state.registry.state(&config.id) {
+            if let Some(runtime) = state.registry.state(&old_config.id) {
                 return owner.finish(Err(format!(
                     "network update refused while prior runtime is {runtime:?}"
                 )));
             }
+            let rollback = rollback_old_network(state, &old_config).await;
+            return owner.finish(Err(format!(
+                "network update lost the predecessor during teardown{rollback}"
+            )));
         }
     }
 
@@ -520,61 +626,7 @@ pub(in crate::control) async fn network_update(
     let joined = match state.mesh.join(config.clone()).await {
         Ok(j) => j,
         Err(e) => {
-            let rollback = match state.mesh.join(old_config.clone()).await {
-                Ok(restored) => {
-                    let attached = {
-                        let net_state = restored.state();
-                        myownmesh_core::engine::attach_signaling(&net_state)
-                    };
-                    match attached {
-                        // The rollback rejoined but could not attach. Restoring
-                        // a network that cannot signal is not a restore, so it
-                        // is taken back down and the caller told both halves.
-                        Err(error) => {
-                            let _ = restored.shutdown().await;
-                            format!(" — AND the rollback join could not attach signaling: {error}")
-                        }
-                        Ok(drivers) => {
-                            match state.registry.insert(restored, drivers).into_refusal() {
-                                None => {
-                                    let restored_owner = state.registry.get(&old_config.id);
-                                    let persisted = restored_owner.and_then(|owner| {
-                                        state.registry.with_current(&old_config.id, &owner, |_| {
-                                            persist_network_update(&old_config)
-                                        })
-                                    });
-                                    match persisted {
-                                        Some(Ok(())) => {
-                                            state.services.on_network_added(&old_config.id).await;
-                                            " — restored the previous config".to_string()
-                                        }
-                                        Some(Err(error)) => format!(
-                                            " — rollback runtime restored but config.json save failed: {error}"
-                                        ),
-                                        None => {
-                                            " — rollback runtime lost its lifecycle owner; config was not overwritten"
-                                                .to_string()
-                                        }
-                                    }
-                                }
-                                Some(refused) => {
-                                    let refusal_state = refused.state;
-                                    drop(refused.drivers);
-                                    let _ = refused.joined.shutdown().await;
-                                    format!(
-                                        " — rollback join was refused by a \
-                                         {refusal_state:?} runtime"
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(re) => {
-                    warn!(network = %config.id, "network update rollback failed: {re:#}");
-                    " — AND rollback failed; re-add it from the Networks tab".to_string()
-                }
-            };
+            let rollback = rollback_old_network(state, &old_config).await;
             return owner.finish(Err(format!("rejoin with new config: {e}{rollback}")));
         }
     };
@@ -592,8 +644,9 @@ pub(in crate::control) async fn network_update(
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
+                let rollback = rollback_old_network(state, &old_config).await;
                 return owner.finish(Err(format!(
-                    "signaling attach failed after update: {error}"
+                    "signaling attach failed after update: {error}{rollback}"
                 )));
             }
         }
@@ -609,8 +662,9 @@ pub(in crate::control) async fn network_update(
         let refusal_state = refused.state;
         drop(refused.drivers);
         let _ = refused.joined.shutdown().await;
+        let rollback = rollback_old_network(state, &old_config).await;
         return owner.finish(Err(format!(
-            "replacement runtime refused while predecessor is {refusal_state:?}"
+            "replacement runtime refused while predecessor is {refusal_state:?}{rollback}"
         )));
     }
 
@@ -620,9 +674,11 @@ pub(in crate::control) async fn network_update(
     let replacement_owner = match state.registry.get(&config.id) {
         Some(owner) => owner,
         _ => {
+            let rollback = rollback_old_network(state, &old_config).await;
             return owner.finish(Err(
-                "replacement runtime lost its lifecycle owner; config was not overwritten"
-                    .to_string(),
+                format!(
+                    "replacement runtime lost its lifecycle owner; config was not overwritten{rollback}"
+                ),
             ));
         }
     };
@@ -634,13 +690,17 @@ pub(in crate::control) async fn network_update(
         });
     match persisted {
         None => {
-            return owner.finish(Err(
-                "replacement runtime lost its lifecycle owner before persistence".to_string(),
-            ));
+            retire_failed_replacement(state, &config.id, &replacement_owner).await;
+            let rollback = rollback_old_network(state, &old_config).await;
+            return owner.finish(Err(format!(
+                "replacement runtime lost its lifecycle owner before persistence{rollback}"
+            )));
         }
         Some(Err(e)) => {
+            retire_failed_replacement(state, &config.id, &replacement_owner).await;
+            let rollback = rollback_old_network(state, &old_config).await;
             return owner.finish(Err(format!(
-                "network updated but config.json save failed: {e}"
+                "network updated but config.json save failed: {e}{rollback}"
             )));
         }
         Some(Ok(())) => {}
@@ -654,48 +714,51 @@ pub(in crate::control) async fn network_update(
 }
 
 fn persist_network_add(net: &NetworkConfig) -> Result<()> {
-    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
-    // Append only if not already present — covers the case where
-    // the user edited config.json by hand between daemon start and
-    // this add, and added the same network there too.
-    if !cfg
-        .networks
-        .iter()
-        .any(|n| n.id == net.id || n.network_id == net.network_id)
-    {
-        cfg.networks.push(net.clone());
-    }
-    cfg.save().map_err(anyhow::Error::msg)?;
+    MeshConfig::transaction(|cfg| {
+        // Append only if not already present — covers the case where
+        // the user edited config.json by hand between daemon start and
+        // this add, and added the same network there too.
+        if !cfg
+            .networks
+            .iter()
+            .any(|n| n.id == net.id || n.network_id == net.network_id)
+        {
+            cfg.networks.push(net.clone());
+        }
+        Ok(())
+    })
+    .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
 fn persist_network_remove(config_id: &str, network_id: &str) -> Result<()> {
-    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
-    let before = cfg.networks.len();
-    cfg.networks
-        .retain(|n| n.id != config_id && n.network_id != network_id);
-    if cfg.networks.len() != before {
-        cfg.save().map_err(anyhow::Error::msg)?;
-    }
+    MeshConfig::transaction(|cfg| {
+        cfg.networks
+            .retain(|n| n.id != config_id && n.network_id != network_id);
+        Ok(())
+    })
+    .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
 fn persist_network_update(net: &NetworkConfig) -> Result<()> {
-    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
-    // Replace the matching record in place (by either alias). If it's
-    // somehow absent — e.g. the user hand-deleted it between join and
-    // this update — append so the on-disk config still agrees with the
-    // now-running engine rather than silently dropping it.
-    if let Some(slot) = cfg
-        .networks
-        .iter_mut()
-        .find(|n| n.id == net.id || n.network_id == net.network_id)
-    {
-        *slot = net.clone();
-    } else {
-        cfg.networks.push(net.clone());
-    }
-    cfg.save().map_err(anyhow::Error::msg)?;
+    MeshConfig::transaction(|cfg| {
+        // Replace the matching record in place (by either alias). If it's
+        // somehow absent — e.g. the user hand-deleted it between join and
+        // this update — append so the on-disk config still agrees with the
+        // now-running engine rather than silently dropping it.
+        if let Some(slot) = cfg
+            .networks
+            .iter_mut()
+            .find(|n| n.id == net.id || n.network_id == net.network_id)
+        {
+            *slot = net.clone();
+        } else {
+            cfg.networks.push(net.clone());
+        }
+        Ok(())
+    })
+    .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 

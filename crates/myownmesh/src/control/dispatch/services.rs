@@ -43,10 +43,11 @@ pub(in crate::control) async fn services_set(
 }
 
 fn persist_services(services: &ServicesConfig) -> Result<()> {
-    let mut cfg = MeshConfig::load().map_err(anyhow::Error::msg)?;
-    cfg.services = services.clone();
-    cfg.save().map_err(anyhow::Error::msg)?;
-    Ok(())
+    MeshConfig::transaction(|cfg| {
+        cfg.services = services.clone();
+        Ok(())
+    })
+    .map_err(anyhow::Error::msg)
 }
 
 /// What the device services are doing right now.

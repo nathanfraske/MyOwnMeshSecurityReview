@@ -488,6 +488,13 @@ pub mod transport_lab {
         state.pending_durable_proof_outbox()
     }
 
+    /// Enumerate every exact durable proof record for this mesh context,
+    /// including Settled and Superseded tombstones for observation controls.
+    #[doc(hidden)]
+    pub fn durable_proof_records(state: &Arc<NetworkState>) -> crate::Result<Vec<ProofRecord>> {
+        state.durable_proof_records()
+    }
+
     /// Build a proof record from facts already admitted by the authoritative
     /// graph and the exact owner witness captured by the caller.
     #[doc(hidden)]
