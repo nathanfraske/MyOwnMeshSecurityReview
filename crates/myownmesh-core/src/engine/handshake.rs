@@ -112,36 +112,51 @@ fn canonical_proof_bundle(
 /// reconnect or restart; a transport send never settles this record.
 fn pending_eviction_proof(
     state: &Arc<NetworkState>,
-    target: &str,
+    owner: &super::peer_registry::PeerOwnerToken,
     proof: Vec<crate::semantic::SignedFact>,
-) -> Option<crate::engine::state::DurableProofOutboxRecord> {
+) -> Option<(
+    crate::semantic::ProofRecord,
+    crate::protocol::ProofDeliveryMessage,
+)> {
     let context_id = state.mesh_context_id();
-    if let Some(record) = state
+    let target = owner.device_id();
+    let existing = state
         .pending_durable_proof_outbox()
+        .ok()?
         .into_iter()
-        .find(|record| record.context_id() == context_id && record.target() == target)
-    {
-        return Some(record);
-    }
-
-    let record =
-        crate::engine::state::DurableProofOutboxRecord::new(context_id, target.to_owned(), proof)
-            .ok()?;
-    match state.admit_durable_proof_outbox(record.clone()) {
-        Ok(true) => Some(record),
-        Ok(false) => state
-            .pending_durable_proof_outbox()
-            .into_iter()
-            .find(|existing| existing.delivery_id() == record.delivery_id()),
+        .find(|record| record.context_id == context_id && record.target.to_string() == target);
+    let record = match existing {
+        Some(record) => record,
+        None => {
+            let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
+            let record = state
+                .new_durable_proof_outbox_record(owner, &fact_ids)
+                .ok()?;
+            match state.admit_durable_proof_outbox(record) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(
+                        peer = %target,
+                        %error,
+                        "durable eviction proof enqueue refused"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+    let delivery = match state.materialize_durable_proof_delivery(&record) {
+        Ok(delivery) => delivery,
         Err(error) => {
             warn!(
                 peer = %target,
                 %error,
-                "durable eviction proof enqueue refused"
+                "durable eviction proof materialization refused"
             );
-            None
+            return None;
         }
-    }
+    };
+    Some((record, delivery))
 }
 
 /// The Hello this node sends, built in exactly one place.
@@ -694,11 +709,11 @@ pub async fn on_auth_response(
             );
             return;
         }
-        let Some(record) = pending_eviction_proof(state, device_id, proof) else {
+        let Some((record, delivery)) = pending_eviction_proof(state, owner, proof) else {
             return;
         };
         if !state
-            .rebind_durable_proof_outbox(owner, record.delivery_id())
+            .rebind_durable_proof_outbox(owner, &record)
             .unwrap_or(false)
         {
             warn!(
@@ -707,9 +722,7 @@ pub async fn on_auth_response(
             );
             return;
         }
-        if let Err(error) =
-            super::send_pending_open_participation(state, owner, record.facts()).await
-        {
+        if let Err(error) = super::send_pending_proof_delivery(state, owner, &delivery).await {
             // Denial is not allowed to outrun the exact proof transfer.  The
             // current owner remains pending so a retry/reconnect can attempt
             // the same canonical bundle; retiring it here would leave an

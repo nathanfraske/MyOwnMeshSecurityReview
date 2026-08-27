@@ -48,6 +48,8 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::FactBundle(_)
         | MeshMessage::FactInventory(_)
         | MeshMessage::FactRequest(_)
+        | MeshMessage::ProofDelivery(_)
+        | MeshMessage::ProofAck(_)
         | MeshMessage::RosterSummary(_)
         | MeshMessage::RosterRequest(_)
         | MeshMessage::RosterEntries(_) => FrameClass::Gossip,

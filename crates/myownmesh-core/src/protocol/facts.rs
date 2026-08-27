@@ -6,7 +6,7 @@
 //! representation.  A fact therefore has one identity regardless of whether
 //! it arrived over a peer, from a cache, or from a durable store.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 
 pub use crate::semantic::{
     CanonicalFact, DeviceId, FactContent, FactId, MeshContextId, ProofDeliveryId, SignedFact,

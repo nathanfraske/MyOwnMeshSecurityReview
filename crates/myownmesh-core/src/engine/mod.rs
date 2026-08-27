@@ -7168,13 +7168,35 @@ pub(super) async fn send_pending_open_participation(
     let message = MeshMessage::FactBundle(crate::protocol::FactBundleMessage {
         facts: facts.to_vec(),
     });
+    send_pending_semantic_message(state, owner, &message).await
+}
+
+/// Send one exact durable proof delivery to the authenticated installation
+/// that is still awaiting approval. The stable delivery identity is retained
+/// by the semantic outbox; transport success never settles it.
+pub(super) async fn send_pending_proof_delivery(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    delivery: &ProofDeliveryMessage,
+) -> Result<()> {
+    delivery
+        .validate()
+        .map_err(|error| Error::Network(format!("pending proof delivery rejected: {error}")))?;
+    send_pending_semantic_message(state, owner, &MeshMessage::ProofDelivery(delivery.clone())).await
+}
+
+async fn send_pending_semantic_message(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    message: &MeshMessage,
+) -> Result<()> {
     let bytes = Bytes::from(serde_json::to_vec(&message).map_err(Error::Serde)?);
     let mesh_context = state.mesh_context_id().to_string();
     let operation = state
         .peers
         .admit_pending_semantic_operation(owner, &mesh_context, &bytes)
         .ok_or_else(|| Error::Network("pending semantic owner is not current".into()))?;
-    if !operation.accepts_message(&message) || !operation.is_current(&state.peers) {
+    if !operation.accepts_message(message) || !operation.is_current(&state.peers) {
         return Err(Error::Network(
             "pending semantic operation is no longer current".into(),
         ));
@@ -7191,7 +7213,7 @@ pub(super) async fn send_pending_open_participation(
     data.diag.bytes_out += sent as u64;
     data.diag.frames_out += 1;
     drop(data);
-    state.traffic.record_tx(traffic::class_of(&message), sent);
+    state.traffic.record_tx(traffic::class_of(message), sent);
     Ok(())
 }
 
