@@ -532,10 +532,11 @@ pub mod transport_lab {
     #[doc(hidden)]
     pub fn supersede_durable_proof(
         state: &Arc<NetworkState>,
+        owner: &ProofOwner,
         record: &ProofRecord,
         replacement_delivery_id: Option<ProofDeliveryId>,
     ) -> crate::Result<bool> {
-        state.supersede_durable_proof_outbox(record, replacement_delivery_id)
+        state.supersede_durable_proof_outbox(&owner.0, record, replacement_delivery_id)
     }
 
     /// Settle one exact ACK through the owner, target, binding, and delivery
@@ -5463,7 +5464,7 @@ async fn replay_pending_durable_proofs(
             // never as a fabricated proof ACK. When a new closure exists its
             // identity is retained as replacement metadata for diagnostics.
             let replacement = current.as_ref().map(|current| current.delivery_id);
-            match state.supersede_durable_proof_outbox(&record, replacement) {
+            match state.supersede_durable_proof_outbox(owner, &record, replacement) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {

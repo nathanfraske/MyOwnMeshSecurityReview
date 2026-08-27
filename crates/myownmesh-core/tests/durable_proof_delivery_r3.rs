@@ -22,8 +22,8 @@ use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::protocol::{ProofAckMessage, ProofDeliveryMessage};
 use myownmesh_core::semantic::{
-    AttestationDecision, DeviceId, FactBody, FactContent, FactGraph, ProofRecordState, SignedFact,
-    VerifiedBootstrap,
+    AttestationDecision, DeviceId, FactBody, FactContent, FactGraph, ProofRecord, ProofRecordState,
+    SignedFact, VerifiedBootstrap,
 };
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
@@ -367,6 +367,46 @@ async fn wait_for_no_proof_owner(
     }
 }
 
+async fn wait_for_replayed_proof(
+    state: &Arc<myownmesh_core::engine::NetworkState>,
+    previous: &ProofRecord,
+) -> ProofRecord {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = None;
+    loop {
+        let current = pending_durable_proofs(state)
+            .expect("replay pending records")
+            .into_iter()
+            .find(|record| record.delivery_id == previous.delivery_id);
+        if let Some(current) = current {
+            // Replay/rebind changes only the exact installation binding. The
+            // durable identity and proof support remain stable while the
+            // owner coordinate advances.
+            let stable_metadata = current.context_id == previous.context_id
+                && current.target == previous.target
+                && current.delivery_id == previous.delivery_id
+                && current.fact_ids == previous.fact_ids
+                && current.owner == previous.owner
+                && current.binding != previous.binding;
+            if stable_metadata {
+                if last.as_ref() == Some(&current) {
+                    return current;
+                }
+                last = Some(current);
+                sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+        }
+        last = None;
+        if Instant::now() > deadline {
+            panic!(
+                "production proof replay did not complete with stable identity and current binding"
+            );
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() {
     let root = TempDir::new().expect("instance root");
@@ -424,17 +464,9 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
     .expect("reopen after offline interval");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
-    let pending = pending_durable_proofs(&reopened).expect("replayed pending records");
-    assert_eq!(pending, vec![record.clone()]);
-    assert_eq!(pending[0].state, ProofRecordState::Pending);
-    assert_eq!(pending[0].delivery_id, delivery.delivery_id);
-    assert!(rebind_durable_proof(&reopened, &reopened_owner, &record)
-        .expect("rebind restored proof to reopened owner"));
-    let rebound = pending_durable_proofs(&reopened)
-        .expect("rebound replay record")
-        .into_iter()
-        .find(|pending| pending.delivery_id == record.delivery_id)
-        .expect("rebound replay proof");
+    let rebound = wait_for_replayed_proof(&reopened, &record).await;
+    assert_eq!(rebound.state, ProofRecordState::Pending);
+    assert_eq!(rebound.delivery_id, delivery.delivery_id);
 
     let receiver = receiver_admits_delivery(reopened.verified_bootstrap(), &delivery);
     assert!(receiver.projection().is_stood_down(&target_id));
@@ -506,10 +538,9 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     .expect("sender reconnects from the durable slot");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
-    assert_eq!(
-        pending_durable_proofs(&reopened).expect("E0 replay pending"),
-        vec![e0.clone()]
-    );
+    let e0_rebound = wait_for_replayed_proof(&reopened, &e0).await;
+    assert_eq!(e0_rebound.state, ProofRecordState::Pending);
+    assert_eq!(e0_rebound.delivery_id, e0_delivery.delivery_id);
 
     // A causal regrant followed by a fresh eviction creates E1 with a new
     // canonical closure. The stale E0 is retired as Superseded, never as an
@@ -541,11 +572,11 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     );
     admit_durable_proof(&reopened, e1.clone()).expect("persist E1 closure");
     assert!(
-        supersede_durable_proof(&reopened, &e0, Some(e1.delivery_id))
+        supersede_durable_proof(&reopened, &reopened_owner, &e0, Some(e1.delivery_id))
             .expect("retire stale E0 without ACK")
     );
     assert!(
-        !supersede_durable_proof(&reopened, &e0, Some(e1.delivery_id))
+        !supersede_durable_proof(&reopened, &reopened_owner, &e0, Some(e1.delivery_id))
             .expect("repeated E0 supersession is idempotent")
     );
 
@@ -620,15 +651,9 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     .expect("replacement target lifecycle");
     attach_local(&replacement, &broker);
     let replacement_owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let rebound = wait_for_replayed_proof(&state, &record).await;
     assert!(!rebind_durable_proof(&state, &owner, &record).expect("stale owner refusal"));
-    assert!(
-        rebind_durable_proof(&state, &replacement_owner, &record).expect("current owner rebind")
-    );
-    let rebound = pending_durable_proofs(&state)
-        .expect("rebound proof remains pending")
-        .into_iter()
-        .find(|pending| pending.delivery_id == record.delivery_id)
-        .expect("rebound proof record");
+    assert_eq!(rebound.state, ProofRecordState::Pending);
 
     let prefix = ProofDeliveryMessage::new(context, target_id.clone(), facts[..3].to_vec())
         .expect("prefix delivery serializes");
@@ -731,6 +756,7 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     .expect("restart durable network");
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    let rebound = wait_for_replayed_proof(&reopened, &record).await;
     let snapshot = governance::snapshot(&reopened);
     assert!(
         snapshot.stood_down.contains(target.public_id()),
@@ -740,17 +766,7 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         reopened.semantic_fact_count() >= facts.len(),
         "restart preserves every adopted proof fact"
     );
-    assert_eq!(
-        pending_durable_proofs(&reopened).expect("restart pending receipt"),
-        vec![record.clone()]
-    );
-    assert!(rebind_durable_proof(&reopened, &reopened_owner, &record)
-        .expect("rebind restart proof to reopened owner"));
-    let rebound = pending_durable_proofs(&reopened)
-        .expect("rebound restart record")
-        .into_iter()
-        .find(|pending| pending.delivery_id == record.delivery_id)
-        .expect("rebound restart proof");
+    assert_eq!(rebound.state, ProofRecordState::Pending);
 
     // Reopen the same signed log as the evicted device.  This is the
     // self-eviction boundary: the receiver's own durable projection must

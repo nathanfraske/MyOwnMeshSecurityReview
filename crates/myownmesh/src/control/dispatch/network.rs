@@ -7,9 +7,11 @@
 //! form is the thing these functions exist to get right.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, Context, Result};
 use myownmesh_core::{MeshConfig, NetworkConfig, TopologyMode};
+use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
 
 use crate::registry::RemoveResult;
@@ -22,6 +24,19 @@ use crate::control::reply::{
     PreparedReply, ResponseOwner,
 };
 
+/// Serialize control-surface mutations that pair a registry transition with
+/// its config-file read-modify-write. The registry's exact-current fence
+/// remains the lifecycle authority; this gate prevents independent dispatch
+/// operations from losing each other's config-file updates.
+static NETWORK_MUTATION_GATE: OnceLock<Mutex<()>> = OnceLock::new();
+
+async fn network_mutation_guard() -> MutexGuard<'static, ()> {
+    NETWORK_MUTATION_GATE
+        .get_or_init(Mutex::default)
+        .lock()
+        .await
+}
+
 /// Join a fresh network through the live mesh, attach signaling,
 /// register the result, and persist the new config to disk. Each
 /// step that mutates daemon-visible state is reversible up to the
@@ -33,6 +48,7 @@ pub(in crate::control) async fn network_add(
     config: NetworkConfig,
     owner: ResponseOwner,
 ) -> FundedVariableReply {
+    let _mutation_guard = network_mutation_guard().await;
     // Reject duplicates against the running registry. We rely on
     // the registry's two-key indexing — checking both the local
     // config id and the wire-level network id covers the user
@@ -150,6 +166,7 @@ async fn network_remove_result(
     purge: bool,
     _owner: &ResponseOwner,
 ) -> std::result::Result<String, String> {
+    let _mutation_guard = network_mutation_guard().await;
     let key_owned = key.to_string();
     let (ids, removal) = if let Some(joined) = state.registry.get(key) {
         let ids = (
@@ -383,6 +400,7 @@ pub(in crate::control) async fn network_update(
     config: NetworkConfig,
     owner: ResponseOwner,
 ) -> FundedVariableReply {
+    let _mutation_guard = network_mutation_guard().await;
     // This is update, not add: the network must already be joined.
     let joined = match state
         .registry
@@ -426,16 +444,34 @@ pub(in crate::control) async fn network_update(
         // place, no peers dropped. ICE servers are read fresh on the next
         // connect, so a credential rotation reaches new connections without
         // tearing down the live ones (see `reconcile::apply_hot`).
-        if let Err(e) = myownmesh_core::engine::reconcile::apply_hot(&net_state, config.clone()) {
-            return owner.finish(Err(format!("apply config: {e}")));
+        let hot_result = state.registry.with_current(&config.id, &joined, |current| {
+            let current_state = current.state();
+            myownmesh_core::engine::reconcile::apply_hot(&current_state, config.clone())?;
+            persist_network_update(&config)
+        });
+        let hot_result = match hot_result {
+            Some(result) => Some(result),
+            None => state
+                .registry
+                .with_current(&config.network_id, &joined, |current| {
+                    let current_state = current.state();
+                    myownmesh_core::engine::reconcile::apply_hot(&current_state, config.clone())?;
+                    persist_network_update(&config)
+                }),
+        };
+        match hot_result {
+            None => {
+                return owner.finish(Err(
+                    "network update refused: lifecycle owner is no longer current".to_string(),
+                ));
+            }
+            Some(Err(e)) => {
+                return owner.finish(Err(format!("apply or persist config: {e}")));
+            }
+            Some(Ok(())) => {}
         }
         drop(net_state);
         drop(joined);
-        if let Err(e) = persist_network_update(&config) {
-            return owner.finish(Err(format!(
-                "config applied but config.json save failed: {e}"
-            )));
-        }
         return owner.finish(Ok(OperationReplyData::UpdatedId {
             id: config.id,
             restarted: false,
@@ -484,7 +520,7 @@ pub(in crate::control) async fn network_update(
     let joined = match state.mesh.join(config.clone()).await {
         Ok(j) => j,
         Err(e) => {
-            let rollback = match state.mesh.join(old_config).await {
+            let rollback = match state.mesh.join(old_config.clone()).await {
                 Ok(restored) => {
                     let attached = {
                         let net_state = restored.state();
@@ -501,8 +537,25 @@ pub(in crate::control) async fn network_update(
                         Ok(drivers) => {
                             match state.registry.insert(restored, drivers).into_refusal() {
                                 None => {
-                                    state.services.on_network_added(&config.id).await;
-                                    " — restored the previous config".to_string()
+                                    let restored_owner = state.registry.get(&old_config.id);
+                                    let persisted = restored_owner.and_then(|owner| {
+                                        state.registry.with_current(&old_config.id, &owner, |_| {
+                                            persist_network_update(&old_config)
+                                        })
+                                    });
+                                    match persisted {
+                                        Some(Ok(())) => {
+                                            state.services.on_network_added(&old_config.id).await;
+                                            " — restored the previous config".to_string()
+                                        }
+                                        Some(Err(error)) => format!(
+                                            " — rollback runtime restored but config.json save failed: {error}"
+                                        ),
+                                        None => {
+                                            " — rollback runtime lost its lifecycle owner; config was not overwritten"
+                                                .to_string()
+                                        }
+                                    }
                                 }
                                 Some(refused) => {
                                     let refusal_state = refused.state;
@@ -561,16 +614,42 @@ pub(in crate::control) async fn network_update(
         )));
     }
 
+    // The insert is the replacement's ownership boundary. Resolve the exact
+    // current Arc and commit persistence under the registry fence; a
+    // refusal/successor path above deliberately never reaches this write.
+    let replacement_owner = match state.registry.get(&config.id) {
+        Some(owner) => owner,
+        _ => {
+            return owner.finish(Err(
+                "replacement runtime lost its lifecycle owner; config was not overwritten"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let persisted = state
+        .registry
+        .with_current(&config.id, &replacement_owner, |_| {
+            persist_network_update(&config)
+        });
+    match persisted {
+        None => {
+            return owner.finish(Err(
+                "replacement runtime lost its lifecycle owner before persistence".to_string(),
+            ));
+        }
+        Some(Err(e)) => {
+            return owner.finish(Err(format!(
+                "network updated but config.json save failed: {e}"
+            )));
+        }
+        Some(Ok(())) => {}
+    }
     // The old network was torn down and a fresh one registered under the
-    // same id; re-run both hooks so the advert tracks the replacement.
+    // same id; only after the fenced persistence succeeds do the async hooks
+    // refresh the advert for the replacement.
     state.services.on_network_removed(&config.id).await;
     state.services.on_network_added(&config.id).await;
-
-    if let Err(e) = persist_network_update(&config) {
-        return owner.finish(Err(format!(
-            "network updated but config.json save failed: {e}"
-        )));
-    }
     owner.finish(Ok(OperationReplyData::Updated(summary)))
 }
 

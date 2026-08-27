@@ -1223,6 +1223,28 @@ impl NetworkRegistry {
         (entry.lifecycle.state() == RuntimeState::Running).then(|| entry.joined.clone())
     }
 
+    /// Run one bounded synchronous operation against the exact currently
+    /// registered runtime.  The identity check and the closure share the
+    /// registry state lock, so removal, replacement, or a second alias update
+    /// cannot interleave after the caller captured its handle.  The closure
+    /// must not await or re-enter this registry; it is the small mutation
+    /// window used by network-update paths that need to commit against the
+    /// same [`Arc<JoinedNetwork>`] they resolved.
+    pub(crate) fn with_current<R>(
+        &self,
+        key: &str,
+        expected: &Arc<JoinedNetwork>,
+        effect: impl FnOnce(&Arc<JoinedNetwork>) -> R,
+    ) -> Option<R> {
+        let state = self.state.lock();
+        let entry = state.aliases.get(key)?;
+        if entry.lifecycle.state() != RuntimeState::Running || !Arc::ptr_eq(&entry.joined, expected)
+        {
+            return None;
+        }
+        Some(effect(&entry.joined))
+    }
+
     /// The lifecycle state of the runtime under `key`, for a caller that needs
     /// to distinguish "never existed" from "on its way out".
     pub fn state(&self, key: &str) -> Option<RuntimeState> {
@@ -2326,6 +2348,132 @@ mod tests {
             .shutdown()
             .await
             .expect("the refused same-network runtime is explicitly retired");
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn exact_current_closure_excludes_remove_until_it_returns() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("fence-closure-config", "fence-closure-wire"))
+            .await
+            .expect("the exact-current fixture joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the exact-current fixture installs"
+        );
+        let expected = registry
+            .get("fence-closure-config")
+            .expect("the exact current handle exists");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fenced_registry = Arc::clone(&registry);
+        let fenced_expected = Arc::clone(&expected);
+        let fenced = tokio::task::spawn_blocking(move || {
+            fenced_registry.with_current("fence-closure-config", &fenced_expected, |_current| {
+                entered_tx
+                    .send(())
+                    .expect("the control observes entry into the fence");
+                release_rx
+                    .recv()
+                    .expect("the control releases the bounded synchronous closure");
+                17u8
+            })
+        });
+        entered_rx
+            .recv()
+            .expect("the exact-current closure entered before removal");
+        let removing = {
+            let registry = Arc::clone(&registry);
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                runtime.block_on(async move { registry.remove("fence-closure-config").await })
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !removing.is_finished(),
+            "removal cannot interleave while the exact-current closure holds the registry fence"
+        );
+        release_tx
+            .send(())
+            .expect("the exact-current closure is released");
+        assert_eq!(
+            fenced.await.expect("the fenced closure does not panic"),
+            Some(17),
+            "the closure committed against the exact handle"
+        );
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_current_handle_is_refused_and_successor_is_not_substituted() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("fence-stale-config", "fence-stale-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let predecessor = registry
+            .get("fence-stale-config")
+            .expect("the predecessor handle exists");
+        let pause = registry.install_claim_pause_for_test();
+        let removing = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.remove("fence-stale-config").await })
+        };
+        pause.reached.wait().await;
+        assert_eq!(
+            registry.state("fence-stale-config"),
+            Some(RuntimeState::Closing)
+        );
+        assert!(
+            registry
+                .with_current("fence-stale-config", &predecessor, |_| ())
+                .is_none(),
+            "a handle held before the claim is refused after removal starts"
+        );
+        pause.release.wait().await;
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+
+        let successor = mesh
+            .join(network("fence-stale-config", "fence-stale-wire"))
+            .await
+            .expect("the successor joins after the predecessor stopped");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs after the predecessor stopped"
+        );
+        let current = registry
+            .get("fence-stale-config")
+            .expect("the successor handle exists");
+        assert!(!Arc::ptr_eq(&predecessor, &current));
+        assert!(
+            registry
+                .with_current("fence-stale-config", &predecessor, |_| ())
+                .is_none(),
+            "the successor is never mistaken for the predecessor"
+        );
+        assert_eq!(
+            registry.with_current("fence-stale-config", &current, |joined| {
+                joined.network_id().to_string()
+            }),
+            Some("fence-stale-wire".to_string()),
+            "the successor is accepted only with its own exact handle"
+        );
         let _ = registry.shutdown_all().await;
     }
 

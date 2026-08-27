@@ -2384,6 +2384,20 @@ impl NetworkState {
         Arc::clone(&self.fact_graph)
     }
 
+    fn ensure_durable_owner_mutation_allowed(&self) -> Result<()> {
+        if self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Network(
+                "durable semantic owner is fenced by shutdown".to_string(),
+            ));
+        }
+        self.durable_semantic_owner
+            .ensure_live()
+            .map_err(|error| Error::Network(format!("durable semantic owner unavailable: {error}")))
+    }
+
     /// Admit one canonical fact only after the resulting authoritative state
     /// has been durably committed. The live graph is swapped after
     /// publication, so a writer/serialization/checksum failure cannot expose
@@ -2396,6 +2410,7 @@ impl NetworkState {
         fact: crate::semantic::SignedFact,
     ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
         let mut live = self.fact_graph.write();
+        self.ensure_durable_owner_mutation_allowed()?;
         let before: std::collections::BTreeSet<_> = live.ids().cloned().collect();
         let mut candidate = live.clone();
         let fact_id = fact.id;
@@ -2461,6 +2476,7 @@ impl NetworkState {
         // admission could publish against a snapshot that compaction is
         // about to replace.
         let mut live = self.fact_graph.write();
+        self.ensure_durable_owner_mutation_allowed()?;
         let restored = self
             .durable_semantic_owner
             .compact(&self.verified_bootstrap)
@@ -2501,6 +2517,7 @@ impl NetworkState {
     /// slot. The caller schedules these same delivery ids; it never invents a
     /// replacement id after restart.
     pub(crate) fn pending_durable_proof_outbox(&self) -> Result<Vec<ProofRecord>> {
+        self.ensure_durable_owner_mutation_allowed()?;
         self.durable_proof_outbox
             .pending(self.mesh_context_id)
             .map_err(|error| Error::Network(format!("durable proof replay: {error}")))
@@ -2513,9 +2530,10 @@ impl NetworkState {
         owner: &PeerOwnerToken,
         fact_ids: &[crate::semantic::FactId],
     ) -> Result<ProofRecord> {
+        let graph = self.fact_graph.read();
+        self.ensure_durable_owner_mutation_allowed()?;
         let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
             .map_err(|error| Error::Network(format!("durable proof target rejected: {error}")))?;
-        let graph = self.fact_graph.read();
         for fact_id in fact_ids {
             if graph.get(fact_id).is_none() {
                 return Err(Error::Network(format!(
@@ -2541,12 +2559,13 @@ impl NetworkState {
         &self,
         record: &ProofRecord,
     ) -> Result<crate::protocol::ProofDeliveryMessage> {
+        let graph = self.fact_graph.read();
+        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id || !record.is_pending() {
             return Err(Error::Network(
                 "durable proof record is not Pending in this mesh context".to_string(),
             ));
         }
-        let graph = self.fact_graph.read();
         let mut facts = Vec::with_capacity(record.fact_ids.len());
         for fact_id in &record.fact_ids {
             let fact = graph
@@ -2574,6 +2593,7 @@ impl NetworkState {
     /// Persist one exact canonical proof record before send admission.
     /// Duplicate delivery ids return the existing record idempotently.
     pub(crate) fn admit_durable_proof_outbox(&self, record: ProofRecord) -> Result<ProofRecord> {
+        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id {
             return Err(Error::Network(
                 "durable proof context does not match this network".to_string(),
@@ -2592,6 +2612,7 @@ impl NetworkState {
         owner: &PeerOwnerToken,
         record: &ProofRecord,
     ) -> Result<bool> {
+        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id
             || record.target.to_string() != owner.device_id()
             || !record.is_pending()
@@ -2621,21 +2642,30 @@ impl NetworkState {
     /// Superseded terminal until normal compaction.
     pub(crate) fn supersede_durable_proof_outbox(
         &self,
+        owner: &PeerOwnerToken,
         record: &ProofRecord,
         replacement_delivery_id: Option<ProofDeliveryId>,
     ) -> Result<bool> {
+        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id {
             return Ok(false);
         }
-        let target = record.target.clone();
-        self.durable_proof_outbox
-            .supersede(
+        if record.target.to_string() != owner.device_id() || record.owner != owner.device_id() {
+            return Ok(false);
+        }
+        match self.peers.with_current_durable_outbox(owner, || {
+            self.durable_proof_outbox.supersede(
                 self.mesh_context_id,
                 record.delivery_id,
-                &target,
+                &record.target,
                 replacement_delivery_id,
             )
-            .map_err(|error| Error::Network(format!("durable proof supersede: {error}")))
+        }) {
+            Some(result) => {
+                result.map_err(|error| Error::Network(format!("durable proof supersede: {error}")))
+            }
+            None => Ok(false),
+        }
     }
 
     /// Settle only an exact ACK while the owner installation and binding
@@ -2647,6 +2677,7 @@ impl NetworkState {
         record: &ProofRecord,
         delivery_id: ProofDeliveryId,
     ) -> Result<bool> {
+        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id
             || record.delivery_id != delivery_id
             || record.target.to_string() != owner.device_id()
@@ -4608,6 +4639,10 @@ impl NetworkState {
             self.resolve_connect_waiters(&peer, Some("network shut down"));
         }
         self.application_gateway.close();
+        let _semantic_fence = self.fact_graph.write();
+        if let Err(error) = self.durable_semantic_owner.release() {
+            tracing::warn!(%error, "durable semantic owner release failed during shutdown");
+        }
     }
 
     /// Publish a carrier departure observation. Fire-and-forget, like every

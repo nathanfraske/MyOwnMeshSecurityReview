@@ -106,7 +106,7 @@ pub struct DurableSemanticStore {
 #[derive(Debug)]
 pub struct DurableSemanticOwner {
     store: DurableSemanticStore,
-    _lease: WriterLease,
+    lease: Mutex<Option<WriterLease>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -556,7 +556,7 @@ impl DurableSemanticStore {
         let lease = WriterLease::acquire(&self.lock_path)?;
         Ok(DurableSemanticOwner {
             store: self.clone(),
-            _lease: lease,
+            lease: Mutex::new(Some(lease)),
         })
     }
 
@@ -749,11 +749,40 @@ impl DurableSemanticStore {
 }
 
 impl DurableSemanticOwner {
+    fn ensure_live_unlocked(&self) -> Result<(), DurableStoreError> {
+        if self
+            .lease
+            .lock()
+            .map_err(|_| DurableStoreError::InProcessGatePoisoned)?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(DurableStoreError::OwnerReleased)
+        }
+    }
+
+    pub(crate) fn ensure_live(&self) -> Result<(), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()
+    }
+
+    pub(crate) fn release(&self) -> Result<(), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        let mut lease = self
+            .lease
+            .lock()
+            .map_err(|_| DurableStoreError::InProcessGatePoisoned)?;
+        lease.take();
+        Ok(())
+    }
+
     pub fn commit<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
     where
         I: IntoIterator<Item = ProvisionalCustody>,
     {
         let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
         self.store.store_snapshot(graph, provisional)
     }
 
@@ -762,6 +791,7 @@ impl DurableSemanticOwner {
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
         let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
         self.store.restore_unlocked(bootstrap)
     }
 
@@ -770,6 +800,7 @@ impl DurableSemanticOwner {
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
         let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
         let state = self.store.restore_unlocked(bootstrap)?;
         self.store
             .store_snapshot(&state.graph, state.provisional.clone())?;
@@ -781,6 +812,7 @@ impl DurableSemanticOwner {
         context_id: MeshContextId,
     ) -> Result<Vec<ProofRecord>, DurableStoreError> {
         let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
         self.store.proof_records_unlocked(context_id)
     }
 
@@ -793,6 +825,7 @@ impl DurableSemanticOwner {
         F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
     {
         let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
         self.store.mutate_proof_records_locked(context_id, mutation)
     }
 }
@@ -1286,6 +1319,8 @@ pub enum DurableStoreError {
     WriterBusy { path: PathBuf },
     #[error("semantic snapshot in-process gate is poisoned")]
     InProcessGatePoisoned,
+    #[error("semantic snapshot owner has been released")]
+    OwnerReleased,
     #[error("semantic snapshot path has no parent: {0}")]
     InvalidPath(PathBuf),
     #[error("semantic snapshot I/O at {path}: {source}")]
@@ -1645,6 +1680,39 @@ mod tests {
         ));
         drop(lease);
         store.begin_write().expect("lease released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn released_owner_refuses_stale_mutation_and_allows_same_slot_reopen() {
+        let root = root();
+        let bootstrap = closed("scope-a", 20, [20; 32]);
+        let graph = FactGraph::from_bootstrap(&bootstrap);
+        let store = DurableSemanticStore::new(&root, "release-slot");
+        let owner = store.open_writable().expect("first owner");
+        owner.commit(&graph, Vec::new()).expect("initial snapshot");
+        owner.release().expect("release owner");
+        assert!(matches!(
+            owner.restore(&bootstrap),
+            Err(DurableStoreError::OwnerReleased)
+        ));
+        assert!(matches!(
+            owner.commit(&graph, Vec::new()),
+            Err(DurableStoreError::OwnerReleased)
+        ));
+        assert!(matches!(
+            owner.compact(&bootstrap),
+            Err(DurableStoreError::OwnerReleased)
+        ));
+        assert!(matches!(
+            owner.mutate_proof_records(bootstrap.context_id(), |_| Ok(())),
+            Err(DurableStoreError::OwnerReleased)
+        ));
+        drop(owner);
+
+        let reopened = store.open_writable().expect("same slot reopens");
+        reopened.restore(&bootstrap).expect("reopen snapshot");
+        drop(reopened);
         let _ = std::fs::remove_dir_all(root);
     }
 

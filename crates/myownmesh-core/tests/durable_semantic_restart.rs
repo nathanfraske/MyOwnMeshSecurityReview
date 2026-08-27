@@ -334,3 +334,113 @@ async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress(
     restored.request_shutdown();
     restored_driver.await.expect("final driver shutdown");
 }
+
+#[tokio::test]
+async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
+    let root = TempDir::new().expect("instance root");
+    let identity = Arc::new(Identity::ephemeral());
+    let config = closed_config("r1-stale-reopen", "r1-stale-reopen-wire");
+    let preserved_target = Identity::ephemeral();
+    let stale_target = Identity::ephemeral();
+    let replacement_target = Identity::ephemeral();
+
+    let (state, driver) = create_network_in_instance_root(
+        config.clone(),
+        identity.clone(),
+        support::test_transport(),
+        root.path().to_path_buf(),
+        [0x94; 32],
+    )
+    .await
+    .expect("create Closed network");
+    let context = state.mesh_context_id();
+    governance::propose(
+        &state,
+        TransitionVariant::RoleGrant {
+            target: preserved_target.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("commit the fact preserved across reopen");
+    let committed_count = state.semantic_fact_count();
+    assert_eq!(
+        governance::snapshot(&state)
+            .roles
+            .get(preserved_target.public_id()),
+        Some(&Role::Member),
+        "the pre-shutdown canonical projection is present"
+    );
+
+    // Keep this Arc as the stale caller while its driver and original owner
+    // are shut down. Shutdown releases the durable writer lease, but the
+    // state-level fence must reject every later mutation through this stale
+    // handle rather than allowing it to write the reopened slot.
+    let stale = Arc::clone(&state);
+    let stale_fact = signed_role_grant(
+        context,
+        identity.as_ref(),
+        DeviceId::from_canonical_str(stale_target.public_id()).expect("stale target id"),
+        Vec::new(),
+    );
+    state.request_shutdown();
+    driver.await.expect("first driver shutdown");
+    assert!(
+        stale.compact_semantic_state().is_err(),
+        "a stale state cannot compact after shutdown"
+    );
+    ingest_semantic_fact(&stale, stale_fact).await;
+    assert_eq!(
+        stale.semantic_fact_count(),
+        committed_count,
+        "a stale semantic admission cannot append after shutdown"
+    );
+    assert_eq!(stale.semantic_unresolved_count(), 0);
+    assert_eq!(stale.semantic_provisional_custody_count(), 0);
+
+    // The old Arc remains held deliberately: successful reopen therefore
+    // proves shutdown released the writer lease without reviving stale
+    // mutation authority.
+    let (reopened, reopened_driver) = spawn_network_in_instance_root(
+        config.clone(),
+        identity.clone(),
+        support::test_transport(),
+        root.path().to_path_buf(),
+    )
+    .await
+    .expect("same-slot reopen after shutdown");
+    assert_eq!(reopened.semantic_fact_count(), committed_count);
+    assert_eq!(
+        governance::snapshot(&reopened)
+            .roles
+            .get(preserved_target.public_id()),
+        Some(&Role::Member),
+        "reopened state preserves the pre-shutdown canonical projection"
+    );
+
+    governance::propose(
+        &reopened,
+        TransitionVariant::RoleGrant {
+            target: replacement_target.public_id().to_string(),
+            role: Role::Member,
+        },
+        None,
+    )
+    .await
+    .expect("replacement state appends a fresh canonical fact");
+    assert_eq!(reopened.semantic_fact_count(), committed_count + 1);
+    assert_eq!(
+        governance::snapshot(&reopened)
+            .roles
+            .get(replacement_target.public_id()),
+        Some(&Role::Member),
+        "replacement append projects through the same durable owner"
+    );
+    assert_eq!(reopened.semantic_unresolved_count(), 0);
+    assert_eq!(reopened.semantic_provisional_custody_count(), 0);
+
+    reopened.request_shutdown();
+    reopened_driver.await.expect("replacement driver shutdown");
+    drop(stale);
+}

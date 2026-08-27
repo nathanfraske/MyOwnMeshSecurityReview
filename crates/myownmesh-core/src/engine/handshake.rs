@@ -48,7 +48,7 @@
 //!   - If we've also sent ours, transition to `Active` and emit
 //!     `PeerApproved`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use tracing::{debug, warn};
@@ -269,8 +269,8 @@ pub(super) async fn initiate(
         );
         warn!(peer = %device_id, "send hello failed: {e}");
     }
-    schedule_hello_retries(state.clone(), owner.clone(), hello_msg);
-    schedule_watchdog(state.clone(), owner.clone());
+    schedule_hello_retries(Arc::downgrade(state), owner.clone(), hello_msg);
+    schedule_watchdog(Arc::downgrade(state), owner.clone());
 }
 
 /// Re-send the same hello at each tick of
@@ -281,13 +281,24 @@ pub(super) async fn initiate(
 /// cached proof, without a new draw, a rebuilt transcript, or a second
 /// signature. Idempotence is a property of the task, not of a slot
 /// this path overwrites.
-fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello: MeshMessage) {
+async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
+    tokio::select! {
+        biased;
+        _ = state.wait_for_shutdown() => true,
+        _ = std::future::ready(()) => false,
+    }
+}
+
+fn schedule_hello_retries(state: Weak<NetworkState>, owner: PeerOwnerToken, hello: MeshMessage) {
     tokio::spawn(async move {
         let device_id = owner.device_id().to_string();
         for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
-            tokio::select! {
-                _ = state.wait_for_shutdown() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            if shutdown_requested_now(&state).await {
+                return;
             }
             let still_handshaking = {
                 let Some(peer) = state.peers.get_if_current(&owner) else {
@@ -299,8 +310,14 @@ fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello
             if !still_handshaking {
                 return;
             }
+            if shutdown_requested_now(&state).await {
+                return;
+            }
             if let Err(e) = send_to_peer_owner(&state, &owner, &hello).await {
                 debug!(peer = %device_id, "hello retry send failed: {e}");
+            }
+            if shutdown_requested_now(&state).await {
+                return;
             }
             if let Some(peer) = state.peers.get_if_current(&owner) {
                 let mut data = peer.state.write();
@@ -311,12 +328,15 @@ fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello
     });
 }
 
-fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
+fn schedule_watchdog(state: Weak<NetworkState>, owner: PeerOwnerToken) {
     tokio::spawn(async move {
         let device_id = owner.device_id().to_string();
-        tokio::select! {
-            _ = state.wait_for_shutdown() => return,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)) => {}
+        tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)).await;
+        let Some(state) = state.upgrade() else {
+            return;
+        };
+        if shutdown_requested_now(&state).await {
+            return;
         }
         let should_fail = {
             let Some(peer) = state.peers.get_if_current(&owner) else {
@@ -330,7 +350,7 @@ fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
                     .map(|t| t.elapsed().as_millis() as u64 >= HANDSHAKE_TIMEOUT_MS)
                     .unwrap_or(false)
         };
-        if should_fail {
+        if should_fail && !shutdown_requested_now(&state).await {
             state.log_diag_with(
                 crate::events::DiagLevel::Warn,
                 "handshake",
