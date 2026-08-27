@@ -16,8 +16,10 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(any(test, windows))]
+use std::time::Duration;
 #[cfg(windows)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
