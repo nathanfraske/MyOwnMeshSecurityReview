@@ -91,7 +91,7 @@ use crate::protocol::{
         RpcStreamEndMessage,
     },
     topology::ShelveMessage,
-    CapabilityAdvert, DepartureCorrelation, MeshMessage,
+    CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
 use crate::resource::{
     LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
@@ -1030,6 +1030,7 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         // is what asked, by coming into existence owing an advertisement.
         NetworkCmd::ReplayCapabilities { owner } => {
             replay_local_capabilities_to_owner(state, &owner).await;
+            replay_pending_durable_proofs(state, &owner).await;
         }
         // ---- governance ops ----
         NetworkCmd::ProposeTransition {
@@ -5262,6 +5263,11 @@ async fn handle_inbound_frame_from(
         MeshMessage::RpcResponse(resp) => on_rpc_response(state, &dispatch, resp).await,
         MeshMessage::RpcStreamChunk(c) => on_rpc_stream_chunk(state, &dispatch, c).await,
         MeshMessage::RpcStreamEnd(e) => on_rpc_stream_end(state, &dispatch, e).await,
+        MeshMessage::ProofDelivery(delivery) => {
+            let route = dispatch.logical_reply_operation();
+            on_proof_delivery(state, &route, delivery).await;
+        }
+        MeshMessage::ProofAck(ack) => on_proof_ack(state, &dispatch, ack),
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(
                 state,
@@ -5330,6 +5336,153 @@ async fn handle_inbound_frame_from(
         | MeshMessage::RosterEntries(_) => {
             trace!(peer = %device_id, "discarding misclassified protocol frame");
         }
+    }
+}
+
+/// Replay every still-pending semantic proof whose target is this exact newly
+/// authenticated owner. The durable record is the source of the delivery id;
+/// reconnects only rebind its owner/binding CAS and resend the same payload.
+/// A send is deliberately not a settlement: only the matching authenticated
+/// [`ProofAckMessage`] may settle the retained record.
+async fn replay_pending_durable_proofs(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+) {
+    let records = match state.pending_durable_proof_outbox() {
+        Ok(records) => records,
+        Err(error) => {
+            warn!(peer = %owner.device_id(), %error, "durable proof replay could not restore pending records");
+            return;
+        }
+    };
+    for record in records {
+        if record.target.to_string() != owner.device_id() || !record.is_pending() {
+            continue;
+        }
+        let facts = {
+            let graph = state.authoritative_fact_graph();
+            let graph = graph.read();
+            record
+                .fact_ids
+                .iter()
+                .map(|id| graph.get(id).cloned())
+                .collect::<Option<Vec<_>>>()
+        };
+        let Some(facts) = facts else {
+            warn!(
+                peer = %owner.device_id(),
+                delivery = %record.delivery_id,
+                "durable proof replay refused because a recorded fact is absent"
+            );
+            continue;
+        };
+        let delivery =
+            match ProofDeliveryMessage::new(record.context_id, record.target.clone(), facts) {
+                Ok(delivery) if delivery.delivery_id == record.delivery_id => delivery,
+                Ok(_) | Err(_) => {
+                    warn!(
+                        peer = %owner.device_id(),
+                        delivery = %record.delivery_id,
+                        "durable proof replay refused because its canonical identity changed"
+                    );
+                    continue;
+                }
+            };
+        match state.rebind_durable_proof_outbox(owner, &record) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                warn!(
+                    peer = %owner.device_id(),
+                    delivery = %record.delivery_id,
+                    %error,
+                    "durable proof replay could not bind the current owner"
+                );
+                continue;
+            }
+        }
+        if let Err(error) =
+            send_to_peer_owner(state, owner, &MeshMessage::ProofDelivery(delivery)).await
+        {
+            debug!(
+                peer = %owner.device_id(),
+                delivery = %record.delivery_id,
+                %error,
+                "durable proof replay send failed; record remains pending"
+            );
+        }
+    }
+}
+
+/// Reduce a typed proof delivery only for this node's exact target and context.
+/// Every embedded fact must be present in the authoritative graph before the
+/// target-bound projection check can produce an acknowledgement; a partial or
+/// quarantined bundle therefore cannot settle the sender's durable obligation.
+async fn on_proof_delivery(
+    state: &Arc<NetworkState>,
+    route: &peer_registry::LogicalSessionOperation,
+    delivery: ProofDeliveryMessage,
+) {
+    if delivery.validate().is_err() {
+        return;
+    }
+    let Ok(local) = DeviceId::from_canonical_str(state.identity.public_id()) else {
+        return;
+    };
+    if delivery.context_id != state.mesh_context_id() || delivery.target != local {
+        return;
+    }
+    for fact in delivery.facts.iter().cloned() {
+        ingest_semantic_fact(state, fact).await;
+    }
+    let complete = {
+        let graph = state.authoritative_fact_graph();
+        let graph = graph.read();
+        delivery
+            .facts
+            .iter()
+            .all(|fact| graph.get(&fact.id) == Some(fact))
+    };
+    if complete && governance::proof_delivery_projection_is_verified(state, &delivery) {
+        governance::acknowledge_proof_delivery(state, route, &delivery).await;
+    }
+}
+
+/// Settle one sender-owned durable proof only when the inbound dispatch and
+/// persisted record agree on context, target, delivery identity, owner, and
+/// binding. The state method repeats the exact registry fence, so a stale
+/// worker/epoch ACK is a no-op and cannot settle a successor's record.
+fn on_proof_ack(
+    state: &Arc<NetworkState>,
+    dispatch: &peer_registry::AdmittedInboundDispatch,
+    ack: ProofAckMessage,
+) {
+    if ack.context_id != state.mesh_context_id()
+        || ack.target.to_string() != dispatch.owner().device_id()
+    {
+        return;
+    }
+    let Ok(records) = state.pending_durable_proof_outbox() else {
+        return;
+    };
+    let Some(record) = records
+        .into_iter()
+        .find(|record| record.delivery_id == ack.delivery_id)
+    else {
+        return;
+    };
+    if record.context_id != ack.context_id || record.target != ack.target {
+        return;
+    }
+    if let Err(error) =
+        state.settle_durable_proof_outbox_ack(dispatch.owner(), &record, ack.delivery_id)
+    {
+        debug!(
+            peer = %dispatch.owner().device_id(),
+            delivery = %ack.delivery_id,
+            %error,
+            "durable proof acknowledgement could not settle"
+        );
     }
 }
 
