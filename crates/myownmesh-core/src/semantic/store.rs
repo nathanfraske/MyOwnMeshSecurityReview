@@ -19,6 +19,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+
 use data_encoding::BASE32_NOPAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Error as JsonError;
@@ -33,8 +38,7 @@ use super::{
 const BOOTSTRAP_DIRECTORY: &str = "bootstrap";
 const SEMANTIC_DIRECTORY: &str = "semantic";
 const SEMANTIC_SNAPSHOT_FILE: &str = "snapshot.json";
-const SEMANTIC_LOCK_FILE: &str = ".writer.lock";
-const SEMANTIC_SNAPSHOT_VERSION: u16 = 1;
+const SEMANTIC_SNAPSHOT_VERSION: u16 = 2;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A local store for one bootstrap record.
@@ -68,17 +72,12 @@ impl ProvisionalCustody {
 #[derive(Debug, Clone)]
 pub struct RestoredSemanticState {
     graph: FactGraph,
-    projection_commitment: [u8; 32],
     provisional: Vec<ProvisionalCustody>,
 }
 
 impl RestoredSemanticState {
     pub fn graph(&self) -> &FactGraph {
         &self.graph
-    }
-
-    pub fn projection_commitment(&self) -> [u8; 32] {
-        self.projection_commitment
     }
 
     pub fn provisional_custody(&self) -> &[ProvisionalCustody] {
@@ -94,7 +93,6 @@ impl RestoredSemanticState {
 /// or the new complete snapshot after a reopen.
 #[derive(Debug, Clone)]
 pub struct DurableSemanticStore {
-    root: PathBuf,
     path: PathBuf,
     lock_path: PathBuf,
 }
@@ -104,6 +102,7 @@ struct DurableSnapshot {
     version: u16,
     context_id: MeshContextId,
     facts: Vec<SignedFact>,
+    quarantined: Vec<SignedFact>,
     projection_commitment: [u8; 32],
     provisional: Vec<ProvisionalCustody>,
     checksum: [u8; 32],
@@ -114,15 +113,19 @@ struct SnapshotPayload<'a> {
     version: u16,
     context_id: MeshContextId,
     facts: &'a [SignedFact],
+    quarantined: &'a [SignedFact],
     projection_commitment: [u8; 32],
     provisional: &'a [ProvisionalCustody],
 }
 
 #[derive(Debug)]
 struct WriterLease {
+    #[cfg(not(any(unix, windows)))]
     path: PathBuf,
     #[cfg(unix)]
-    file: std::fs::File,
+    _file: std::fs::File,
+    #[cfg(windows)]
+    _file: std::fs::File,
 }
 
 impl WriterLease {
@@ -159,13 +162,48 @@ impl WriterLease {
                 path: path.to_path_buf(),
                 source,
             })?;
-            return Ok(Self {
-                path: path.to_path_buf(),
-                file,
-            });
+            Ok(Self { _file: file })
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Delete-on-close makes a hard-dead writer recoverable without
+            // unlink/recreate races or a PID/timeout oracle. The zero share
+            // mode keeps the live lease exclusive across processes.
+            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_DELETE_ON_CLOSE);
+            let mut file = options.open(path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    DurableStoreError::WriterBusy {
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    DurableStoreError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    }
+                }
+            })?;
+            if let Err(source) = writeln!(file, "pid={}", std::process::id()) {
+                return Err(DurableStoreError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+            file.sync_all().map_err(|source| DurableStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(Self { _file: file })
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             let mut file = OpenOptions::new();
             file.write(true).create_new(true);
@@ -212,8 +250,14 @@ impl Drop for WriterLease {
         #[cfg(unix)]
         {
             const LOCK_UN: std::os::raw::c_int = 8;
-            let _ = unsafe { flock(self.file.as_raw_fd(), LOCK_UN) };
+            let _ = unsafe { flock(self._file.as_raw_fd(), LOCK_UN) };
         }
+        // Unix deliberately retains the lock pathname. flock owns the
+        // inode lease and removing the name after unlock would permit a
+        // competing process to create a second inode in the gap. Windows
+        // uses FILE_FLAG_DELETE_ON_CLOSE, so the kernel removes its path
+        // only after the owning handle is gone.
+        #[cfg(not(any(unix, windows)))]
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -433,14 +477,9 @@ impl DurableSemanticStore {
         let slot = BASE32_NOPAD.encode(&digest).to_lowercase();
         let directory = root.join(SEMANTIC_DIRECTORY);
         Self {
-            root,
             path: directory.join(format!("{slot}-{SEMANTIC_SNAPSHOT_FILE}")),
             lock_path: directory.join(format!("{slot}.lock")),
         }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// The resolved snapshot path, exposed for diagnostics and interruption
@@ -536,6 +575,8 @@ impl DurableSemanticStore {
         }
 
         let expected_facts = snapshot.facts.len();
+        let expected_quarantined: std::collections::BTreeSet<_> =
+            snapshot.quarantined.iter().map(|fact| fact.id).collect();
         let mut graph = FactGraph::from_bootstrap(bootstrap);
         for fact in snapshot.facts {
             graph
@@ -545,18 +586,44 @@ impl DurableSemanticStore {
                     reason: error.to_string(),
                 })?;
         }
+        for fact in snapshot.quarantined {
+            match graph.admit(fact) {
+                Ok(crate::semantic::Admission::Quarantined { .. }) => {}
+                Ok(crate::semantic::Admission::AlreadyPresent) => {
+                    return Err(DurableStoreError::Rebuild {
+                        path: self.path.clone(),
+                        reason: "snapshot marks an already-admitted fact unresolved".into(),
+                    })
+                }
+                Ok(crate::semantic::Admission::Inserted) => {
+                    return Err(DurableStoreError::Rebuild {
+                        path: self.path.clone(),
+                        reason: "snapshot unresolved fact has no missing dependency".into(),
+                    })
+                }
+                Err(error) => {
+                    return Err(DurableStoreError::Rebuild {
+                        path: self.path.clone(),
+                        reason: error.to_string(),
+                    })
+                }
+            }
+        }
         graph
             .retry_quarantined()
             .map_err(|error| DurableStoreError::Rebuild {
                 path: self.path.clone(),
                 reason: error.to_string(),
             })?;
-        if graph.len() != expected_facts || graph.quarantined().next().is_some() {
+        let actual_quarantined: std::collections::BTreeSet<_> =
+            graph.quarantined().map(|(id, _)| *id).collect();
+        if graph.len() != expected_facts || actual_quarantined != expected_quarantined {
             return Err(DurableStoreError::Rebuild {
                 path: self.path.clone(),
-                reason: "snapshot contains unresolved fact dependencies".into(),
+                reason: "snapshot contains unresolved or missing fact dependencies".into(),
             });
         }
+        validate_provisional_for_state(&snapshot.provisional, &graph)?;
         let actual_projection = projection_commitment(&graph.projection());
         if actual_projection != snapshot.projection_commitment {
             return Err(DurableStoreError::ProjectionMismatch {
@@ -565,7 +632,6 @@ impl DurableSemanticStore {
         }
         Ok(RestoredSemanticState {
             graph,
-            projection_commitment: snapshot.projection_commitment,
             provisional: snapshot.provisional,
         })
     }
@@ -594,18 +660,17 @@ impl DurableSemanticStore {
     where
         I: IntoIterator<Item = ProvisionalCustody>,
     {
-        if graph.quarantined().next().is_some() {
-            return Err(DurableStoreError::UnsettledDependencies {
-                path: self.path.clone(),
-            });
-        }
         let mut facts: Vec<_> = graph.facts.values().cloned().collect();
         facts.sort_by_key(|fact| fact.id);
+        let mut quarantined: Vec<_> = graph.quarantined().map(|(_, fact)| fact.clone()).collect();
+        quarantined.sort_by_key(|fact| fact.id);
         let provisional = canonical_provisional(provisional)?;
+        validate_provisional_for_state(&provisional, graph)?;
         let projection_commitment = projection_commitment(&graph.projection());
         let snapshot = DurableSnapshot::new(
             graph.context_id(),
             facts,
+            quarantined,
             projection_commitment,
             provisional,
         )?;
@@ -618,10 +683,7 @@ impl DurableSemanticStore {
             path: parent.to_path_buf(),
             source,
         })?;
-        crate::persist::write_atomic(&self.path, &bytes).map_err(|source| DurableStoreError::Io {
-            path: self.path.clone(),
-            source,
-        })
+        write_snapshot_atomic(&self.path, &bytes)
     }
 }
 
@@ -629,6 +691,7 @@ impl DurableSnapshot {
     fn new(
         context_id: MeshContextId,
         facts: Vec<SignedFact>,
+        quarantined: Vec<SignedFact>,
         projection_commitment: [u8; 32],
         provisional: Vec<ProvisionalCustody>,
     ) -> Result<Self, DurableStoreError> {
@@ -636,6 +699,7 @@ impl DurableSnapshot {
             version: SEMANTIC_SNAPSHOT_VERSION,
             context_id,
             facts,
+            quarantined,
             projection_commitment,
             provisional,
             checksum: [0; 32],
@@ -649,6 +713,7 @@ impl DurableSnapshot {
             version: self.version,
             context_id: self.context_id,
             facts: &self.facts,
+            quarantined: &self.quarantined,
             projection_commitment: self.projection_commitment,
             provisional: &self.provisional,
         };
@@ -695,6 +760,22 @@ where
     Ok(values)
 }
 
+fn validate_provisional_for_state(
+    claims: &[ProvisionalCustody],
+    graph: &FactGraph,
+) -> Result<(), DurableStoreError> {
+    let unresolved: std::collections::BTreeSet<_> =
+        graph.quarantined().map(|(id, _)| *id).collect();
+    if claims.len() != unresolved.len()
+        || claims
+            .iter()
+            .any(|claim| !unresolved.contains(&claim.fact_id))
+    {
+        return Err(DurableStoreError::UnknownCustodyFact);
+    }
+    Ok(())
+}
+
 fn projection_commitment(projection: &Projection) -> [u8; 32] {
     let mut bytes = Vec::new();
     for (cell, value) in projection.cells() {
@@ -726,6 +807,74 @@ fn projection_commitment(projection: &Projection) -> [u8; 32] {
     let mut commitment = [0; 32];
     commitment.copy_from_slice(&digest);
     commitment
+}
+
+fn write_snapshot_atomic(path: &Path, bytes: &[u8]) -> Result<(), DurableStoreError> {
+    #[cfg(not(windows))]
+    {
+        crate::persist::write_atomic(path, bytes).map_err(|source| DurableStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| DurableStoreError::InvalidPath(path.to_path_buf()))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| DurableStoreError::InvalidPath(path.to_path_buf()))?;
+        let counter = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            name.to_string_lossy(),
+            std::process::id(),
+            counter
+        ));
+        let mut file = OpenOptions::new();
+        file.write(true).create_new(true);
+        let mut file = file.open(&temp).map_err(|source| DurableStoreError::Io {
+            path: temp.clone(),
+            source,
+        })?;
+        if let Err(source) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(DurableStoreError::Io { path: temp, source });
+        }
+        let source = wide_path(&temp);
+        let destination = wide_path(path);
+        const MOVEFILE_REPLACE_EXISTING: u32 = 1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 8;
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            let source = std::io::Error::last_os_error();
+            let _ = std::fs::remove_file(&temp);
+            return Err(DurableStoreError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
 }
 
 /// Create a missing directory hierarchy one component at a time. Each newly
@@ -900,8 +1049,6 @@ pub enum DurableStoreError {
     ProjectionMismatch { path: PathBuf },
     #[error("semantic snapshot cannot rebuild at {path}: {reason}")]
     Rebuild { path: PathBuf, reason: String },
-    #[error("semantic snapshot has unresolved fact dependencies at {path}")]
-    UnsettledDependencies { path: PathBuf },
     #[error("semantic snapshot writer is busy: {path}")]
     WriterBusy { path: PathBuf },
     #[error("semantic snapshot path has no parent: {0}")]
@@ -914,6 +1061,8 @@ pub enum DurableStoreError {
     },
     #[error("semantic snapshot contains invalid provisional custody")]
     InvalidCustody,
+    #[error("semantic snapshot provisional custody names an unknown fact")]
+    UnknownCustodyFact,
     #[error("semantic snapshot contains duplicate provisional custody")]
     DuplicateCustody,
     #[error("semantic snapshot serialization failed: {0}")]
@@ -925,7 +1074,9 @@ mod tests {
     use super::*;
     use crate::semantic::{FactBody, FactContent, FactDomain};
     use ed25519_dalek::SigningKey;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1178,18 +1329,43 @@ mod tests {
         let fact = root_fact(&bootstrap, &signing_key);
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph.admit(fact.clone()).expect("root fact admits");
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("test root id");
+        let missing = FactId::from_bytes([0xabu8; 32]);
+        let unresolved = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target: author.clone(),
+                    role: super::super::Role::Member,
+                },
+                author,
+                vec![missing],
+            ),
+            &signing_key,
+        )
+        .expect("unresolved fact signs");
+        graph
+            .admit(unresolved.clone())
+            .expect("missing-parent fact quarantines");
         let store = DurableSemanticStore::new(&root, "semantic-slot");
-        let custody = ProvisionalCustody::new(fact.id, "writer-a");
+        let custody = ProvisionalCustody::new(unresolved.id, "writer-a");
         store
             .commit(&graph, vec![custody.clone()])
             .expect("atomic semantic commit");
         let restored = store.restore(&bootstrap).expect("semantic reopen");
         assert_eq!(restored.graph().len(), 1);
-        assert_eq!(restored.provisional_custody(), &[custody]);
         assert_eq!(
-            restored.projection_commitment(),
-            projection_commitment(&graph.projection())
+            restored
+                .graph()
+                .quarantined()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![unresolved.id]
         );
+        assert_eq!(restored.provisional_custody(), &[custody]);
         let compacted = store.compact(&bootstrap).expect("compact and reopen");
         assert_eq!(compacted.graph().len(), 1);
         let _ = std::fs::remove_dir_all(root);
@@ -1216,11 +1392,25 @@ mod tests {
         let graph = FactGraph::from_bootstrap(&bootstrap);
         let store = DurableSemanticStore::new(&root, "restart-slot");
         store.commit(&graph, Vec::new()).expect("initial snapshot");
-        std::fs::write(
-            store.path().with_extension("json.tmp"),
-            b"interrupted replacement",
-        )
-        .expect("interrupted temp");
+
+        #[cfg(not(windows))]
+        let stale_temp = store.path().with_extension("json.tmp");
+        #[cfg(windows)]
+        let stale_temp = store
+            .path()
+            .parent()
+            .expect("snapshot parent")
+            .join(format!(
+                ".{}.{}.{}.tmp",
+                store
+                    .path()
+                    .file_name()
+                    .expect("snapshot name")
+                    .to_string_lossy(),
+                std::process::id(),
+                u64::MAX
+            ));
+        std::fs::write(&stale_temp, b"interrupted replacement").expect("interrupted temp");
         assert_eq!(
             store
                 .restore(&bootstrap)
@@ -1232,7 +1422,16 @@ mod tests {
         store
             .commit(&graph, Vec::new())
             .expect("next commit replaces interrupted temp");
-        assert!(!store.path().with_extension("json.tmp").exists());
+        #[cfg(not(windows))]
+        assert!(!stale_temp.exists());
+        #[cfg(windows)]
+        {
+            assert!(
+                stale_temp.exists(),
+                "unrelated unique stale temp is not broad-cleaned"
+            );
+            let _ = std::fs::remove_file(stale_temp);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1257,5 +1456,78 @@ mod tests {
             Err(DurableStoreError::ChecksumMismatch { .. })
         ));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn provisional_custody_must_name_a_fact_in_the_rebuilt_graph() {
+        let root = root();
+        let bootstrap = closed("scope-a", 15, [15; 32]);
+        let graph = FactGraph::from_bootstrap(&bootstrap);
+        let store = DurableSemanticStore::new(&root, "custody-fact-slot");
+        store.commit(&graph, Vec::new()).expect("initial snapshot");
+        let mut snapshot: DurableSnapshot =
+            serde_json::from_slice(&std::fs::read(store.path()).expect("snapshot bytes"))
+                .expect("snapshot envelope");
+        snapshot.provisional = vec![ProvisionalCustody::new(
+            FactId::from_bytes([0xabu8; 32]),
+            "orphan",
+        )];
+        snapshot.checksum = snapshot.calculate_checksum().expect("custody checksum");
+        std::fs::write(
+            store.path(),
+            serde_json::to_vec(&snapshot).expect("custody envelope"),
+        )
+        .expect("custody snapshot");
+        assert!(matches!(
+            store.restore(&bootstrap),
+            Err(DurableStoreError::UnknownCustodyFact)
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_process_contention_and_hard_death_release_the_writer() {
+        let root = root();
+        let ready = root.join("child-ready");
+        let store = DurableSemanticStore::new(&root, "child-slot");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("child_writer_holds_lease")
+            .env("MYOWNMESH_STORE_CHILD_ROOT", &root)
+            .env("MYOWNMESH_STORE_CHILD_READY", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn child writer");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let child_ready = ready.exists();
+        let contended = matches!(
+            store.begin_write(),
+            Err(DurableStoreError::WriterBusy { .. })
+        );
+        child.kill().expect("hard-stop child writer");
+        child.wait().expect("reap child writer");
+        assert!(child_ready, "child must publish that its lease is held");
+        assert!(contended, "live child writer must exclude this process");
+        store
+            .begin_write()
+            .expect("hard-dead child must not strand the writer lease");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn child_writer_holds_lease() {
+        let (Some(root), Some(ready)) = (
+            std::env::var_os("MYOWNMESH_STORE_CHILD_ROOT"),
+            std::env::var_os("MYOWNMESH_STORE_CHILD_READY"),
+        ) else {
+            return;
+        };
+        let store = DurableSemanticStore::new(root, "child-slot");
+        let _lease = store.begin_write().expect("child writer lease");
+        std::fs::write(ready, b"ready").expect("child ready marker");
+        std::thread::sleep(Duration::from_secs(30));
     }
 }

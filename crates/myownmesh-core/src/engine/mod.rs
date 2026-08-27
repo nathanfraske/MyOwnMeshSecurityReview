@@ -97,7 +97,7 @@ use crate::resource::{
     LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
 };
 use crate::semantic::{
-    BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId,
+    BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId, SignedFact,
     VerifiedBootstrap, VerifiedProjectPolicy,
 };
 use crate::transport::{
@@ -438,6 +438,34 @@ pub async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
             .await
             .map(|_| ()),
         None => governance::join_open_participation(state).await.map(|_| ()),
+    }
+}
+
+/// Ingest one authenticated canonical fact through the production semantic
+/// reducer. Carrier/session identity is deliberately absent: the signed fact
+/// supplies its own authority and the reducer supplies durable admission,
+/// quarantine custody, projection, and broadcast ordering.
+pub(crate) async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: SignedFact) {
+    let semantic_ingress::SemanticAdmission::Durable(exchange) =
+        semantic_ingress::admit(MeshMessage::Fact(fact))
+    else {
+        return;
+    };
+    semantic_ingress::reduce(state, exchange, None).await;
+}
+
+/// Integration-only facade for production-shaped transport-lab controls.
+#[cfg(feature = "transport-lab")]
+pub mod transport_lab {
+    use std::sync::Arc;
+
+    use crate::semantic::SignedFact;
+
+    use super::NetworkState;
+
+    #[doc(hidden)]
+    pub async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: SignedFact) {
+        super::ingest_semantic_fact(state, fact).await;
     }
 }
 

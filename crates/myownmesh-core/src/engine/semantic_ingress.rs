@@ -72,7 +72,6 @@
 //! durable exchange arm while the classifier still moves that frame exactly
 //! once.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use tracing::trace;
@@ -348,39 +347,20 @@ pub(super) async fn reduce(
 fn admit_with_quarantine_retry(
     state: &Arc<NetworkState>,
     fact: SignedFact,
-) -> Result<(Admission, Vec<SignedFact>), crate::semantic::SemanticError> {
-    let graph = state.authoritative_fact_graph();
-    let mut graph = graph.write();
-    let before: BTreeSet<_> = graph.ids().cloned().collect();
-    let fact_id = fact.id;
-    let admission = graph.admit(fact)?;
-    if !matches!(admission, Admission::Inserted) {
-        return Ok((admission, Vec::new()));
-    }
-
-    // A malformed quarantined fact must not prevent the successfully inserted
-    // parent (or any earlier successful retries) from being reduced. The
-    // post-attempt graph diff still captures every fact that did get inserted
-    // before such an error was returned.
-    let _ = graph.retry_quarantined();
-    let mut newly_inserted: Vec<_> = graph
-        .ids()
-        .filter(|id| !before.contains(*id))
-        .filter_map(|id| graph.get(id).cloned())
-        .collect();
-    if let Some(parent) = newly_inserted
-        .iter()
-        .position(|inserted| inserted.id == fact_id)
-    {
-        newly_inserted.swap(0, parent);
-    }
-    Ok((admission, newly_inserted))
+) -> Result<(Admission, Vec<SignedFact>), crate::error::Error> {
+    state.admit_fact_durably(fact)
 }
 
 async fn reduce_signed_fact(state: &Arc<NetworkState>, fact: SignedFact) {
-    if let Ok((Admission::Inserted, newly_inserted)) = admit_with_quarantine_retry(state, fact) {
-        for fact in newly_inserted {
-            governance::on_fact(state, fact).await;
+    match admit_with_quarantine_retry(state, fact) {
+        Ok((Admission::Inserted, newly_inserted)) => {
+            for fact in newly_inserted {
+                governance::on_fact(state, fact).await;
+            }
+        }
+        Ok((Admission::AlreadyPresent | Admission::Quarantined { .. }, _)) => {}
+        Err(error) => {
+            trace!(error = %error, "durable semantic admission refused");
         }
     }
 }

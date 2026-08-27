@@ -85,6 +85,7 @@ use tokio::task::JoinHandle;
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
+use crate::semantic::store::{DurableSemanticStore, ProvisionalCustody};
 
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
@@ -1360,6 +1361,13 @@ pub struct NetworkState {
     /// carrier/session identities are selectors and never become semantic
     /// authority.
     pub(crate) fact_graph: Arc<RwLock<crate::semantic::FactGraph>>,
+    /// The one durable owner for this instance's canonical graph, projection
+    /// commitment, and provisional semantic custody.  Its slot is local
+    /// (`config.id`) while the snapshot itself is bound to the immutable
+    /// bootstrap context, so two instances may share a wire network id while
+    /// retaining independent on-disk state.
+    durable_semantic_store: DurableSemanticStore,
+    durable_provisional: Mutex<Vec<ProvisionalCustody>>,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
@@ -1826,9 +1834,32 @@ impl NetworkState {
         let session_broker = transport.session_broker();
         let governance_state = Arc::new(RwLock::new(governance_state));
         let local_device_id = identity.public_id().to_string();
-        let fact_graph = Arc::new(RwLock::new(crate::semantic::FactGraph::from_bootstrap(
-            &verified_bootstrap,
-        )));
+        let durable_root = instance_root
+            .clone()
+            .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
+        let durable_semantic_store = DurableSemanticStore::new(durable_root, &config.id);
+        let (initial_graph, durable_provisional) =
+            match durable_semantic_store.restore(&verified_bootstrap) {
+                Ok(restored) => (
+                    restored.graph().clone(),
+                    restored.provisional_custody().to_vec(),
+                ),
+                Err(crate::semantic::store::DurableStoreError::Missing { .. }) => {
+                    let graph = crate::semantic::FactGraph::from_bootstrap(&verified_bootstrap);
+                    durable_semantic_store
+                        .commit(&graph, Vec::new())
+                        .map_err(|error| {
+                            Error::Network(format!("initial semantic snapshot: {error}"))
+                        })?;
+                    (graph, Vec::new())
+                }
+                Err(error) => {
+                    return Err(Error::Network(format!(
+                        "restoring semantic snapshot: {error}"
+                    )))
+                }
+            };
+        let fact_graph = Arc::new(RwLock::new(initial_graph));
         let state = Arc::new(Self {
             network_id: config.network_id.clone(),
             verified_bootstrap,
@@ -1844,6 +1875,8 @@ impl NetworkState {
             roster: RwLock::new(roster),
             governance_state,
             fact_graph,
+            durable_semantic_store,
+            durable_provisional: Mutex::new(durable_provisional),
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             application_gateway: crate::application_gateway::ApplicationGateway::new(
@@ -2333,6 +2366,111 @@ impl NetworkState {
     /// default graph would silently bypass the trusted-root boundary.
     pub(crate) fn authoritative_fact_graph(&self) -> Arc<RwLock<crate::semantic::FactGraph>> {
         Arc::clone(&self.fact_graph)
+    }
+
+    /// Admit one canonical fact only after the resulting authoritative state
+    /// has been durably committed. The live graph is swapped after
+    /// publication, so a writer/serialization/checksum failure cannot expose
+    /// an effect that will disappear on restart. Quarantined facts are also
+    /// persisted as unresolved dependencies with one exact custody claim; they
+    /// are not projected or advertised until a later parent admission resolves
+    /// them.
+    pub(crate) fn admit_fact_durably(
+        &self,
+        fact: crate::semantic::SignedFact,
+    ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
+        let mut live = self.fact_graph.write();
+        let before: std::collections::BTreeSet<_> = live.ids().cloned().collect();
+        let mut candidate = live.clone();
+        let fact_id = fact.id;
+        let admission = candidate
+            .admit(fact)
+            .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
+        if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
+            let mut candidate_provisional = self.durable_provisional.lock().clone();
+            if !candidate_provisional
+                .iter()
+                .any(|claim| claim.fact_id == fact_id)
+            {
+                candidate_provisional.push(ProvisionalCustody::new(fact_id, "semantic-ingress"));
+            }
+            self.durable_semantic_store
+                .commit(&candidate, candidate_provisional.clone())
+                .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
+            *live = candidate;
+            *self.durable_provisional.lock() = candidate_provisional;
+            return Ok((admission, Vec::new()));
+        }
+        if matches!(admission, crate::semantic::Admission::Inserted) {
+            if let Err(error) = candidate.retry_quarantined() {
+                if matches!(
+                    error,
+                    crate::semantic::SemanticError::ContextMismatch { .. }
+                ) {
+                    return Err(Error::Other(format!(
+                        "quarantined semantic fact context rejected: {error}"
+                    )));
+                }
+                // retry_quarantined removes a ready fact before validating its
+                // authority.  A rejected fact is therefore an exact terminal
+                // outcome: publish the remaining candidate and settle its
+                // custody instead of allowing that stale entry to starve all
+                // later admissions.
+            }
+            let mut candidate_provisional = self.durable_provisional.lock().clone();
+            let unresolved: std::collections::BTreeSet<_> =
+                candidate.quarantined().map(|(id, _)| *id).collect();
+            candidate_provisional.retain(|claim| unresolved.contains(&claim.fact_id));
+            self.durable_semantic_store
+                .commit(&candidate, candidate_provisional.clone())
+                .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
+            let newly_inserted = candidate
+                .ids()
+                .filter(|id| !before.contains(*id))
+                .filter_map(|id| candidate.get(id).cloned())
+                .collect();
+            *live = candidate;
+            *self.durable_provisional.lock() = candidate_provisional;
+            return Ok((admission, newly_inserted));
+        }
+        Ok((admission, Vec::new()))
+    }
+
+    /// Re-verify and compact the exact production-owned semantic snapshot.
+    /// The restored graph is installed only after compaction/reopen succeeds.
+    pub(crate) fn compact_durable_semantic_state(&self) -> Result<()> {
+        let restored = self
+            .durable_semantic_store
+            .compact(&self.verified_bootstrap)
+            .map_err(|error| Error::Network(format!("semantic snapshot compact: {error}")))?;
+        *self.fact_graph.write() = restored.graph().clone();
+        *self.durable_provisional.lock() = restored.provisional_custody().to_vec();
+        Ok(())
+    }
+
+    /// Compact and reopen this network's canonical semantic snapshot through
+    /// the same owner used by admission and restart.  The operation is
+    /// fail-closed: a failed verification or publication leaves the live graph
+    /// untouched.
+    pub fn compact_semantic_state(&self) -> Result<()> {
+        self.compact_durable_semantic_state()
+    }
+
+    /// Number of admitted facts currently restored in the authoritative graph.
+    /// This observation is useful to diagnostics and restart controls; it does
+    /// not expose or alter semantic authority.
+    pub fn semantic_fact_count(&self) -> usize {
+        self.fact_graph.read().len()
+    }
+
+    /// Number of unresolved canonical facts retained by the durable snapshot.
+    pub fn semantic_unresolved_count(&self) -> usize {
+        self.fact_graph.read().quarantined().count()
+    }
+
+    /// Number of exact provisional custody claims paired with unresolved facts.
+    pub fn semantic_provisional_custody_count(&self) -> usize {
+        self.durable_provisional.lock().len()
     }
 
     /// Read observations for this live joined network instance.

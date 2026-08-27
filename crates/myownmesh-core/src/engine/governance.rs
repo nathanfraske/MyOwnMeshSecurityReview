@@ -69,11 +69,7 @@ fn signed_fact(
 }
 
 fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()> {
-    let graph = state.authoritative_fact_graph();
-    let admission = graph
-        .write()
-        .admit(fact.clone())
-        .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
+    let (admission, _) = state.admit_fact_durably(fact.clone())?;
     if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
         return Err(Error::Other(
             "authored semantic fact is missing a causal parent".into(),
@@ -1274,13 +1270,23 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    let graph = state.authoritative_fact_graph();
-    let admission = graph.write().admit(fact.clone());
-    if let Err(error) = admission {
+    let admission = state.admit_fact_durably(fact.clone());
+    let (admission, _) = match admission {
+        Ok(admission) => admission,
+        Err(error) => {
+            diag(
+                state,
+                crate::events::DiagLevel::Warn,
+                format!("rejecting semantic fact admission: {error}"),
+            );
+            return;
+        }
+    };
+    if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
         diag(
             state,
             crate::events::DiagLevel::Warn,
-            format!("rejecting semantic fact admission: {error}"),
+            "deferring semantic fact with missing causal parent",
         );
         return;
     }
