@@ -202,6 +202,26 @@ fn reissued_stand_down_facts(
     facts
 }
 
+fn regrant_after_eviction_fact(
+    bootstrap: &VerifiedBootstrap,
+    prior: &[SignedFact],
+    owner: &Identity,
+    target: &Identity,
+) -> SignedFact {
+    let target_id = device(target);
+    let mut graph = FactGraph::from_bootstrap(bootstrap);
+    for fact in prior.iter().cloned() {
+        graph.admit(fact).expect("prior eviction history admits");
+    }
+    let regrant = authored(
+        &graph,
+        owner,
+        FactBody::MembershipAdmit { target: target_id },
+    );
+    graph.admit(regrant.clone()).expect("causal regrant admits");
+    regrant
+}
+
 fn receiver_admits_delivery(
     bootstrap: &VerifiedBootstrap,
     delivery: &ProofDeliveryMessage,
@@ -411,6 +431,31 @@ async fn wait_for_replayed_proof(
         }
         if Instant::now() > deadline {
             panic!("production proof replay did not expose Pending or an exact Settled tombstone");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_durable_record_state(
+    state: &Arc<myownmesh_core::engine::NetworkState>,
+    delivery_id: myownmesh_core::semantic::ProofDeliveryId,
+    expected: ProofRecordState,
+) -> ProofRecord {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let record = durable_proof_records(state)
+            .expect("read exact durable replay state")
+            .into_iter()
+            .find(|record| record.delivery_id == delivery_id)
+            .expect("durable delivery record remains observable");
+        if record.state == expected {
+            return record;
+        }
+        if Instant::now() > deadline {
+            panic!(
+                "durable delivery {delivery_id} remained {:?}, expected {expected:?}",
+                record.state
+            );
         }
         sleep(Duration::from_millis(20)).await;
     }
@@ -703,6 +748,117 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
 
     reopened.request_shutdown();
     reopened_driver.await.expect("reconnect lifecycle shutdown");
+    target_state.request_shutdown();
+    target_driver.await.expect("target lifecycle shutdown");
+}
+
+#[tokio::test]
+async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
+    let root = TempDir::new().expect("instance root");
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        target,
+        _member,
+        facts,
+        _context,
+        config,
+        broker,
+        _target_root,
+    ) = create_fixture(&root, "r3-regrant-race").await;
+    assert!(
+        !governance::snapshot(&target_state)
+            .stood_down
+            .contains(target.public_id()),
+        "initial authenticated target has not received a stand-down proof"
+    );
+
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let e0 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &owner,
+        &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+    )
+    .expect("E0 proof record");
+    let e0_delivery = materialize_durable_proof_delivery(&state, &e0).expect("E0 delivery");
+    admit_durable_proof(&state, e0.clone()).expect("persist selected E0");
+    assert_eq!(
+        durable_proof_records(&state)
+            .expect("observe selected E0")
+            .into_iter()
+            .find(|record| record.delivery_id == e0.delivery_id)
+            .expect("selected E0 remains present")
+            .state,
+        ProofRecordState::Pending
+    );
+    assert_eq!(e0_delivery.delivery_id, e0.delivery_id);
+
+    state.request_shutdown();
+    driver.await.expect("selected E0 lifecycle shutdown");
+    drop(owner);
+    drop(state);
+
+    // Deterministic resume barrier: reopen without attaching transport, commit
+    // the causal G1 regrant, and only then resume the broker replay path.
+    let (reopened, reopened_driver) = spawn_network_in_instance_root(
+        config.clone(),
+        identity,
+        support::test_transport(),
+        root.path().to_path_buf(),
+    )
+    .await
+    .expect("reopen before replay");
+    let g1 = regrant_after_eviction_fact(
+        reopened.verified_bootstrap(),
+        &facts,
+        reopened.identity.as_ref(),
+        &target,
+    );
+    ingest_semantic_fact(&reopened, g1).await;
+    reopened
+        .compact_semantic_state()
+        .expect("durably commit G1 before resume");
+    assert!(
+        !governance::snapshot(&reopened)
+            .stood_down
+            .contains(target.public_id()),
+        "G1 restoration clears the sender's active stand-down before replay"
+    );
+    let selected_before_resume = durable_proof_records(&reopened)
+        .expect("observe E0 before resume")
+        .into_iter()
+        .find(|record| record.delivery_id == e0.delivery_id)
+        .expect("E0 remains durable across the regrant");
+    assert_exact_delivery_metadata(&selected_before_resume, &e0);
+    assert_eq!(selected_before_resume.state, ProofRecordState::Pending);
+
+    // Attaching the broker is the only resume action. Replay must inspect the
+    // current proof selection, fence E0 as Superseded, and never send E0.
+    attach_local(&reopened, &broker);
+    let _reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    let e0_terminal =
+        wait_for_durable_record_state(&reopened, e0.delivery_id, ProofRecordState::Superseded)
+            .await;
+    assert_exact_delivery_metadata(&e0_terminal, &e0);
+    assert!(
+        !pending_durable_proofs(&reopened)
+            .expect("enumerate resumed replay")
+            .iter()
+            .any(|record| record.delivery_id == e0.delivery_id),
+        "the selected E0 is never replayed after G1 restoration"
+    );
+    assert!(
+        !governance::snapshot(&target_state)
+            .stood_down
+            .contains(target.public_id()),
+        "the stale E0 never reaches the target as a stand-down-causing proof"
+    );
+
+    reopened.request_shutdown();
+    reopened_driver.await.expect("resumed sender shutdown");
     target_state.request_shutdown();
     target_driver.await.expect("target lifecycle shutdown");
 }

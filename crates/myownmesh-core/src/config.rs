@@ -7,12 +7,17 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +50,101 @@ struct ConfigFileLease {
     _file: std::fs::File,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConfigFileIdentity {
+    len: u64,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    volume_serial: u32,
+    #[cfg(windows)]
+    file_index: u64,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileTime {
+    _low: u32,
+    _high: u32,
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsFileInformation {
+    _attributes: u32,
+    _creation_time: WindowsFileTime,
+    _access_time: WindowsFileTime,
+    _write_time: WindowsFileTime,
+    volume_serial: u32,
+    _file_size_high: u32,
+    _file_size_low: u32,
+    _links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        information: *mut WindowsFileInformation,
+    ) -> i32;
+}
+
+impl ConfigFileIdentity {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+
+    fn from_file(file: &std::fs::File) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self::from_metadata(&file.metadata().map_err(|error| {
+                Error::Config(format!("stat config: {error}"))
+            })?))
+        }
+
+        #[cfg(windows)]
+        {
+            let mut information = std::mem::MaybeUninit::<WindowsFileInformation>::uninit();
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) }
+                == 0
+            {
+                return Err(Error::Config(format!(
+                    "get config file identity: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            let information = unsafe { information.assume_init() };
+            let metadata = file
+                .metadata()
+                .map_err(|error| Error::Config(format!("stat config: {error}")))?;
+            Ok(Self {
+                len: metadata.len(),
+                volume_serial: information.volume_serial,
+                file_index: (u64::from(information.file_index_high) << 32)
+                    | u64::from(information.file_index_low),
+            })
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            Err(Error::Config(
+                "config file identity is unsupported on this platform".to_string(),
+            ))
+        }
+    }
+}
+
 impl ConfigFileLease {
     fn acquire(path: &Path) -> Result<Self> {
         #[cfg(unix)]
@@ -53,6 +153,7 @@ impl ConfigFileLease {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(path)
                 .map_err(|error| {
                     Error::Config(format!(
@@ -67,7 +168,7 @@ impl ConfigFileLease {
                     path.display()
                 )));
             }
-            return Ok(Self { _file: file });
+            Ok(Self { _file: file })
         }
 
         #[cfg(windows)]
@@ -83,10 +184,10 @@ impl ConfigFileLease {
                     .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
                     .open(path)
                 {
-                    Ok(file) => return Ok(Self { _file: file }),
+                    Ok(file) => break Ok(Self { _file: file }),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                         if Instant::now() >= deadline {
-                            return Err(Error::Config(format!(
+                            break Err(Error::Config(format!(
                                 "timed out waiting for config transaction: {}",
                                 path.display()
                             )));
@@ -94,7 +195,7 @@ impl ConfigFileLease {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(error) => {
-                        return Err(Error::Config(format!(
+                        break Err(Error::Config(format!(
                             "open config transaction lock {}: {error}",
                             path.display()
                         )));
@@ -807,7 +908,7 @@ fn save_config_locked(path: &Path, config: &MeshConfig) -> Result<()> {
         .map_err(|error| Error::Config(format!("write {}: {error}", path.display())))
 }
 
-/// Where a prepared load will get its bytes.
+/// Where a prepared load will get its bytes and exact file identity.
 enum PreparedConfigSource {
     /// No file. The plan will produce [`MeshConfig::default`] and reads
     /// nothing.
@@ -815,8 +916,38 @@ enum PreparedConfigSource {
     /// An **already-open** handle and the length the plan was measured
     /// against. Opened during planning rather than at commit so the bytes that
     /// get read are the bytes that were measured, not whatever a later `open`
-    /// would find.
-    Present { file: std::fs::File, len: u64 },
+    /// would find. The identity rejects an uncoordinated replacement before
+    /// the prepared handle can quarantine the wrong pathname.
+    Present {
+        file: std::fs::File,
+        len: u64,
+        identity: ConfigFileIdentity,
+    },
+}
+
+fn ensure_prepared_source_identity(path: &Path, source: &PreparedConfigSource) -> Result<()> {
+    match source {
+        PreparedConfigSource::Missing => match std::fs::metadata(path) {
+            Ok(_) => Err(Error::Config(format!(
+                "config {} appeared after preparation",
+                path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Config(format!("stat {}: {error}", path.display()))),
+        },
+        PreparedConfigSource::Present { identity, .. } => {
+            let file = std::fs::File::open(path)
+                .map_err(|error| Error::Config(format!("open {}: {error}", path.display())))?;
+            if ConfigFileIdentity::from_file(&file)? != *identity {
+                Err(Error::Config(format!(
+                    "config {} changed after preparation",
+                    path.display()
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// A measured, funded-but-not-yet-performed config load.
@@ -828,18 +959,22 @@ enum PreparedConfigSource {
 /// snapshot construction.
 ///
 /// **Core keeps the file semantics; the caller keeps the admission decision.**
-/// There is deliberately no scope or provider parameter here and no acquisition
-/// inside: the caller acquires against [`Self::loader_residual_claim`] and
-/// [`Self::load_work_claim`], then hands both leases to [`Self::commit`]. Once
-/// committed, the funded owner can measure its compact width before the caller
-/// acquires output capacity. Quarantine, the fail-safe default and the version
-/// refusal stay in this crate, where they are already the one source of truth.
+/// The transaction lease is acquired during preparation and held through
+/// commit. The caller still acquires against [`Self::loader_residual_claim`]
+/// and [`Self::load_work_claim`], then hands both leases to [`Self::commit`].
+/// Once committed, the funded owner can measure its compact width before the
+/// caller acquires output capacity. Quarantine, the fail-safe default and the
+/// version refusal stay in this crate, where they are already the one source of
+/// truth.
 ///
 /// Move-only, and there is no accessor for the handle. A plan is a single
 /// permission to perform one load.
 #[must_use = "a prepared load has opened the config file and must be committed or dropped"]
 pub struct PreparedConfigLoad {
     source: PreparedConfigSource,
+    /// Held from preparation through commit, so supported writers cannot
+    /// change the prepared path between its identity check and parse.
+    _transaction: ConfigTransactionLease,
     /// Kept because quarantine needs the path, and the plan may be the only
     /// thing still holding it by the time a corrupt parse is discovered.
     path: PathBuf,
@@ -965,14 +1100,17 @@ impl PreparedConfigLoad {
         // charge that covers it has already gone back.
         let PreparedConfigLoad {
             source,
+            _transaction,
             path,
             loader_residual_claim: _,
             load_work_claim: _,
         } = self;
 
+        ensure_prepared_source_identity(&path, &source)?;
+
         let value = match source {
             PreparedConfigSource::Missing => MeshConfig::default(),
-            PreparedConfigSource::Present { file, len } => {
+            PreparedConfigSource::Present { file, len, .. } => {
                 // One byte past the measurement: enough to *detect* growth,
                 // never enough to read an unbounded file.
                 //
@@ -1053,13 +1191,19 @@ impl MeshConfig {
     /// about that expansion.
     pub fn prepare_load() -> Result<PreparedConfigLoad> {
         let path = crate::dirs::config_path()?;
+        let transaction = ConfigTransactionLease::acquire(&path)?;
         let source = match std::fs::File::open(&path) {
             Ok(file) => {
-                let len = file
+                let metadata = file
                     .metadata()
-                    .map_err(|e| Error::Config(format!("stat {}: {e}", path.display())))?
-                    .len();
-                PreparedConfigSource::Present { file, len }
+                    .map_err(|e| Error::Config(format!("stat {}: {e}", path.display())))?;
+                let len = metadata.len();
+                let identity = ConfigFileIdentity::from_file(&file)?;
+                PreparedConfigSource::Present {
+                    file,
+                    len,
+                    identity,
+                }
             }
             // Absent is the ordinary first-run case, not a failure: the plan
             // will produce defaults, and the loader residual names their
@@ -1131,6 +1275,7 @@ impl MeshConfig {
 
         Ok(PreparedConfigLoad {
             source,
+            _transaction: transaction,
             path,
             loader_residual_claim,
             load_work_claim,
@@ -1638,6 +1783,29 @@ mod tests {
         release_tx.send(()).unwrap();
         let error = transaction.join().unwrap().unwrap_err();
         assert!(error.to_string().contains("changed during transaction"));
+        remove_transaction_test_files(&path);
+    }
+
+    #[test]
+    fn prepared_load_rejects_corrupt_to_valid_replacement() {
+        let path = transaction_test_path("prepared-identity");
+        std::fs::write(&path, b"{ corrupt config").unwrap();
+        let transaction = ConfigTransactionLease::acquire(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let source = PreparedConfigSource::Present {
+            len: metadata.len(),
+            identity: ConfigFileIdentity::from_file(&file).unwrap(),
+            file,
+        };
+
+        // A direct atomic replacement is not allowed to make the prepared
+        // handle quarantine valid V in place of the corrupt C it measured.
+        save_config_locked(&path, &MeshConfig::default()).unwrap();
+        assert!(ensure_prepared_source_identity(&path, &source).is_err());
+
+        drop(source);
+        drop(transaction);
         remove_transaction_test_files(&path);
     }
 }

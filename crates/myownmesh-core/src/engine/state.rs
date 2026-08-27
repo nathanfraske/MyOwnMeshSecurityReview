@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 struct SignalingEmissionAllocator {
     next: AtomicU64,
 }
@@ -91,6 +93,51 @@ use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
 >;
+
+/// A synchronous, funded witness for sending one exact Pending proof.  The
+/// witness owns the provider claim and exact endpoint/worker identity; it is
+/// intentionally returned only after the publication gate, canonical policy,
+/// outbox, and registry checks have all succeeded.  Transport code must drop
+/// the state gate before awaiting on the returned worker.
+#[must_use = "dropping an admitted proof send releases its exact provider claim"]
+pub(crate) struct DurableProofSendAdmission {
+    owner: PeerOwnerToken,
+    worker: Arc<crate::transport::WebRtcConnectorWorker>,
+    endpoint_auth: Arc<crate::endpoint_auth::EndpointAuthTask>,
+    mesh_context: String,
+    bytes: Bytes,
+    work: ResourceLease,
+}
+
+/// Result of the final durable proof admission fence.  Superseded is a
+/// terminal non-send outcome: the pending record was retired under the same
+/// publication gate that observed it was no longer canonical.
+pub(crate) enum DurableProofSendPreparation {
+    Ready(Box<DurableProofSendAdmission>),
+    Superseded,
+}
+
+impl DurableProofSendAdmission {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        PeerOwnerToken,
+        Arc<crate::transport::WebRtcConnectorWorker>,
+        Arc<crate::endpoint_auth::EndpointAuthTask>,
+        String,
+        Bytes,
+        ResourceLease,
+    ) {
+        (
+            self.owner,
+            self.worker,
+            self.endpoint_auth,
+            self.mesh_context,
+            self.bytes,
+            self.work,
+        )
+    }
+}
 
 struct RecoveryCohort {
     pending: RecoveryCohortCauseList,
@@ -381,6 +428,25 @@ struct CarrierAttemptList {
 }
 
 impl CarrierAttemptList {
+    fn emissions_for_owner(&self, owner: &PeerOwnerToken) -> Vec<(SignalingEmissionId, String)> {
+        let mut emissions = Vec::new();
+        let mut cursor = self.head.as_deref();
+        while let Some(node) = cursor {
+            if node.owner.as_ref().is_some_and(|candidate| {
+                Arc::ptr_eq(candidate.connection(), owner.connection())
+                    && candidate.binding_coordinate() == owner.binding_coordinate()
+            }) {
+                emissions.push((node.emission, node.attempt.clone()));
+            }
+            cursor = node.next.as_deref();
+        }
+        emissions
+    }
+
+    fn settle_emission(&mut self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        self.remove_emission(emission, attempt).is_some()
+    }
+
     fn find_emission_mut(
         &mut self,
         emission: SignalingEmissionId,
@@ -1368,6 +1434,10 @@ pub struct NetworkState {
     /// bootstrap context, so two instances may share a wire network id while
     /// retaining independent on-disk state.
     durable_semantic_owner: Arc<DurableSemanticOwner>,
+    /// Serializes the synchronous publication/validation portion of durable
+    /// semantic work.  The guard is never held across an async transport
+    /// await; callers receive a funded, exact send witness instead.
+    durable_publication_gate: Mutex<()>,
     durable_provisional: Mutex<Vec<ProvisionalCustody>>,
     durable_proof_outbox: DurableProofOutbox,
     pub current_phase: RwLock<MeshPhase>,
@@ -1885,6 +1955,7 @@ impl NetworkState {
             governance_state,
             fact_graph,
             durable_semantic_owner,
+            durable_publication_gate: Mutex::new(()),
             durable_provisional: Mutex::new(durable_provisional),
             durable_proof_outbox,
             current_phase: RwLock::new(MeshPhase::Joining),
@@ -2409,6 +2480,7 @@ impl NetworkState {
         &self,
         fact: crate::semantic::SignedFact,
     ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
+        let _publication = self.durable_publication_gate.lock();
         let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
         let before: std::collections::BTreeSet<_> = live.ids().cloned().collect();
@@ -2475,6 +2547,7 @@ impl NetworkState {
         // that fence through installing both restored views, otherwise an
         // admission could publish against a snapshot that compaction is
         // about to replace.
+        let _publication = self.durable_publication_gate.lock();
         let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
         let restored = self
@@ -2517,6 +2590,7 @@ impl NetworkState {
     /// slot. The caller schedules these same delivery ids; it never invents a
     /// replacement id after restart.
     pub(crate) fn pending_durable_proof_outbox(&self) -> Result<Vec<ProofRecord>> {
+        let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
         self.durable_proof_outbox
             .pending(self.mesh_context_id)
@@ -2527,6 +2601,7 @@ impl NetworkState {
     /// for this live mesh context. The owner/liveness fence prevents a stale
     /// state facade from observing a released slot as if it were still live.
     pub(crate) fn durable_proof_records(&self) -> Result<Vec<ProofRecord>> {
+        let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
         self.durable_semantic_owner
             .proof_records(self.mesh_context_id)
@@ -2540,6 +2615,7 @@ impl NetworkState {
         owner: &PeerOwnerToken,
         fact_ids: &[crate::semantic::FactId],
     ) -> Result<ProofRecord> {
+        let _publication = self.durable_publication_gate.lock();
         let graph = self.fact_graph.read();
         self.ensure_durable_owner_mutation_allowed()?;
         let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
@@ -2569,6 +2645,7 @@ impl NetworkState {
         &self,
         record: &ProofRecord,
     ) -> Result<crate::protocol::ProofDeliveryMessage> {
+        let _publication = self.durable_publication_gate.lock();
         let graph = self.fact_graph.read();
         self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id || !record.is_pending() {
@@ -2600,9 +2677,112 @@ impl NetworkState {
         Ok(delivery)
     }
 
+    /// Admit the final synchronous portion of an eviction-proof send.
+    ///
+    /// This is the state-owned boundary between canonical eviction and an
+    /// async transport write.  It serializes the final graph/outbox decision
+    /// with durable fact publication, rechecks the exact current owner, and
+    /// funds the pending semantic operation before returning.  The returned
+    /// record must already be durably enqueued (the idempotent enqueue seam is
+    /// [`Self::admit_durable_proof_outbox`]); this method performs the final
+    /// rebind and send admission as one fenced synchronous step.  The returned
+    /// witness carries the exact worker and provider claim; callers must drop
+    /// it (or consume its parts) before awaiting transport, so no graph or
+    /// publication lock crosses an await.
+    pub(crate) fn prepare_durable_eviction_proof_send(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+        delivery: &crate::protocol::ProofDeliveryMessage,
+    ) -> Result<DurableProofSendPreparation> {
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        if !super::governance::log_evicted(self, owner.device_id()) {
+            return self.supersede_durable_proof_if_noncanonical_under_publication(owner, record);
+        }
+        if record.context_id != self.mesh_context_id
+            || !record.is_pending()
+            || record.target.to_string() != owner.device_id()
+            || record.owner != owner.device_id()
+            || delivery.context_id != self.mesh_context_id
+            || delivery.target != record.target
+            || delivery.delivery_id != record.delivery_id
+        {
+            return Err(Error::Network(
+                "durable eviction proof owner or identity is stale".to_string(),
+            ));
+        }
+        delivery
+            .validate()
+            .map_err(|error| Error::Network(format!("durable eviction proof: {error}")))?;
+        let delivery_fact_ids: Vec<_> = delivery.facts.iter().map(|fact| fact.id).collect();
+        if delivery_fact_ids != record.fact_ids {
+            return Err(Error::Network(
+                "durable eviction proof facts are not the recorded canonical set".to_string(),
+            ));
+        }
+        {
+            let graph = self.fact_graph.read();
+            if delivery
+                .facts
+                .iter()
+                .any(|fact| graph.get(&fact.id) != Some(fact))
+            {
+                return Err(Error::Network(
+                    "durable eviction proof fact is absent or changed".to_string(),
+                ));
+            }
+        }
+
+        let bytes = Bytes::from(
+            serde_json::to_vec(&crate::protocol::MeshMessage::ProofDelivery(
+                delivery.clone(),
+            ))
+            .map_err(Error::Serde)?,
+        );
+        let rebound = self.peers.with_current_durable_outbox(owner, || {
+            self.durable_proof_outbox.rebind(
+                record.context_id,
+                record.delivery_id,
+                &record.owner,
+                &record.binding,
+                owner.device_id(),
+                owner.binding_key(),
+            )
+        });
+        match rebound {
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                return Err(Error::Network(format!("durable proof rebind: {error}")));
+            }
+            None => {
+                return Err(Error::Network(
+                    "durable proof owner is no longer current".to_string(),
+                ));
+            }
+        }
+
+        let operation = self
+            .peers
+            .admit_pending_semantic_operation(owner, &self.mesh_context_id.to_string(), &bytes)
+            .ok_or_else(|| Error::Network("durable proof send owner is not current".into()))?;
+        let (captured_owner, worker, endpoint_auth, mesh_context, work) = operation.into_parts();
+        Ok(DurableProofSendPreparation::Ready(Box::new(
+            DurableProofSendAdmission {
+                owner: captured_owner,
+                worker,
+                endpoint_auth,
+                mesh_context,
+                bytes,
+                work,
+            },
+        )))
+    }
+
     /// Persist one exact canonical proof record before send admission.
     /// Duplicate delivery ids return the existing record idempotently.
     pub(crate) fn admit_durable_proof_outbox(&self, record: ProofRecord) -> Result<ProofRecord> {
+        let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id {
             return Err(Error::Network(
@@ -2622,6 +2802,7 @@ impl NetworkState {
         owner: &PeerOwnerToken,
         record: &ProofRecord,
     ) -> Result<bool> {
+        let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id
             || record.target.to_string() != owner.device_id()
@@ -2651,12 +2832,57 @@ impl NetworkState {
     /// acknowledgement. The durable record remains as a non-replayable
     /// Superseded terminal until normal compaction.
     pub(crate) fn supersede_durable_proof_outbox(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+        replacement_delivery_id: Option<ProofDeliveryId>,
+    ) -> Result<bool> {
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.supersede_durable_proof_outbox_under_publication(
+            owner,
+            record,
+            replacement_delivery_id,
+        )
+    }
+
+    pub(crate) fn supersede_durable_proof_if_noncanonical(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+    ) -> Result<DurableProofSendPreparation> {
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.supersede_durable_proof_if_noncanonical_under_publication(owner, record)
+    }
+
+    fn supersede_durable_proof_if_noncanonical_under_publication(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+    ) -> Result<DurableProofSendPreparation> {
+        if super::governance::log_evicted(self, owner.device_id()) {
+            return Err(Error::Network(
+                "durable eviction proof remains currently canonical".to_string(),
+            ));
+        }
+        let superseded =
+            self.supersede_durable_proof_outbox_under_publication(owner, record, None)?;
+        if superseded {
+            Ok(DurableProofSendPreparation::Superseded)
+        } else {
+            Err(Error::Network(
+                "durable eviction proof supersession was not admitted".to_string(),
+            ))
+        }
+    }
+
+    fn supersede_durable_proof_outbox_under_publication(
         &self,
         owner: &PeerOwnerToken,
         record: &ProofRecord,
         replacement_delivery_id: Option<ProofDeliveryId>,
     ) -> Result<bool> {
-        self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id {
             return Ok(false);
         }
@@ -2687,6 +2913,7 @@ impl NetworkState {
         record: &ProofRecord,
         delivery_id: ProofDeliveryId,
     ) -> Result<bool> {
+        let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
         if record.context_id != self.mesh_context_id
             || record.delivery_id != delivery_id
@@ -3081,6 +3308,36 @@ impl NetworkState {
 
     pub(crate) fn clear_carrier_attempt(&self, attempt: &str) {
         self.carrier_attempts.lock().remove_unfenced(attempt);
+    }
+
+    /// Settle only signaling emissions owned by a displaced peer installation.
+    /// A replacement may reuse the same device and attempt correlation, so
+    /// broad attempt settlement here would incorrectly retire the successor's
+    /// carrier custody.
+    pub(crate) fn settle_displaced_owner_emissions(&self, owner: &PeerOwnerToken) -> usize {
+        let emissions = self.carrier_attempts.lock().emissions_for_owner(owner);
+        if emissions.is_empty() {
+            return 0;
+        }
+
+        let settled = {
+            let mut attempts = self.carrier_attempts.lock();
+            emissions
+                .iter()
+                .filter(|(emission, attempt)| attempts.settle_emission(*emission, attempt))
+                .count()
+        };
+
+        // Runtime guards have their own lock and provider custody. Keep this
+        // call outside the state carrier lock: exact runtime settlement is the
+        // corresponding physical-copy operation and cannot touch a successor
+        // that reused the same attempt correlation.
+        if let Some(runtime) = self.signaling_runtime() {
+            for (emission, attempt) in emissions {
+                runtime.settle_emission(emission, &attempt);
+            }
+        }
+        settled
     }
 
     pub(crate) fn settle_attempt(
@@ -4649,6 +4906,12 @@ impl NetworkState {
             self.resolve_connect_waiters(&peer, Some("network shut down"));
         }
         self.application_gateway.close();
+        // Join the same synchronous publication fence used by durable graph
+        // and proof work before releasing the owner.  The shutdown flag stops
+        // new work immediately; this second fence lets one already-admitted
+        // send-preparation finish its exact owner/store step before the slot
+        // becomes permanently unavailable to stale state facades.
+        let _publication = self.durable_publication_gate.lock();
         let _semantic_fence = self.fact_graph.write();
         if let Err(error) = self.durable_semantic_owner.release() {
             tracing::warn!(%error, "durable semantic owner release failed during shutdown");
@@ -4976,6 +5239,62 @@ mod arc03_peer_registry_tests {
             .is_none());
         assert!(registry
             .with_current_durable_outbox(&replacement, || ())
+            .is_some());
+    }
+
+    #[test]
+    fn v4_r3_displaced_owner_settles_only_its_emission() {
+        let registry = PeerRegistry::default();
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "r3-displaced-emission".to_string(),
+                None,
+            )))
+            .is_none());
+        let displaced = registry
+            .owner("r3-displaced-emission")
+            .expect("predecessor owner exists");
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "r3-displaced-emission".to_string(),
+                None,
+            )))
+            .is_some());
+        let successor = registry
+            .owner("r3-displaced-emission")
+            .expect("successor owner exists");
+
+        let mut attempts = CarrierAttemptList::default();
+        for (emission, owner) in [
+            (SignalingEmissionId(1), displaced.clone()),
+            (SignalingEmissionId(2), successor),
+        ] {
+            attempts.push_front(Box::new(CarrierAttemptNode {
+                emission,
+                attempt: "shared-attempt".to_string(),
+                owner: Some(owner),
+                _entry_lease: None,
+                carriers: None,
+                expected: 0,
+                resolved: 0,
+                accepted: false,
+                claimed: false,
+                fenced: false,
+                terminal: None,
+                next: None,
+            }));
+        }
+
+        assert_eq!(
+            attempts.emissions_for_owner(&displaced),
+            vec![(SignalingEmissionId(1), "shared-attempt".to_string())]
+        );
+        assert!(attempts.settle_emission(SignalingEmissionId(1), "shared-attempt"));
+        assert!(attempts
+            .find_emission_mut(SignalingEmissionId(1), "shared-attempt")
+            .is_none());
+        assert!(attempts
+            .find_emission_mut(SignalingEmissionId(2), "shared-attempt")
             .is_some());
     }
 

@@ -54,6 +54,8 @@ pub use signaling_bridge::{
 #[cfg(test)]
 use signaling_ingress::SignalingCarrier;
 use signaling_ingress::{CarrierAttribution, EphemeralIngress};
+#[cfg(test)]
+use state::SignalingEmissionId;
 
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound
@@ -5485,51 +5487,47 @@ async fn replay_pending_durable_proofs(
             }
             continue;
         }
-        let facts = {
-            let graph = state.authoritative_fact_graph();
-            let graph = graph.read();
-            record
-                .fact_ids
-                .iter()
-                .map(|id| graph.get(id).cloned())
-                .collect::<Option<Vec<_>>>()
-        };
-        let Some(facts) = facts else {
-            warn!(
-                peer = %owner.device_id(),
-                delivery = %record.delivery_id,
-                "durable proof replay refused because a recorded fact is absent"
-            );
-            continue;
-        };
-        let delivery =
-            match ProofDeliveryMessage::new(record.context_id, record.target.clone(), facts) {
-                Ok(delivery) if delivery.delivery_id == record.delivery_id => delivery,
-                Ok(_) | Err(_) => {
-                    warn!(
-                        peer = %owner.device_id(),
-                        delivery = %record.delivery_id,
-                        "durable proof replay refused because its canonical identity changed"
-                    );
-                    continue;
-                }
-            };
-        match state.rebind_durable_proof_outbox(owner, &record) {
-            Ok(true) => {}
-            Ok(false) => continue,
+        let delivery = match state.materialize_durable_proof_delivery(&record) {
+            Ok(delivery) => delivery,
             Err(error) => {
                 warn!(
                     peer = %owner.device_id(),
                     delivery = %record.delivery_id,
                     %error,
-                    "durable proof replay could not bind the current owner"
+                    "durable proof replay refused because its canonical identity changed"
                 );
                 continue;
             }
-        }
-        if let Err(error) =
-            send_to_peer_owner(state, owner, &MeshMessage::ProofDelivery(delivery)).await
-        {
+        };
+        let admission = match state.prepare_durable_eviction_proof_send(owner, &record, &delivery) {
+            Ok(state::DurableProofSendPreparation::Ready(admission)) => *admission,
+            Ok(state::DurableProofSendPreparation::Superseded) => continue,
+            Err(error) => {
+                // A canonical regrant can invalidate this record between the
+                // replay snapshot and the final preparation fence.  Preserve
+                // the non-send terminal edge even if preparation reported a
+                // validation refusal: this retry takes the same exact-owner
+                // publication gate, while a stale owner remains a no-op.
+                match state.supersede_durable_proof_if_noncanonical(owner, &record) {
+                    Ok(state::DurableProofSendPreparation::Superseded) => continue,
+                    _ => {
+                        debug!(
+                            peer = %owner.device_id(),
+                            delivery = %record.delivery_id,
+                            "noncanonical durable proof terminalization refused"
+                        );
+                    }
+                }
+                debug!(
+                    peer = %owner.device_id(),
+                    delivery = %record.delivery_id,
+                    %error,
+                    "durable proof replay send admission refused"
+                );
+                continue;
+            }
+        };
+        if let Err(error) = send_prepared_durable_proof(state, admission).await {
             debug!(
                 peer = %owner.device_id(),
                 delivery = %record.delivery_id,
@@ -7293,20 +7291,6 @@ pub(super) async fn send_pending_open_participation(
     send_pending_semantic_message(state, owner, &message).await
 }
 
-/// Send one exact durable proof delivery to the authenticated installation
-/// that is still awaiting approval. The stable delivery identity is retained
-/// by the semantic outbox; transport success never settles it.
-pub(super) async fn send_pending_proof_delivery(
-    state: &Arc<NetworkState>,
-    owner: &peer_registry::PeerOwnerToken,
-    delivery: &ProofDeliveryMessage,
-) -> Result<()> {
-    delivery
-        .validate()
-        .map_err(|error| Error::Network(format!("pending proof delivery rejected: {error}")))?;
-    send_pending_semantic_message(state, owner, &MeshMessage::ProofDelivery(delivery.clone())).await
-}
-
 async fn send_pending_semantic_message(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
@@ -7336,6 +7320,30 @@ async fn send_pending_semantic_message(
     data.diag.frames_out += 1;
     drop(data);
     state.traffic.record_tx(traffic::class_of(message), sent);
+    Ok(())
+}
+
+/// Complete an already-admitted durable proof send. The state-owned
+/// preparation fence has captured the exact worker and provider claim; this
+/// helper only awaits that worker and settles no semantic state.
+async fn send_prepared_durable_proof(
+    state: &Arc<NetworkState>,
+    admission: state::DurableProofSendAdmission,
+) -> Result<()> {
+    let (captured_owner, worker, _endpoint_auth, _mesh_context, bytes, _work) =
+        admission.into_parts();
+    let send = worker.begin_send()?;
+    let sent = tokio::time::timeout(
+        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        send.send(bytes),
+    )
+    .await
+    .map_err(|_| Error::Transport("peer send timed out".into()))??;
+    let mut data = captured_owner.connection().state.write();
+    data.diag.bytes_out += sent as u64;
+    data.diag.frames_out += 1;
+    drop(data);
+    state.traffic.record_tx(traffic::FrameClass::Gossip, sent);
     Ok(())
 }
 
@@ -8620,21 +8628,17 @@ fn install_peer(
 }
 
 /// Production replacement boundary with access to the network's exact
-/// delivery settlement coordinator. The displaced peer is still held under
-/// the registry mutation fence when its attempt is settled, so replacement
-/// cannot accidentally finish a successor by device id.
+/// delivery settlement coordinator. The registry atomically returns the
+/// displaced owner token; state then settles only that captured owner before
+/// any asynchronous close, so a replacement cannot be retired by device or
+/// attempt correlation.
 fn install_peer_for_state(
     state: &Arc<NetworkState>,
     peer: Arc<PeerConnection>,
 ) -> Option<connection::AttemptDisplacement> {
-    let replaced = state.peers.install(peer)?;
-    let replaced_attempt = replaced.attempt();
-    if !replaced_attempt.is_empty() {
-        state.settle_attempt(
-            &replaced_attempt,
-            myownmesh_signaling::nostr::delivery::DeliveryTerminal::AttemptReplaced,
-        );
-    }
+    let displaced = state.peers.install_with_displaced_owner(peer)?;
+    let replaced = displaced.peer;
+    state.settle_displaced_owner_emissions(&displaced.owner);
     let mut attempt = replaced.take_attempt_displacement();
     replaced.retire_connector();
     attempt.retired_dedup = replaced.take_retired_dedup();
@@ -21186,6 +21190,73 @@ mod tests {
             }
             _ => panic!("successor cleanup remains exact"),
         }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_r3_displaced_install_settles_exact_same_attempt_emission() {
+        let state = build_test_state("r3-displaced-install-emission");
+        let target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let first = Arc::new(PeerConnection::new(target.clone(), None));
+        assert!(state.peers.install(Arc::clone(&first)).is_none());
+        let predecessor = state
+            .peers
+            .owner(&target)
+            .expect("the predecessor owner is installed");
+        let predecessor_emission = SignalingEmissionId::next().expect("emission id");
+        let predecessor_instance = state
+            .next_recovery_carrier_instance()
+            .expect("predecessor carrier instance");
+        assert!(matches!(
+            state.begin_carrier_emission_for_owner_result(
+                predecessor_emission,
+                "shared-r3-attempt",
+                predecessor,
+                [predecessor_instance],
+            ),
+            state::CarrierEmissionAdmission::Admitted
+        ));
+
+        let successor = Arc::new(PeerConnection::new(target.clone(), None));
+        let displaced = state
+            .peers
+            .install_with_displaced_owner(Arc::clone(&successor))
+            .expect("the successor captures its exact predecessor");
+        let current = state
+            .peers
+            .owner(&target)
+            .expect("the successor owner is current");
+        let successor_emission = SignalingEmissionId::next().expect("emission id");
+        let successor_instance = state
+            .next_recovery_carrier_instance()
+            .expect("successor carrier instance");
+        assert!(matches!(
+            state.begin_carrier_emission_for_owner_result(
+                successor_emission,
+                "shared-r3-attempt",
+                current.clone(),
+                [successor_instance],
+            ),
+            state::CarrierEmissionAdmission::Admitted
+        ));
+
+        assert_eq!(
+            state.settle_displaced_owner_emissions(&displaced.owner),
+            1,
+            "the displaced predecessor emission is settled exactly once"
+        );
+        assert_eq!(
+            state.settle_displaced_owner_emissions(&displaced.owner),
+            0,
+            "the predecessor cannot be settled again"
+        );
+        assert_eq!(
+            state.settle_displaced_owner_emissions(&current),
+            1,
+            "the same-attempt successor remains independently settleable"
+        );
         state.shutdown().await;
     }
 

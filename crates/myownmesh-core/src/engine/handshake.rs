@@ -49,7 +49,7 @@
 //!     `PeerApproved`.
 
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 
@@ -164,6 +164,33 @@ fn pending_eviction_proof(
         }
     };
     Some((record, delivery))
+}
+
+/// Send a proof through the witness that already passed the final canonical,
+/// owner, and pending-operation fence.  This must not call the generic
+/// pending-semantic helper: that helper mints a second admission after the
+/// fence and would reopen the replacement window this witness closes.
+async fn send_admitted_eviction_proof(
+    state: &Arc<NetworkState>,
+    admission: super::state::DurableProofSendAdmission,
+) -> crate::Result<()> {
+    let (captured_owner, worker, _endpoint_auth, _mesh_context, bytes, _work) =
+        admission.into_parts();
+    let send = worker.begin_send()?;
+    let sent = tokio::time::timeout(
+        Duration::from_millis(super::scheduler::PEER_SEND_TIMEOUT_MS),
+        send.send(bytes),
+    )
+    .await
+    .map_err(|_| crate::error::Error::Transport("peer send timed out".into()))??;
+    let mut data = captured_owner.connection().state.write();
+    data.diag.bytes_out += sent as u64;
+    data.diag.frames_out += 1;
+    drop(data);
+    state
+        .traffic
+        .record_tx(super::traffic::FrameClass::Gossip, sent);
+    Ok(())
 }
 
 /// Derive the current proof identity without enqueuing it.  Replay uses this
@@ -763,28 +790,40 @@ pub async fn on_auth_response(
         let Some((record, delivery)) = pending_eviction_proof(state, owner, proof) else {
             return;
         };
-        if !state
-            .rebind_durable_proof_outbox(owner, &record)
-            .unwrap_or(false)
-        {
-            warn!(
-                peer = %device_id,
-                "durable eviction proof owner binding is stale"
-            );
-            return;
+        match state.prepare_durable_eviction_proof_send(owner, &record, &delivery) {
+            Ok(super::state::DurableProofSendPreparation::Ready(admission)) => {
+                if let Err(error) = send_admitted_eviction_proof(state, *admission).await {
+                    // Denial is not allowed to outrun the exact proof transfer.
+                    // The current owner remains pending so a retry/reconnect
+                    // can attempt the same canonical bundle; retiring it here
+                    // would leave an offline peer denied without the evidence
+                    // needed to stand down.
+                    warn!(
+                        peer = %device_id,
+                        %error,
+                        "eviction proof transfer refused; keeping the authenticated peer pending"
+                    );
+                    return;
+                }
+            }
+            Ok(super::state::DurableProofSendPreparation::Superseded) => {}
+            Err(error) => {
+                warn!(
+                    peer = %device_id,
+                    %error,
+                    "durable eviction proof send admission refused"
+                );
+                return;
+            }
         }
-        if let Err(error) = super::send_pending_proof_delivery(state, owner, &delivery).await {
-            // Denial is not allowed to outrun the exact proof transfer.  The
-            // current owner remains pending so a retry/reconnect can attempt
-            // the same canonical bundle; retiring it here would leave an
-            // offline peer denied without the evidence needed to stand down.
-            warn!(
-                peer = %device_id,
-                %error,
-                "eviction proof transfer refused; keeping the authenticated peer pending"
-            );
-            return;
-        }
+    } else {
+        // A regrant clears the eviction before this new installation is
+        // promoted, so it may not enqueue a ReplayCapabilities command yet.
+        // Reconcile retained proof obligations at this exact authenticated
+        // owner now; the replay helper's publication/owner fence makes this
+        // a terminal non-send path and leaves a later transport failure rule
+        // unchanged.
+        super::replay_pending_durable_proofs(state, owner).await;
     }
     if super::governance::deny_if_evicted(state, owner).await {
         return;

@@ -255,6 +255,45 @@ impl CarrierInstanceGuard {
         }
     }
 
+    /// Fence one exact physical copy without fencing a successor that reuses
+    /// the peer-visible attempt correlation. The attempt is an additional
+    /// stale-identity check; the process-local emission id is the authority
+    /// for the retained node.
+    #[cfg(test)]
+    pub(crate) fn fence_emission(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        let mut attempts = self.attempts.lock();
+        let mut cursor = attempts.as_deref_mut();
+        while let Some(known) = cursor {
+            if known.emission == emission && known.attempt == attempt {
+                known.fenced = true;
+                return true;
+            }
+            cursor = known.next.as_deref_mut();
+        }
+        false
+    }
+
+    /// Settle one exact guard node and release its carrier-instance custody.
+    /// Returns whether this guard owned the exact `(emission, attempt)` pair.
+    pub(crate) fn settle_emission(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        let mut attempts = self.attempts.lock();
+        let mut link = &mut *attempts;
+        loop {
+            if link
+                .as_ref()
+                .is_some_and(|known| known.emission == emission && known.attempt == attempt)
+            {
+                let mut removed = link.take().expect("matched exact emission custody");
+                *link = removed.next.take();
+                return true;
+            }
+            match link.as_mut() {
+                Some(known) => link = &mut known.next,
+                None => return false,
+            }
+        }
+    }
+
     /// Settle the exact guard node, then notify state of a terminal carrier
     /// copy after the guard lock is released.  The state call is exact and
     /// idempotent: an outcome may already have removed its carrier node, while
@@ -329,10 +368,12 @@ impl CarrierInstanceGuard {
         candidate
     }
 
-    /// Claim one physical copy while running the state-side admission under
-    /// the same guard lock.  Lifecycle fencing waits on this lock, so a
-    /// carrier cannot observe a claim, pause before state admission, and then
-    /// recreate or publish that copy after settlement.
+    /// Claim one physical copy, then run state-side admission after releasing
+    /// the guard lock. The callback is deliberately outside the lock:
+    /// admission may synchronously settle or fence this exact emission, and
+    /// allowing callback reentry while `attempts` is held would self-deadlock.
+    /// The callback receives the already-claimed opaque token, so it cannot
+    /// select a successor by the peer-visible attempt string.
     pub(crate) fn claim_attempt_with<R>(
         &self,
         attempt: &str,
@@ -341,29 +382,32 @@ impl CarrierInstanceGuard {
         if self.detached.load(Ordering::Acquire) {
             return None;
         }
-        let mut attempts = self.attempts.lock();
-        if self.detached.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut candidate = None;
-        let mut cursor = attempts.as_deref();
-        while let Some(known) = cursor {
-            if known.attempt == attempt && !known.claimed && !known.fenced {
-                candidate = Some(known.emission);
+        let emission = {
+            let mut attempts = self.attempts.lock();
+            if self.detached.load(Ordering::Acquire) {
+                return None;
             }
-            cursor = known.next.as_deref();
-        }
-        let emission = candidate?;
-        let mut cursor = attempts.as_deref_mut();
-        while let Some(known) = cursor {
-            if known.emission == emission && known.attempt == attempt {
-                known.claimed = true;
-                let result = admit(emission);
-                return Some((emission, result));
+            let mut candidate = None;
+            let mut cursor = attempts.as_deref();
+            while let Some(known) = cursor {
+                if known.attempt == attempt && !known.claimed && !known.fenced {
+                    candidate = Some(known.emission);
+                }
+                cursor = known.next.as_deref();
             }
-            cursor = known.next.as_deref_mut();
-        }
-        None
+            let emission = candidate?;
+            let mut cursor = attempts.as_deref_mut();
+            while let Some(known) = cursor {
+                if known.emission == emission && known.attempt == attempt {
+                    known.claimed = true;
+                    break;
+                }
+                cursor = known.next.as_deref_mut();
+            }
+            emission
+        };
+        let result = admit(emission);
+        Some((emission, result))
     }
 
     pub(crate) fn fence_attempt(&self, attempt: &str) {
@@ -1273,6 +1317,40 @@ impl SignalingRuntime {
             }
         }
         self.prune_guard_index();
+    }
+
+    /// Fence one exact emission across the registered carrier guards. Unlike
+    /// [`Self::fence_attempt`], this cannot fence a successor using the same
+    /// peer-visible attempt correlation.
+    #[cfg(test)]
+    pub(crate) fn fence_emission(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        let guards = self.guards.lock();
+        let mut found = false;
+        let mut cursor = guards.as_deref();
+        while let Some(entry) = cursor {
+            if let Some(guard) = Weak::upgrade(&entry.guard) {
+                found |= guard.fence_emission(emission, attempt);
+            }
+            cursor = entry.next.as_deref();
+        }
+        found
+    }
+
+    /// Settle one exact emission on every registered guard and release only
+    /// that physical copy's custody.
+    pub(crate) fn settle_emission(&self, emission: SignalingEmissionId, attempt: &str) -> bool {
+        let guards = self.guards.lock();
+        let mut found = false;
+        let mut cursor = guards.as_deref();
+        while let Some(entry) = cursor {
+            if let Some(guard) = Weak::upgrade(&entry.guard) {
+                found |= guard.settle_emission(emission, attempt);
+            }
+            cursor = entry.next.as_deref();
+        }
+        drop(guards);
+        self.prune_guard_index();
+        found
     }
 
     fn prune_guard_index(&self) {
@@ -2605,6 +2683,46 @@ pub(super) mod tests {
         assert_eq!(next_non_wrapping(&runtime.dedup_instances), None);
         assert_eq!(runtime.instances.load(Ordering::Relaxed), u64::MAX);
         assert_eq!(runtime.dedup_instances.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn registered_guard_reentry_settles_exact_emission_without_successor_substitution() {
+        let (runtime, _rx) = runtime_with_rx();
+        let state = crate::engine::build_test_state("registered-guard-reentry");
+        let instance = state
+            .next_recovery_carrier_instance()
+            .expect("carrier instance");
+        let attach = SignalingRuntime::attach_for_state(
+            &runtime,
+            SignalingCarrier::Nostr,
+            &state,
+            Some(instance),
+        )
+        .expect("registered carrier guard");
+        let guard = Arc::clone(&attach.guard);
+        let attempt = "registered-reentry";
+        let predecessor = SignalingEmissionId::next().expect("emission id");
+        assert!(state.begin_carrier_emission(predecessor, attempt, [instance]));
+        assert!(guard.track_attempt(predecessor, attempt));
+
+        // This callback re-enters the registered runtime/guard path. It must
+        // complete: claim_attempt_with no longer holds `attempts` while
+        // invoking admission. The exact predecessor is fenced and removed;
+        // no operation here is allowed to select by attempt name.
+        let observed = guard.claim_attempt_with(attempt, |claimed| {
+            assert!(runtime.fence_emission(claimed, attempt));
+            assert!(runtime.fence_emission(claimed, attempt));
+            assert!(runtime.settle_emission(claimed, attempt));
+            assert!(!runtime.settle_emission(claimed, attempt));
+            claimed
+        });
+        assert_eq!(observed, Some((predecessor, predecessor)));
+
+        let successor = SignalingEmissionId::next().expect("successor emission id");
+        assert!(state.begin_carrier_emission(successor, attempt, [instance]));
+        assert!(guard.track_attempt(successor, attempt));
+        assert_eq!(guard.claim_attempt(attempt), Some(successor));
+        assert_eq!(guard.claim_attempt(attempt), None);
     }
 
     /// **The `Debug` output carries the diagnostic fields and none of the

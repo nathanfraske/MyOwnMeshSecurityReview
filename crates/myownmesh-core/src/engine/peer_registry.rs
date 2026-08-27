@@ -78,6 +78,15 @@ struct PeerRegistryEntry {
     binding_epoch: u64,
 }
 
+/// The exact installation displaced by a replacement. The owner token keeps
+/// the old `Arc<()>` installation identity and binding epoch paired with the
+/// old connection, so delayed cleanup can distinguish it from the successor
+/// that reused the same device id.
+pub(super) struct DisplacedPeerInstallation {
+    pub(super) peer: Arc<PeerConnection>,
+    pub(super) owner: PeerOwnerToken,
+}
+
 /// Unforgeable process-local identity for one installed peer owner.
 ///
 /// This is carried by delayed engine work so a timer or callback created for
@@ -1540,7 +1549,14 @@ impl PeerRegistry {
         self.peers.iter().map(|entry| entry.key().clone()).collect()
     }
 
-    pub(super) fn install(&self, peer: Arc<PeerConnection>) -> Option<Arc<PeerConnection>> {
+    /// Install a peer and retain the exact predecessor identity when this is
+    /// a same-device replacement. The mutation fence covers the map swap and
+    /// owner capture together; no caller needs to re-resolve the displaced
+    /// device after the replacement.
+    pub(super) fn install_with_displaced_owner(
+        &self,
+        peer: Arc<PeerConnection>,
+    ) -> Option<DisplacedPeerInstallation> {
         let device_id = peer.device_id.clone();
         let _mutation = self.mutation.lock();
         if self
@@ -1573,14 +1589,34 @@ impl PeerRegistry {
                     binding_epoch,
                 },
             )
-            .map(|entry| entry.peer);
+            .map(|entry| {
+                let owner = PeerOwnerToken {
+                    peer: Arc::clone(&entry.peer),
+                    installation: Arc::clone(&entry.installation),
+                    binding_namespace: self.binding_namespace,
+                    binding_epoch: entry.binding_epoch,
+                    worker: None,
+                };
+                DisplacedPeerInstallation {
+                    peer: entry.peer,
+                    owner,
+                }
+            });
         if let Some(runtime) = self.signaling_runtime.read().as_ref() {
             peer.bind_signaling_runtime(runtime.clone());
         }
         if let Some(replaced) = replaced.as_ref() {
-            replaced.retire_connector();
+            replaced.peer.retire_connector();
         }
         replaced
+    }
+
+    /// Compatibility projection for callers that only need the displaced
+    /// connection. New replacement-aware callers should use
+    /// [`Self::install_with_displaced_owner`].
+    pub(super) fn install(&self, peer: Arc<PeerConnection>) -> Option<Arc<PeerConnection>> {
+        self.install_with_displaced_owner(peer)
+            .map(|replaced| replaced.peer)
     }
 
     pub(super) fn remove(
