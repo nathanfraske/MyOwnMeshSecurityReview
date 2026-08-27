@@ -661,21 +661,31 @@ pub async fn on_auth_response(
     {
         return;
     }
+    // Reconcile every retained durable proof immediately after this exact
+    // authenticated owner becomes pending.  A causal regrant makes
+    // `log_evicted` false, but it must still fence any stale E0 obligation
+    // before the ordinary admission branch can proceed.
+    let canonical_eviction_proof = match state.reconcile_durable_eviction_proofs(owner) {
+        Ok(record) => record,
+        Err(error) => {
+            warn!(
+                peer = %device_id,
+                %error,
+                "durable eviction proof reconciliation refused"
+            );
+            return;
+        }
+    };
     // A Deny is only a session outcome. When the current signed projection
     // evicts this peer, send the complete canonical graph first so the peer
     // can independently verify the eviction and derive its own stand-down.
     if super::governance::log_evicted(state, device_id) {
-        let record = match state.reconcile_durable_eviction_proofs(owner) {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(error) => {
-                warn!(
-                    peer = %device_id,
-                    %error,
-                    "durable eviction proof reconciliation refused"
-                );
-                return;
-            }
+        let Some(record) = canonical_eviction_proof else {
+            warn!(
+                peer = %device_id,
+                "evicted authenticated peer has no canonical durable proof"
+            );
+            return;
         };
         let delivery = match state.materialize_durable_proof_delivery(&record) {
             Ok(delivery) => delivery,

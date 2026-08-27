@@ -1172,61 +1172,42 @@ async fn handle_speculative_promotion(
     // exchange first.  This path deliberately precedes ordinary promotion:
     // it never creates a session or application route and never lets the
     // policy-denied candidate reach the SessionBroker.
-    let canonical_eviction = state
-        .canonical_durable_eviction_proof_record(&owner)
-        .ok()
-        .flatten()
-        .is_some();
-    if canonical_eviction {
-        match state.reconcile_durable_eviction_proofs(&owner) {
-            Ok(Some(record)) => {
-                let delivery = match state.materialize_durable_proof_delivery(&record) {
-                    Ok(delivery) => delivery,
-                    Err(_) => {
-                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
-                        return;
-                    }
-                };
-                let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
-                    reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
-                });
-                let deny_bytes = match serde_json::to_vec(&deny).map(Bytes::from) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
-                        return;
-                    }
-                };
-                match state.prepare_durable_eviction_proof_send_for_speculative(
-                    &owner,
-                    &candidate,
-                    &correlation,
-                    &record,
-                    &delivery,
-                    deny_bytes.len(),
-                ) {
-                    Ok(state::DurableProofSendPreparation::Ready(admission)) => {
-                        send_speculative_eviction_proof_then_deny(
-                            state,
-                            &owner,
-                            &correlation,
-                            &candidate,
-                            *admission,
-                            deny_bytes,
-                            deny,
-                        )
-                        .await;
-                        return;
-                    }
-                    Ok(state::DurableProofSendPreparation::Superseded) | Err(_) => {
-                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
-                        return;
-                    }
-                }
-            }
-            Ok(None) => {}
+    let canonical_eviction = match state.reconcile_durable_eviction_proofs(&owner) {
+        Ok(record) => record,
+        Err(_) => {
+            retire_speculative_carrier_exact(state, &owner, &correlation, &candidate).await;
+            return;
+        }
+    };
+    if let Some(record) = canonical_eviction {
+        let delivery = match state.materialize_durable_proof_delivery(&record) {
+            Ok(delivery) => delivery,
             Err(_) => {
-                retire_speculative_exact(state, &owner, &correlation, &candidate).await;
+                retire_speculative_carrier_exact(state, &owner, &correlation, &candidate).await;
+                return;
+            }
+        };
+        match state.prepare_durable_eviction_proof_send_for_speculative(
+            &owner,
+            &candidate,
+            &correlation,
+            &record,
+            &delivery,
+            0,
+        ) {
+            Ok(state::DurableProofSendPreparation::Ready(admission)) => {
+                send_speculative_eviction_proof(
+                    state,
+                    &owner,
+                    &correlation,
+                    &candidate,
+                    *admission,
+                )
+                .await;
+                return;
+            }
+            Ok(state::DurableProofSendPreparation::Superseded) | Err(_) => {
+                retire_speculative_carrier_exact(state, &owner, &correlation, &candidate).await;
                 return;
             }
         }
@@ -3699,6 +3680,16 @@ async fn handle_speculative_message(
                 }
             }
             SpeculativeMessageOutcome::Handled(true)
+        }
+        MeshMessage::ProofAck(ack) => {
+            // A proof ACK is the one non-handshake frame admitted from an
+            // unpromoted candidate.  Consume it here so the generic refusal
+            // path cannot retire the candidate before the exact durable
+            // obligation is settled.  Invalid or stale ACKs are ignored and
+            // do not send Deny or settle any record.
+            SpeculativeMessageOutcome::Handled(
+                settle_speculative_proof_ack(state, owner, correlation, worker, ack).await,
+            )
         }
         _ => SpeculativeMessageOutcome::Handled(false),
     }
@@ -7455,18 +7446,16 @@ async fn send_prepared_durable_proof(
     Ok(())
 }
 
-/// Complete the exact speculative exception: ProofDelivery first, then Deny
-/// on the same authenticated candidate.  The state preparation has already
-/// funded both serialized writes and captured the candidate worker, so this
-/// function performs only the two awaits and exact-candidate retirement.
-async fn send_speculative_eviction_proof_then_deny(
+/// Complete the exact speculative exception: send ProofDelivery on the same
+/// authenticated candidate and retain that candidate until its typed ACK is
+/// admitted.  Deny is sent by [`settle_speculative_proof_ack`] only after the
+/// exact durable record has settled, so a denial cannot race its ACK.
+async fn send_speculative_eviction_proof(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     correlation: &str,
     candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
     admission: state::DurableProofSendAdmission,
-    deny_bytes: Bytes,
-    deny: MeshMessage,
 ) {
     let (captured_owner, worker, _endpoint_auth, _mesh_context, proof_bytes, work) =
         admission.into_parts();
@@ -7474,7 +7463,7 @@ async fn send_speculative_eviction_proof_then_deny(
         Ok(send) => send,
         Err(_) => {
             drop(work);
-            retire_speculative_exact(state, owner, correlation, candidate).await;
+            retire_speculative_carrier_exact(state, owner, correlation, candidate).await;
             return;
         }
     };
@@ -7487,7 +7476,7 @@ async fn send_speculative_eviction_proof_then_deny(
         Ok(Ok(sent)) => sent,
         _ => {
             drop(work);
-            retire_speculative_exact(state, owner, correlation, candidate).await;
+            retire_speculative_carrier_exact(state, owner, correlation, candidate).await;
             return;
         }
     };
@@ -7500,9 +7489,86 @@ async fn send_speculative_eviction_proof_then_deny(
         .traffic
         .record_tx(traffic::FrameClass::Gossip, proof_sent);
 
-    // ProofDelivery succeeded, so and only so is Deny attempted.  It uses
-    // the same captured worker rather than routing through the device id.
-    let deny_sent = match worker.begin_send() {
+    // Keep this exact authenticated candidate current until the ordered
+    // ProofAck can return.  The ACK handler settles the durable record first,
+    // then sends Deny through this same owner/worker fence.  Dropping the
+    // bounded send claim here is safe: Deny is a protocol frame and the
+    // candidate's exact worker remains the only route for the later send.
+    drop(work);
+}
+
+async fn settle_speculative_proof_ack(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    correlation: &str,
+    worker: &Arc<crate::transport::WebRtcConnectorWorker>,
+    ack: ProofAckMessage,
+) -> bool {
+    if !matches!(
+        state
+            .peers
+            .speculative_worker_route(owner, correlation, worker),
+        peer_registry::SpeculativeWorkerRoute::Speculative
+    ) || ack.context_id != state.mesh_context_id()
+        || ack.target.to_string() != owner.device_id()
+    {
+        return false;
+    }
+    let Ok(records) = state.pending_durable_proof_outbox() else {
+        return false;
+    };
+    let Some(record) = records
+        .into_iter()
+        .find(|record| record.delivery_id == ack.delivery_id)
+    else {
+        return false;
+    };
+    if record.context_id != ack.context_id || record.target != ack.target {
+        return false;
+    }
+    let exact_owner = owner.for_worker(Arc::clone(worker));
+    if !matches!(
+        state
+            .peers
+            .speculative_worker_route(&exact_owner, correlation, worker),
+        peer_registry::SpeculativeWorkerRoute::Speculative
+    ) {
+        return false;
+    }
+    if !matches!(
+        state.settle_durable_proof_outbox_ack(&exact_owner, &record, ack.delivery_id),
+        Ok(true)
+    ) {
+        return false;
+    }
+    if !matches!(
+        state
+            .peers
+            .speculative_worker_route(&exact_owner, correlation, worker),
+        peer_registry::SpeculativeWorkerRoute::Speculative
+    ) {
+        return true;
+    }
+    let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
+        reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
+    });
+    let Ok(deny_bytes) = serde_json::to_vec(&deny).map(Bytes::from) else {
+        retire_speculative_carrier_exact(state, &exact_owner, correlation, worker).await;
+        return true;
+    };
+    let Some(operation) = state.peers.with_current_speculative_proof(
+        &exact_owner,
+        worker,
+        correlation,
+        &state.mesh_context_id().to_string(),
+        deny_bytes.len(),
+        |operation| operation,
+    ) else {
+        retire_speculative_carrier_exact(state, &exact_owner, correlation, worker).await;
+        return true;
+    };
+    let (captured_owner, deny_worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
+    let sent = match deny_worker.begin_send() {
         Ok(send) => tokio::time::timeout(
             Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
             send.send(deny_bytes),
@@ -7512,7 +7578,7 @@ async fn send_speculative_eviction_proof_then_deny(
         .and_then(Result::ok),
         Err(_) => None,
     };
-    if let Some(sent) = deny_sent {
+    if let Some(sent) = sent {
         let mut data = captured_owner.connection().state.write();
         data.diag.bytes_out += sent as u64;
         data.diag.frames_out += 1;
@@ -7520,7 +7586,8 @@ async fn send_speculative_eviction_proof_then_deny(
         state.traffic.record_tx(traffic::class_of(&deny), sent);
     }
     drop(work);
-    retire_speculative_exact(state, owner, correlation, candidate).await;
+    retire_speculative_carrier_exact(state, &exact_owner, correlation, worker).await;
+    true
 }
 
 /// The one outbound send.

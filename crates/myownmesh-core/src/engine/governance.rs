@@ -591,34 +591,81 @@ pub(super) fn proof_delivery_projection_is_verified(
     if delivery.context_id != state.mesh_context_id() {
         return false;
     }
-    let target = delivery.target.to_string();
-    let projection = canonical_projection_snapshot(state);
-    if !projection.stood_down.contains(&target) && !projection.evicted.contains(&target) {
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let projection = graph.projection();
+    if graph.evaluator().effective_membership(&delivery.target) != Some(false)
+        && !projection.is_stood_down(&delivery.target)
+    {
         return false;
     }
-    let mut has_target_evidence = false;
+
+    // A terminal fact is evidence for this delivery only when it is the
+    // selected terminal of the corresponding canonical cell.  This prevents
+    // a stale or losing same-target branch from satisfying the check merely
+    // because it names the right device.
+    let selected_membership = projection.value(&crate::semantic::ExclusiveCell::membership(
+        delivery.target.clone(),
+    ));
+    let selected_stand_down = projection
+        .stand_down(&delivery.target)
+        .map(|stand_down| stand_down.proof);
+    let mut selected_roots = BTreeSet::new();
     for fact in &delivery.facts {
         match &fact.content.body {
             FactBody::Evict {
                 target: fact_target,
+            } if fact_target == &delivery.target => {
+                if selected_membership == Some(fact.id) && graph.fact_is_authoritative(&fact.id) {
+                    selected_roots.insert(fact.id);
+                }
             }
-            | FactBody::EvictionProof {
+            FactBody::EvictionProof {
                 target: fact_target,
                 ..
             }
             | FactBody::SelfStandDown {
                 device_id: fact_target,
                 ..
-            } => {
-                if fact_target.to_string() != target {
-                    return false;
+            } if fact_target == &delivery.target => {
+                if selected_stand_down == Some(fact.id) && graph.fact_is_authoritative(&fact.id) {
+                    selected_roots.insert(fact.id);
                 }
-                has_target_evidence = true;
             }
             _ => {}
         }
     }
-    has_target_evidence
+    if selected_roots.is_empty()
+        || delivery
+            .facts
+            .iter()
+            .any(|fact| graph.get(&fact.id) != Some(fact))
+    {
+        return false;
+    }
+
+    // The delivery must be exactly the complete causal closure of the
+    // selected target evidence.  A terminal fact for another target is thus
+    // accepted only when B's selected evidence actually cites it as an
+    // ancestor; an unrelated cross-target terminal cannot be smuggled into a
+    // valid-looking proof bundle.
+    let delivered_ids = delivery
+        .facts
+        .iter()
+        .map(|fact| fact.id)
+        .collect::<BTreeSet<_>>();
+    let mut closure = BTreeSet::new();
+    let mut pending = selected_roots.into_iter().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        if !closure.insert(id) {
+            continue;
+        }
+        let Some(fact) = graph.get(&id) else {
+            return false;
+        };
+        pending.extend(crate::semantic::causal::dependencies(fact));
+    }
+    closure == delivered_ids
 }
 
 /// A FactBundle acknowledgement is the receiver's exact current inventory on

@@ -53,9 +53,21 @@ fn device(identity: &Identity) -> DeviceId {
 }
 
 fn authored(graph: &FactGraph, signer: &Identity, body: FactBody) -> SignedFact {
+    authored_with_support(graph, signer, body, std::iter::empty())
+}
+
+fn authored_with_support<I>(
+    graph: &FactGraph,
+    signer: &Identity,
+    body: FactBody,
+    support: I,
+) -> SignedFact
+where
+    I: IntoIterator<Item = myownmesh_core::semantic::FactId>,
+{
     let signer_id = device(signer);
     let witness = graph.authoring_witness(&body, &signer_id);
-    let content = FactContent::from_authoring_witness(graph, body, &witness, Vec::new());
+    let content = FactContent::from_authoring_witness(graph, body, &witness, support);
     SignedFact::sign(content, signer.signing_key()).expect("fixture fact signs")
 }
 
@@ -221,6 +233,126 @@ fn regrant_after_eviction_fact(
     );
     graph.admit(regrant.clone()).expect("causal regrant admits");
     regrant
+}
+
+struct CrossTargetFacts {
+    facts: Vec<SignedFact>,
+    cross_target_evict: SignedFact,
+    target_evict: SignedFact,
+}
+
+/// Build a fresh target proof whose target Evict explicitly depends on an
+/// Evict for a different device.  The dependency is carried through the real
+/// authoring witness plus an exact causal support parent, so the receiver must
+/// admit the cross-target fact before the target's terminal projection can
+/// become authoritative.
+fn cross_target_stand_down_facts(
+    bootstrap: &VerifiedBootstrap,
+    prior: &[SignedFact],
+    owner: &Identity,
+    target: &Identity,
+    member: &Identity,
+    cross_target: &Identity,
+) -> CrossTargetFacts {
+    let target_id = device(target);
+    let member_id = device(member);
+    let cross_target_id = device(cross_target);
+    let mut graph = FactGraph::from_bootstrap(bootstrap);
+    for fact in prior.iter().cloned() {
+        graph.admit(fact).expect("prior eviction history admits");
+    }
+
+    let regrant = authored(
+        &graph,
+        owner,
+        FactBody::RoleGrant {
+            target: target_id.clone(),
+            role: myownmesh_core::semantic::Role::Member,
+        },
+    );
+    graph.admit(regrant.clone()).expect("target regrant admits");
+
+    let cross_grant = authored(
+        &graph,
+        owner,
+        FactBody::RoleGrant {
+            target: cross_target_id.clone(),
+            role: myownmesh_core::semantic::Role::Member,
+        },
+    );
+    graph
+        .admit(cross_grant.clone())
+        .expect("cross-target grant admits");
+
+    let cross_target_evict = authored(
+        &graph,
+        owner,
+        FactBody::Evict {
+            target: cross_target_id,
+        },
+    );
+    graph
+        .admit(cross_target_evict.clone())
+        .expect("cross-target eviction admits");
+
+    let target_evict = authored_with_support(
+        &graph,
+        owner,
+        FactBody::Evict {
+            target: target_id.clone(),
+        },
+        [cross_target_evict.id],
+    );
+    assert!(
+        myownmesh_core::semantic::causal::dependencies(&target_evict)
+            .contains(&cross_target_evict.id),
+        "target Evict carries the cross-target causal dependency"
+    );
+    graph
+        .admit(target_evict.clone())
+        .expect("cross-target target eviction admits");
+
+    let attestation = authored(
+        &graph,
+        member,
+        FactBody::Attestation {
+            target: target_id.clone(),
+            proposal: target_evict.id,
+            decision: AttestationDecision::Evict,
+            signer: member_id,
+            contributions: Vec::new(),
+        },
+    );
+    graph
+        .admit(attestation.clone())
+        .expect("cross-target target attestation admits");
+
+    let proof = authored(
+        &graph,
+        owner,
+        FactBody::EvictionProof {
+            target: target_id,
+            evidence: vec![attestation.id],
+        },
+    );
+    graph
+        .admit(proof.clone())
+        .expect("cross-target target proof admits");
+
+    let mut facts = prior.to_vec();
+    facts.extend([
+        regrant,
+        cross_grant,
+        cross_target_evict.clone(),
+        target_evict.clone(),
+        attestation,
+        proof,
+    ]);
+    CrossTargetFacts {
+        facts,
+        cross_target_evict,
+        target_evict,
+    }
 }
 
 fn receiver_admits_delivery(
@@ -717,6 +849,164 @@ async fn r3_pending_approval_proof_delivery_sends_one_ack_and_settles_sender() {
 }
 
 #[tokio::test]
+async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
+    let root = TempDir::new().expect("instance root");
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        _identity,
+        target,
+        member,
+        prior,
+        _context,
+        config,
+        broker,
+        target_root,
+    ) = create_fixture(&root, "r3-cross-target").await;
+    let cross_target = Identity::ephemeral();
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let cross = cross_target_stand_down_facts(
+        state.verified_bootstrap(),
+        &prior,
+        state.identity.as_ref(),
+        &target,
+        &member,
+        &cross_target,
+    );
+    for fact in cross.facts.iter().skip(prior.len()).cloned() {
+        ingest_semantic_fact(&state, fact).await;
+    }
+    state
+        .compact_semantic_state()
+        .expect("durably commit cross-target eviction closure");
+    assert!(
+        governance::snapshot(&state)
+            .stood_down
+            .contains(target.public_id()),
+        "the target's terminal projection is active before delivery"
+    );
+
+    let record = myownmesh_core::engine::transport_lab::canonical_durable_eviction_proof_record(
+        &state, &owner,
+    )
+    .expect("derive canonical cross-target proof record")
+    .expect("cross-target target eviction proof exists");
+    assert!(
+        record.fact_ids.contains(&cross.cross_target_evict.id),
+        "canonical proof carries the cross-target Evict dependency"
+    );
+    assert!(
+        record.fact_ids.contains(&cross.target_evict.id),
+        "canonical proof carries the target Evict head"
+    );
+    let delivery =
+        materialize_durable_proof_delivery(&state, &record).expect("cross-target proof delivery");
+    assert!(
+        delivery
+            .facts
+            .iter()
+            .any(|fact| fact.id == cross.cross_target_evict.id),
+        "wire delivery contains the exact cross-target dependency"
+    );
+    admit_durable_proof(&state, record.clone()).expect("persist cross-target proof");
+
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("offline-evicted target shutdown");
+    drop(owner);
+    drop(target_state);
+    wait_for_no_proof_owner(&state, target.public_id()).await;
+
+    let mut target_config = config.clone();
+    target_config.auto_approve = false;
+    let restarted_target_identity = Arc::new(Identity::from_signing_key(
+        target_signing_key,
+        "r3-cross-target-target",
+    ));
+    let (restarted_target, restarted_target_driver) = import_network_in_instance_root(
+        target_config,
+        restarted_target_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        state.mesh_context_id(),
+        target_bootstrap,
+    )
+    .await
+    .expect("recreate cross-target PendingApproval target");
+    for fact in prior.iter().take(2).cloned() {
+        ingest_semantic_fact(&restarted_target, fact).await;
+    }
+    restarted_target
+        .compact_semantic_state()
+        .expect("target retains the authenticated roster grants");
+    let target_initial_fact_count = restarted_target.semantic_fact_count();
+    attach_local(&restarted_target, &broker);
+
+    let rebound_owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let settled =
+        wait_for_durable_record_state(&state, record.delivery_id, ProofRecordState::Settled).await;
+    let expected = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &rebound_owner,
+        &record.fact_ids,
+    )
+    .expect("current cross-target owner proof identity");
+    assert_exact_delivery_metadata(&settled, &expected);
+    assert_eq!(
+        durable_proof_records(&state)
+            .expect("settled cross-target sender records")
+            .into_iter()
+            .filter(|candidate| candidate.delivery_id == record.delivery_id)
+            .count(),
+        1,
+        "one exact sender record is settled by the matching ACK"
+    );
+    assert!(pending_durable_proofs(&state)
+        .expect("settled cross-target proof leaves no pending record")
+        .is_empty());
+    assert!(
+        restarted_target
+            .self_evicted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "PendingApproval target adopts the terminal cross-target proof"
+    );
+    assert!(
+        restarted_target.semantic_fact_count() > target_initial_fact_count,
+        "target receives the cross-target causal closure"
+    );
+    assert_eq!(
+        restarted_target.semantic_unresolved_count(),
+        0,
+        "cross-target dependency is durably resolved before ACK"
+    );
+    assert!(
+        governance::snapshot(&restarted_target)
+            .stood_down
+            .contains(target.public_id()),
+        "target terminal projection holds after exact delivery"
+    );
+    let ack = ProofAckMessage::for_delivery(&delivery);
+    assert!(ack.matches(&delivery));
+    assert!(
+        !settle_durable_proof_ack(&state, &rebound_owner, &settled, ack.delivery_id)
+            .expect("duplicate matching ACK is idempotent"),
+        "a second matching ACK does not settle twice"
+    );
+
+    state.request_shutdown();
+    driver.await.expect("cross-target sender shutdown");
+    restarted_target.request_shutdown();
+    restarted_target_driver
+        .await
+        .expect("cross-target target shutdown");
+}
+
+#[tokio::test]
 async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     let root = TempDir::new().expect("instance root");
     let (
@@ -895,7 +1185,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         context,
         config,
         broker,
-        _target_root,
+        target_root,
     ) = create_fixture(&root, "r3-external-pause").await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
@@ -1013,19 +1303,47 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     assert_ne!(e0.delivery_id, e1.delivery_id);
     assert_eq!(e1_delivery.delivery_id, e1.delivery_id);
 
-    // Resume admits both records only after G1/E1 are durable.  The sender is
-    // then restarted before its next carrier attach, making the following
-    // attach the sole replay trigger: production must supersede stale E0 and
-    // send only the canonical E1.
+    // Resume admits both records only after G1/E1 are durable.  Close both
+    // endpoint lifecycles at this pause boundary, then recreate the same
+    // target identity and root before the sender's next carrier attach.  The
+    // following attach is therefore the sole replay trigger: production must
+    // supersede stale E0 and send only the canonical E1.
     admit_durable_proof(&state, e0.clone()).expect("admit paused E0 for replay fencing");
     admit_durable_proof(&state, e1.clone()).expect("admit exact E1 for replay");
     let pending_before_resume = pending_durable_proofs(&state).expect("pending E0/E1");
     assert!(pending_before_resume.iter().any(|record| record == &e0));
     assert!(pending_before_resume.iter().any(|record| record == &e1));
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
     state.request_shutdown();
     driver.await.expect("paused sender shutdown");
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("paused target endpoint shutdown");
     drop(owner);
     drop(state);
+    drop(target_state);
+
+    let restarted_target_identity =
+        Arc::new(Identity::from_signing_key(target_signing_key, "r3-target"));
+    let (restarted_target, restarted_target_driver) = import_network_in_instance_root(
+        config.clone(),
+        restarted_target_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        context,
+        target_bootstrap,
+    )
+    .await
+    .expect("recreate target endpoint from the same identity");
+    for fact in facts.iter().take(2).cloned() {
+        ingest_semantic_fact(&restarted_target, fact).await;
+    }
+    restarted_target
+        .compact_semantic_state()
+        .expect("recreated target commits the authenticated roster grants");
+    attach_local(&restarted_target, &broker);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config,
@@ -1075,7 +1393,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     assert_eq!(e1_rebound.target, target_id);
     assert_exact_delivery_metadata(&e1_rebound, &rebound_e1);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !governance::snapshot(&target_state)
+    while !governance::snapshot(&restarted_target)
         .stood_down
         .contains(target.public_id())
     {
@@ -1087,8 +1405,10 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
 
     reopened.request_shutdown();
     reopened_driver.await.expect("resumed sender shutdown");
-    target_state.request_shutdown();
-    target_driver.await.expect("target lifecycle shutdown");
+    restarted_target.request_shutdown();
+    restarted_target_driver
+        .await
+        .expect("recreated target lifecycle shutdown");
 }
 
 #[tokio::test]
