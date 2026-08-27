@@ -78,7 +78,7 @@ use tracing::trace;
 
 use crate::protocol::{
     FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
-    RosterRequestMessage, RosterSummaryMessage,
+    ProofDeliveryMessage, RosterRequestMessage, RosterSummaryMessage,
 };
 use crate::semantic::{Admission, SignedFact};
 
@@ -96,7 +96,7 @@ pub(crate) struct DurableSemanticExchange {
 
 /// The closed set of things a durable semantic exchange can be.
 ///
-/// Four classes, because these seven messages are not one semantic kind and
+/// Five classes, because these messages are not one semantic kind and
 /// calling them all "facts" hid the difference that matters: only two of these
 /// classes are things to content-address, store, compact or project, and only
 /// the other two have anyone to answer.
@@ -134,6 +134,10 @@ enum Exchange {
     /// authority-bearing membership fact. Signed governance/member logs are
     /// the canonical state source; inventories and requests remain exchanges.
     FactBundle(FactBundleMessage),
+    /// A typed durable stand-down proof. Its identity is bound to the exact
+    /// context, target, and canonical FactIds and may receive a verified ACK
+    /// only after admission and projection succeed.
+    ProofDelivery(ProofDeliveryMessage),
     /// A summary of what the sender has, so the two sides can find a difference.
     ///
     /// Counts and digests. Nothing here is stored or projected; its whole use is
@@ -185,12 +189,13 @@ pub(crate) enum SemanticAdmission {
 ///
 /// Written as a total function over `MeshMessage` with no `_` arm, so a new
 /// variant is a compile error here and has to be classified deliberately rather
-/// than silently falling out of the durable set — and, now that the set has four
+/// than silently falling out of the durable set — and, now that the set has five
 /// classes, classified into the right one rather than into a single bucket.
 pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
     let exchange = match message {
         MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
         MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
+        MeshMessage::ProofDelivery(m) => Exchange::ProofDelivery(m),
         other @ MeshMessage::RosterEntries(_) => {
             return SemanticAdmission::NotDurable(Box::new(other));
         }
@@ -213,6 +218,7 @@ pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)
         | MeshMessage::RpcStreamEnd(_)
+        | MeshMessage::ProofAck(_)
         | MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }) => {
@@ -235,6 +241,7 @@ impl DurableSemanticExchange {
         match self.exchange {
             Exchange::SignedFact(_) => "signed_fact",
             Exchange::FactBundle(_) => "fact_bundle",
+            Exchange::ProofDelivery(_) => "proof_delivery",
             Exchange::Inventory(Inventory::NetworkState(_)) => "state_inventory",
             Exchange::Inventory(Inventory::Roster(_)) => "roster_inventory",
             Exchange::Inventory(Inventory::Facts(_)) => "fact_inventory",
@@ -294,16 +301,56 @@ pub(super) async fn reduce(
         // accept or reject anything. `on_roster_entries` verifies the logs from
         // genesis; `source` does not appear in that decision.
         Exchange::FactBundle(m) => {
-            for fact in m.facts {
+            let facts = m.facts;
+            for fact in facts.iter().cloned() {
                 reduce_signed_fact(state, fact).await;
             }
             // The inventory is a durable exchange acknowledgement: it is the
             // receiver's exact post-admission fact set, sent back through the
             // same logical operation that delivered this bundle. A carrier,
             // heartbeat, or session observation cannot acknowledge a signed
-            // proof, and a replacement cannot steal this reply route.
-            if let Some(route) = reply {
-                governance::acknowledge_fact_bundle(state, route).await;
+            // proof, and a replacement cannot steal this reply route. Do not
+            // call this an ACK until every fact in the bundle is present in the
+            // authoritative graph. A quarantined, malformed, or empty bundle
+            // must remain eligible for a later inventory/request repair; an
+            // inventory emitted for it would be indistinguishable from a
+            // verified acceptance to a sender that already has the same IDs.
+            // Eviction proofs add one more check: their exact target must be
+            // stood down by the resulting canonical projection.
+            if bundle_is_admitted(state, &facts)
+                && governance::fact_bundle_projection_is_verified(state, &facts)
+            {
+                if let Some(route) = reply {
+                    governance::acknowledge_fact_bundle(state, route).await;
+                }
+            } else {
+                trace!(kind, "withholding semantic ACK for incomplete fact bundle");
+            }
+        }
+        Exchange::ProofDelivery(delivery) => {
+            if delivery.context_id != state.mesh_context_id() {
+                trace!(kind, "withholding proof ACK for foreign mesh context");
+                return;
+            }
+            if let Err(error) = delivery.validate() {
+                trace!(kind, %error, "withholding proof ACK for invalid delivery");
+                return;
+            }
+            let facts = delivery.facts.clone();
+            for fact in facts.iter().cloned() {
+                reduce_signed_fact(state, fact).await;
+            }
+            if bundle_is_admitted(state, &facts)
+                && governance::proof_delivery_projection_is_verified(state, &delivery)
+            {
+                if let Some(route) = reply {
+                    governance::acknowledge_proof_delivery(state, route, &delivery).await;
+                }
+            } else {
+                trace!(
+                    kind,
+                    "withholding proof ACK for incomplete or unresolved delivery"
+                );
             }
         }
         // Comparisons and questions. These are the ones with somebody to answer.
@@ -348,6 +395,22 @@ pub(super) async fn reduce(
     }
 }
 
+/// Return whether a bundle is fully and exactly present in the authoritative
+/// graph after reduction. The graph comparison is intentional rather than a
+/// count check: a duplicate FactId with a different body must never turn into
+/// an apparently successful ACK, and a quarantined fact is not admitted merely
+/// because it has durable provisional custody.
+fn bundle_is_admitted(state: &Arc<NetworkState>, facts: &[SignedFact]) -> bool {
+    if facts.is_empty() {
+        return false;
+    }
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    facts
+        .iter()
+        .all(|fact| graph.get(&fact.id).is_some_and(|admitted| admitted == fact))
+}
+
 /// Admit a fact and, when it supplies a missing parent, move every fact that
 /// becomes ready out of quarantine in the same graph write section. The graph
 /// lock is released before any semantic reducer runs; `AlreadyPresent` never
@@ -383,6 +446,7 @@ mod tests {
             SemanticAdmission::Durable(exchange) => match exchange.exchange {
                 Exchange::SignedFact(_) => "signed_fact",
                 Exchange::FactBundle(_) => "fact_bundle",
+                Exchange::ProofDelivery(_) => "proof_delivery",
                 Exchange::Inventory(_) => "inventory",
                 Exchange::DependencyRequest(_) => "dependency_request",
             },

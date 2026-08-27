@@ -15,7 +15,8 @@ use crate::events::DropReason;
 use crate::network_state::{self, NetworkKind, Role, TransitionVariant};
 use crate::protocol::{
     FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
-    RosterEntriesMessage, RosterEntry, RosterRequestMessage, RosterSummaryMessage,
+    ProofAckMessage, ProofDeliveryMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
+    RosterSummaryMessage,
 };
 use crate::semantic::{DeviceId, FactBody, FactContent, FactId, SignedFact};
 
@@ -554,6 +555,72 @@ pub(super) async fn on_fact_request(
     }
 }
 
+/// Verify that any eviction material in a reduced bundle agrees with the
+/// canonical projection before it can be acknowledged.  Ordinary governance
+/// and participation bundles have no target-level acknowledgement condition;
+/// eviction closures do.  In particular, a signed proof is not acknowledged
+/// merely because its bytes entered the graph: the exact target must be stood
+/// down by the resulting authoritative projection.  The plain `Evict` closure
+/// used during a denied handshake is checked against the corresponding
+/// membership tombstone instead.
+pub(super) fn fact_bundle_projection_is_verified(
+    state: &Arc<EngineState>,
+    facts: &[SignedFact],
+) -> bool {
+    let projection = canonical_projection_snapshot(state);
+    facts.iter().all(|fact| match &fact.content.body {
+        FactBody::Evict { target } => projection.evicted.contains(&target.to_string()),
+        FactBody::EvictionProof { target, .. }
+        | FactBody::SelfStandDown {
+            device_id: target, ..
+        } => projection.stood_down.contains(&target.to_string()),
+        _ => true,
+    })
+}
+
+/// Verify the target-bound projection condition for one typed proof delivery.
+/// The wire identity is checked by `ProofDeliveryMessage::validate`; this
+/// predicate adds the receiver's exact mesh-context fence and requires the
+/// delivery target itself to be represented by the resulting canonical
+/// stand-down/eviction projection. A valid bundle for some other target can
+/// therefore never settle this delivery.
+pub(super) fn proof_delivery_projection_is_verified(
+    state: &Arc<EngineState>,
+    delivery: &ProofDeliveryMessage,
+) -> bool {
+    if delivery.context_id != state.mesh_context_id() {
+        return false;
+    }
+    let target = delivery.target.to_string();
+    let projection = canonical_projection_snapshot(state);
+    if !projection.stood_down.contains(&target) && !projection.evicted.contains(&target) {
+        return false;
+    }
+    let mut has_target_evidence = false;
+    for fact in &delivery.facts {
+        match &fact.content.body {
+            FactBody::Evict {
+                target: fact_target,
+            }
+            | FactBody::EvictionProof {
+                target: fact_target,
+                ..
+            }
+            | FactBody::SelfStandDown {
+                device_id: fact_target,
+                ..
+            } => {
+                if fact_target.to_string() != target {
+                    return false;
+                }
+                has_target_evidence = true;
+            }
+            _ => {}
+        }
+    }
+    has_target_evidence
+}
+
 /// A FactBundle acknowledgement is the receiver's exact current inventory on
 /// the same logical route that requested the bundle.  It is deliberately an
 /// inventory rather than a new authority fact: the sender learns which signed
@@ -572,6 +639,24 @@ pub(super) async fn acknowledge_fact_bundle(
             peer = %route.owner().device_id(),
             %error,
             "fact bundle acknowledgement send failed"
+        );
+    }
+}
+
+/// Emit the only verified receipt for a typed proof delivery. The exact
+/// context, target, and content-derived delivery identity are copied from the
+/// validated wire envelope; no generic inventory can settle this proof.
+pub(super) async fn acknowledge_proof_delivery(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    delivery: &ProofDeliveryMessage,
+) {
+    let ack = MeshMessage::ProofAck(ProofAckMessage::for_delivery(delivery));
+    if let Err(error) = super::send_logical_reply(state, route, &ack).await {
+        tracing::debug!(
+            peer = %route.owner().device_id(),
+            %error,
+            "proof delivery acknowledgement send failed"
         );
     }
 }
