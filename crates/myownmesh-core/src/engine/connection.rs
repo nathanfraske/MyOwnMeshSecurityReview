@@ -374,6 +374,10 @@ pub(super) struct SpeculativeAttempt {
     pub(super) session: Arc<WebRtcConnectorWorker>,
     pub(super) endpoint_auth: Option<Arc<crate::endpoint_auth::EndpointAuthTask>>,
     pub(super) authenticated_channel: Option<crate::endpoint_auth::AuthenticatedChannelCapability>,
+    /// The one durable proof delivery admitted on this exact candidate, if
+    /// any.  Keeping this binding on the candidate makes the ACK fence
+    /// candidate-relative rather than a lookup by delivery id alone.
+    pub(super) proof_delivery: Option<crate::semantic::ProofDeliveryId>,
     pub(super) dedup: Option<DedupToken>,
     pub(super) additional_dedup: PromotedDedupSet,
     pub(super) _attempt_lease: ResourceLease,
@@ -936,6 +940,7 @@ impl PeerConnection {
             session,
             endpoint_auth: None,
             authenticated_channel: None,
+            proof_delivery: None,
             dedup: dedup.take(),
             additional_dedup: PromotedDedupSet::new(),
             _attempt_lease: attempt_lease,
@@ -1004,6 +1009,62 @@ impl PeerConnection {
         self.speculative.lock().iter().any(|attempt| {
             attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
         })
+    }
+
+    /// Bind one pending proof to this exact speculative candidate.  The
+    /// candidate owns at most one proof generation; a repeated bind is
+    /// idempotent only for the same delivery identity.
+    pub(super) fn bind_speculative_proof_delivery(
+        &self,
+        correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
+        delivery_id: crate::semantic::ProofDeliveryId,
+    ) -> bool {
+        let mut candidates = self.speculative.lock();
+        let Some(attempt) = candidates.iter_mut().find(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+        }) else {
+            return false;
+        };
+        match attempt.proof_delivery {
+            Some(current) => current == delivery_id,
+            None => {
+                attempt.proof_delivery = Some(delivery_id);
+                true
+            }
+        }
+    }
+
+    pub(super) fn speculative_proof_delivery_matches(
+        &self,
+        correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
+        delivery_id: crate::semantic::ProofDeliveryId,
+    ) -> bool {
+        self.speculative.lock().iter().any(|attempt| {
+            attempt.correlation == correlation
+                && Arc::ptr_eq(&attempt.session, worker)
+                && attempt.proof_delivery == Some(delivery_id)
+        })
+    }
+
+    pub(super) fn clear_speculative_proof_delivery(
+        &self,
+        correlation: &str,
+        worker: &Arc<WebRtcConnectorWorker>,
+        delivery_id: crate::semantic::ProofDeliveryId,
+    ) -> bool {
+        let mut candidates = self.speculative.lock();
+        let Some(attempt) = candidates.iter_mut().find(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, worker)
+        }) else {
+            return false;
+        };
+        if attempt.proof_delivery != Some(delivery_id) {
+            return false;
+        }
+        attempt.proof_delivery = None;
+        true
     }
 
     pub(super) fn speculative_endpoint_auth(

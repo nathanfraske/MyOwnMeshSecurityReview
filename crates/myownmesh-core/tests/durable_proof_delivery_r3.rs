@@ -23,8 +23,8 @@ use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::protocol::{ProofAckMessage, ProofDeliveryMessage};
 use myownmesh_core::semantic::{
-    AttestationDecision, DeviceId, FactBody, FactContent, FactGraph, ProofRecord, ProofRecordState,
-    SignedFact, VerifiedBootstrap,
+    AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, ProofRecord,
+    ProofRecordState, SignedFact, VerifiedBootstrap,
 };
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
@@ -239,6 +239,107 @@ struct CrossTargetFacts {
     facts: Vec<SignedFact>,
     cross_target_evict: SignedFact,
     target_evict: SignedFact,
+}
+
+struct ConcurrentResolutionFacts {
+    facts: Vec<SignedFact>,
+    membership_admit: SignedFact,
+    evict: SignedFact,
+    resolution: SignedFact,
+}
+
+/// Build two concurrent membership decisions and resolve the exact Evict
+/// branch.  Both decisions are authored from the same predecessor graph, so
+/// the receiver must carry the typed Resolution and both cited heads rather
+/// than relying on arrival order or a final boolean.
+fn concurrent_evict_membership_resolution_facts(
+    bootstrap: &VerifiedBootstrap,
+    prior: &[SignedFact],
+    owner: &Identity,
+    resolver: &Identity,
+    target: &Identity,
+) -> ConcurrentResolutionFacts {
+    let target_id = device(target);
+    let resolver_id = device(resolver);
+    let mut base = FactGraph::from_bootstrap(bootstrap);
+    for fact in prior.iter().cloned() {
+        base.admit(fact).expect("prior eviction history admits");
+    }
+
+    let resolver_grant = authored(
+        &base,
+        owner,
+        FactBody::RoleGrant {
+            target: resolver_id,
+            role: myownmesh_core::semantic::Role::Owner,
+        },
+    );
+    base.admit(resolver_grant.clone())
+        .expect("distinct Owner resolver grant admits");
+
+    let membership_admit = authored(
+        &base,
+        owner,
+        FactBody::MembershipAdmit {
+            target: target_id.clone(),
+        },
+    );
+    let evict = authored(
+        &base,
+        resolver,
+        FactBody::Evict {
+            target: target_id.clone(),
+        },
+    );
+    let mut concurrent = base.clone();
+    concurrent
+        .admit(membership_admit.clone())
+        .expect("concurrent MembershipAdmit admits");
+    concurrent
+        .admit(evict.clone())
+        .expect("concurrent Evict admits");
+
+    let cell = ExclusiveCell::membership(target_id);
+    let mut cited_heads = concurrent.cell_heads(&cell);
+    cited_heads.sort();
+    assert!(cited_heads.contains(&membership_admit.id));
+    assert!(cited_heads.contains(&evict.id));
+    let resolution = authored(
+        &concurrent,
+        resolver,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads,
+            selected_head: evict.id,
+        },
+    );
+    concurrent
+        .admit(resolution.clone())
+        .expect("typed Resolution selects the Evict branch");
+    assert_eq!(
+        concurrent.projection().value(&cell),
+        Some(evict.id),
+        "typed Resolution selects Evict rather than MembershipAdmit"
+    );
+    assert_eq!(
+        concurrent.evaluator().effective_membership(&device(target)),
+        Some(false),
+        "the selected Evict branch remains terminal membership"
+    );
+
+    let mut facts = prior.to_vec();
+    facts.extend([
+        resolver_grant,
+        membership_admit.clone(),
+        evict.clone(),
+        resolution.clone(),
+    ]);
+    ConcurrentResolutionFacts {
+        facts,
+        membership_admit,
+        evict,
+        resolution,
+    }
 }
 
 /// Build a fresh target proof whose target Evict explicitly depends on an
@@ -1004,6 +1105,166 @@ async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
     restarted_target_driver
         .await
         .expect("cross-target target shutdown");
+}
+
+#[tokio::test]
+async fn r3_resolution_selected_evict_delivers_exact_pending_approval_closure() {
+    let root = TempDir::new().expect("instance root");
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        _identity,
+        target,
+        member,
+        prior,
+        _context,
+        config,
+        broker,
+        target_root,
+    ) = create_fixture(&root, "r3-resolution-pending").await;
+    let target_id = device(&target);
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let scenario = concurrent_evict_membership_resolution_facts(
+        state.verified_bootstrap(),
+        &prior,
+        state.identity.as_ref(),
+        &member,
+        &target,
+    );
+    for fact in scenario.facts.iter().skip(prior.len()).cloned() {
+        ingest_semantic_fact(&state, fact).await;
+    }
+    state
+        .compact_semantic_state()
+        .expect("durably commit concurrent Evict/MembershipAdmit resolution");
+    assert!(
+        governance::snapshot(&state)
+            .stood_down
+            .contains(target.public_id()),
+        "the selected Evict resolution keeps the target stood down"
+    );
+
+    let record = myownmesh_core::engine::transport_lab::canonical_durable_eviction_proof_record(
+        &state, &owner,
+    )
+    .expect("derive canonical resolved eviction proof")
+    .expect("resolved Evict remains a canonical terminal proof");
+    for fact_id in [
+        scenario.membership_admit.id,
+        scenario.evict.id,
+        scenario.resolution.id,
+    ] {
+        assert!(
+            record.fact_ids.contains(&fact_id),
+            "canonical proof carries every exact resolution dependency"
+        );
+    }
+    let delivery = materialize_durable_proof_delivery(&state, &record)
+        .expect("materialize resolved eviction proof delivery");
+    let wire_resolution = delivery
+        .facts
+        .iter()
+        .find_map(|fact| match &fact.content.body {
+            FactBody::Resolution { selected_head, .. } => Some(*selected_head),
+            _ => None,
+        })
+        .expect("wire closure contains the typed Resolution");
+    assert_eq!(wire_resolution, scenario.evict.id);
+    assert!(delivery.facts.iter().any(|fact| {
+        fact.id == scenario.membership_admit.id
+            && matches!(fact.content.body, FactBody::MembershipAdmit { .. })
+    }));
+    assert!(delivery.facts.iter().any(|fact| {
+        fact.id == scenario.evict.id && matches!(fact.content.body, FactBody::Evict { .. })
+    }));
+    admit_durable_proof(&state, record.clone()).expect("persist resolved proof before send");
+
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("offline PendingApproval target shutdown");
+    drop(owner);
+    drop(target_state);
+    wait_for_no_proof_owner(&state, target.public_id()).await;
+
+    let mut target_config = config.clone();
+    target_config.auto_approve = false;
+    let restarted_target_identity = Arc::new(Identity::from_signing_key(
+        target_signing_key,
+        "r3-resolution-target",
+    ));
+    let (restarted_target, restarted_target_driver) = import_network_in_instance_root(
+        target_config,
+        restarted_target_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        state.mesh_context_id(),
+        target_bootstrap,
+    )
+    .await
+    .expect("recreate PendingApproval resolution target");
+    for fact in prior.iter().take(2).cloned() {
+        ingest_semantic_fact(&restarted_target, fact).await;
+    }
+    restarted_target
+        .compact_semantic_state()
+        .expect("target commits pre-eviction authenticated facts");
+    let target_initial_fact_count = restarted_target.semantic_fact_count();
+    attach_local(&restarted_target, &broker);
+
+    let rebound_owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let settled =
+        wait_for_durable_record_state(&state, record.delivery_id, ProofRecordState::Settled).await;
+    let expected = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &rebound_owner,
+        &record.fact_ids,
+    )
+    .expect("current owner proof identity");
+    assert_exact_delivery_metadata(&settled, &expected);
+    assert_eq!(
+        durable_proof_records(&state)
+            .expect("settled resolved proof records")
+            .into_iter()
+            .filter(|candidate| candidate.delivery_id == record.delivery_id)
+            .count(),
+        1,
+        "exactly one matching ACK settles the resolved proof"
+    );
+    assert!(pending_durable_proofs(&state)
+        .expect("settled resolved proof leaves no pending record")
+        .is_empty());
+    assert!(
+        restarted_target
+            .self_evicted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "PendingApproval target adopts the resolved Evict closure"
+    );
+    assert!(restarted_target.semantic_fact_count() > target_initial_fact_count);
+    assert_eq!(restarted_target.semantic_unresolved_count(), 0);
+    assert!(
+        governance::snapshot(&restarted_target)
+            .stood_down
+            .contains(&target_id.to_string()),
+        "target stand-down projection holds after exact closure delivery"
+    );
+    let ack = ProofAckMessage::for_delivery(&delivery);
+    assert!(ack.matches(&delivery));
+    assert!(
+        !settle_durable_proof_ack(&state, &rebound_owner, &settled, ack.delivery_id,)
+            .expect("duplicate matching ACK is idempotent")
+    );
+
+    state.request_shutdown();
+    driver.await.expect("resolved sender lifecycle shutdown");
+    restarted_target.request_shutdown();
+    restarted_target_driver
+        .await
+        .expect("resolved target lifecycle shutdown");
 }
 
 #[tokio::test]

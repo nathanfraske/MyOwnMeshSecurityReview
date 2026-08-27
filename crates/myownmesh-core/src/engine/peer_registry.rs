@@ -927,6 +927,90 @@ impl PeerRegistry {
         }))
     }
 
+    /// Bind a durable proof while the exact candidate fence is held.  The
+    /// binding is installed before the callback and rolled back if the
+    /// publication-side mutation refuses, so no ACK can observe a half-bound
+    /// candidate after this method returns.
+    // Each identity and accounting witness is independently checked under the
+    // registry fence; combining them would obscure the exact candidate,
+    // delivery, context, and provider charge being authorized.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn with_current_speculative_proof_bound<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        delivery_id: crate::semantic::ProofDeliveryId,
+        mesh_context: &str,
+        total_bytes: usize,
+        effect: impl FnOnce(AdmittedPendingSemanticOperation) -> Result<R>,
+    ) -> Option<Result<R>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        if owner
+            .worker()
+            .is_some_and(|stamped| !Arc::ptr_eq(stamped, candidate))
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        let (endpoint_auth, work) =
+            peer.speculative_proof_admission(correlation, candidate, mesh_context, total_bytes)?;
+        if !peer.bind_speculative_proof_delivery(correlation, candidate, delivery_id) {
+            return None;
+        }
+        let result = effect(AdmittedPendingSemanticOperation {
+            owner: owner.clone(),
+            worker: Arc::clone(candidate),
+            endpoint_auth,
+            mesh_context: mesh_context.to_owned(),
+            work,
+        });
+        if result.is_err() {
+            let _ = peer.clear_speculative_proof_delivery(correlation, candidate, delivery_id);
+        }
+        Some(result)
+    }
+
+    /// Run the durable ACK mutation only while the delivery is bound to the
+    /// same exact speculative owner, correlation, and worker.  Publication
+    /// locking is supplied by the caller; this registry fence is the
+    /// linearization point against replacement, promotion, and candidate
+    /// retirement.  A successful settlement clears the binding before the
+    /// fence is released.
+    pub(super) fn settle_current_speculative_proof(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        delivery_id: crate::semantic::ProofDeliveryId,
+        effect: impl FnOnce() -> Result<bool>,
+    ) -> Option<Result<bool>> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        if owner
+            .worker()
+            .is_some_and(|stamped| !Arc::ptr_eq(stamped, candidate))
+        {
+            return None;
+        }
+        let peer = &current.value().peer;
+        if !peer.speculative_proof_delivery_matches(correlation, candidate, delivery_id) {
+            return None;
+        }
+        let result = effect();
+        if matches!(&result, Ok(true)) {
+            let _ = peer.clear_speculative_proof_delivery(correlation, candidate, delivery_id);
+        }
+        Some(result)
+    }
+
     /// Resolve an exact installation without requiring a worker stamp.
     ///
     /// This is deliberately narrower than `with_current`: it is only for a

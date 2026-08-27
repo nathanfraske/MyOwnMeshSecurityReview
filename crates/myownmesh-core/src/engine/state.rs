@@ -2941,10 +2941,11 @@ impl NetworkState {
             let total_bytes = bytes.len().checked_add(deny_bytes).ok_or_else(|| {
                 Error::Network("durable proof send accounting overflow".to_string())
             })?;
-            let admitted = self.peers.with_current_speculative_proof(
+            let admitted = self.peers.with_current_speculative_proof_bound(
                 owner,
                 candidate,
                 correlation,
+                record.delivery_id,
                 &self.mesh_context_id.to_string(),
                 total_bytes,
                 |operation| match self.durable_proof_outbox.rebind(
@@ -3213,6 +3214,45 @@ impl NetworkState {
             Some(result) => {
                 result.map_err(|error| Error::Network(format!("durable proof settle: {error}")))
             }
+            None => Ok(false),
+        }
+    }
+
+    /// Settle an ACK received by the exact speculative candidate that carried
+    /// this delivery.  Unlike the native owner-only path, the publication gate
+    /// and registry mutation fence jointly cover the binding check and the
+    /// durable transition, so a replacement or promotion cannot redirect it.
+    pub(crate) fn settle_durable_proof_outbox_ack_for_speculative(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        record: &ProofRecord,
+        delivery_id: ProofDeliveryId,
+    ) -> Result<bool> {
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        if record.context_id != self.mesh_context_id
+            || record.delivery_id != delivery_id
+            || record.target.to_string() != owner.device_id()
+            || record.owner != owner.device_id()
+            || record.binding != owner.binding_key()
+            || !record.is_pending()
+        {
+            return Ok(false);
+        }
+        match self.peers.settle_current_speculative_proof(
+            owner,
+            candidate,
+            correlation,
+            delivery_id,
+            || {
+                self.durable_proof_outbox
+                    .settle(self.mesh_context_id, delivery_id)
+                    .map_err(|error| Error::Network(format!("durable proof settle: {error}")))
+            },
+        ) {
+            Some(result) => result,
             None => Ok(false),
         }
     }

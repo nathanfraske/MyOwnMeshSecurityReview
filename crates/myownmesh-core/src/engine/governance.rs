@@ -600,40 +600,23 @@ pub(super) fn proof_delivery_projection_is_verified(
         return false;
     }
 
-    // A terminal fact is evidence for this delivery only when it is the
-    // selected terminal of the corresponding canonical cell.  This prevents
-    // a stale or losing same-target branch from satisfying the check merely
-    // because it names the right device.
-    let selected_membership = projection.value(&crate::semantic::ExclusiveCell::membership(
-        delivery.target.clone(),
-    ));
-    let selected_stand_down = projection
-        .stand_down(&delivery.target)
-        .map(|stand_down| stand_down.proof);
+    // Seed the receiver closure from the same current role/membership heads
+    // as the sender's canonical builder.  The membership head may be a
+    // Resolution selecting an Evict rather than the Evict fact itself, so
+    // looking only for a terminal `Evict` payload would reject a valid
+    // R+E+G closure.  The effective terminal projection above remains a
+    // separate requirement; these heads only define the exact causal roots.
     let mut selected_roots = BTreeSet::new();
-    for fact in &delivery.facts {
-        match &fact.content.body {
-            FactBody::Evict {
-                target: fact_target,
-            } if fact_target == &delivery.target => {
-                if selected_membership == Some(fact.id) && graph.fact_is_authoritative(&fact.id) {
-                    selected_roots.insert(fact.id);
-                }
-            }
-            FactBody::EvictionProof {
-                target: fact_target,
-                ..
-            }
-            | FactBody::SelfStandDown {
-                device_id: fact_target,
-                ..
-            } if fact_target == &delivery.target => {
-                if selected_stand_down == Some(fact.id) && graph.fact_is_authoritative(&fact.id) {
-                    selected_roots.insert(fact.id);
-                }
-            }
-            _ => {}
-        }
+    selected_roots.extend(graph.cell_heads(&crate::semantic::ExclusiveCell::role(
+        delivery.target.clone(),
+    )));
+    selected_roots.extend(
+        graph.cell_heads(&crate::semantic::ExclusiveCell::membership(
+            delivery.target.clone(),
+        )),
+    );
+    if let Some(stand_down) = projection.stand_down(&delivery.target) {
+        selected_roots.insert(stand_down.proof);
     }
     if selected_roots.is_empty()
         || delivery

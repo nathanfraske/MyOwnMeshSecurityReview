@@ -3557,6 +3557,13 @@ async fn handle_speculative_transport_event(
                     }
                     return handled;
                 }
+                SpeculativeMessageOutcome::InvalidProofAck => {
+                    // An invalid ACK is a candidate-local protocol failure.
+                    // It must never fall through to attempt-wide settlement,
+                    // because another emission may share this correlation.
+                    retire_speculative_carrier_exact(state, &owner, &correlation, &worker).await;
+                    return false;
+                }
             }
         }
         _ => {}
@@ -3566,6 +3573,7 @@ async fn handle_speculative_transport_event(
 
 enum SpeculativeMessageOutcome {
     Handled(bool),
+    InvalidProofAck,
     ReclassifiedPromoted,
 }
 
@@ -3687,9 +3695,11 @@ async fn handle_speculative_message(
             // path cannot retire the candidate before the exact durable
             // obligation is settled.  Invalid or stale ACKs are ignored and
             // do not send Deny or settle any record.
-            SpeculativeMessageOutcome::Handled(
-                settle_speculative_proof_ack(state, owner, correlation, worker, ack).await,
-            )
+            if settle_speculative_proof_ack(state, owner, correlation, worker, ack).await {
+                SpeculativeMessageOutcome::Handled(true)
+            } else {
+                SpeculativeMessageOutcome::InvalidProofAck
+            }
         }
         _ => SpeculativeMessageOutcome::Handled(false),
     }
@@ -7536,7 +7546,13 @@ async fn settle_speculative_proof_ack(
         return false;
     }
     if !matches!(
-        state.settle_durable_proof_outbox_ack(&exact_owner, &record, ack.delivery_id),
+        state.settle_durable_proof_outbox_ack_for_speculative(
+            &exact_owner,
+            worker,
+            correlation,
+            &record,
+            ack.delivery_id,
+        ),
         Ok(true)
     ) {
         return false;
@@ -21778,6 +21794,330 @@ mod tests {
             capability,
         ));
         task
+    }
+
+    /// The speculative proof exception is bound to the exact authenticated
+    /// candidate that carried it.  W0 is already promoted, W1 and W2 are
+    /// authenticated candidates on the same installation, and only W1 is
+    /// bound/sent the proof.  The ACK enters the production speculative
+    /// message reducer rather than calling the durable settlement facade.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens native WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_b2_speculative_proof_ack_is_bound_to_exact_w1() {
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let target = data_encoding::BASE32_NOPAD
+            .encode(remote_key.verifying_key().as_bytes())
+            .to_lowercase();
+        let (state, _signaling_in_rx, mut cmd_rx, provider, _grant) =
+            build_test_state_parts_metered_with_creation(
+                "b2-exact-proof-ack",
+                None,
+                4,
+                None,
+                Some([0xB4; 32]),
+            );
+        let target_device = crate::semantic::DeviceId::from_canonical_str(&target)
+            .expect("the W0 target is canonical");
+        let role_grant = crate::semantic::FactBody::RoleGrant {
+            target: target_device.clone(),
+            role: crate::semantic::Role::Member,
+        };
+        let author = crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+            .expect("the test identity is canonical");
+        let role_grant = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::new(
+                role_grant.domain(),
+                state.mesh_context_id(),
+                role_grant,
+                author,
+                Vec::new(),
+            ),
+            state.identity.signing_key(),
+        )
+        .expect("the W0 RoleGrant signs");
+        let persisted_fact_id = role_grant.id;
+        ingest_semantic_fact(&state, role_grant).await;
+        let baseline = provider.in_use();
+        let fixture = insert_promoted_peer(&state, &target).await;
+        let owner = state
+            .peers
+            .owner(&target)
+            .expect("the promoted W0 owner exists");
+        assert!(state
+            .peers
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+        let _w0 = fixture
+            .peer
+            .session
+            .lock()
+            .clone()
+            .expect("the promoted fixture exposes W0");
+        let replay_delivery = cmd_rx
+            .try_recv()
+            .expect("W0 promotion queues exactly one ReplayCapabilities delivery");
+        assert!(matches!(
+            replay_delivery.value(),
+            NetworkCmd::ReplayCapabilities { owner: announced }
+                if announced.device_id() == owner.device_id()
+        ));
+        replay_delivery
+            .run_terminal_effect(|command| handle_command(&state, command))
+            .await;
+        state.park_command_receiver_for_test(cmd_rx);
+
+        let remote_state_w1 = build_test_state("b2-exact-proof-ack-remote-w1");
+        let mut link_w1 =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &remote_state_w1)
+                .await;
+        let open_w1 = link_w1.take_open_event();
+        let open_w1 = link_w1
+            .left
+            .accept_event(open_w1)
+            .expect("W1 accepts its genuine open callback");
+        let (open_w1, open_w1_resources) = open_w1.into_parts();
+        assert!(matches!(open_w1, TransportEvent::DataChannelOpen));
+        link_w1._left_events.commit_data_channel_open();
+        let candidate_w1 = Arc::clone(&link_w1.left);
+        let correlation_w1 = "b2-exact-proof-w1";
+        let _task_w1 = prepare_b2_provider_speculative_channel(
+            &state,
+            &fixture.peer,
+            &candidate_w1,
+            correlation_w1,
+            &target,
+            &remote_key,
+        )
+        .await;
+        drop(open_w1_resources);
+
+        let remote_state_w2 = build_test_state("b2-exact-proof-ack-remote-w2");
+        let mut link_w2 =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &remote_state_w2)
+                .await;
+        let open_w2 = link_w2.take_open_event();
+        let open_w2 = link_w2
+            .left
+            .accept_event(open_w2)
+            .expect("W2 accepts its genuine open callback");
+        let (open_w2, open_w2_resources) = open_w2.into_parts();
+        assert!(matches!(open_w2, TransportEvent::DataChannelOpen));
+        link_w2._left_events.commit_data_channel_open();
+        let candidate_w2 = Arc::clone(&link_w2.left);
+        let correlation_w2 = "b2-exact-proof-w2";
+        let _task_w2 = prepare_b2_provider_speculative_channel(
+            &state,
+            &fixture.peer,
+            &candidate_w2,
+            correlation_w2,
+            &target,
+            &remote_key,
+        )
+        .await;
+        drop(open_w2_resources);
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            1,
+            "W0 remains promoted"
+        );
+        assert!(fixture.peer.select_promoted_channel(&_w0));
+        assert!(fixture
+            .peer
+            .speculative_is_exact(correlation_w1, &candidate_w1));
+        assert!(fixture
+            .peer
+            .speculative_is_exact(correlation_w2, &candidate_w2));
+
+        let record = state
+            .new_durable_proof_outbox_record(&owner, &[persisted_fact_id])
+            .expect("the exact W1 proof record is constructed");
+        let record = state
+            .admit_durable_proof_outbox(record)
+            .expect("the exact W1 proof record is durably admitted");
+        let delivery = state
+            .materialize_durable_proof_delivery(&record)
+            .expect("the exact W1 proof materializes from the authoritative graph");
+        let proof_bytes = serde_json::to_vec(&MeshMessage::ProofDelivery(delivery.clone()))
+            .expect("the proof delivery serializes");
+        let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
+            reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
+        });
+        let deny_bytes = serde_json::to_vec(&deny).expect("the exact Deny serializes");
+        let admitted = state
+            .peers
+            .with_current_speculative_proof_bound(
+                &owner,
+                &candidate_w1,
+                correlation_w1,
+                record.delivery_id,
+                &state.mesh_context_id().to_string(),
+                proof_bytes.len() + deny_bytes.len(),
+                Ok,
+            )
+            .expect("W1 remains the exact current candidate")
+            .expect("W1 proof admission is provider-funded");
+        let (_captured_owner, proof_worker, _auth, _context, work) = admitted.into_parts();
+        assert!(Arc::ptr_eq(&proof_worker, &candidate_w1));
+        let send = proof_worker
+            .begin_send()
+            .expect("the exact W1 candidate has a live data channel");
+        tokio::time::timeout(
+            Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+            send.send(Bytes::from(proof_bytes)),
+        )
+        .await
+        .expect("W1 proof send does not hang")
+        .expect("the proof is sent only by W1");
+        drop(work);
+
+        let wrong_context = ProofAckMessage {
+            context_id: crate::semantic::MeshContextId::from_bytes([0xA1; 32]),
+            target: delivery.target.clone(),
+            delivery_id: delivery.delivery_id,
+        };
+        assert!(
+            !settle_speculative_proof_ack(
+                &state,
+                &owner,
+                correlation_w1,
+                &candidate_w1,
+                wrong_context,
+            )
+            .await
+        );
+        let wrong_target = crate::semantic::DeviceId::from_canonical_str(
+            &data_encoding::BASE32_NOPAD
+                .encode(&[9u8; 32])
+                .to_lowercase(),
+        )
+        .expect("the wrong target is canonical");
+        assert!(
+            !settle_speculative_proof_ack(
+                &state,
+                &owner,
+                correlation_w1,
+                &candidate_w1,
+                ProofAckMessage {
+                    context_id: delivery.context_id,
+                    target: wrong_target,
+                    delivery_id: delivery.delivery_id,
+                },
+            )
+            .await
+        );
+        assert!(
+            !settle_speculative_proof_ack(
+                &state,
+                &owner,
+                correlation_w1,
+                &candidate_w1,
+                ProofAckMessage {
+                    context_id: delivery.context_id,
+                    target: delivery.target.clone(),
+                    delivery_id: crate::semantic::ProofDeliveryId::from_bytes([0xB2; 32]),
+                },
+            )
+            .await
+        );
+        assert!(
+            !settle_speculative_proof_ack(
+                &state,
+                &owner,
+                correlation_w2,
+                &candidate_w2,
+                ProofAckMessage::for_delivery(&delivery),
+            )
+            .await
+        );
+        assert!(fixture
+            .peer
+            .speculative_is_exact(correlation_w1, &candidate_w1));
+        assert!(fixture
+            .peer
+            .speculative_is_exact(correlation_w2, &candidate_w2));
+        assert!(state
+            .pending_durable_proof_outbox()
+            .expect("invalid ACKs leave the exact durable proof pending")
+            .iter()
+            .any(|current| current.delivery_id == delivery.delivery_id));
+
+        let ack_bytes = serde_json::to_vec(&MeshMessage::ProofAck(ProofAckMessage::for_delivery(
+            &delivery,
+        )))
+        .expect("the exact W1 ACK serializes");
+        assert!(matches!(
+            handle_speculative_message(
+                &state,
+                &owner,
+                correlation_w1,
+                &candidate_w1,
+                Bytes::from(ack_bytes.clone()),
+            )
+            .await,
+            SpeculativeMessageOutcome::Handled(true)
+        ));
+        let records = state
+            .durable_proof_records()
+            .expect("the exact terminal record remains observable");
+        assert!(records.iter().any(|current| {
+            current.delivery_id == delivery.delivery_id
+                && current.state == crate::semantic::ProofRecordState::Settled
+        }));
+        assert!(!fixture
+            .peer
+            .speculative_is_exact(correlation_w1, &candidate_w1));
+        assert!(fixture
+            .peer
+            .speculative_is_exact(correlation_w2, &candidate_w2));
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            1,
+            "W0 remains promoted"
+        );
+        assert!(fixture.peer.select_promoted_channel(&_w0));
+        assert!(
+            !settle_speculative_proof_ack(
+                &state,
+                &owner,
+                correlation_w1,
+                &candidate_w1,
+                ProofAckMessage::for_delivery(&delivery),
+            )
+            .await
+        );
+        let records_after_duplicate = state
+            .durable_proof_records()
+            .expect("duplicate ACK does not lose the terminal record");
+        assert!(records_after_duplicate.iter().any(|current| {
+            current.delivery_id == delivery.delivery_id
+                && current.state == crate::semantic::ProofRecordState::Settled
+        }));
+
+        state.shutdown().await;
+        remote_state_w1.shutdown().await;
+        remote_state_w2.shutdown().await;
+        let _ = link_w1.close_outcomes().await;
+        let _ = link_w2.close_outcomes().await;
+        drop(proof_worker);
+        drop(candidate_w1);
+        drop(candidate_w2);
+        drop(_task_w1);
+        drop(_task_w2);
+        drop(_w0);
+        drop(fixture);
+        drop(owner);
+        drop(remote_state_w1);
+        drop(remote_state_w2);
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "exact W1 settlement returns provider baseline"
+        );
     }
 
     /// The provider delta is measured at the actual logical-session, realtime
