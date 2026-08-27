@@ -1929,6 +1929,12 @@ impl NetworkState {
             conn_trace_tx,
             conn_trace_force_on,
         });
+        // A restored canonical eviction must be visible before this state can
+        // escape to callers.  The driver repeats this refresh before any
+        // announce or dial, but it is spawned asynchronously; deferring the
+        // first refresh to that task leaves a window where an already-evicted
+        // installation reports itself live immediately after reopen.
+        super::governance::refresh_self_evicted(&state);
         // The registry announces a newly minted session on this same queue, so
         // the driver handles it once every fence lock has been released. Bound
         // here because this is the one place that owns both the registry and the
