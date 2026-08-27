@@ -11,8 +11,9 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::store::{DurableSemanticStore, DurableStoreError};
+use super::store::{DurableSemanticOwner, DurableSemanticStore, DurableStoreError};
 use super::{DeviceId, FactId, MeshContextId};
+use std::sync::Arc;
 
 const PROOF_DELIVERY_DOMAIN: &[u8] = b"myownmesh-semantic-v4-proof-delivery-v1";
 const PROOF_RECORD_VERSION: u16 = 1;
@@ -111,6 +112,7 @@ impl<'de> Deserialize<'de> for ProofDeliveryId {
 pub enum ProofRecordState {
     Pending,
     Settled,
+    Superseded,
 }
 
 /// One pending or settled proof delivery, including its exact custody
@@ -194,7 +196,13 @@ impl ProofRecord {
 /// Durable access to proof records for one local semantic store.
 #[derive(Debug, Clone)]
 pub struct DurableProofOutbox {
-    store: DurableSemanticStore,
+    backend: ProofOutboxBackend,
+}
+
+#[derive(Debug, Clone)]
+enum ProofOutboxBackend {
+    Store(DurableSemanticStore),
+    Owner(Arc<DurableSemanticOwner>),
 }
 
 impl DurableProofOutbox {
@@ -202,7 +210,16 @@ impl DurableProofOutbox {
     /// corresponding [`DurableSemanticStore`].
     pub fn new(instance_root: impl Into<std::path::PathBuf>, local_slot: impl AsRef<str>) -> Self {
         Self {
-            store: DurableSemanticStore::new(instance_root, local_slot),
+            backend: ProofOutboxBackend::Store(DurableSemanticStore::new(
+                instance_root,
+                local_slot,
+            )),
+        }
+    }
+
+    pub(crate) fn from_owner(owner: Arc<DurableSemanticOwner>) -> Self {
+        Self {
+            backend: ProofOutboxBackend::Owner(owner),
         }
     }
 
@@ -210,7 +227,6 @@ impl DurableProofOutbox {
     /// context.  Settled records remain persisted so replay is idempotent.
     pub fn pending(&self, context_id: MeshContextId) -> Result<Vec<ProofRecord>, ProofOutboxError> {
         Ok(self
-            .store
             .proof_records(context_id)?
             .into_iter()
             .filter(ProofRecord::is_pending)
@@ -224,7 +240,7 @@ impl DurableProofOutbox {
         record.validate()?;
         let mut result = record.clone();
         let context_id = record.context_id;
-        self.store.mutate_proof_records(context_id, |records| {
+        self.mutate_proof_records(context_id, |records| {
             if let Some(existing) = records
                 .iter()
                 .find(|existing| existing.delivery_id == record.delivery_id)
@@ -263,7 +279,7 @@ impl DurableProofOutbox {
             ));
         }
         let mut rebound = None;
-        self.store.mutate_proof_records(context_id, |records| {
+        self.mutate_proof_records(context_id, |records| {
             let record = records
                 .iter_mut()
                 .find(|record| record.delivery_id == delivery_id)
@@ -290,17 +306,84 @@ impl DurableProofOutbox {
         delivery_id: ProofDeliveryId,
     ) -> Result<bool, ProofOutboxError> {
         let mut settled = false;
-        self.store.mutate_proof_records(context_id, |records| {
+        self.mutate_proof_records(context_id, |records| {
             if let Some(record) = records
                 .iter_mut()
                 .find(|record| record.delivery_id == delivery_id)
             {
-                record.state = ProofRecordState::Settled;
-                settled = true;
+                match record.state {
+                    ProofRecordState::Pending => {
+                        record.state = ProofRecordState::Settled;
+                        settled = true;
+                    }
+                    ProofRecordState::Settled | ProofRecordState::Superseded => {}
+                }
             }
             Ok(())
         })?;
         Ok(settled)
+    }
+
+    /// Retire one obsolete Pending delivery without representing an
+    /// acknowledgement. The exact target is a CAS witness; an optional
+    /// replacement identity documents the successor selected by the caller
+    /// but never makes this record replayable or settles the successor.
+    pub fn supersede(
+        &self,
+        context_id: MeshContextId,
+        delivery_id: ProofDeliveryId,
+        expected_target: &DeviceId,
+        replacement_delivery_id: Option<ProofDeliveryId>,
+    ) -> Result<bool, ProofOutboxError> {
+        if replacement_delivery_id == Some(delivery_id) {
+            return Err(ProofOutboxError::InvalidRecord(
+                "proof replacement must have a distinct delivery identity".into(),
+            ));
+        }
+        let mut superseded = false;
+        self.mutate_proof_records(context_id, |records| {
+            let record = records
+                .iter_mut()
+                .find(|record| record.delivery_id == delivery_id)
+                .ok_or(DurableStoreError::ProofNotFound)?;
+            if &record.target != expected_target {
+                return Err(DurableStoreError::StaleProofTarget);
+            }
+            match record.state {
+                ProofRecordState::Pending => {
+                    record.state = ProofRecordState::Superseded;
+                    superseded = true;
+                }
+                ProofRecordState::Settled => return Err(DurableStoreError::ProofSettled),
+                ProofRecordState::Superseded => {}
+            }
+            Ok(())
+        })?;
+        Ok(superseded)
+    }
+
+    fn proof_records(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        match &self.backend {
+            ProofOutboxBackend::Store(store) => store.proof_records(context_id),
+            ProofOutboxBackend::Owner(owner) => owner.proof_records(context_id),
+        }
+    }
+
+    fn mutate_proof_records<F>(
+        &self,
+        context_id: MeshContextId,
+        mutation: F,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError>
+    where
+        F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
+    {
+        match &self.backend {
+            ProofOutboxBackend::Store(store) => store.mutate_proof_records(context_id, mutation),
+            ProofOutboxBackend::Owner(owner) => owner.mutate_proof_records(context_id, mutation),
+        }
     }
 }
 
@@ -331,6 +414,8 @@ pub enum ProofOutboxError {
     AlreadySettled,
     #[error("proof delivery binding is stale")]
     StaleBinding,
+    #[error("proof delivery target is stale")]
+    StaleTarget,
     #[error("durable proof outbox storage failed: {0}")]
     Storage(String),
 }
@@ -345,6 +430,7 @@ impl From<DurableStoreError> for ProofOutboxError {
             DurableStoreError::ProofNotFound => Self::NotFound,
             DurableStoreError::ProofSettled => Self::AlreadySettled,
             DurableStoreError::StaleProofBinding => Self::StaleBinding,
+            DurableStoreError::StaleProofTarget => Self::StaleTarget,
             error => Self::Storage(error.to_string()),
         }
     }
@@ -491,6 +577,40 @@ mod tests {
             outbox.enqueue(unknown),
             Err(ProofOutboxError::Storage(_))
         ));
+        let obsolete_target_key = SigningKey::from_bytes(&[8; 32]);
+        let obsolete_target =
+            DeviceId::from_public_key_bytes(*obsolete_target_key.verifying_key().as_bytes())
+                .expect("obsolete target");
+        let obsolete = ProofRecord::pending(
+            bootstrap.context_id(),
+            obsolete_target.clone(),
+            vec![fact.id],
+            "obsolete-owner",
+            "obsolete-binding",
+        )
+        .expect("obsolete record");
+        outbox.enqueue(obsolete.clone()).expect("obsolete enqueue");
+        assert!(outbox
+            .supersede(
+                bootstrap.context_id(),
+                obsolete.delivery_id,
+                &obsolete_target,
+                Some(rebound.delivery_id),
+            )
+            .expect("supersede"));
+        assert!(!outbox
+            .supersede(
+                bootstrap.context_id(),
+                obsolete.delivery_id,
+                &obsolete_target,
+                None,
+            )
+            .expect("repeat supersede"));
+        assert!(!outbox
+            .pending(bootstrap.context_id())
+            .expect("pending after supersede")
+            .iter()
+            .any(|record| record.delivery_id == obsolete.delivery_id));
         store
             .commit(&graph, Vec::new())
             .expect("graph commit preserves proof");
@@ -503,9 +623,30 @@ mod tests {
         assert!(reopened
             .settle(bootstrap.context_id(), record.delivery_id)
             .expect("settle"));
-        assert!(reopened
+        assert!(!reopened
             .settle(bootstrap.context_id(), record.delivery_id)
             .expect("repeat settle"));
+        assert!(reopened
+            .pending(bootstrap.context_id())
+            .expect("settled pending")
+            .is_empty());
+        let settled_reopen = DurableProofOutbox::new(&root, "slot");
+        let settled_records = settled_reopen
+            .proof_records(bootstrap.context_id())
+            .expect("settled tombstone reopen");
+        assert_eq!(settled_records.len(), 2);
+        assert!(settled_records.iter().any(|persisted| {
+            persisted.delivery_id == obsolete.delivery_id
+                && persisted.state == ProofRecordState::Superseded
+        }));
+        assert!(settled_records.iter().any(|persisted| {
+            persisted.delivery_id == record.delivery_id
+                && persisted.state == ProofRecordState::Settled
+        }));
+        assert!(settled_reopen
+            .pending(bootstrap.context_id())
+            .expect("settled tombstone pending")
+            .is_empty());
         assert!(matches!(
             reopened.rebind(
                 bootstrap.context_id(),
@@ -517,10 +658,6 @@ mod tests {
             ),
             Err(ProofOutboxError::AlreadySettled)
         ));
-        assert!(reopened
-            .pending(bootstrap.context_id())
-            .expect("settled pending")
-            .is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

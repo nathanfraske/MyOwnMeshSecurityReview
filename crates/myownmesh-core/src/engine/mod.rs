@@ -459,9 +459,96 @@ pub(crate) async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: Signed
 pub mod transport_lab {
     use std::sync::Arc;
 
-    use crate::semantic::SignedFact;
+    use crate::semantic::{FactId, ProofDeliveryId, ProofRecord, SignedFact};
 
     use super::NetworkState;
+
+    /// Opaque transport-lab witness for one exact installed peer owner.
+    ///
+    /// The underlying installation token is intentionally not nameable by an
+    /// integration crate.  Every proof-outbox mutation below therefore keeps
+    /// the same owner/binding fence as the production path.
+    #[derive(Clone)]
+    pub struct ProofOwner(super::peer_registry::PeerOwnerToken);
+
+    /// Capture the current exact owner for a transport-lab control. A later
+    /// replacement does not make this witness current again.
+    #[doc(hidden)]
+    pub fn proof_owner_for_device(
+        state: &Arc<NetworkState>,
+        device_id: &str,
+    ) -> Option<ProofOwner> {
+        state.peers.owner(device_id).map(ProofOwner)
+    }
+
+    /// Enumerate Pending records restored from this exact network's durable
+    /// semantic slot. Settled and superseded records are not replayable.
+    #[doc(hidden)]
+    pub fn pending_durable_proofs(state: &Arc<NetworkState>) -> crate::Result<Vec<ProofRecord>> {
+        state.pending_durable_proof_outbox()
+    }
+
+    /// Build a proof record from facts already admitted by the authoritative
+    /// graph and the exact owner witness captured by the caller.
+    #[doc(hidden)]
+    pub fn new_durable_proof_record(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+        fact_ids: &[FactId],
+    ) -> crate::Result<ProofRecord> {
+        state.new_durable_proof_outbox_record(&owner.0, fact_ids)
+    }
+
+    /// Materialize one Pending record through the authoritative graph. Fact
+    /// bodies are never reconstructed by an integration caller.
+    #[doc(hidden)]
+    pub fn materialize_durable_proof_delivery(
+        state: &Arc<NetworkState>,
+        record: &ProofRecord,
+    ) -> crate::Result<crate::protocol::ProofDeliveryMessage> {
+        state.materialize_durable_proof_delivery(record)
+    }
+
+    /// Persist one exact proof obligation before any transport send.
+    #[doc(hidden)]
+    pub fn admit_durable_proof(
+        state: &Arc<NetworkState>,
+        record: ProofRecord,
+    ) -> crate::Result<ProofRecord> {
+        state.admit_durable_proof_outbox(record)
+    }
+
+    /// Rebind a Pending obligation through the exact current owner fence.
+    #[doc(hidden)]
+    pub fn rebind_durable_proof(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+        record: &ProofRecord,
+    ) -> crate::Result<bool> {
+        state.rebind_durable_proof_outbox(&owner.0, record)
+    }
+
+    /// Retire an obsolete obligation without manufacturing an ACK.
+    #[doc(hidden)]
+    pub fn supersede_durable_proof(
+        state: &Arc<NetworkState>,
+        record: &ProofRecord,
+        replacement_delivery_id: Option<ProofDeliveryId>,
+    ) -> crate::Result<bool> {
+        state.supersede_durable_proof_outbox(record, replacement_delivery_id)
+    }
+
+    /// Settle one exact ACK through the owner, target, binding, and delivery
+    /// identity fences used by the production receiver.
+    #[doc(hidden)]
+    pub fn settle_durable_proof_ack(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+        record: &ProofRecord,
+        delivery_id: ProofDeliveryId,
+    ) -> crate::Result<bool> {
+        state.settle_durable_proof_outbox_ack(&owner.0, record, delivery_id)
+    }
 
     #[doc(hidden)]
     pub async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: SignedFact) {
@@ -5355,6 +5442,7 @@ async fn replay_pending_durable_proofs(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
 ) {
+    let current = handshake::current_eviction_proof_record(state, owner);
     let records = match state.pending_durable_proof_outbox() {
         Ok(records) => records,
         Err(error) => {
@@ -5364,6 +5452,29 @@ async fn replay_pending_durable_proofs(
     };
     for record in records {
         if record.target.to_string() != owner.device_id() || !record.is_pending() {
+            continue;
+        }
+        let current_matches = current.as_ref().is_some_and(|current| {
+            record.delivery_id == current.delivery_id && record.fact_ids == current.fact_ids
+        });
+        if !current_matches {
+            // A regrant or a later eviction makes the old same-target
+            // obligation obsolete. Retire it as a distinct durable terminal,
+            // never as a fabricated proof ACK. When a new closure exists its
+            // identity is retained as replacement metadata for diagnostics.
+            let replacement = current.as_ref().map(|current| current.delivery_id);
+            match state.supersede_durable_proof_outbox(&record, replacement) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    debug!(
+                        peer = %owner.device_id(),
+                        delivery = %record.delivery_id,
+                        %error,
+                        "stale durable proof supersession refused"
+                    );
+                }
+            }
             continue;
         }
         let facts = {

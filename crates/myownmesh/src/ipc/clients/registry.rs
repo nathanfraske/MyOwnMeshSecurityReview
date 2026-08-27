@@ -621,7 +621,7 @@ impl ClientRegistry {
         owner: &FundedArc<ClientHandle>,
         network: String,
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
-    ) -> Result<RealtimeFlowCapability, RealtimeFlowRejected> {
+    ) -> Result<RealtimeFlowCapability, Box<RealtimeFlowRejected>> {
         // The capability is a fixed-width mint, so its length is known before
         // it exists; the network name is the client-influenced half and is the
         // reason this is computed per call rather than being a constant.
@@ -646,10 +646,10 @@ impl ClientRegistry {
         }) {
             Ok(cleanup) => cleanup,
             Err(reason) => {
-                return Err(RealtimeFlowRejected {
+                return Err(Box::new(RealtimeFlowRejected {
                     flow,
                     reason: RegistrationError::Admission(reason),
-                });
+                }));
             }
         };
         self.install_if_live(
@@ -661,7 +661,7 @@ impl ClientRegistry {
                 owner.register_realtime_flow(network, flow, entry, retained, cleanup)
             },
         )
-        .map_err(|(flow, reason)| RealtimeFlowRejected { flow, reason })
+        .map_err(|(flow, reason)| Box::new(RealtimeFlowRejected { flow, reason }))
     }
 
     /// Run `install` only while `owner` is still a registered, connected client

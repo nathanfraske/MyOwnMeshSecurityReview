@@ -85,7 +85,7 @@ use tokio::task::JoinHandle;
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
-use crate::semantic::store::{DurableSemanticStore, ProvisionalCustody};
+use crate::semantic::store::{DurableSemanticOwner, DurableSemanticStore, ProvisionalCustody};
 use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
 
 pub(crate) type AttemptSettlement = Arc<
@@ -1367,7 +1367,7 @@ pub struct NetworkState {
     /// (`config.id`) while the snapshot itself is bound to the immutable
     /// bootstrap context, so two instances may share a wire network id while
     /// retaining independent on-disk state.
-    durable_semantic_store: DurableSemanticStore,
+    durable_semantic_owner: Arc<DurableSemanticOwner>,
     durable_provisional: Mutex<Vec<ProvisionalCustody>>,
     durable_proof_outbox: DurableProofOutbox,
     pub current_phase: RwLock<MeshPhase>,
@@ -1839,17 +1839,23 @@ impl NetworkState {
         let durable_root = instance_root
             .clone()
             .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
-        let durable_proof_outbox = DurableProofOutbox::new(durable_root.clone(), &config.id);
         let durable_semantic_store = DurableSemanticStore::new(durable_root, &config.id);
+        let durable_semantic_owner = Arc::new(
+            durable_semantic_store
+                .open_writable()
+                .map_err(|error| Error::Network(format!("open semantic slot: {error}")))?,
+        );
+        let durable_proof_outbox =
+            DurableProofOutbox::from_owner(Arc::clone(&durable_semantic_owner));
         let (initial_graph, durable_provisional) =
-            match durable_semantic_store.restore(&verified_bootstrap) {
+            match durable_semantic_owner.restore(&verified_bootstrap) {
                 Ok(restored) => (
                     restored.graph().clone(),
                     restored.provisional_custody().to_vec(),
                 ),
                 Err(crate::semantic::store::DurableStoreError::Missing { .. }) => {
                     let graph = crate::semantic::FactGraph::from_bootstrap(&verified_bootstrap);
-                    durable_semantic_store
+                    durable_semantic_owner
                         .commit(&graph, Vec::new())
                         .map_err(|error| {
                             Error::Network(format!("initial semantic snapshot: {error}"))
@@ -1878,7 +1884,7 @@ impl NetworkState {
             roster: RwLock::new(roster),
             governance_state,
             fact_graph,
-            durable_semantic_store,
+            durable_semantic_owner,
             durable_provisional: Mutex::new(durable_provisional),
             durable_proof_outbox,
             current_phase: RwLock::new(MeshPhase::Joining),
@@ -2404,7 +2410,7 @@ impl NetworkState {
             {
                 candidate_provisional.push(ProvisionalCustody::new(fact_id, "semantic-ingress"));
             }
-            self.durable_semantic_store
+            self.durable_semantic_owner
                 .commit(&candidate, candidate_provisional.clone())
                 .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
             *live = candidate;
@@ -2431,7 +2437,7 @@ impl NetworkState {
             let unresolved: std::collections::BTreeSet<_> =
                 candidate.quarantined().map(|(id, _)| *id).collect();
             candidate_provisional.retain(|claim| unresolved.contains(&claim.fact_id));
-            self.durable_semantic_store
+            self.durable_semantic_owner
                 .commit(&candidate, candidate_provisional.clone())
                 .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
             let newly_inserted = candidate
@@ -2450,7 +2456,7 @@ impl NetworkState {
     /// The restored graph is installed only after compaction/reopen succeeds.
     pub(crate) fn compact_durable_semantic_state(&self) -> Result<()> {
         let restored = self
-            .durable_semantic_store
+            .durable_semantic_owner
             .compact(&self.verified_bootstrap)
             .map_err(|error| Error::Network(format!("semantic snapshot compact: {error}")))?;
         *self.fact_graph.write() = restored.graph().clone();
@@ -2602,6 +2608,28 @@ impl NetworkState {
         }
     }
 
+    /// Retire an obsolete exact-target proof delivery without fabricating an
+    /// acknowledgement. The durable record remains as a non-replayable
+    /// Superseded terminal until normal compaction.
+    pub(crate) fn supersede_durable_proof_outbox(
+        &self,
+        record: &ProofRecord,
+        replacement_delivery_id: Option<ProofDeliveryId>,
+    ) -> Result<bool> {
+        if record.context_id != self.mesh_context_id {
+            return Ok(false);
+        }
+        let target = record.target.clone();
+        self.durable_proof_outbox
+            .supersede(
+                self.mesh_context_id,
+                record.delivery_id,
+                &target,
+                replacement_delivery_id,
+            )
+            .map_err(|error| Error::Network(format!("durable proof supersede: {error}")))
+    }
+
     /// Settle only an exact ACK while the owner installation and binding
     /// remain current. The semantic outbox retains its Settled tombstone, so
     /// an identical ACK is idempotent while stale owners remain no-ops.
@@ -2616,6 +2644,7 @@ impl NetworkState {
             || record.target.to_string() != owner.device_id()
             || record.owner != owner.device_id()
             || record.binding != owner.binding_key()
+            || !record.is_pending()
         {
             return Ok(false);
         }

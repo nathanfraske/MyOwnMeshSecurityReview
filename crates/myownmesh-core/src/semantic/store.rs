@@ -98,6 +98,15 @@ pub struct DurableSemanticStore {
     lock_path: PathBuf,
 }
 
+/// The process/lifetime owner of one writable semantic slot. Graph commits
+/// and proof-outbox mutations may share this owner; no second writer can open
+/// the slot until the owner is dropped (including on process death).
+#[derive(Debug)]
+pub struct DurableSemanticOwner {
+    store: DurableSemanticStore,
+    _lease: WriterLease,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableSnapshot {
     version: u16,
@@ -495,6 +504,7 @@ impl DurableSemanticStore {
     /// Commit facts, their derived projection commitment, and provisional
     /// custody as one durable record. The writer lease covers validation and
     /// publication, so a competing process cannot interleave a partial state.
+    #[cfg(test)]
     pub fn commit<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
     where
         I: IntoIterator<Item = ProvisionalCustody>,
@@ -505,6 +515,7 @@ impl DurableSemanticStore {
 
     /// Acquire the cross-process writer lease and hold it until commit or
     /// drop. Readers remain lock-free and only consume complete snapshots.
+    #[cfg(test)]
     pub fn begin_write(&self) -> Result<DurableSemanticWriter, DurableStoreError> {
         let parent = self
             .path
@@ -521,9 +532,29 @@ impl DurableSemanticStore {
         })
     }
 
+    /// Open the slot for the entire lifetime of the semantic owner. This is
+    /// the shared writable gate used by a live NetworkState and its proof
+    /// outbox; a competing process is refused before state publication.
+    pub fn open_writable(&self) -> Result<DurableSemanticOwner, DurableStoreError> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| DurableStoreError::InvalidPath(self.path.clone()))?;
+        std::fs::create_dir_all(parent).map_err(|source| DurableStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lease = WriterLease::acquire(&self.lock_path)?;
+        Ok(DurableSemanticOwner {
+            store: self.clone(),
+            _lease: lease,
+        })
+    }
+
     /// Reopen, verify, and rebuild the exact graph and projection commitment.
     /// A stale temporary file from an interrupted writer is ignored because
     /// the published snapshot itself is never truncated.
+    #[cfg(test)]
     pub fn restore(
         &self,
         bootstrap: &VerifiedBootstrap,
@@ -534,6 +565,7 @@ impl DurableSemanticStore {
     /// Rewrite the canonical sorted representation under the writer lease.
     /// Compaction has no separate correctness path: it first verifies the
     /// existing snapshot, then atomically republishes the same state.
+    #[cfg(test)]
     pub fn compact(
         &self,
         bootstrap: &VerifiedBootstrap,
@@ -568,8 +600,19 @@ impl DurableSemanticStore {
     where
         F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
     {
-        let lease = self.begin_write()?;
-        let result = (|| {
+        let owner = self.open_writable()?;
+        owner.mutate_proof_records(context_id, mutation)
+    }
+
+    fn mutate_proof_records_locked<F>(
+        &self,
+        context_id: MeshContextId,
+        mutation: F,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError>
+    where
+        F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
+    {
+        (|| {
             let mut snapshot = self.read_snapshot()?;
             if snapshot.context_id != context_id {
                 return Err(DurableStoreError::ContextMismatch {
@@ -584,9 +627,7 @@ impl DurableSemanticStore {
             let bytes = serde_json::to_vec(&snapshot)?;
             write_snapshot_atomic(&self.path, &bytes)?;
             Ok(snapshot.proofs)
-        })();
-        drop(lease);
-        result
+        })()
     }
 
     fn read_snapshot(&self) -> Result<DurableSnapshot, DurableStoreError> {
@@ -688,13 +729,59 @@ impl DurableSemanticStore {
     }
 }
 
+impl DurableSemanticOwner {
+    pub fn commit<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
+    where
+        I: IntoIterator<Item = ProvisionalCustody>,
+    {
+        self.store.store_snapshot(graph, provisional)
+    }
+
+    pub fn restore(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        self.store.restore_unlocked(bootstrap)
+    }
+
+    pub fn compact(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let state = self.store.restore_unlocked(bootstrap)?;
+        self.store
+            .store_snapshot(&state.graph, state.provisional.clone())?;
+        Ok(state)
+    }
+
+    pub(crate) fn proof_records(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        self.store.proof_records(context_id)
+    }
+
+    pub(crate) fn mutate_proof_records<F>(
+        &self,
+        context_id: MeshContextId,
+        mutation: F,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError>
+    where
+        F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
+    {
+        self.store.mutate_proof_records_locked(context_id, mutation)
+    }
+}
+
 /// A held durable writer lease. Dropping without commit is an explicit abort;
 /// the previously published snapshot remains untouched.
+#[cfg(test)]
 pub struct DurableSemanticWriter {
     store: DurableSemanticStore,
     lease: WriterLease,
 }
 
+#[cfg(test)]
 impl DurableSemanticWriter {
     pub fn commit<I>(self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
     where
@@ -1198,6 +1285,8 @@ pub enum DurableStoreError {
     ProofSettled,
     #[error("semantic snapshot proof binding is stale")]
     StaleProofBinding,
+    #[error("semantic snapshot proof target is stale")]
+    StaleProofTarget,
     #[error("semantic snapshot proof names an unknown fact")]
     UnknownProofFact,
     #[error("semantic snapshot serialization failed: {0}")]
@@ -1248,12 +1337,23 @@ mod tests {
         let author =
             super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
                 .expect("test root id");
+        root_fact_for_target(bootstrap, signing_key, author)
+    }
+
+    fn root_fact_for_target(
+        bootstrap: &VerifiedBootstrap,
+        signing_key: &SigningKey,
+        target: super::super::DeviceId,
+    ) -> SignedFact {
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("test root id");
         SignedFact::sign(
             FactContent::new(
                 FactDomain::Governance,
                 bootstrap.context_id(),
                 FactBody::RoleGrant {
-                    target: author.clone(),
+                    target,
                     role: super::super::Role::Member,
                 },
                 author,
@@ -1653,6 +1753,78 @@ mod tests {
     }
 
     #[test]
+    fn lifetime_owner_blocks_second_open_then_reopens_for_append() {
+        let root = root();
+        let signing_key = key(16);
+        let bootstrap = closed("scope-a", 16, [16; 32]);
+        let target_key = key(17);
+        let target =
+            super::super::DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes())
+                .expect("target id");
+        let first = root_fact_for_target(&bootstrap, &signing_key, target.clone());
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(first.clone()).expect("first fact");
+        let store = DurableSemanticStore::new(&root, "lifetime-slot");
+        store
+            .commit(&graph, Vec::new())
+            .expect("initial publication");
+
+        let ready = root.join("lifetime-child-ready");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("child_holds_lifetime_owner")
+            .env("MYOWNMESH_STORE_CHILD_ROOT", &root)
+            .env("MYOWNMESH_STORE_CHILD_READY", &ready)
+            .env("MYOWNMESH_STORE_CHILD_SLOT", "lifetime-slot")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn live owner");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "child must publish its live owner");
+        assert!(matches!(
+            store.open_writable(),
+            Err(DurableStoreError::WriterBusy { .. })
+        ));
+        child.kill().expect("hard-stop live owner");
+        child.wait().expect("reap live owner");
+
+        let owner = store.open_writable().expect("reopen after owner death");
+        let second = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target,
+                    role: super::super::Role::Member,
+                },
+                super::super::DeviceId::from_public_key_bytes(
+                    *signing_key.verifying_key().as_bytes(),
+                )
+                .expect("root id"),
+                vec![first.id],
+            ),
+            &signing_key,
+        )
+        .expect("second fact");
+        graph.admit(second).expect("append second fact");
+        owner
+            .commit(&graph, Vec::new())
+            .expect("append publication");
+        assert_eq!(
+            store
+                .restore(&bootstrap)
+                .expect("final reopen")
+                .graph()
+                .len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn child_writer_holds_lease() {
         let (Some(root), Some(ready)) = (
             std::env::var_os("MYOWNMESH_STORE_CHILD_ROOT"),
@@ -1662,6 +1834,21 @@ mod tests {
         };
         let store = DurableSemanticStore::new(root, "child-slot");
         let _lease = store.begin_write().expect("child writer lease");
+        std::fs::write(ready, b"ready").expect("child ready marker");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn child_holds_lifetime_owner() {
+        let (Some(root), Some(ready), Some(slot)) = (
+            std::env::var_os("MYOWNMESH_STORE_CHILD_ROOT"),
+            std::env::var_os("MYOWNMESH_STORE_CHILD_READY"),
+            std::env::var_os("MYOWNMESH_STORE_CHILD_SLOT"),
+        ) else {
+            return;
+        };
+        let store = DurableSemanticStore::new(root, slot.to_string_lossy());
+        let _owner = store.open_writable().expect("child lifetime owner");
         std::fs::write(ready, b"ready").expect("child ready marker");
         std::thread::sleep(Duration::from_secs(30));
     }

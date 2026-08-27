@@ -120,30 +120,37 @@ fn pending_eviction_proof(
 )> {
     let context_id = state.mesh_context_id();
     let target = owner.device_id();
+    // Derive the current canonical delivery identity before looking at any
+    // retained obligation.  A same-target record is not reusable when its
+    // signed closure is stale: the target may have been regranted and later
+    // evicted again with a distinct proof.
+    let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
+    let candidate = state
+        .new_durable_proof_outbox_record(owner, &fact_ids)
+        .ok()?;
     let existing = state
         .pending_durable_proof_outbox()
         .ok()?
         .into_iter()
-        .find(|record| record.context_id == context_id && record.target.to_string() == target);
+        .find(|record| {
+            record.context_id == context_id
+                && record.target.to_string() == target
+                && record.delivery_id == candidate.delivery_id
+                && record.fact_ids == candidate.fact_ids
+        });
     let record = match existing {
         Some(record) => record,
-        None => {
-            let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
-            let record = state
-                .new_durable_proof_outbox_record(owner, &fact_ids)
-                .ok()?;
-            match state.admit_durable_proof_outbox(record) {
-                Ok(record) => record,
-                Err(error) => {
-                    warn!(
-                        peer = %target,
-                        %error,
-                        "durable eviction proof enqueue refused"
-                    );
-                    return None;
-                }
+        None => match state.admit_durable_proof_outbox(candidate) {
+            Ok(record) => record,
+            Err(error) => {
+                warn!(
+                    peer = %target,
+                    %error,
+                    "durable eviction proof enqueue refused"
+                );
+                return None;
             }
-        }
+        },
     };
     let delivery = match state.materialize_durable_proof_delivery(&record) {
         Ok(delivery) => delivery,
@@ -157,6 +164,24 @@ fn pending_eviction_proof(
         }
     };
     Some((record, delivery))
+}
+
+/// Derive the current proof identity without enqueuing it.  Replay uses this
+/// exact candidate to reject stale same-target obligations and to avoid
+/// resurrecting a proof after a causal regrant removed the eviction.
+pub(super) fn current_eviction_proof_record(
+    state: &Arc<NetworkState>,
+    owner: &super::peer_registry::PeerOwnerToken,
+) -> Option<crate::semantic::ProofRecord> {
+    if !super::governance::log_evicted(state, owner.device_id()) {
+        return None;
+    }
+    let proof = canonical_proof_bundle(state, owner.device_id());
+    if proof.is_empty() {
+        return None;
+    }
+    let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
+    state.new_durable_proof_outbox_record(owner, &fact_ids).ok()
 }
 
 /// The Hello this node sends, built in exactly one place.
@@ -260,7 +285,10 @@ fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello
     tokio::spawn(async move {
         let device_id = owner.device_id().to_string();
         for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::select! {
+                _ = state.wait_for_shutdown() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+            }
             let still_handshaking = {
                 let Some(peer) = state.peers.get_if_current(&owner) else {
                     return;
@@ -286,7 +314,10 @@ fn schedule_hello_retries(state: Arc<NetworkState>, owner: PeerOwnerToken, hello
 fn schedule_watchdog(state: Arc<NetworkState>, owner: PeerOwnerToken) {
     tokio::spawn(async move {
         let device_id = owner.device_id().to_string();
-        tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)).await;
+        tokio::select! {
+            _ = state.wait_for_shutdown() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)) => {}
+        }
         let should_fail = {
             let Some(peer) = state.peers.get_if_current(&owner) else {
                 return;

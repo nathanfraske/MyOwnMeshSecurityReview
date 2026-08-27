@@ -2,27 +2,32 @@
 
 //! Production-shaped R3 controls for durable stand-down proof delivery.
 //!
-//! These controls intentionally use the public outbox and proof-wire APIs
-//! from the proof-delivery lane.  The checkout on which this file was first
-//! authored may not yet contain those exports; that is an integration
-//! dependency, not a test-local substitute for durable custody.
+//! These controls intentionally use the state-owned transport-lab façade and
+//! proof-wire APIs from the proof-delivery lane.  The façade keeps each test
+//! on the same durable semantic slot as production.
 
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::transport_lab::ingest_semantic_fact;
+use myownmesh_core::engine::transport_lab::{
+    admit_durable_proof, materialize_durable_proof_delivery, pending_durable_proofs,
+    proof_owner_for_device, rebind_durable_proof, settle_durable_proof_ack,
+    supersede_durable_proof,
+};
 use myownmesh_core::engine::{
-    create_network_in_instance_root, governance, import_network_in_instance_root,
-    spawn_network_in_instance_root,
+    attach_local, create_network_in_instance_root, governance, import_network_in_instance_root,
+    spawn_network_in_instance_root, transport_lab::ingest_semantic_fact,
 };
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::protocol::{ProofAckMessage, ProofDeliveryMessage};
 use myownmesh_core::semantic::{
-    AttestationDecision, DeviceId, DurableProofOutbox, FactBody, FactContent, FactGraph,
-    ProofRecord, ProofRecordState, SignedFact, VerifiedBootstrap,
+    AttestationDecision, DeviceId, FactBody, FactContent, FactGraph, ProofRecordState, SignedFact,
+    VerifiedBootstrap,
 };
+use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
+use tokio::time::{sleep, Duration, Instant};
 
 mod support;
 
@@ -38,7 +43,7 @@ fn closed_config(id: &str) -> NetworkConfig {
         turn_servers: Vec::new(),
         roster_path: None,
         pinned_peers: Vec::new(),
-        auto_approve: false,
+        auto_approve: true,
     }
 }
 
@@ -70,11 +75,23 @@ fn stand_down_facts(
         &graph,
         owner,
         FactBody::RoleGrant {
+            target: target_id.clone(),
+            role: myownmesh_core::semantic::Role::Member,
+        },
+    );
+    graph.admit(grant.clone()).expect("target grant admits");
+
+    let member_grant = authored(
+        &graph,
+        owner,
+        FactBody::RoleGrant {
             target: member_id.clone(),
             role: myownmesh_core::semantic::Role::Member,
         },
     );
-    graph.admit(grant.clone()).expect("member grant admits");
+    graph
+        .admit(member_grant.clone())
+        .expect("member grant admits");
 
     let proposal = authored(
         &graph,
@@ -112,7 +129,77 @@ fn stand_down_facts(
     );
     graph.admit(proof.clone()).expect("eviction proof admits");
 
-    vec![grant, proposal, attestation, proof]
+    vec![grant, member_grant, proposal, attestation, proof]
+}
+
+/// Extend an adopted eviction with a causal regrant and a distinct second
+/// eviction. The second closure includes the first history, but its new
+/// regrant/proposal/attestation/proof identities force a new delivery id.
+fn reissued_stand_down_facts(
+    bootstrap: &VerifiedBootstrap,
+    prior: &[SignedFact],
+    owner: &Identity,
+    target: &Identity,
+    member: &Identity,
+) -> Vec<SignedFact> {
+    let target_id = device(target);
+    let member_id = device(member);
+    let mut graph = FactGraph::from_bootstrap(bootstrap);
+    for fact in prior.iter().cloned() {
+        graph.admit(fact).expect("prior eviction history admits");
+    }
+
+    let regrant = authored(
+        &graph,
+        owner,
+        FactBody::RoleGrant {
+            target: target_id.clone(),
+            role: myownmesh_core::semantic::Role::Member,
+        },
+    );
+    graph.admit(regrant.clone()).expect("causal regrant admits");
+
+    let proposal = authored(
+        &graph,
+        owner,
+        FactBody::Evict {
+            target: target_id.clone(),
+        },
+    );
+    graph
+        .admit(proposal.clone())
+        .expect("second eviction proposal admits");
+
+    let attestation = authored(
+        &graph,
+        member,
+        FactBody::Attestation {
+            target: target_id.clone(),
+            proposal: proposal.id,
+            decision: AttestationDecision::Evict,
+            signer: member_id,
+            contributions: Vec::new(),
+        },
+    );
+    graph
+        .admit(attestation.clone())
+        .expect("second eviction attestation admits");
+
+    let proof = authored(
+        &graph,
+        owner,
+        FactBody::EvictionProof {
+            target: target_id,
+            evidence: vec![attestation.id],
+        },
+    );
+    graph
+        .admit(proof.clone())
+        .expect("second eviction proof admits");
+
+    let mut facts = prior.to_vec();
+    facts.extend([regrant, proposal, attestation, proof]);
+    facts
 }
 
 fn receiver_admits_delivery(
@@ -137,11 +224,16 @@ async fn create_fixture(
 ) -> (
     Arc<myownmesh_core::engine::NetworkState>,
     tokio::task::JoinHandle<()>,
+    Arc<myownmesh_core::engine::NetworkState>,
+    tokio::task::JoinHandle<()>,
     Arc<Identity>,
+    Identity,
     Identity,
     Vec<SignedFact>,
     myownmesh_core::semantic::MeshContextId,
     NetworkConfig,
+    LocalBroker,
+    TempDir,
 ) {
     let identity = Arc::new(Identity::ephemeral());
     let target = Identity::ephemeral();
@@ -163,60 +255,186 @@ async fn create_fixture(
         &target,
         &member,
     );
-    for fact in facts.iter().cloned() {
+
+    // Keep a real authenticated target installation in the sender registry so
+    // the transport-lab façade can issue the exact owner witness used by
+    // rebind/settle.  The target receives the grants but not the eviction
+    // closure: it remains a live carrier while the sender adopts the proof.
+    let target_root = TempDir::new().expect("target instance root");
+    let target_identity = Arc::new(Identity::from_signing_key(
+        target.signing_key().clone(),
+        "r3-target",
+    ));
+    let (target_state, target_driver) = import_network_in_instance_root(
+        config.clone(),
+        target_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        context,
+        state.verified_bootstrap().record().clone(),
+    )
+    .await
+    .expect("target imports the exact bootstrap");
+    for fact in facts.iter().take(2).cloned() {
+        ingest_semantic_fact(&state, fact.clone()).await;
+        ingest_semantic_fact(&target_state, fact).await;
+    }
+    state
+        .compact_semantic_state()
+        .expect("compact the admitted roster grants");
+    target_state
+        .compact_semantic_state()
+        .expect("compact target roster grants");
+
+    let broker = LocalBroker::new();
+    let mut state_events = state.events_tx.subscribe();
+    let mut target_events = target_state.events_tx.subscribe();
+    attach_local(&state, &broker);
+    attach_local(&target_state, &broker);
+    wait_for_approval(&mut state_events, target.public_id()).await;
+    wait_for_approval(&mut target_events, identity.public_id()).await;
+
+    for fact in facts.iter().skip(2).cloned() {
         ingest_semantic_fact(&state, fact).await;
     }
     state
         .compact_semantic_state()
         .expect("compact the adopted semantic proof");
-    (state, driver, identity, target, facts, context, config)
+    (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        target,
+        member,
+        facts,
+        context,
+        config,
+        broker,
+        target_root,
+    )
+}
+
+async fn wait_for_approval(
+    rx: &mut tokio::sync::broadcast::Receiver<myownmesh_core::MeshEvent>,
+    peer_id: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if Instant::now() > deadline {
+            panic!("never saw PeerApproved for {peer_id}");
+        }
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(myownmesh_core::MeshEvent::Peer(myownmesh_core::PeerEvent::Approved {
+                device_id,
+                ..
+            }))) if device_id == peer_id => return,
+            _ => continue,
+        }
+    }
+}
+
+async fn wait_for_proof_owner(
+    state: &Arc<myownmesh_core::engine::NetworkState>,
+    device_id: &str,
+) -> myownmesh_core::engine::transport_lab::ProofOwner {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(owner) = proof_owner_for_device(state, device_id) {
+            return owner;
+        }
+        if Instant::now() > deadline {
+            panic!("never installed proof owner for {device_id}");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn wait_for_no_proof_owner(
+    state: &Arc<myownmesh_core::engine::NetworkState>,
+    device_id: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if proof_owner_for_device(state, device_id).is_none() {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("stale proof owner remained installed for {device_id}");
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
 async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() {
     let root = TempDir::new().expect("instance root");
-    let (state, driver, _identity, target, facts, context, config) =
-        create_fixture(&root, "r3-replay").await;
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        target,
+        _member,
+        facts,
+        _context,
+        config,
+        broker,
+        _target_root,
+    ) = create_fixture(&root, "r3-replay").await;
     let target_id = device(&target);
-    let outbox = DurableProofOutbox::new(root.path(), &config.id);
-    let record = ProofRecord::pending(
-        context,
-        target_id.clone(),
-        facts.iter().map(|fact| fact.id).collect(),
-        "owner-before-send",
-        "binding-before-send",
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &owner,
+        &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
     )
     .expect("pending proof record");
-    let persisted = outbox
-        .enqueue(record.clone())
-        .expect("persist before transport send");
+    let persisted =
+        admit_durable_proof(&state, record.clone()).expect("persist before transport send");
     assert_eq!(persisted.delivery_id, record.delivery_id);
-    assert_eq!(outbox.pending(context).expect("pending records").len(), 1);
+    assert_eq!(
+        pending_durable_proofs(&state)
+            .expect("pending records")
+            .len(),
+        1
+    );
 
-    let delivery = ProofDeliveryMessage::new(context, target_id.clone(), facts.clone())
-        .expect("typed proof delivery");
+    let delivery =
+        materialize_durable_proof_delivery(&state, &record).expect("typed proof delivery");
     assert_eq!(delivery.delivery_id, record.delivery_id);
-    let duplicate = outbox
-        .enqueue(record.clone())
+    let duplicate = admit_durable_proof(&state, record.clone())
         .expect("same delivery id is an idempotent enqueue");
     assert_eq!(duplicate, record);
 
     state.request_shutdown();
     driver.await.expect("first lifecycle shutdown");
+    drop(owner);
+    drop(state);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
-        _identity,
+        identity,
         support::test_transport(),
         root.path().to_path_buf(),
     )
     .await
     .expect("reopen after offline interval");
-    let replay = DurableProofOutbox::new(root.path(), &config.id);
-    let pending = replay.pending(context).expect("replayed pending records");
+    attach_local(&reopened, &broker);
+    let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    let pending = pending_durable_proofs(&reopened).expect("replayed pending records");
     assert_eq!(pending, vec![record.clone()]);
     assert_eq!(pending[0].state, ProofRecordState::Pending);
     assert_eq!(pending[0].delivery_id, delivery.delivery_id);
+    assert!(rebind_durable_proof(&reopened, &reopened_owner, &record)
+        .expect("rebind restored proof to reopened owner"));
+    let rebound = pending_durable_proofs(&reopened)
+        .expect("rebound replay record")
+        .into_iter()
+        .find(|pending| pending.delivery_id == record.delivery_id)
+        .expect("rebound replay proof");
 
     let receiver = receiver_admits_delivery(reopened.verified_bootstrap(), &delivery);
     assert!(receiver.projection().is_stood_down(&target_id));
@@ -225,51 +443,192 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
         ack.matches(&delivery),
         "ACK is typed to this exact delivery"
     );
-    assert!(replay
-        .settle(context, record.delivery_id)
-        .expect("settle exact delivery"));
-    assert!(replay
-        .settle(context, record.delivery_id)
-        .expect("duplicate ACK is idempotent"));
-    assert!(replay
-        .pending(context)
+    assert!(
+        settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
+            .expect("settle exact delivery")
+    );
+    assert!(
+        !settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
+            .expect("duplicate ACK is an idempotent no-op")
+    );
+    assert!(pending_durable_proofs(&reopened)
         .expect("settled records filter from replay")
         .is_empty());
 
     reopened.request_shutdown();
     reopened_driver.await.expect("reopened lifecycle shutdown");
+    target_state.request_shutdown();
+    target_driver.await.expect("target lifecycle shutdown");
+}
+
+#[tokio::test]
+async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
+    let root = TempDir::new().expect("instance root");
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        target,
+        member,
+        e0_facts,
+        _context,
+        config,
+        broker,
+        _target_root,
+    ) = create_fixture(&root, "r3-supersede").await;
+    let target_id = device(&target);
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let e0 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &owner,
+        &e0_facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+    )
+    .expect("E0 pending proof record");
+    let e0_delivery = materialize_durable_proof_delivery(&state, &e0).expect("E0 proof delivery");
+    admit_durable_proof(&state, e0.clone()).expect("persist E0 before send");
+    assert_eq!(e0_delivery.delivery_id, e0.delivery_id);
+
+    // ACK loss is represented by shutting down with E0 still Pending. A
+    // sender restart restores that exact durable obligation, not a new id.
+    state.request_shutdown();
+    driver.await.expect("sender restart boundary");
+    drop(owner);
+    drop(state);
+    let (reopened, reopened_driver) = spawn_network_in_instance_root(
+        config.clone(),
+        identity,
+        support::test_transport(),
+        root.path().to_path_buf(),
+    )
+    .await
+    .expect("sender reconnects from the durable slot");
+    attach_local(&reopened, &broker);
+    let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    assert_eq!(
+        pending_durable_proofs(&reopened).expect("E0 replay pending"),
+        vec![e0.clone()]
+    );
+
+    // A causal regrant followed by a fresh eviction creates E1 with a new
+    // canonical closure. The stale E0 is retired as Superseded, never as an
+    // ACK, before the admitted reconnect can enumerate replayable records.
+    let e1_facts = reissued_stand_down_facts(
+        reopened.verified_bootstrap(),
+        &e0_facts,
+        reopened.identity.as_ref(),
+        &target,
+        &member,
+    );
+    for fact in e1_facts.iter().skip(e0_facts.len()).cloned() {
+        ingest_semantic_fact(&reopened, fact).await;
+    }
+    reopened
+        .compact_semantic_state()
+        .expect("compact the newly admitted E1 closure");
+    let e1 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &reopened,
+        &reopened_owner,
+        &e1_facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+    )
+    .expect("E1 pending proof record");
+    let e1_delivery =
+        materialize_durable_proof_delivery(&reopened, &e1).expect("E1 proof delivery");
+    assert_ne!(
+        e0.delivery_id, e1.delivery_id,
+        "E1 must not reuse E0 identity"
+    );
+    admit_durable_proof(&reopened, e1.clone()).expect("persist E1 closure");
+    assert!(
+        supersede_durable_proof(&reopened, &e0, Some(e1.delivery_id))
+            .expect("retire stale E0 without ACK")
+    );
+    assert!(
+        !supersede_durable_proof(&reopened, &e0, Some(e1.delivery_id))
+            .expect("repeated E0 supersession is idempotent")
+    );
+
+    let pending = pending_durable_proofs(&reopened).expect("enumerate reconnect replay");
+    assert_eq!(
+        pending,
+        vec![e1.clone()],
+        "reconnect must emit E1, never E0"
+    );
+    assert!(!pending
+        .iter()
+        .any(|record| record.delivery_id == e0.delivery_id));
+    let receiver = receiver_admits_delivery(reopened.verified_bootstrap(), &e1_delivery);
+    assert!(
+        receiver.projection().is_stood_down(&target_id),
+        "the fresh E1 closure still proves the target stand-down"
+    );
+
+    reopened.request_shutdown();
+    reopened_driver.await.expect("reconnect lifecycle shutdown");
+    target_state.request_shutdown();
+    target_driver.await.expect("target lifecycle shutdown");
 }
 
 #[tokio::test]
 async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     let root = TempDir::new().expect("instance root");
-    let (state, driver, _identity, target, facts, context, config) =
-        create_fixture(&root, "r3-typed").await;
-    let target_id = device(&target);
-    let outbox = DurableProofOutbox::new(root.path(), &config.id);
-    let record = ProofRecord::pending(
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        _identity,
+        target,
+        _member,
+        facts,
         context,
-        target_id.clone(),
-        facts.iter().map(|fact| fact.id).collect(),
-        "owner-live",
-        "binding-live",
+        config,
+        broker,
+        target_root,
+    ) = create_fixture(&root, "r3-typed").await;
+    let target_id = device(&target);
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &owner,
+        &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
     )
     .expect("typed pending record");
-    outbox
-        .enqueue(record.clone())
-        .expect("enqueue typed record");
+    admit_durable_proof(&state, record.clone()).expect("enqueue typed record");
 
-    assert!(matches!(
-        outbox.rebind(
-            context,
-            record.delivery_id,
-            "wrong-owner",
-            "binding-live",
-            "owner-next",
-            "binding-next",
-        ),
-        Err(myownmesh_core::semantic::ProofOutboxError::StaleBinding)
+    // Replace the target installation. The first witness is now stale, while
+    // the replacement witness is the only one allowed to rebind the Pending
+    // record through the state-owned façade.
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("stale target lifecycle shutdown");
+    drop(target_state);
+    wait_for_no_proof_owner(&state, target.public_id()).await;
+    let replacement_identity = Arc::new(Identity::from_signing_key(
+        target.signing_key().clone(),
+        "r3-target-replacement",
     ));
+    let (replacement, replacement_driver) = spawn_network_in_instance_root(
+        config.clone(),
+        replacement_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+    )
+    .await
+    .expect("replacement target lifecycle");
+    attach_local(&replacement, &broker);
+    let replacement_owner = wait_for_proof_owner(&state, target.public_id()).await;
+    assert!(!rebind_durable_proof(&state, &owner, &record).expect("stale owner refusal"));
+    assert!(
+        rebind_durable_proof(&state, &replacement_owner, &record).expect("current owner rebind")
+    );
+    let rebound = pending_durable_proofs(&state)
+        .expect("rebound proof remains pending")
+        .into_iter()
+        .find(|pending| pending.delivery_id == record.delivery_id)
+        .expect("rebound proof record");
 
     let prefix = ProofDeliveryMessage::new(context, target_id.clone(), facts[..3].to_vec())
         .expect("prefix delivery serializes");
@@ -279,8 +638,8 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
         "a receiver cannot ACK before canonical proof evidence is admitted"
     );
 
-    let delivery = ProofDeliveryMessage::new(context, target_id.clone(), facts.clone())
-        .expect("complete delivery serializes");
+    let delivery =
+        materialize_durable_proof_delivery(&state, &rebound).expect("complete delivery serializes");
 
     // The receiver is a second durable NetworkState, not only an in-memory
     // reducer.  Its production ingress must adopt the exact proof facts before
@@ -314,16 +673,20 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
     );
     let ack = ProofAckMessage::for_delivery(&delivery);
     assert!(ack.matches(&delivery));
-    assert!(outbox
-        .settle(context, ack.delivery_id)
-        .expect("exact ACK settles"));
-    assert!(outbox
-        .pending(context)
+    assert!(
+        settle_durable_proof_ack(&state, &replacement_owner, &rebound, ack.delivery_id,)
+            .expect("exact ACK settles")
+    );
+    assert!(pending_durable_proofs(&state)
         .expect("settled proof filters")
         .is_empty());
 
     state.request_shutdown();
     driver.await.expect("typed delivery lifecycle shutdown");
+    replacement.request_shutdown();
+    replacement_driver
+        .await
+        .expect("replacement target shutdown");
     receiver_state.request_shutdown();
     receiver_driver.await.expect("receiver lifecycle shutdown");
 }
@@ -331,23 +694,32 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
 #[tokio::test]
 async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() {
     let root = TempDir::new().expect("instance root");
-    let (state, driver, identity, target, facts, context, config) =
-        create_fixture(&root, "r3-restart").await;
-    let target_id = device(&target);
-    let outbox = DurableProofOutbox::new(root.path(), &config.id);
-    let record = ProofRecord::pending(
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        target,
+        _member,
+        facts,
         context,
-        target_id.clone(),
-        facts.iter().map(|fact| fact.id).collect(),
-        "owner-restart",
-        "binding-restart",
+        config,
+        broker,
+        _target_root,
+    ) = create_fixture(&root, "r3-restart").await;
+    let owner = wait_for_proof_owner(&state, target.public_id()).await;
+    let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &state,
+        &owner,
+        &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
     )
     .expect("restart pending record");
-    outbox
-        .enqueue(record.clone())
-        .expect("persist restart receipt");
+    admit_durable_proof(&state, record.clone()).expect("persist restart receipt");
     state.request_shutdown();
     driver.await.expect("pre-restart shutdown");
+    drop(owner);
+    drop(state);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
@@ -357,6 +729,8 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     )
     .await
     .expect("restart durable network");
+    attach_local(&reopened, &broker);
+    let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
     let snapshot = governance::snapshot(&reopened);
     assert!(
         snapshot.stood_down.contains(target.public_id()),
@@ -366,11 +740,17 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         reopened.semantic_fact_count() >= facts.len(),
         "restart preserves every adopted proof fact"
     );
-    let replay = DurableProofOutbox::new(root.path(), &config.id);
     assert_eq!(
-        replay.pending(context).expect("restart pending receipt"),
+        pending_durable_proofs(&reopened).expect("restart pending receipt"),
         vec![record.clone()]
     );
+    assert!(rebind_durable_proof(&reopened, &reopened_owner, &record)
+        .expect("rebind restart proof to reopened owner"));
+    let rebound = pending_durable_proofs(&reopened)
+        .expect("rebound restart record")
+        .into_iter()
+        .find(|pending| pending.delivery_id == record.delivery_id)
+        .expect("rebound restart proof");
 
     // Reopen the same signed log as the evicted device.  This is the
     // self-eviction boundary: the receiver's own durable projection must
@@ -404,19 +784,21 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     );
 
     let delivery =
-        ProofDeliveryMessage::new(context, target_id, facts).expect("restart replay delivery");
+        materialize_durable_proof_delivery(&reopened, &rebound).expect("restart replay delivery");
     let ack = ProofAckMessage::for_delivery(&delivery);
     assert!(ack.matches(&delivery));
-    assert!(replay
-        .settle(context, record.delivery_id)
-        .expect("restart ACK settles"));
-    assert!(replay
-        .pending(context)
+    assert!(
+        settle_durable_proof_ack(&reopened, &reopened_owner, &rebound, record.delivery_id,)
+            .expect("restart ACK settles")
+    );
+    assert!(pending_durable_proofs(&reopened)
         .expect("restart receipt settles")
         .is_empty());
 
     reopened.request_shutdown();
     reopened_driver.await.expect("post-restart shutdown");
+    target_state.request_shutdown();
+    target_driver.await.expect("target lifecycle shutdown");
     receiver_state.request_shutdown();
     receiver_driver
         .await

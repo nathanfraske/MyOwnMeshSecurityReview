@@ -118,6 +118,7 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         .expect("compact semantic snapshot");
     state.request_shutdown();
     driver.await.expect("first driver shutdown");
+    drop(state);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config,
@@ -202,6 +203,7 @@ async fn quarantine_unrelated_commit_restart_then_parent_settles_exact_custody()
 
     state.request_shutdown();
     driver.await.expect("first driver shutdown");
+    drop(state);
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config,
         identity,
@@ -297,6 +299,7 @@ async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress(
 
     state.request_shutdown();
     driver.await.expect("first driver shutdown");
+    drop(state);
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
         identity.clone(),
@@ -316,6 +319,7 @@ async fn rejected_quarantine_is_settled_without_starving_valid_restart_progress(
 
     reopened.request_shutdown();
     reopened_driver.await.expect("second driver shutdown");
+    drop(reopened);
     let (restored, restored_driver) = spawn_network_in_instance_root(
         config,
         identity,
