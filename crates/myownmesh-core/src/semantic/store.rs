@@ -30,6 +30,7 @@ use serde_json::Error as JsonError;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use super::proof_outbox::ProofRecord;
 use super::{
     BootstrapError, BootstrapRecord, ExpectedMeshContext, FactGraph, FactId, MeshContextId,
     Projection, SignedFact, VerifiedBootstrap,
@@ -38,7 +39,7 @@ use super::{
 const BOOTSTRAP_DIRECTORY: &str = "bootstrap";
 const SEMANTIC_DIRECTORY: &str = "semantic";
 const SEMANTIC_SNAPSHOT_FILE: &str = "snapshot.json";
-const SEMANTIC_SNAPSHOT_VERSION: u16 = 2;
+const SEMANTIC_SNAPSHOT_VERSION: u16 = 3;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// A local store for one bootstrap record.
@@ -105,6 +106,7 @@ struct DurableSnapshot {
     quarantined: Vec<SignedFact>,
     projection_commitment: [u8; 32],
     provisional: Vec<ProvisionalCustody>,
+    proofs: Vec<ProofRecord>,
     checksum: [u8; 32],
 }
 
@@ -116,6 +118,7 @@ struct SnapshotPayload<'a> {
     quarantined: &'a [SignedFact],
     projection_commitment: [u8; 32],
     provisional: &'a [ProvisionalCustody],
+    proofs: &'a [ProofRecord],
 }
 
 #[derive(Debug)]
@@ -543,30 +546,77 @@ impl DurableSemanticStore {
         Ok(state)
     }
 
-    fn restore_unlocked(
+    pub(crate) fn proof_records(
         &self,
-        bootstrap: &VerifiedBootstrap,
-    ) -> Result<RestoredSemanticState, DurableStoreError> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(DurableStoreError::Missing {
-                    path: self.path.clone(),
-                })
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let snapshot = self.read_snapshot()?;
+        if snapshot.context_id != context_id {
+            return Err(DurableStoreError::ContextMismatch {
+                expected: context_id,
+                actual: snapshot.context_id,
+            });
+        }
+        Ok(snapshot.proofs)
+    }
+
+    pub(crate) fn mutate_proof_records<F>(
+        &self,
+        context_id: MeshContextId,
+        mutation: F,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError>
+    where
+        F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
+    {
+        let lease = self.begin_write()?;
+        let result = (|| {
+            let mut snapshot = self.read_snapshot()?;
+            if snapshot.context_id != context_id {
+                return Err(DurableStoreError::ContextMismatch {
+                    expected: context_id,
+                    actual: snapshot.context_id,
+                });
             }
-            Err(source) => {
-                return Err(DurableStoreError::Io {
+            mutation(&mut snapshot.proofs)?;
+            canonical_proofs(&snapshot.proofs)?;
+            validate_proofs_for_snapshot(&snapshot)?;
+            snapshot.checksum = snapshot.calculate_checksum()?;
+            let bytes = serde_json::to_vec(&snapshot)?;
+            write_snapshot_atomic(&self.path, &bytes)?;
+            Ok(snapshot.proofs)
+        })();
+        drop(lease);
+        result
+    }
+
+    fn read_snapshot(&self) -> Result<DurableSnapshot, DurableStoreError> {
+        let bytes = std::fs::read(&self.path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                DurableStoreError::Missing {
                     path: self.path.clone(),
-                    source,
-                })
+                }
+            } else {
+                DurableStoreError::Io {
+                    path: self.path.clone(),
+                    source: error,
+                }
             }
-        };
+        })?;
         let snapshot: DurableSnapshot =
             serde_json::from_slice(&bytes).map_err(|source| DurableStoreError::Corrupt {
                 path: self.path.clone(),
                 reason: source.to_string(),
             })?;
         snapshot.verify(self.path.as_path())?;
+        validate_proofs_for_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn restore_unlocked(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let snapshot = self.read_snapshot()?;
         if snapshot.context_id != bootstrap.context_id() {
             return Err(DurableStoreError::ContextMismatch {
                 expected: bootstrap.context_id(),
@@ -623,6 +673,7 @@ impl DurableSemanticStore {
                 reason: "snapshot contains unresolved or missing fact dependencies".into(),
             });
         }
+        validate_proofs_for_state(&snapshot.proofs, &graph)?;
         validate_provisional_for_state(&snapshot.provisional, &graph)?;
         let actual_projection = projection_commitment(&graph.projection());
         if actual_projection != snapshot.projection_commitment {
@@ -666,13 +717,28 @@ impl DurableSemanticStore {
         quarantined.sort_by_key(|fact| fact.id);
         let provisional = canonical_provisional(provisional)?;
         validate_provisional_for_state(&provisional, graph)?;
+        let proofs = match self.read_snapshot() {
+            Ok(snapshot) => {
+                if snapshot.context_id != graph.context_id() {
+                    return Err(DurableStoreError::ContextMismatch {
+                        expected: graph.context_id(),
+                        actual: snapshot.context_id,
+                    });
+                }
+                snapshot.proofs
+            }
+            Err(DurableStoreError::Missing { .. }) => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        validate_proofs_for_state(&proofs, graph)?;
         let projection_commitment = projection_commitment(&graph.projection());
-        let snapshot = DurableSnapshot::new(
+        let snapshot = DurableSnapshot::new_with_proofs(
             graph.context_id(),
             facts,
             quarantined,
             projection_commitment,
             provisional,
+            proofs,
         )?;
         let bytes = serde_json::to_vec(&snapshot)?;
         let parent = self
@@ -688,12 +754,13 @@ impl DurableSemanticStore {
 }
 
 impl DurableSnapshot {
-    fn new(
+    fn new_with_proofs(
         context_id: MeshContextId,
         facts: Vec<SignedFact>,
         quarantined: Vec<SignedFact>,
         projection_commitment: [u8; 32],
         provisional: Vec<ProvisionalCustody>,
+        proofs: Vec<ProofRecord>,
     ) -> Result<Self, DurableStoreError> {
         let mut snapshot = Self {
             version: SEMANTIC_SNAPSHOT_VERSION,
@@ -702,6 +769,7 @@ impl DurableSnapshot {
             quarantined,
             projection_commitment,
             provisional,
+            proofs,
             checksum: [0; 32],
         };
         snapshot.checksum = snapshot.calculate_checksum()?;
@@ -716,6 +784,7 @@ impl DurableSnapshot {
             quarantined: &self.quarantined,
             projection_commitment: self.projection_commitment,
             provisional: &self.provisional,
+            proofs: &self.proofs,
         };
         let bytes = serde_json::to_vec(&payload)?;
         let digest = Sha256::digest(bytes);
@@ -737,8 +806,40 @@ impl DurableSnapshot {
             });
         }
         canonical_provisional(self.provisional.clone())?;
+        canonical_proofs(&self.proofs)?;
         Ok(())
     }
+}
+
+fn canonical_proofs(values: &[ProofRecord]) -> Result<(), DurableStoreError> {
+    for proof in values {
+        proof
+            .validate()
+            .map_err(|error| DurableStoreError::InvalidProof(error.to_string()))?;
+    }
+    if values
+        .windows(2)
+        .any(|pair| pair[0].delivery_id >= pair[1].delivery_id)
+    {
+        return Err(DurableStoreError::DuplicateProof);
+    }
+    Ok(())
+}
+
+fn validate_proofs_for_snapshot(snapshot: &DurableSnapshot) -> Result<(), DurableStoreError> {
+    let mut known = std::collections::BTreeSet::new();
+    known.extend(snapshot.facts.iter().map(|fact| fact.id));
+    known.extend(snapshot.quarantined.iter().map(|fact| fact.id));
+    for proof in &snapshot.proofs {
+        if proof
+            .fact_ids
+            .iter()
+            .any(|fact_id| !known.contains(fact_id))
+        {
+            return Err(DurableStoreError::UnknownProofFact);
+        }
+    }
+    Ok(())
 }
 
 fn canonical_provisional<I>(values: I) -> Result<Vec<ProvisionalCustody>, DurableStoreError>
@@ -772,6 +873,26 @@ fn validate_provisional_for_state(
             .any(|claim| !unresolved.contains(&claim.fact_id))
     {
         return Err(DurableStoreError::UnknownCustodyFact);
+    }
+    Ok(())
+}
+
+fn validate_proofs_for_state(
+    proofs: &[ProofRecord],
+    graph: &FactGraph,
+) -> Result<(), DurableStoreError> {
+    canonical_proofs(proofs)?;
+    let mut known = std::collections::BTreeSet::new();
+    known.extend(graph.facts.keys().copied());
+    known.extend(graph.quarantined().map(|(id, _)| *id));
+    for proof in proofs {
+        if proof
+            .fact_ids
+            .iter()
+            .any(|fact_id| !known.contains(fact_id))
+        {
+            return Err(DurableStoreError::UnknownProofFact);
+        }
     }
     Ok(())
 }
@@ -1065,6 +1186,20 @@ pub enum DurableStoreError {
     UnknownCustodyFact,
     #[error("semantic snapshot contains duplicate provisional custody")]
     DuplicateCustody,
+    #[error("semantic snapshot contains an invalid proof record: {0}")]
+    InvalidProof(String),
+    #[error("semantic snapshot contains duplicate proof delivery identity")]
+    DuplicateProof,
+    #[error("semantic snapshot proof delivery identity conflicts with existing metadata")]
+    ProofConflict,
+    #[error("semantic snapshot proof delivery identity was not found")]
+    ProofNotFound,
+    #[error("semantic snapshot proof delivery is already settled")]
+    ProofSettled,
+    #[error("semantic snapshot proof binding is stale")]
+    StaleProofBinding,
+    #[error("semantic snapshot proof names an unknown fact")]
+    UnknownProofFact,
     #[error("semantic snapshot serialization failed: {0}")]
     Serialization(#[from] JsonError),
 }

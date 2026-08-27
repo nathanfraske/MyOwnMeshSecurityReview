@@ -12,6 +12,7 @@ pub mod causal;
 pub mod content;
 pub mod fact;
 pub mod projection;
+pub mod proof_outbox;
 pub(crate) mod store;
 pub mod verify;
 
@@ -26,6 +27,9 @@ pub use content::{
 };
 pub use fact::{CanonicalFact, FactContent, FactId, SignedFact};
 pub use projection::{CellProjection, Projection, StandDown};
+pub use proof_outbox::{
+    DurableProofOutbox, ProofDeliveryId, ProofOutboxError, ProofRecord, ProofRecordState,
+};
 pub use verify::{verify_fact, SemanticError};
 
 pub const SEMANTIC_SCHEMA_VERSION: u32 = 4;

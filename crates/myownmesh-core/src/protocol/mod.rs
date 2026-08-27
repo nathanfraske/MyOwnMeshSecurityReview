@@ -54,7 +54,7 @@ pub use departure::{
 };
 pub use facts::{
     CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactInventoryMessage,
-    FactRequest, FactRequestMessage, SignedFact,
+    FactRequest, FactRequestMessage, ProofAckMessage, ProofDeliveryMessage, SignedFact,
 };
 pub use features::{Feature, ADVERTISED_FEATURES};
 pub use governance::{
@@ -248,11 +248,11 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
             admission: FrameAdmission::Protocol,
             on_failure: FailurePolicy::EndSession,
         },
-        // Facts are the only non-handshake frames with a self-authenticating
-        // durable semantic body. Keep this exact pair distinct from every
+        // Facts and exact proof delivery/receipt are the only non-handshake
+        // frames with a durable semantic identity. Keep this exact set distinct from every
         // inventory/request/roster/application kind; those remain Application
         // and retain their existing failure policies below.
-        "fact" | "fact_bundle" => ClassifiedFrame {
+        "fact" | "fact_bundle" | "proof_delivery" | "proof_ack" => ClassifiedFrame {
             admission: FrameAdmission::DurableFact,
             on_failure: FailurePolicy::EndSession,
         },
@@ -387,6 +387,11 @@ pub enum MeshMessage {
     FactInventory(FactInventory),
     /// Non-authoritative exact-context request for signed facts by FactId.
     FactRequest(FactRequest),
+    /// Exact, durable stand-down proof. Receipt is acknowledged only after the
+    /// signed facts are durably admitted and canonically project the target.
+    ProofDelivery(ProofDeliveryMessage),
+    /// Verified receipt for one exact proof delivery identity.
+    ProofAck(ProofAckMessage),
 
     // -- roster gossip --
     /// Merkle-root summary of the sender's roster. Triggers a
@@ -575,7 +580,7 @@ mod tests {
                 on_failure: FailurePolicy::DropFrame,
             })
         );
-        for fact_kind in ["fact", "fact_bundle"] {
+        for fact_kind in ["fact", "fact_bundle", "proof_delivery", "proof_ack"] {
             assert_eq!(
                 classify_frame(format!(r#"{{"kind":"{fact_kind}","payload":[}}"#).as_bytes()),
                 Some(ClassifiedFrame {

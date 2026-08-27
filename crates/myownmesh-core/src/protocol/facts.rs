@@ -8,7 +8,117 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-pub use crate::semantic::{CanonicalFact, FactContent, FactId, SignedFact};
+pub use crate::semantic::{
+    CanonicalFact, DeviceId, FactContent, FactId, MeshContextId, ProofDeliveryId, SignedFact,
+};
+
+/// One exact durable stand-down proof delivery.
+///
+/// The delivery identity is derived from the authenticated mesh context,
+/// target, and canonical fact identities. Transport custody is deliberately
+/// absent from the wire envelope: a sender validates the current owner and
+/// binding separately, and a receiver acknowledges only this stable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProofDeliveryMessage {
+    pub context_id: MeshContextId,
+    pub target: DeviceId,
+    pub delivery_id: ProofDeliveryId,
+    pub facts: Vec<SignedFact>,
+}
+
+impl ProofDeliveryMessage {
+    pub fn new(
+        context_id: MeshContextId,
+        target: DeviceId,
+        mut facts: Vec<SignedFact>,
+    ) -> Result<Self, String> {
+        facts.sort_by_key(|fact| fact.id);
+        let delivery_id = ProofDeliveryId::digest(
+            context_id,
+            &target,
+            &facts.iter().map(|fact| fact.id).collect::<Vec<_>>(),
+        );
+        let message = Self {
+            context_id,
+            target,
+            delivery_id,
+            facts,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.facts.is_empty() {
+            return Err("proof delivery must contain at least one signed fact".into());
+        }
+        if self.facts.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err("proof facts must be sorted by unique FactId".into());
+        }
+        if self
+            .facts
+            .iter()
+            .any(|fact| fact.content.mesh_context != self.context_id)
+        {
+            return Err("proof fact mesh context does not match delivery context".into());
+        }
+        let fact_ids: Vec<_> = self.facts.iter().map(|fact| fact.id).collect();
+        let expected = ProofDeliveryId::digest(self.context_id, &self.target, &fact_ids);
+        if self.delivery_id != expected {
+            return Err("proof delivery identity does not match its exact payload".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProofDeliveryMessage {
+    context_id: MeshContextId,
+    target: DeviceId,
+    delivery_id: ProofDeliveryId,
+    facts: Vec<SignedFact>,
+}
+
+impl<'de> Deserialize<'de> for ProofDeliveryMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawProofDeliveryMessage::deserialize(deserializer)?;
+        let message = Self {
+            context_id: raw.context_id,
+            target: raw.target,
+            delivery_id: raw.delivery_id,
+            facts: raw.facts,
+        };
+        message.validate().map_err(D::Error::custom)?;
+        Ok(message)
+    }
+}
+
+/// Verified durable receipt for one exact proof delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofAckMessage {
+    pub context_id: MeshContextId,
+    pub target: DeviceId,
+    pub delivery_id: ProofDeliveryId,
+}
+
+impl ProofAckMessage {
+    pub fn for_delivery(delivery: &ProofDeliveryMessage) -> Self {
+        Self {
+            context_id: delivery.context_id,
+            target: delivery.target.clone(),
+            delivery_id: delivery.delivery_id,
+        }
+    }
+
+    pub fn matches(&self, delivery: &ProofDeliveryMessage) -> bool {
+        self.context_id == delivery.context_id
+            && self.target == delivery.target
+            && self.delivery_id == delivery.delivery_id
+    }
+}
 
 /// A wire grouping of canonical semantic facts.
 ///
@@ -141,3 +251,49 @@ impl<'de> Deserialize<'de> for FactRequest {
 /// Compatibility names matching the other protocol DTOs' `*Message` style.
 pub type FactInventoryMessage = FactInventory;
 pub type FactRequestMessage = FactRequest;
+
+#[cfg(test)]
+mod tests {
+    use ed25519_dalek::SigningKey;
+
+    use super::*;
+
+    fn signed_fact(context_id: MeshContextId) -> SignedFact {
+        let key = SigningKey::from_bytes(&[11; 32]);
+        let device = DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap();
+        SignedFact::sign(
+            FactContent::open_participation(context_id, device, true, Vec::new()),
+            &key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn proof_delivery_round_trips_with_exact_identity() {
+        let context_id = MeshContextId::from_bytes([7; 32]);
+        let target_key = SigningKey::from_bytes(&[12; 32]);
+        let target =
+            DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes()).unwrap();
+        let delivery =
+            ProofDeliveryMessage::new(context_id, target, vec![signed_fact(context_id)]).unwrap();
+        let ack = ProofAckMessage::for_delivery(&delivery);
+        assert!(ack.matches(&delivery));
+
+        let encoded = serde_json::to_vec(&delivery).unwrap();
+        let decoded: ProofDeliveryMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, delivery);
+    }
+
+    #[test]
+    fn proof_delivery_rejects_payload_or_context_mutation() {
+        let context_id = MeshContextId::from_bytes([8; 32]);
+        let target_key = SigningKey::from_bytes(&[13; 32]);
+        let target =
+            DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes()).unwrap();
+        let delivery =
+            ProofDeliveryMessage::new(context_id, target, vec![signed_fact(context_id)]).unwrap();
+        let mut wire = serde_json::to_value(&delivery).unwrap();
+        wire["context_id"] = serde_json::to_value(MeshContextId::from_bytes([9; 32])).unwrap();
+        assert!(serde_json::from_value::<ProofDeliveryMessage>(wire).is_err());
+    }
+}
