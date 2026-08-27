@@ -93,16 +93,6 @@ pub struct PeerOwnerToken {
     worker: Option<Arc<crate::transport::WebRtcConnectorWorker>>,
 }
 
-/// Opaque identity for one installed peer binding.  Durable-effect records
-/// may retain this epoch as a fence witness, but never use a device id to
-/// re-resolve the owner after an await or replacement.
-#[derive(Clone)]
-pub(crate) struct PeerBindingEpoch {
-    installation: Arc<()>,
-    binding_namespace: [u8; 16],
-    binding_epoch: u64,
-}
-
 /// A restart-serializable coordinate for one exact peer installation.  The
 /// Arc installation identity is deliberately not persisted; this value is
 /// only a durable witness that must be re-bound to a live owner under the
@@ -121,14 +111,6 @@ impl PeerBindingCoordinate {
             hex::encode(self.binding_namespace),
             self.binding_epoch
         )
-    }
-}
-
-impl PeerBindingEpoch {
-    pub(crate) fn matches(&self, owner: &PeerOwnerToken) -> bool {
-        Arc::ptr_eq(&self.installation, &owner.installation)
-            && self.binding_namespace == owner.binding_namespace
-            && self.binding_epoch == owner.binding_epoch
     }
 }
 
@@ -165,14 +147,6 @@ impl PeerOwnerToken {
 
     pub(super) fn worker(&self) -> Option<&Arc<crate::transport::WebRtcConnectorWorker>> {
         self.worker.as_ref()
-    }
-
-    pub(crate) fn binding_epoch(&self) -> PeerBindingEpoch {
-        PeerBindingEpoch {
-            installation: Arc::clone(&self.installation),
-            binding_namespace: self.binding_namespace,
-            binding_epoch: self.binding_epoch,
-        }
     }
 
     pub(crate) fn binding_coordinate(&self) -> PeerBindingCoordinate {
@@ -743,27 +717,6 @@ impl PeerRegistry {
             && peer.holds_promoted_session()
             && peer.has_usable_session_for_recovery()
             && self.policy_admits(owner.device_id())
-    }
-
-    /// Capture the exact current authenticated owner for a durable-effect
-    /// delivery.  The worker is stamped while holding the registry mutation
-    /// fence, so a later callback cannot silently fall back to a replacement
-    /// selected by the same device id.
-    pub(crate) fn authenticated_owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
-        let _mutation = self.mutation.lock();
-        let current = self.peers.get(device_id)?;
-        let peer = &current.value().peer;
-        let worker = peer.current_worker()?;
-        if !peer.owns_authenticated_worker(&worker) || !peer.state.read().authenticated {
-            return None;
-        }
-        Some(PeerOwnerToken {
-            peer: Arc::clone(peer),
-            installation: Arc::clone(&current.value().installation),
-            binding_namespace: self.binding_namespace,
-            binding_epoch: current.value().binding_epoch,
-            worker: Some(worker),
-        })
     }
 
     /// Run a synchronous durable-effect operation under the exact owner

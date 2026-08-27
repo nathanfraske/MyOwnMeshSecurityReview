@@ -193,8 +193,8 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
     assert_eq!(persisted.delivery_id, record.delivery_id);
     assert_eq!(outbox.pending(context).expect("pending records").len(), 1);
 
-    let delivery =
-        ProofDeliveryMessage::new(context, target_id, facts.clone()).expect("typed proof delivery");
+    let delivery = ProofDeliveryMessage::new(context, target_id.clone(), facts.clone())
+        .expect("typed proof delivery");
     assert_eq!(delivery.delivery_id, record.delivery_id);
     let duplicate = outbox
         .enqueue(record.clone())

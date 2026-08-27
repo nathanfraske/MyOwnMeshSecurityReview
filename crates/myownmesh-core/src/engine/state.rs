@@ -83,7 +83,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::peer_registry::{PeerBindingEpoch, PeerOwnerToken, PeerRegistry};
+use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 use crate::semantic::store::{DurableSemanticStore, ProvisionalCustody};
 use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
@@ -2477,18 +2477,6 @@ impl NetworkState {
         self.durable_provisional.lock().len()
     }
 
-    /// Capture the authenticated owner that a durable outbox record may bind
-    /// to. The durable record remains provider-neutral; this method captures
-    /// only the exact live transport witness for one attempt.
-    pub(crate) fn capture_durable_outbox_owner(
-        &self,
-        target: &str,
-    ) -> Option<(PeerOwnerToken, PeerBindingEpoch)> {
-        let owner = self.peers.authenticated_owner(target)?;
-        let epoch = owner.binding_epoch();
-        Some((owner, epoch))
-    }
-
     /// Return all Pending records restored from the exact semantic store
     /// slot. The caller schedules these same delivery ids; it never invents a
     /// replacement id after restart.
@@ -4872,8 +4860,7 @@ mod arc03_peer_registry_tests {
         let first = registry
             .owner("r3-owner-epoch")
             .expect("first exact owner exists");
-        let epoch = first.binding_epoch();
-        assert!(epoch.matches(&first));
+        let first_binding = first.binding_coordinate();
         assert!(registry
             .with_current_durable_outbox(&first, || ())
             .is_some());
@@ -4887,9 +4874,8 @@ mod arc03_peer_registry_tests {
         let replacement = registry
             .owner("r3-owner-epoch")
             .expect("replacement exact owner exists");
-        assert!(!epoch.matches(&replacement));
         assert_ne!(
-            first.binding_coordinate(),
+            first_binding,
             replacement.binding_coordinate(),
             "replacement must have a distinct serializable binding coordinate"
         );
