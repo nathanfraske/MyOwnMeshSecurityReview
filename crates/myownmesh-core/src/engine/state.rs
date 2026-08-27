@@ -2455,12 +2455,20 @@ impl NetworkState {
     /// Re-verify and compact the exact production-owned semantic snapshot.
     /// The restored graph is installed only after compaction/reopen succeeds.
     pub(crate) fn compact_durable_semantic_state(&self) -> Result<()> {
+        // Admission serializes the live graph before entering the durable
+        // owner.  Compaction must use the same graph -> owner order and keep
+        // that fence through installing both restored views, otherwise an
+        // admission could publish against a snapshot that compaction is
+        // about to replace.
+        let mut live = self.fact_graph.write();
         let restored = self
             .durable_semantic_owner
             .compact(&self.verified_bootstrap)
             .map_err(|error| Error::Network(format!("semantic snapshot compact: {error}")))?;
-        *self.fact_graph.write() = restored.graph().clone();
-        *self.durable_provisional.lock() = restored.provisional_custody().to_vec();
+        let restored_graph = restored.graph().clone();
+        let restored_provisional = restored.provisional_custody().to_vec();
+        *live = restored_graph;
+        *self.durable_provisional.lock() = restored_provisional;
         Ok(())
     }
 

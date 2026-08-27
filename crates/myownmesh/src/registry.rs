@@ -1954,10 +1954,6 @@ mod tests {
             .join(before_config)
             .await
             .expect("the predecessor joins");
-        let after = mesh
-            .join(after_config)
-            .await
-            .expect("the same-sized successor joins independently");
         assert!(registry.insert(before, None).into_refusal().is_none());
 
         let provider = myownmesh_core::FiniteResourceProvider::new(grant);
@@ -1990,6 +1986,10 @@ mod tests {
             registry.remove("line-config").await,
             RemoveResult::Removed(Ok(()))
         ));
+        let after = mesh
+            .join(after_config)
+            .await
+            .expect("the same-sized successor joins after its predecessor stopped");
         assert!(
             registry.insert(after, None).into_refusal().is_none(),
             "the same-sized successor installs after its predecessor stopped"
@@ -2269,10 +2269,20 @@ mod tests {
             .join(network("f13-running-config", "f13-running-wire"))
             .await
             .expect("incumbent joins");
-        let same_config = mesh
+        let same_config_error = match mesh
             .join(network("f13-running-config", "f13-other-wire"))
             .await
-            .expect("same-config newcomer joins independently");
+        {
+            Ok(_) => panic!("a concurrent same-config join must refuse its busy writer"),
+            Err(error) => error,
+        };
+        assert!(
+            same_config_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("writer is busy"),
+            "same-config join reports the typed WriterBusy refusal: {same_config_error}"
+        );
         let same_network = mesh
             .join(network("f13-other-config", "f13-running-wire"))
             .await
@@ -2282,11 +2292,6 @@ mod tests {
             "the first runtime installs"
         );
 
-        let refused_config = registry
-            .insert(same_config, None)
-            .into_refusal()
-            .expect("a Running collision must not overwrite either alias");
-        assert_eq!(refused_config.state, RuntimeState::Running);
         let refused_network = registry
             .insert(same_network, None)
             .into_refusal()
@@ -2304,10 +2309,6 @@ mod tests {
         );
         assert_eq!(by_network.network_id(), "f13-running-wire");
         assert!(
-            registry.get("f13-other-wire").is_none(),
-            "the same-config newcomer did not install its distinct network alias"
-        );
-        assert!(
             registry.get("f13-other-config").is_none(),
             "the same-network newcomer did not install its distinct config alias"
         );
@@ -2320,11 +2321,6 @@ mod tests {
         assert!(Arc::ptr_eq(&by_config_after, &by_network_after));
         assert!(Arc::ptr_eq(&by_config, &by_config_after));
 
-        refused_config
-            .joined
-            .shutdown()
-            .await
-            .expect("the refused same-config runtime is explicitly retired");
         refused_network
             .joined
             .shutdown()
@@ -2343,7 +2339,7 @@ mod tests {
             .await
             .expect("incumbent joins");
         let replacement = mesh
-            .join(network("f13-race-config", "f13-race-wire"))
+            .join(network("f13-race-replacement", "f13-race-wire"))
             .await
             .expect("replacement joins independently");
         assert!(
@@ -2385,7 +2381,7 @@ mod tests {
             "the same replacement installs only after Stopped"
         );
         let installed = registry
-            .get("f13-race-config")
+            .get("f13-race-replacement")
             .expect("the replacement is now authoritative");
         assert_eq!(installed.network_id(), "f13-race-wire");
         let _ = registry.shutdown_all().await;

@@ -15,6 +15,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -96,6 +97,7 @@ impl RestoredSemanticState {
 pub struct DurableSemanticStore {
     path: PathBuf,
     lock_path: PathBuf,
+    process_gate: Arc<Mutex<()>>,
 }
 
 /// The process/lifetime owner of one writable semantic slot. Graph commits
@@ -491,7 +493,14 @@ impl DurableSemanticStore {
         Self {
             path: directory.join(format!("{slot}-{SEMANTIC_SNAPSHOT_FILE}")),
             lock_path: directory.join(format!("{slot}.lock")),
+            process_gate: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn lock_process(&self) -> Result<MutexGuard<'_, ()>, DurableStoreError> {
+        self.process_gate
+            .lock()
+            .map_err(|_| DurableStoreError::InProcessGatePoisoned)
     }
 
     /// The resolved snapshot path, exposed for diagnostics and interruption
@@ -559,6 +568,7 @@ impl DurableSemanticStore {
         &self,
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let _gate = self.lock_process()?;
         self.restore_unlocked(bootstrap)
     }
 
@@ -570,6 +580,7 @@ impl DurableSemanticStore {
         &self,
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let _gate = self.lock_process()?;
         let lease = self.begin_write()?;
         let state = self.restore_unlocked(bootstrap)?;
         lease
@@ -579,6 +590,14 @@ impl DurableSemanticStore {
     }
 
     pub(crate) fn proof_records(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let _gate = self.lock_process()?;
+        self.proof_records_unlocked(context_id)
+    }
+
+    fn proof_records_unlocked(
         &self,
         context_id: MeshContextId,
     ) -> Result<Vec<ProofRecord>, DurableStoreError> {
@@ -734,6 +753,7 @@ impl DurableSemanticOwner {
     where
         I: IntoIterator<Item = ProvisionalCustody>,
     {
+        let _gate = self.store.lock_process()?;
         self.store.store_snapshot(graph, provisional)
     }
 
@@ -741,6 +761,7 @@ impl DurableSemanticOwner {
         &self,
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
         self.store.restore_unlocked(bootstrap)
     }
 
@@ -748,6 +769,7 @@ impl DurableSemanticOwner {
         &self,
         bootstrap: &VerifiedBootstrap,
     ) -> Result<RestoredSemanticState, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
         let state = self.store.restore_unlocked(bootstrap)?;
         self.store
             .store_snapshot(&state.graph, state.provisional.clone())?;
@@ -758,7 +780,8 @@ impl DurableSemanticOwner {
         &self,
         context_id: MeshContextId,
     ) -> Result<Vec<ProofRecord>, DurableStoreError> {
-        self.store.proof_records(context_id)
+        let _gate = self.store.lock_process()?;
+        self.store.proof_records_unlocked(context_id)
     }
 
     pub(crate) fn mutate_proof_records<F>(
@@ -769,6 +792,7 @@ impl DurableSemanticOwner {
     where
         F: FnOnce(&mut Vec<ProofRecord>) -> Result<(), DurableStoreError>,
     {
+        let _gate = self.store.lock_process()?;
         self.store.mutate_proof_records_locked(context_id, mutation)
     }
 }
@@ -787,6 +811,7 @@ impl DurableSemanticWriter {
     where
         I: IntoIterator<Item = ProvisionalCustody>,
     {
+        let _gate = self.store.lock_process()?;
         let result = self.store.store_snapshot(graph, provisional);
         drop(self.lease);
         result
@@ -1259,6 +1284,8 @@ pub enum DurableStoreError {
     Rebuild { path: PathBuf, reason: String },
     #[error("semantic snapshot writer is busy: {path}")]
     WriterBusy { path: PathBuf },
+    #[error("semantic snapshot in-process gate is poisoned")]
+    InProcessGatePoisoned,
     #[error("semantic snapshot path has no parent: {0}")]
     InvalidPath(PathBuf),
     #[error("semantic snapshot I/O at {path}: {source}")]
@@ -1296,10 +1323,11 @@ pub enum DurableStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::semantic::{FactBody, FactContent, FactDomain};
+    use crate::semantic::{FactBody, FactContent, FactDomain, ProofRecord};
     use ed25519_dalek::SigningKey;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
     static NEXT_ROOT: AtomicUsize = AtomicUsize::new(0);
@@ -1821,6 +1849,108 @@ mod tests {
                 .len(),
             2
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn lifetime_owner_preserves_deterministic_graph_and_proof_union() {
+        let root = root();
+        let signing_key = key(18);
+        let bootstrap = closed("scope-a", 18, [18; 32]);
+        let target_key = key(19);
+        let target =
+            super::super::DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes())
+                .expect("target id");
+        let first = root_fact_for_target(&bootstrap, &signing_key, target.clone());
+        let mut graph_a = FactGraph::from_bootstrap(&bootstrap);
+        graph_a.admit(first.clone()).expect("first fact");
+
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("root id");
+        let second = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target: target.clone(),
+                    role: super::super::Role::Member,
+                },
+                author,
+                vec![first.id],
+            ),
+            &signing_key,
+        )
+        .expect("second fact");
+        let mut graph_b = graph_a.clone();
+        graph_b.admit(second).expect("second fact");
+
+        let store = DurableSemanticStore::new(&root, "union-slot");
+        let owner = store.open_writable().expect("owner");
+        owner
+            .commit(&graph_a, Vec::new())
+            .expect("graph A publication");
+        let proof = ProofRecord::pending(
+            bootstrap.context_id(),
+            target,
+            vec![first.id],
+            "proof-owner",
+            "proof-binding",
+        )
+        .expect("proof record");
+        let owner = std::sync::Arc::new(owner);
+        let context_id = bootstrap.context_id();
+        let (proof_entered_tx, proof_entered_rx) = mpsc::channel();
+        let (proof_release_tx, proof_release_rx) = mpsc::channel();
+        let proof_owner = std::sync::Arc::clone(&owner);
+        let proof_for_thread = proof.clone();
+        let proof_thread = std::thread::spawn(move || {
+            proof_owner
+                .mutate_proof_records(context_id, |records| {
+                    proof_entered_tx.send(()).expect("proof parked");
+                    proof_release_rx.recv().expect("release proof transaction");
+                    records.push(proof_for_thread);
+                    Ok(())
+                })
+                .expect("proof publication");
+        });
+        proof_entered_rx.recv().expect("proof transaction entered");
+
+        let (graph_started_tx, graph_started_rx) = mpsc::channel();
+        let (graph_done_tx, graph_done_rx) = mpsc::channel();
+        let graph_owner = std::sync::Arc::clone(&owner);
+        let graph_thread = std::thread::spawn(move || {
+            graph_started_tx.send(()).expect("graph commit started");
+            graph_owner
+                .commit(&graph_b, Vec::new())
+                .expect("graph B preserves proof");
+            graph_done_tx.send(()).expect("graph commit completed");
+        });
+        graph_started_rx.recv().expect("graph commit entered");
+        assert!(matches!(
+            graph_done_rx.recv_timeout(Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        proof_release_tx
+            .send(())
+            .expect("release proof transaction");
+        proof_thread.join().expect("proof transaction thread");
+        graph_thread.join().expect("graph commit thread");
+        graph_done_rx.recv().expect("graph commit completion");
+
+        let restored = owner.restore(&bootstrap).expect("union restore");
+        assert_eq!(restored.graph().len(), 2);
+        assert_eq!(
+            owner.proof_records(bootstrap.context_id()).unwrap(),
+            vec![proof]
+        );
+        let compacted = owner.compact(&bootstrap).expect("union compact");
+        assert_eq!(compacted.graph().len(), 2);
+        assert_eq!(
+            owner.proof_records(bootstrap.context_id()).unwrap().len(),
+            1
+        );
+        drop(owner);
         let _ = std::fs::remove_dir_all(root);
     }
 

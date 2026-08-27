@@ -470,6 +470,51 @@ mod tests {
         root
     }
 
+    fn shared_owner_fixture() -> (
+        std::path::PathBuf,
+        Arc<DurableProofOutbox>,
+        MeshContextId,
+        ProofRecord,
+    ) {
+        let root = root();
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let bootstrap =
+            VerifiedBootstrap::create_closed("proof-outbox-race", vec![key.clone()], [9; 32])
+                .expect("bootstrap");
+        let device =
+            DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).expect("device");
+        let fact = SignedFact::sign(
+            FactContent::new(
+                FactDomain::Governance,
+                bootstrap.context_id(),
+                FactBody::RoleGrant {
+                    target: device.clone(),
+                    role: Role::Member,
+                },
+                device.clone(),
+                Vec::new(),
+            ),
+            &key,
+        )
+        .expect("fact");
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph.admit(fact.clone()).expect("fact admission");
+        let store = DurableSemanticStore::new(&root, "slot");
+        store.commit(&graph, Vec::new()).expect("snapshot");
+        let owner = Arc::new(store.open_writable().expect("shared owner"));
+        let outbox = Arc::new(DurableProofOutbox::from_owner(owner));
+        let record = ProofRecord::pending(
+            bootstrap.context_id(),
+            device,
+            vec![fact.id],
+            "race-owner",
+            "race-binding",
+        )
+        .expect("record");
+        outbox.enqueue(record.clone()).expect("enqueue");
+        (root, outbox, bootstrap.context_id(), record)
+    }
+
     #[test]
     fn identity_is_order_independent_and_metadata_bound() {
         let context = MeshContextId::from_bytes([1; 32]);
@@ -694,6 +739,135 @@ mod tests {
             ),
             Err(ProofOutboxError::AlreadySettled)
         ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_owner_rebind_vs_supersede_has_one_terminal_and_exact_metadata() {
+        let (root, outbox, context, record) = shared_owner_fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let rebind_outbox = Arc::clone(&outbox);
+        let rebind_barrier = Arc::clone(&barrier);
+        let rebind_record = record.clone();
+        let rebind_thread = std::thread::spawn(move || {
+            rebind_barrier.wait();
+            rebind_outbox.rebind(
+                context,
+                rebind_record.delivery_id,
+                "race-owner",
+                "race-binding",
+                "rebound-owner",
+                "rebound-binding",
+            )
+        });
+
+        let supersede_outbox = Arc::clone(&outbox);
+        let supersede_barrier = Arc::clone(&barrier);
+        let supersede_record = record.clone();
+        let supersede_thread = std::thread::spawn(move || {
+            supersede_barrier.wait();
+            supersede_outbox.supersede(
+                context,
+                supersede_record.delivery_id,
+                &supersede_record.target,
+                None,
+            )
+        });
+        barrier.wait();
+        let rebind_result = rebind_thread.join().expect("rebind race thread");
+        let supersede_result = supersede_thread.join().expect("supersede race thread");
+        assert!(
+            supersede_result.is_ok(),
+            "supersede must complete under the shared owner: {supersede_result:?}"
+        );
+        assert!(
+            rebind_result.is_ok()
+                || matches!(
+                    &rebind_result,
+                    Err(ProofOutboxError::AlreadySettled)
+                        | Err(ProofOutboxError::AlreadySuperseded)
+                ),
+            "rebind may win or observe the terminal supersession: {rebind_result:?}"
+        );
+
+        let pending = outbox.pending(context).expect("pending race records");
+        assert!(pending.is_empty(), "a terminal race cannot leave Pending");
+        let persisted = outbox
+            .proof_records(context)
+            .expect("terminal race record")
+            .into_iter()
+            .find(|candidate| candidate.delivery_id == record.delivery_id)
+            .expect("terminal race tombstone");
+        assert_eq!(persisted.state, ProofRecordState::Superseded);
+        assert_eq!(persisted.version, record.version);
+        assert_eq!(persisted.context_id, record.context_id);
+        assert_eq!(persisted.target, record.target);
+        assert_eq!(persisted.delivery_id, record.delivery_id);
+        assert_eq!(persisted.fact_ids, record.fact_ids);
+        assert!(
+            (persisted.owner == "race-owner" && persisted.binding == "race-binding")
+                || (persisted.owner == "rebound-owner" && persisted.binding == "rebound-binding"),
+            "only the exact original or CAS-rebound custody metadata is valid"
+        );
+        drop(outbox);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_owner_settle_vs_supersede_has_one_terminal_and_exact_metadata() {
+        let (root, outbox, context, record) = shared_owner_fixture();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let settle_outbox = Arc::clone(&outbox);
+        let settle_barrier = Arc::clone(&barrier);
+        let settle_id = record.delivery_id;
+        let settle_thread = std::thread::spawn(move || {
+            settle_barrier.wait();
+            settle_outbox.settle(context, settle_id)
+        });
+
+        let supersede_outbox = Arc::clone(&outbox);
+        let supersede_barrier = Arc::clone(&barrier);
+        let supersede_record = record.clone();
+        let supersede_thread = std::thread::spawn(move || {
+            supersede_barrier.wait();
+            supersede_outbox.supersede(
+                context,
+                supersede_record.delivery_id,
+                &supersede_record.target,
+                None,
+            )
+        });
+        barrier.wait();
+        let settled = settle_thread.join().expect("settle race thread");
+        let superseded = supersede_thread.join().expect("supersede race thread");
+        let settled = settled.expect("settle race operation");
+        let superseded = superseded.expect("supersede race operation");
+        assert_ne!(settled, superseded, "exactly one terminal operation wins");
+
+        let pending = outbox.pending(context).expect("pending race records");
+        assert!(pending.is_empty(), "a terminal race cannot leave Pending");
+        let persisted = outbox
+            .proof_records(context)
+            .expect("terminal race record")
+            .into_iter()
+            .find(|candidate| candidate.delivery_id == record.delivery_id)
+            .expect("terminal race tombstone");
+        assert_eq!(
+            persisted.state,
+            if settled {
+                ProofRecordState::Settled
+            } else {
+                ProofRecordState::Superseded
+            }
+        );
+        assert_eq!(persisted.version, record.version);
+        assert_eq!(persisted.context_id, record.context_id);
+        assert_eq!(persisted.target, record.target);
+        assert_eq!(persisted.delivery_id, record.delivery_id);
+        assert_eq!(persisted.fact_ids, record.fact_ids);
+        assert_eq!(persisted.owner, record.owner);
+        assert_eq!(persisted.binding, record.binding);
+        drop(outbox);
         let _ = std::fs::remove_dir_all(root);
     }
 }
