@@ -2158,6 +2158,9 @@ impl AdmittedPendingSemanticOperation {
                         fact.content.mesh_context.base32() == self.mesh_context.as_str()
                     })
             }
+            crate::protocol::MeshMessage::ProofAck(ack) => {
+                ack.context_id.base32() == self.mesh_context.as_str()
+            }
             // Inventory/request are exact-context Application-phase
             // coordination, never pending durable semantic input.
             crate::protocol::MeshMessage::FactInventory(_)

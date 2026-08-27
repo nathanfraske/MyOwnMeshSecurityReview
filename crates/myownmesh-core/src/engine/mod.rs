@@ -4859,11 +4859,18 @@ async fn handle_pending_semantic_frame(
     if !operation.accepts_message(&msg) || !operation.is_current(&state.peers) {
         return;
     }
-    let semantic_ingress::SemanticAdmission::Durable(durable) = semantic_ingress::admit(msg) else {
-        return;
-    };
-    let (_owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
-    semantic_ingress::reduce(state, durable, None).await;
+    let admission = semantic_ingress::admit(msg);
+    let (owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
+    match admission {
+        semantic_ingress::SemanticAdmission::Durable(durable) => {
+            semantic_ingress::reduce(state, durable, None).await;
+        }
+        semantic_ingress::SemanticAdmission::NotDurable(message) => {
+            if let MeshMessage::ProofAck(ack) = *message {
+                on_proof_ack(state, &owner, ack);
+            }
+        }
+    }
     drop(work);
 }
 
@@ -5267,7 +5274,7 @@ async fn handle_inbound_frame_from(
             let route = dispatch.logical_reply_operation();
             on_proof_delivery(state, &route, delivery).await;
         }
-        MeshMessage::ProofAck(ack) => on_proof_ack(state, &dispatch, ack),
+        MeshMessage::ProofAck(ack) => on_proof_ack(state, dispatch.owner(), ack),
         MeshMessage::Channel { channel, payload } => {
             on_channel_frame(
                 state,
@@ -5454,12 +5461,10 @@ async fn on_proof_delivery(
 /// worker/epoch ACK is a no-op and cannot settle a successor's record.
 fn on_proof_ack(
     state: &Arc<NetworkState>,
-    dispatch: &peer_registry::AdmittedInboundDispatch,
+    owner: &peer_registry::PeerOwnerToken,
     ack: ProofAckMessage,
 ) {
-    if ack.context_id != state.mesh_context_id()
-        || ack.target.to_string() != dispatch.owner().device_id()
-    {
+    if ack.context_id != state.mesh_context_id() || ack.target.to_string() != owner.device_id() {
         return;
     }
     let Ok(records) = state.pending_durable_proof_outbox() else {
@@ -5474,11 +5479,9 @@ fn on_proof_ack(
     if record.context_id != ack.context_id || record.target != ack.target {
         return;
     }
-    if let Err(error) =
-        state.settle_durable_proof_outbox_ack(dispatch.owner(), &record, ack.delivery_id)
-    {
+    if let Err(error) = state.settle_durable_proof_outbox_ack(owner, &record, ack.delivery_id) {
         debug!(
-            peer = %dispatch.owner().device_id(),
+            peer = %owner.device_id(),
             delivery = %ack.delivery_id,
             %error,
             "durable proof acknowledgement could not settle"
