@@ -840,9 +840,13 @@ mod tests {
         barrier.wait();
         let settled = settle_thread.join().expect("settle race thread");
         let superseded = supersede_thread.join().expect("supersede race thread");
-        let settled = settled.expect("settle race operation");
-        let superseded = superseded.expect("supersede race operation");
-        assert_ne!(settled, superseded, "exactly one terminal operation wins");
+        let terminal_state = match (settled, superseded) {
+            (Ok(true), Err(ProofOutboxError::AlreadySettled)) => ProofRecordState::Settled,
+            (Ok(false), Ok(true)) => ProofRecordState::Superseded,
+            (settled, superseded) => panic!(
+                "shared-owner race returned an invalid terminal pair: {settled:?}, {superseded:?}"
+            ),
+        };
 
         let pending = outbox.pending(context).expect("pending race records");
         assert!(pending.is_empty(), "a terminal race cannot leave Pending");
@@ -852,14 +856,7 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.delivery_id == record.delivery_id)
             .expect("terminal race tombstone");
-        assert_eq!(
-            persisted.state,
-            if settled {
-                ProofRecordState::Settled
-            } else {
-                ProofRecordState::Superseded
-            }
-        );
+        assert_eq!(persisted.state, terminal_state);
         assert_eq!(persisted.version, record.version);
         assert_eq!(persisted.context_id, record.context_id);
         assert_eq!(persisted.target, record.target);
