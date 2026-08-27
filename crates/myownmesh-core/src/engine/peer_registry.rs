@@ -894,6 +894,39 @@ impl PeerRegistry {
         })
     }
 
+    /// Admit the narrowly scoped proof exception for an authenticated,
+    /// unpromoted speculative candidate.  The registry mutation fence covers
+    /// candidate identity, installation identity, endpoint-auth provenance,
+    /// and the finite send claim in one synchronous decision.  The callback
+    /// is used by the publication owner to rebind the durable record while
+    /// this same fence is still held; it must not await or re-resolve by
+    /// device id.
+    pub(super) fn with_current_speculative_proof<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        mesh_context: &str,
+        total_bytes: usize,
+        effect: impl FnOnce(AdmittedPendingSemanticOperation) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation) {
+            return None;
+        }
+        let peer = &current.value().peer;
+        let (endpoint_auth, work) =
+            peer.speculative_proof_admission(correlation, candidate, mesh_context, total_bytes)?;
+        Some(effect(AdmittedPendingSemanticOperation {
+            owner: owner.clone(),
+            worker: Arc::clone(candidate),
+            endpoint_auth,
+            mesh_context: mesh_context.to_owned(),
+            work,
+        }))
+    }
+
     /// Resolve an exact installation without requiring a worker stamp.
     ///
     /// This is deliberately narrower than `with_current`: it is only for a

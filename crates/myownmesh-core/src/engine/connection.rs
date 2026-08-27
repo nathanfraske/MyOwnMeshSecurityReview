@@ -1117,6 +1117,46 @@ impl PeerConnection {
         true
     }
 
+    /// Prove the exact authenticated speculative candidate for the one
+    /// durable eviction proof exception.  This intentionally does not touch
+    /// the promoted-session slot or peer status: the candidate remains a
+    /// transport-only carrier until its proof and Deny have been attempted.
+    /// The caller holds the registry mutation fence while this synchronous
+    /// witness is minted.
+    pub(super) fn speculative_proof_admission(
+        &self,
+        correlation: &str,
+        candidate: &Arc<WebRtcConnectorWorker>,
+        mesh_context: &str,
+        total_bytes: usize,
+    ) -> Option<(Arc<crate::endpoint_auth::EndpointAuthTask>, ResourceLease)> {
+        if self.registry_retired() || candidate.live_connector_incarnation().is_none() {
+            return None;
+        }
+        let mut candidates = self.speculative.lock();
+        let attempt = candidates.iter_mut().find(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, candidate)
+        })?;
+        let endpoint_auth = attempt.endpoint_auth.as_ref()?.clone();
+        let capability = attempt.authenticated_channel.as_ref()?;
+        if endpoint_auth.is_retired()
+            || !candidate.owns_endpoint_auth(&endpoint_auth)
+            || !capability.belongs_to(endpoint_auth.incarnation())
+            || !endpoint_auth.issued(capability)
+            || !endpoint_auth
+                .context_matches(mesh_context, crate::signing::pubkey_part(&self.device_id))
+        {
+            return None;
+        }
+        // The claim covers both the ProofDelivery and the ordered Deny.  It
+        // is one bounded witness, so a failed first send cannot leave an
+        // unfunded second send or any retry loop hidden behind the candidate.
+        let claim =
+            crate::application_gateway::AdmittedApplicationFrame::claim(total_bytes).ok()?;
+        let work = candidate.reserve_attempt_work(claim).ok()?;
+        Some((endpoint_auth, work))
+    }
+
     /// Atomically move an authenticated speculative connector into the
     /// promoted slot.  The caller holds the registry mutation fence, so the
     /// predecessor can be retired after this returns without a device-id

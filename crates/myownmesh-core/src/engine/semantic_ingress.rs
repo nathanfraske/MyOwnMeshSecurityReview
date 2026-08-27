@@ -80,7 +80,7 @@ use crate::protocol::{
     FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
     ProofDeliveryMessage, RosterRequestMessage, RosterSummaryMessage,
 };
-use crate::semantic::{Admission, SignedFact};
+use crate::semantic::{Admission, DeviceId, SignedFact};
 
 use super::governance;
 use super::peer_registry::LogicalSessionOperation;
@@ -340,9 +340,7 @@ pub(super) async fn reduce(
             for fact in facts.iter().cloned() {
                 reduce_signed_fact(state, fact).await;
             }
-            if bundle_is_admitted(state, &facts)
-                && governance::proof_delivery_projection_is_verified(state, &delivery)
-            {
+            if proof_delivery_is_verified(state, &delivery) {
                 if let Some(route) = reply {
                     governance::acknowledge_proof_delivery(state, route, &delivery).await;
                 }
@@ -409,6 +407,25 @@ fn bundle_is_admitted(state: &Arc<NetworkState>, facts: &[SignedFact]) -> bool {
     facts
         .iter()
         .all(|fact| graph.get(&fact.id).is_some_and(|admitted| admitted == fact))
+}
+
+/// Return whether a proof delivery is complete enough to acknowledge.  This
+/// predicate is shared by the promoted reply route and the pending direct
+/// worker route so neither path can emit a receipt merely because reduction
+/// ran: the exact local target must be stood down by the resulting projection,
+/// and every signed fact must be present in the authoritative graph.
+pub(super) fn proof_delivery_is_verified(
+    state: &Arc<NetworkState>,
+    delivery: &ProofDeliveryMessage,
+) -> bool {
+    let Ok(local) = DeviceId::from_canonical_str(state.identity.public_id()) else {
+        return false;
+    };
+    delivery.validate().is_ok()
+        && delivery.context_id == state.mesh_context_id()
+        && delivery.target == local
+        && bundle_is_admitted(state, &delivery.facts)
+        && governance::proof_delivery_projection_is_verified(state, delivery)
 }
 
 /// Admit a fact and, when it supplies a missing parent, move every fact that

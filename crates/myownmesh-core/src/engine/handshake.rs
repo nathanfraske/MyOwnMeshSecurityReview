@@ -70,102 +70,6 @@ use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
 
-/// Snapshot the exact canonical facts needed for a peer to independently
-/// verify this network's current governance verdict.  This is deliberately a
-/// complete graph snapshot rather than a compatibility roster or a single
-/// eviction hint: dependencies and the signed authority chain must travel
-/// together, and the pending semantic reducer will verify every fact before
-/// projecting anything.  The graph lock is released before the transport
-/// await; the returned values are owned by this exact handshake attempt.
-fn canonical_proof_bundle(
-    state: &Arc<NetworkState>,
-    target: &str,
-) -> Vec<crate::semantic::SignedFact> {
-    let Ok(target) = crate::semantic::DeviceId::from_canonical_str(target) else {
-        return Vec::new();
-    };
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
-    let mut pending = graph.cell_heads(&crate::semantic::ExclusiveCell::role(target.clone()));
-    pending.extend(graph.cell_heads(&crate::semantic::ExclusiveCell::membership(target.clone())));
-    if let Some(stand_down) = graph.projection().stand_down(&target) {
-        pending.push(stand_down.proof);
-    }
-    let mut ids = std::collections::BTreeSet::new();
-    while let Some(id) = pending.pop() {
-        if !ids.insert(id) {
-            continue;
-        }
-        let Some(fact) = graph.get(&id) else {
-            continue;
-        };
-        pending.extend(crate::semantic::causal::dependencies(fact));
-    }
-    ids.into_iter()
-        .filter_map(|id| graph.get(&id).cloned())
-        .collect()
-}
-
-/// Return the stable Pending proof obligation for one exact target, creating
-/// it durably from the current canonical closure only when no replayable
-/// record already exists.  The delivery id is therefore reused after a
-/// reconnect or restart; a transport send never settles this record.
-fn pending_eviction_proof(
-    state: &Arc<NetworkState>,
-    owner: &super::peer_registry::PeerOwnerToken,
-    proof: Vec<crate::semantic::SignedFact>,
-) -> Option<(
-    crate::semantic::ProofRecord,
-    crate::protocol::ProofDeliveryMessage,
-)> {
-    let context_id = state.mesh_context_id();
-    let target = owner.device_id();
-    // Derive the current canonical delivery identity before looking at any
-    // retained obligation.  A same-target record is not reusable when its
-    // signed closure is stale: the target may have been regranted and later
-    // evicted again with a distinct proof.
-    let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
-    let candidate = state
-        .new_durable_proof_outbox_record(owner, &fact_ids)
-        .ok()?;
-    let existing = state
-        .pending_durable_proof_outbox()
-        .ok()?
-        .into_iter()
-        .find(|record| {
-            record.context_id == context_id
-                && record.target.to_string() == target
-                && record.delivery_id == candidate.delivery_id
-                && record.fact_ids == candidate.fact_ids
-        });
-    let record = match existing {
-        Some(record) => record,
-        None => match state.admit_durable_proof_outbox(candidate) {
-            Ok(record) => record,
-            Err(error) => {
-                warn!(
-                    peer = %target,
-                    %error,
-                    "durable eviction proof enqueue refused"
-                );
-                return None;
-            }
-        },
-    };
-    let delivery = match state.materialize_durable_proof_delivery(&record) {
-        Ok(delivery) => delivery,
-        Err(error) => {
-            warn!(
-                peer = %target,
-                %error,
-                "durable eviction proof materialization refused"
-            );
-            return None;
-        }
-    };
-    Some((record, delivery))
-}
-
 /// Send a proof through the witness that already passed the final canonical,
 /// owner, and pending-operation fence.  This must not call the generic
 /// pending-semantic helper: that helper mints a second admission after the
@@ -191,24 +95,6 @@ async fn send_admitted_eviction_proof(
         .traffic
         .record_tx(super::traffic::FrameClass::Gossip, sent);
     Ok(())
-}
-
-/// Derive the current proof identity without enqueuing it.  Replay uses this
-/// exact candidate to reject stale same-target obligations and to avoid
-/// resurrecting a proof after a causal regrant removed the eviction.
-pub(super) fn current_eviction_proof_record(
-    state: &Arc<NetworkState>,
-    owner: &super::peer_registry::PeerOwnerToken,
-) -> Option<crate::semantic::ProofRecord> {
-    if !super::governance::log_evicted(state, owner.device_id()) {
-        return None;
-    }
-    let proof = canonical_proof_bundle(state, owner.device_id());
-    if proof.is_empty() {
-        return None;
-    }
-    let fact_ids: Vec<_> = proof.iter().map(|fact| fact.id).collect();
-    state.new_durable_proof_outbox_record(owner, &fact_ids).ok()
 }
 
 /// The Hello this node sends, built in exactly one place.
@@ -779,16 +665,28 @@ pub async fn on_auth_response(
     // evicts this peer, send the complete canonical graph first so the peer
     // can independently verify the eviction and derive its own stand-down.
     if super::governance::log_evicted(state, device_id) {
-        let proof = canonical_proof_bundle(state, device_id);
-        if proof.is_empty() {
-            warn!(
-                peer = %device_id,
-                "eviction proof is unavailable; keeping the authenticated peer pending"
-            );
-            return;
-        }
-        let Some((record, delivery)) = pending_eviction_proof(state, owner, proof) else {
-            return;
+        let record = match state.reconcile_durable_eviction_proofs(owner) {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    peer = %device_id,
+                    %error,
+                    "durable eviction proof reconciliation refused"
+                );
+                return;
+            }
+        };
+        let delivery = match state.materialize_durable_proof_delivery(&record) {
+            Ok(delivery) => delivery,
+            Err(error) => {
+                warn!(
+                    peer = %device_id,
+                    %error,
+                    "durable eviction proof materialization refused"
+                );
+                return;
+            }
         };
         match state.prepare_durable_eviction_proof_send(owner, &record, &delivery) {
             Ok(super::state::DurableProofSendPreparation::Ready(admission)) => {

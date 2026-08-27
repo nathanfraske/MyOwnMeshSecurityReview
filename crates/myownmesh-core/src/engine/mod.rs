@@ -508,6 +508,18 @@ pub mod transport_lab {
         state.new_durable_proof_outbox_record(&owner.0, fact_ids)
     }
 
+    /// Derive the exact current canonical eviction proof for an owner without
+    /// constructing or admitting a durable send record.  The graph projection
+    /// remains the authority; transport-lab callers cannot supply an arbitrary
+    /// history vector as the current proof closure.
+    #[doc(hidden)]
+    pub fn canonical_durable_eviction_proof_record(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+    ) -> crate::Result<Option<ProofRecord>> {
+        state.canonical_durable_eviction_proof_record(&owner.0)
+    }
+
     /// Materialize one Pending record through the authoritative graph. Fact
     /// bodies are never reconstructed by an integration caller.
     #[doc(hidden)]
@@ -1154,6 +1166,72 @@ async fn handle_speculative_promotion(
         correlation,
     } = promotion;
     let displaced_attempt = owner.connection().attempt();
+
+    // A freshly authenticated speculative carrier must still be denied when
+    // canonical policy evicts its target, but it is allowed one exact proof
+    // exchange first.  This path deliberately precedes ordinary promotion:
+    // it never creates a session or application route and never lets the
+    // policy-denied candidate reach the SessionBroker.
+    let canonical_eviction = state
+        .canonical_durable_eviction_proof_record(&owner)
+        .ok()
+        .flatten()
+        .is_some();
+    if canonical_eviction {
+        match state.reconcile_durable_eviction_proofs(&owner) {
+            Ok(Some(record)) => {
+                let delivery = match state.materialize_durable_proof_delivery(&record) {
+                    Ok(delivery) => delivery,
+                    Err(_) => {
+                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
+                        return;
+                    }
+                };
+                let deny = MeshMessage::Deny(crate::protocol::DenyMessage {
+                    reason: Some(crate::protocol::DENY_REASON_EVICTED.to_string()),
+                });
+                let deny_bytes = match serde_json::to_vec(&deny).map(Bytes::from) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
+                        return;
+                    }
+                };
+                match state.prepare_durable_eviction_proof_send_for_speculative(
+                    &owner,
+                    &candidate,
+                    &correlation,
+                    &record,
+                    &delivery,
+                    deny_bytes.len(),
+                ) {
+                    Ok(state::DurableProofSendPreparation::Ready(admission)) => {
+                        send_speculative_eviction_proof_then_deny(
+                            state,
+                            &owner,
+                            &correlation,
+                            &candidate,
+                            *admission,
+                            deny_bytes,
+                            deny,
+                        )
+                        .await;
+                        return;
+                    }
+                    Ok(state::DurableProofSendPreparation::Superseded) | Err(_) => {
+                        retire_speculative_exact(state, &owner, &correlation, &candidate).await;
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                retire_speculative_exact(state, &owner, &correlation, &candidate).await;
+                return;
+            }
+        }
+    }
+
     if let Some(broker) = state.session_broker.as_ref() {
         if let Some(promotion) = state.peers.promote_speculative_command(
             &owner,
@@ -4956,18 +5034,72 @@ async fn handle_pending_semantic_frame(
     if !operation.accepts_message(&msg) || !operation.is_current(&state.peers) {
         return;
     }
+    let pending_proof = match &msg {
+        MeshMessage::ProofDelivery(delivery) => Some(delivery.clone()),
+        _ => None,
+    };
     let admission = semantic_ingress::admit(msg);
-    let (owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
     match admission {
         semantic_ingress::SemanticAdmission::Durable(durable) => {
             semantic_ingress::reduce(state, durable, None).await;
+            if let Some(delivery) = pending_proof {
+                send_pending_proof_ack(state, operation, delivery).await;
+            } else {
+                drop(operation);
+            }
         }
         semantic_ingress::SemanticAdmission::NotDurable(message) => {
+            let (owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
             if let MeshMessage::ProofAck(ack) = *message {
                 on_proof_ack(state, &owner, ack);
             }
+            drop(work);
         }
     }
+}
+
+/// Send a verified proof receipt through the exact authenticated worker that
+/// admitted the pending delivery.  PendingApproval has no promoted logical
+/// session, so this path must not call `send_logical_reply` or re-resolve by
+/// device id.  The admission operation keeps the provider lease alive through
+/// graph/projection verification and the bounded send; all registry checks
+/// happen synchronously before this function awaits.
+async fn send_pending_proof_ack(
+    state: &Arc<NetworkState>,
+    operation: peer_registry::AdmittedPendingSemanticOperation,
+    delivery: ProofDeliveryMessage,
+) {
+    if !operation.is_current(&state.peers)
+        || !semantic_ingress::proof_delivery_is_verified(state, &delivery)
+    {
+        return;
+    }
+    let ack = MeshMessage::ProofAck(ProofAckMessage::for_delivery(&delivery));
+    let Ok(bytes) = serde_json::to_vec(&ack).map(Bytes::from) else {
+        return;
+    };
+    let (captured_owner, worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
+    let Ok(send) = worker.begin_send() else {
+        drop(work);
+        return;
+    };
+    let sent = match tokio::time::timeout(
+        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        send.send(bytes),
+    )
+    .await
+    {
+        Ok(Ok(sent)) => sent,
+        _ => {
+            drop(work);
+            return;
+        }
+    };
+    let mut data = captured_owner.connection().state.write();
+    data.diag.bytes_out += sent as u64;
+    data.diag.frames_out += 1;
+    drop(data);
+    state.traffic.record_tx(traffic::class_of(&ack), sent);
     drop(work);
 }
 
@@ -5452,7 +5584,6 @@ async fn replay_pending_durable_proofs(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
 ) {
-    let current = handshake::current_eviction_proof_record(state, owner);
     let records = match state.pending_durable_proof_outbox() {
         Ok(records) => records,
         Err(error) => {
@@ -5462,29 +5593,6 @@ async fn replay_pending_durable_proofs(
     };
     for record in records {
         if record.target.to_string() != owner.device_id() || !record.is_pending() {
-            continue;
-        }
-        let current_matches = current.as_ref().is_some_and(|current| {
-            record.delivery_id == current.delivery_id && record.fact_ids == current.fact_ids
-        });
-        if !current_matches {
-            // A regrant or a later eviction makes the old same-target
-            // obligation obsolete. Retire it as a distinct durable terminal,
-            // never as a fabricated proof ACK. When a new closure exists its
-            // identity is retained as replacement metadata for diagnostics.
-            let replacement = current.as_ref().map(|current| current.delivery_id);
-            match state.supersede_durable_proof_outbox(owner, &record, replacement) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(error) => {
-                    debug!(
-                        peer = %owner.device_id(),
-                        delivery = %record.delivery_id,
-                        %error,
-                        "stale durable proof supersession refused"
-                    );
-                }
-            }
             continue;
         }
         let delivery = match state.materialize_durable_proof_delivery(&record) {
@@ -7345,6 +7453,74 @@ async fn send_prepared_durable_proof(
     drop(data);
     state.traffic.record_tx(traffic::FrameClass::Gossip, sent);
     Ok(())
+}
+
+/// Complete the exact speculative exception: ProofDelivery first, then Deny
+/// on the same authenticated candidate.  The state preparation has already
+/// funded both serialized writes and captured the candidate worker, so this
+/// function performs only the two awaits and exact-candidate retirement.
+async fn send_speculative_eviction_proof_then_deny(
+    state: &Arc<NetworkState>,
+    owner: &peer_registry::PeerOwnerToken,
+    correlation: &str,
+    candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+    admission: state::DurableProofSendAdmission,
+    deny_bytes: Bytes,
+    deny: MeshMessage,
+) {
+    let (captured_owner, worker, _endpoint_auth, _mesh_context, proof_bytes, work) =
+        admission.into_parts();
+    let proof_send = match worker.begin_send() {
+        Ok(send) => send,
+        Err(_) => {
+            drop(work);
+            retire_speculative_exact(state, owner, correlation, candidate).await;
+            return;
+        }
+    };
+    let proof_sent = match tokio::time::timeout(
+        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        proof_send.send(proof_bytes),
+    )
+    .await
+    {
+        Ok(Ok(sent)) => sent,
+        _ => {
+            drop(work);
+            retire_speculative_exact(state, owner, correlation, candidate).await;
+            return;
+        }
+    };
+    {
+        let mut data = captured_owner.connection().state.write();
+        data.diag.bytes_out += proof_sent as u64;
+        data.diag.frames_out += 1;
+    }
+    state
+        .traffic
+        .record_tx(traffic::FrameClass::Gossip, proof_sent);
+
+    // ProofDelivery succeeded, so and only so is Deny attempted.  It uses
+    // the same captured worker rather than routing through the device id.
+    let deny_sent = match worker.begin_send() {
+        Ok(send) => tokio::time::timeout(
+            Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+            send.send(deny_bytes),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok),
+        Err(_) => None,
+    };
+    if let Some(sent) = deny_sent {
+        let mut data = captured_owner.connection().state.write();
+        data.diag.bytes_out += sent as u64;
+        data.diag.frames_out += 1;
+        drop(data);
+        state.traffic.record_tx(traffic::class_of(&deny), sent);
+    }
+    drop(work);
+    retire_speculative_exact(state, owner, correlation, candidate).await;
 }
 
 /// The one outbound send.
@@ -21210,10 +21386,10 @@ mod tests {
             .next_recovery_carrier_instance()
             .expect("predecessor carrier instance");
         assert!(matches!(
-            state.begin_carrier_emission_for_owner_result(
+            state.begin_carrier_emission_for_current_owner(
                 predecessor_emission,
                 "shared-r3-attempt",
-                predecessor,
+                predecessor.clone(),
                 [predecessor_instance],
             ),
             state::CarrierEmissionAdmission::Admitted
@@ -21240,12 +21416,23 @@ mod tests {
             .peers
             .owner(&target)
             .expect("the successor owner is current");
+        let stale_emission = SignalingEmissionId::next().expect("stale emission id");
+        assert_eq!(
+            state.begin_carrier_emission_for_current_owner(
+                stale_emission,
+                "shared-r3-attempt",
+                displaced.owner.clone(),
+                [predecessor_instance],
+            ),
+            state::CarrierEmissionAdmission::Stale,
+            "a displaced callback cannot create a carrier node for the successor lane"
+        );
         let successor_emission = SignalingEmissionId::next().expect("emission id");
         let successor_instance = state
             .next_recovery_carrier_instance()
             .expect("successor carrier instance");
         assert!(matches!(
-            state.begin_carrier_emission_for_owner_result(
+            state.begin_carrier_emission_for_current_owner(
                 successor_emission,
                 "shared-r3-attempt",
                 current.clone(),

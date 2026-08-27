@@ -757,7 +757,7 @@ impl<T: Send> OutboundSource<T> for TranslatedOutbound<T> {
                 ) {
                     let Some((emission, (admission, fenced))) =
                         self.guard.claim_attempt_with(attempt, |emission| {
-                            let admission = state.begin_carrier_emission_for_owner_result(
+                            let admission = state.begin_carrier_emission_for_current_owner(
                                 emission,
                                 attempt,
                                 owner,
@@ -1994,7 +1994,7 @@ fn spawn_fanout(
                         outbound_owner
                             .clone()
                             .map_or(CarrierEmissionAdmission::Refused, |owner| {
-                                state.begin_carrier_emission_for_owner_result(
+                                state.begin_carrier_emission_for_current_owner(
                                     emission,
                                     attempt,
                                     owner,

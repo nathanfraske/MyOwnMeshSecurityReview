@@ -2646,8 +2646,15 @@ impl NetworkState {
         record: &ProofRecord,
     ) -> Result<crate::protocol::ProofDeliveryMessage> {
         let _publication = self.durable_publication_gate.lock();
-        let graph = self.fact_graph.read();
         self.ensure_durable_owner_mutation_allowed()?;
+        self.materialize_durable_proof_delivery_under_publication(record)
+    }
+
+    fn materialize_durable_proof_delivery_under_publication(
+        &self,
+        record: &ProofRecord,
+    ) -> Result<crate::protocol::ProofDeliveryMessage> {
+        let graph = self.fact_graph.read();
         if record.context_id != self.mesh_context_id || !record.is_pending() {
             return Err(Error::Network(
                 "durable proof record is not Pending in this mesh context".to_string(),
@@ -2677,6 +2684,124 @@ impl NetworkState {
         Ok(delivery)
     }
 
+    /// Derive the exact current canonical eviction proof from the authoritative
+    /// graph.  This is deliberately projection-based rather than a boolean
+    /// `log_evicted` check: the returned record carries the complete causal
+    /// closure and stable delivery identity that the publication fence admits.
+    pub(crate) fn canonical_durable_eviction_proof_record(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Result<Option<ProofRecord>> {
+        let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
+            .map_err(|error| Error::Network(format!("durable proof target rejected: {error}")))?;
+        let graph = self.fact_graph.read();
+        let projection = graph.projection();
+        // A closed-network eviction is canonically represented by the
+        // membership cell selecting `false`.  A plain `Evict` fact has not
+        // necessarily produced a self-stand-down proof on the denying node;
+        // requiring that optional projection would strand the offline target
+        // before its first proof delivery.  Keep the canonical membership
+        // decision as the gate and include stand-down evidence when present.
+        if graph.evaluator().effective_membership(&target) != Some(false) {
+            return Ok(None);
+        }
+        let mut pending = graph.cell_heads(&crate::semantic::ExclusiveCell::role(target.clone()));
+        pending
+            .extend(graph.cell_heads(&crate::semantic::ExclusiveCell::membership(target.clone())));
+        if let Some(stand_down) = projection.stand_down(&target) {
+            pending.push(stand_down.proof);
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id) {
+                continue;
+            }
+            let Some(fact) = graph.get(&id) else {
+                return Err(Error::Network(
+                    "durable eviction proof closure is incomplete".to_string(),
+                ));
+            };
+            pending.extend(crate::semantic::causal::dependencies(fact));
+        }
+        let fact_ids = ids.into_iter().collect::<Vec<_>>();
+        drop(graph);
+        ProofRecord::pending(
+            self.mesh_context_id,
+            target,
+            fact_ids,
+            owner.device_id(),
+            owner.binding_key(),
+        )
+        .map(Some)
+        .map_err(|error| Error::Network(format!("durable eviction proof record: {error}")))
+    }
+
+    /// Reconcile every still-pending proof obligation for one authenticated
+    /// evicted owner before the proof send is admitted. The current canonical
+    /// closure is derived once, then the exact owner fence encloses every
+    /// same-target outbox mutation: obsolete records become non-replayable
+    /// Superseded tombstones and exactly one current canonical record remains
+    /// Pending. No transport or async work runs under this fence.
+    pub(crate) fn reconcile_durable_eviction_proofs(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+    ) -> Result<Option<ProofRecord>> {
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        let canonical = self.canonical_durable_eviction_proof_record(owner)?;
+        let context = self.mesh_context_id;
+        let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
+            .map_err(|error| Error::Network(format!("durable proof target rejected: {error}")))?;
+        let reconciled = self.peers.with_current_durable_outbox(owner, || {
+            let pending = self
+                .durable_proof_outbox
+                .pending(context)
+                .map_err(|error| {
+                    Error::Network(format!("durable proof reconciliation: {error}"))
+                })?;
+            let mut current = None;
+            for record in pending {
+                if record.context_id != context || record.target != target {
+                    continue;
+                }
+                let is_canonical = canonical.as_ref().is_some_and(|expected| {
+                    expected.context_id == record.context_id
+                        && expected.target == record.target
+                        && expected.delivery_id == record.delivery_id
+                        && expected.fact_ids == record.fact_ids
+                });
+                if is_canonical {
+                    current = Some(record);
+                } else {
+                    self.durable_proof_outbox
+                        .supersede(context, record.delivery_id, &target, None)
+                        .map_err(|error| {
+                            Error::Network(format!("durable proof supersession: {error}"))
+                        })?;
+                }
+            }
+            match canonical {
+                Some(canonical) => match current {
+                    Some(current) => Ok(Some(current)),
+                    None => self
+                        .durable_proof_outbox
+                        .enqueue(canonical)
+                        .map(Some)
+                        .map_err(|error| {
+                            Error::Network(format!("durable proof canonical enqueue: {error}"))
+                        }),
+                },
+                None => Ok(None),
+            }
+        });
+        match reconciled {
+            Some(result) => result,
+            None => Err(Error::Network(
+                "durable proof owner is no longer current".to_string(),
+            )),
+        }
+    }
+
     /// Admit the final synchronous portion of an eviction-proof send.
     ///
     /// This is the state-owned boundary between canonical eviction and an
@@ -2695,21 +2820,93 @@ impl NetworkState {
         record: &ProofRecord,
         delivery: &crate::protocol::ProofDeliveryMessage,
     ) -> Result<DurableProofSendPreparation> {
+        self.prepare_durable_eviction_proof_send_with_candidate(
+            owner, None, "", record, delivery, 0,
+        )
+    }
+
+    /// Prepare the same canonical proof for a fresh authenticated speculative
+    /// candidate while policy still denies promotion.  The candidate is only
+    /// a transport carrier: no session, application route, or status change
+    /// is made.  `deny_bytes` is included in the single bounded work claim so
+    /// the ordered ProofDelivery followed by Deny cannot overrun custody.
+    pub(crate) fn prepare_durable_eviction_proof_send_for_speculative(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
+        correlation: &str,
+        record: &ProofRecord,
+        delivery: &crate::protocol::ProofDeliveryMessage,
+        deny_bytes: usize,
+    ) -> Result<DurableProofSendPreparation> {
+        self.prepare_durable_eviction_proof_send_with_candidate(
+            owner,
+            Some(candidate),
+            correlation,
+            record,
+            delivery,
+            deny_bytes,
+        )
+    }
+
+    fn prepare_durable_eviction_proof_send_with_candidate(
+        self: &Arc<Self>,
+        owner: &PeerOwnerToken,
+        candidate: Option<&Arc<crate::transport::WebRtcConnectorWorker>>,
+        correlation: &str,
+        record: &ProofRecord,
+        delivery: &crate::protocol::ProofDeliveryMessage,
+        deny_bytes: usize,
+    ) -> Result<DurableProofSendPreparation> {
         let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
-        if !super::governance::log_evicted(self, owner.device_id()) {
-            return self.supersede_durable_proof_if_noncanonical_under_publication(owner, record);
-        }
         if record.context_id != self.mesh_context_id
             || !record.is_pending()
             || record.target.to_string() != owner.device_id()
             || record.owner != owner.device_id()
-            || delivery.context_id != self.mesh_context_id
+        {
+            return Err(Error::Network(
+                "durable eviction proof owner or identity is stale".to_string(),
+            ));
+        }
+
+        let canonical = self.canonical_durable_eviction_proof_record(owner)?;
+        let same_identity = canonical.as_ref().is_some_and(|canonical| {
+            canonical.context_id == record.context_id
+                && canonical.target == record.target
+                && canonical.delivery_id == record.delivery_id
+                && canonical.fact_ids == record.fact_ids
+        });
+        let (record, delivery) = if same_identity {
+            (record.clone(), delivery.clone())
+        } else {
+            let Some(canonical) = canonical else {
+                let superseded =
+                    self.supersede_durable_proof_outbox_under_publication(owner, record, None)?;
+                if !superseded {
+                    return Err(Error::Network(
+                        "durable eviction proof stale record was not superseded".to_string(),
+                    ));
+                }
+                return Ok(DurableProofSendPreparation::Superseded);
+            };
+            let Some(record) =
+                self.supersede_and_enqueue_canonical_under_publication(owner, record, canonical)?
+            else {
+                return Err(Error::Network(
+                    "durable eviction proof stale record was not superseded".to_string(),
+                ));
+            };
+            let delivery = self.materialize_durable_proof_delivery_under_publication(&record)?;
+            (record, delivery)
+        };
+
+        if delivery.context_id != self.mesh_context_id
             || delivery.target != record.target
             || delivery.delivery_id != record.delivery_id
         {
             return Err(Error::Network(
-                "durable eviction proof owner or identity is stale".to_string(),
+                "durable eviction proof delivery identity is stale".to_string(),
             ));
         }
         delivery
@@ -2740,32 +2937,62 @@ impl NetworkState {
             ))
             .map_err(Error::Serde)?,
         );
-        let rebound = self.peers.with_current_durable_outbox(owner, || {
-            self.durable_proof_outbox.rebind(
-                record.context_id,
-                record.delivery_id,
-                &record.owner,
-                &record.binding,
-                owner.device_id(),
-                owner.binding_key(),
-            )
-        });
-        match rebound {
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                return Err(Error::Network(format!("durable proof rebind: {error}")));
+        let operation = if let Some(candidate) = candidate {
+            let total_bytes = bytes.len().checked_add(deny_bytes).ok_or_else(|| {
+                Error::Network("durable proof send accounting overflow".to_string())
+            })?;
+            let admitted = self.peers.with_current_speculative_proof(
+                owner,
+                candidate,
+                correlation,
+                &self.mesh_context_id.to_string(),
+                total_bytes,
+                |operation| match self.durable_proof_outbox.rebind(
+                    record.context_id,
+                    record.delivery_id,
+                    &record.owner,
+                    &record.binding,
+                    owner.device_id(),
+                    owner.binding_key(),
+                ) {
+                    Ok(_) => Ok(operation),
+                    Err(error) => Err(Error::Network(format!("durable proof rebind: {error}"))),
+                },
+            );
+            match admitted {
+                Some(result) => result?,
+                None => {
+                    return Err(Error::Network(
+                        "durable proof speculative candidate is no longer current".to_string(),
+                    ));
+                }
             }
-            None => {
-                return Err(Error::Network(
-                    "durable proof owner is no longer current".to_string(),
-                ));
+        } else {
+            let rebound = self.peers.with_current_durable_outbox(owner, || {
+                self.durable_proof_outbox.rebind(
+                    record.context_id,
+                    record.delivery_id,
+                    &record.owner,
+                    &record.binding,
+                    owner.device_id(),
+                    owner.binding_key(),
+                )
+            });
+            match rebound {
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    return Err(Error::Network(format!("durable proof rebind: {error}")));
+                }
+                None => {
+                    return Err(Error::Network(
+                        "durable proof owner is no longer current".to_string(),
+                    ));
+                }
             }
-        }
-
-        let operation = self
-            .peers
-            .admit_pending_semantic_operation(owner, &self.mesh_context_id.to_string(), &bytes)
-            .ok_or_else(|| Error::Network("durable proof send owner is not current".into()))?;
+            self.peers
+                .admit_pending_semantic_operation(owner, &self.mesh_context_id.to_string(), &bytes)
+                .ok_or_else(|| Error::Network("durable proof send owner is not current".into()))?
+        };
         let (captured_owner, worker, endpoint_auth, mesh_context, work) = operation.into_parts();
         Ok(DurableProofSendPreparation::Ready(Box::new(
             DurableProofSendAdmission {
@@ -2861,7 +3088,14 @@ impl NetworkState {
         owner: &PeerOwnerToken,
         record: &ProofRecord,
     ) -> Result<DurableProofSendPreparation> {
-        if super::governance::log_evicted(self, owner.device_id()) {
+        let canonical = self.canonical_durable_eviction_proof_record(owner)?;
+        let same_identity = canonical.as_ref().is_some_and(|canonical| {
+            canonical.context_id == record.context_id
+                && canonical.target == record.target
+                && canonical.delivery_id == record.delivery_id
+                && canonical.fact_ids == record.fact_ids
+        });
+        if same_identity {
             return Err(Error::Network(
                 "durable eviction proof remains currently canonical".to_string(),
             ));
@@ -2869,6 +3103,13 @@ impl NetworkState {
         let superseded =
             self.supersede_durable_proof_outbox_under_publication(owner, record, None)?;
         if superseded {
+            if let Some(canonical) = canonical {
+                self.durable_proof_outbox
+                    .enqueue(canonical)
+                    .map_err(|error| {
+                        Error::Network(format!("durable proof successor enqueue: {error}"))
+                    })?;
+            }
             Ok(DurableProofSendPreparation::Superseded)
         } else {
             Err(Error::Network(
@@ -2901,6 +3142,47 @@ impl NetworkState {
                 result.map_err(|error| Error::Network(format!("durable proof supersede: {error}")))
             }
             None => Ok(false),
+        }
+    }
+
+    /// Supersede one stale obligation and enqueue its exact canonical successor
+    /// while the same current-owner registry fence is held. Materialization is
+    /// performed immediately after this synchronous fence, still under the
+    /// publication gate and before any transport await.
+    fn supersede_and_enqueue_canonical_under_publication(
+        &self,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+        canonical: ProofRecord,
+    ) -> Result<Option<ProofRecord>> {
+        if record.context_id != self.mesh_context_id
+            || record.target.to_string() != owner.device_id()
+            || record.owner != owner.device_id()
+        {
+            return Ok(None);
+        }
+        match self.peers.with_current_durable_outbox(owner, || {
+            let superseded = self
+                .durable_proof_outbox
+                .supersede(
+                    self.mesh_context_id,
+                    record.delivery_id,
+                    &record.target,
+                    None,
+                )
+                .map_err(|error| Error::Network(format!("durable proof supersede: {error}")))?;
+            if !superseded {
+                return Ok(None);
+            }
+            self.durable_proof_outbox
+                .enqueue(canonical)
+                .map(Some)
+                .map_err(|error| {
+                    Error::Network(format!("durable proof successor enqueue: {error}"))
+                })
+        }) {
+            Some(result) => result,
+            None => Ok(None),
         }
     }
 
@@ -3015,6 +3297,33 @@ impl NetworkState {
         I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
     {
         self.begin_carrier_emission_inner(emission, attempt, Some(owner), instances)
+    }
+
+    /// Begin an exact carrier emission only while the captured peer owner is
+    /// current.  The registry mutation fence encloses both the owner check and
+    /// the carrier find/create operation, so replacement orders atomically
+    /// before or after this admission; no stale callback can create custody for
+    /// a successor and no await or graph lock is taken under the fence.
+    pub(crate) fn begin_carrier_emission_for_current_owner<I>(
+        &self,
+        emission: SignalingEmissionId,
+        attempt: &str,
+        owner: PeerOwnerToken,
+        instances: I,
+    ) -> CarrierEmissionAdmission
+    where
+        I: IntoIterator<Item = RecoveryCarrierInstance> + Clone,
+    {
+        self.peers
+            .with_current_durable_outbox(&owner, || {
+                self.begin_carrier_emission_for_owner_result(
+                    emission,
+                    attempt,
+                    owner.clone(),
+                    instances,
+                )
+            })
+            .unwrap_or(CarrierEmissionAdmission::Stale)
     }
 
     fn begin_carrier_emission_inner<I>(
