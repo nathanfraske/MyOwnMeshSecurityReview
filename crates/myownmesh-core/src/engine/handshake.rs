@@ -106,6 +106,44 @@ fn canonical_proof_bundle(
         .collect()
 }
 
+/// Return the stable Pending proof obligation for one exact target, creating
+/// it durably from the current canonical closure only when no replayable
+/// record already exists.  The delivery id is therefore reused after a
+/// reconnect or restart; a transport send never settles this record.
+fn pending_eviction_proof(
+    state: &Arc<NetworkState>,
+    target: &str,
+    proof: Vec<crate::semantic::SignedFact>,
+) -> Option<crate::engine::state::DurableProofOutboxRecord> {
+    let context_id = state.mesh_context_id();
+    if let Some(record) = state
+        .pending_durable_proof_outbox()
+        .into_iter()
+        .find(|record| record.context_id() == context_id && record.target() == target)
+    {
+        return Some(record);
+    }
+
+    let record =
+        crate::engine::state::DurableProofOutboxRecord::new(context_id, target.to_owned(), proof)
+            .ok()?;
+    match state.admit_durable_proof_outbox(record.clone()) {
+        Ok(true) => Some(record),
+        Ok(false) => state
+            .pending_durable_proof_outbox()
+            .into_iter()
+            .find(|existing| existing.delivery_id() == record.delivery_id()),
+        Err(error) => {
+            warn!(
+                peer = %target,
+                %error,
+                "durable eviction proof enqueue refused"
+            );
+            None
+        }
+    }
+}
+
 /// The Hello this node sends, built in exactly one place.
 ///
 /// No capability advertisement travels here. The local advert is sent after
@@ -649,8 +687,39 @@ pub async fn on_auth_response(
     // can independently verify the eviction and derive its own stand-down.
     if super::governance::log_evicted(state, device_id) {
         let proof = canonical_proof_bundle(state, device_id);
-        if !proof.is_empty() {
-            let _ = super::send_pending_open_participation(state, owner, &proof).await;
+        if proof.is_empty() {
+            warn!(
+                peer = %device_id,
+                "eviction proof is unavailable; keeping the authenticated peer pending"
+            );
+            return;
+        }
+        let Some(record) = pending_eviction_proof(state, device_id, proof) else {
+            return;
+        };
+        if !state
+            .rebind_durable_proof_outbox(owner, record.delivery_id())
+            .unwrap_or(false)
+        {
+            warn!(
+                peer = %device_id,
+                "durable eviction proof owner binding is stale"
+            );
+            return;
+        }
+        if let Err(error) =
+            super::send_pending_open_participation(state, owner, record.facts()).await
+        {
+            // Denial is not allowed to outrun the exact proof transfer.  The
+            // current owner remains pending so a retry/reconnect can attempt
+            // the same canonical bundle; retiring it here would leave an
+            // offline peer denied without the evidence needed to stand down.
+            warn!(
+                peer = %device_id,
+                %error,
+                "eviction proof transfer refused; keeping the authenticated peer pending"
+            );
+            return;
         }
     }
     if super::governance::deny_if_evicted(state, owner).await {

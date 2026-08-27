@@ -1025,6 +1025,7 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     )
     .await
     .expect("carol shared Closed bootstrap import");
+    let carol_initial_fact_count = carol_state.semantic_fact_count();
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
@@ -1117,6 +1118,72 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
         verdict,
         "carol's own adopted (verified) state must carry her eviction"
     );
+
+    // The proof was admitted through the production durable semantic owner,
+    // not just held in the live graph. Restart Carol from the same instance
+    // root and prove the exact context, restored fact set, and stand-down
+    // survive before she is allowed another handshake attempt.
+    let restored_fact_count = carol_state.semantic_fact_count();
+    let restored_context = carol_state.mesh_context_id();
+    assert!(
+        restored_fact_count > 0,
+        "the proof must be durably admitted"
+    );
+    assert!(
+        restored_fact_count > carol_initial_fact_count,
+        "the restored graph must contain facts learned from the eviction proof"
+    );
+    assert_eq!(
+        carol_state.semantic_unresolved_count(),
+        0,
+        "the eviction proof must restore without unresolved dependencies"
+    );
+    shutdown_drivers([(carol_state, carol_driver)]).await;
+    let mut carol_config = fresh_network("carol", network_id);
+    carol_config.kind = NetworkKind::Closed;
+    let (carol_state, carol_driver) = import_network_in_instance_root(
+        carol_config,
+        carol_id.clone(),
+        support::test_transport(),
+        carol_root.path().to_path_buf(),
+        restored_context,
+        alice_state.verified_bootstrap_record().clone(),
+    )
+    .await
+    .expect("carol restores the durable semantic snapshot");
+    assert_eq!(
+        carol_state.mesh_context_id(),
+        restored_context,
+        "restart must preserve the exact mesh context"
+    );
+    assert_eq!(
+        carol_state.semantic_fact_count(),
+        restored_fact_count,
+        "restart must restore the exact admitted proof fact set"
+    );
+    assert_eq!(
+        carol_state.semantic_unresolved_count(),
+        0,
+        "restart must not resurrect unresolved proof dependencies"
+    );
+    assert!(
+        carol_state
+            .self_evicted
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "restart must preserve the verified stand-down verdict"
+    );
+    attach_local(&carol_state, &broker);
+    wait_for(
+        "restarted carol remains stood down",
+        Duration::from_secs(10),
+        || {
+            carol_state
+                .self_evicted
+                .load(std::sync::atomic::Ordering::SeqCst)
+        },
+    )
+    .await;
+
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
         (bob_state.clone(), bob_driver),
