@@ -23,7 +23,12 @@
 //! between a check and the act it authorized. Everything run under it must be
 //! synchronous, non-reentrant, and free to hand a value off but not to await.
 
-use std::sync::{Arc, Weak};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Weak,
+};
+
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::resource::ResourceMailboxSender;
@@ -46,6 +51,8 @@ pub(crate) struct PeerRegistry {
     canonical_fact_graph:
         parking_lot::RwLock<Option<Arc<parking_lot::RwLock<crate::semantic::FactGraph>>>>,
     local_device_id: String,
+    binding_namespace: [u8; 16],
+    next_binding_epoch: AtomicU64,
     /// Where a newly minted session is announced.
     ///
     /// The engine's own command queue, so the announcement is handled by the
@@ -68,6 +75,7 @@ pub(crate) struct PeerRegistry {
 struct PeerRegistryEntry {
     peer: Arc<PeerConnection>,
     installation: Arc<()>,
+    binding_epoch: u64,
 }
 
 /// Unforgeable process-local identity for one installed peer owner.
@@ -80,7 +88,48 @@ struct PeerRegistryEntry {
 pub struct PeerOwnerToken {
     peer: Arc<PeerConnection>,
     installation: Arc<()>,
+    binding_namespace: [u8; 16],
+    binding_epoch: u64,
     worker: Option<Arc<crate::transport::WebRtcConnectorWorker>>,
+}
+
+/// Opaque identity for one installed peer binding.  Durable-effect records
+/// may retain this epoch as a fence witness, but never use a device id to
+/// re-resolve the owner after an await or replacement.
+#[derive(Clone)]
+pub(crate) struct PeerBindingEpoch {
+    installation: Arc<()>,
+    binding_namespace: [u8; 16],
+    binding_epoch: u64,
+}
+
+/// A restart-serializable coordinate for one exact peer installation.  The
+/// Arc installation identity is deliberately not persisted; this value is
+/// only a durable witness that must be re-bound to a live owner under the
+/// registry mutation fence before it can authorize an acknowledgement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PeerBindingCoordinate {
+    pub(crate) device_id: String,
+    pub(crate) binding_namespace: [u8; 16],
+    pub(crate) binding_epoch: u64,
+}
+
+impl PeerBindingCoordinate {
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "{}:{}",
+            hex::encode(self.binding_namespace),
+            self.binding_epoch
+        )
+    }
+}
+
+impl PeerBindingEpoch {
+    pub(crate) fn matches(&self, owner: &PeerOwnerToken) -> bool {
+        Arc::ptr_eq(&self.installation, &owner.installation)
+            && self.binding_namespace == owner.binding_namespace
+            && self.binding_epoch == owner.binding_epoch
+    }
 }
 
 impl PeerOwnerToken {
@@ -108,12 +157,34 @@ impl PeerOwnerToken {
         Self {
             peer: Arc::clone(&self.peer),
             installation: Arc::clone(&self.installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: self.binding_epoch,
             worker: Some(worker),
         }
     }
 
     pub(super) fn worker(&self) -> Option<&Arc<crate::transport::WebRtcConnectorWorker>> {
         self.worker.as_ref()
+    }
+
+    pub(crate) fn binding_epoch(&self) -> PeerBindingEpoch {
+        PeerBindingEpoch {
+            installation: Arc::clone(&self.installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: self.binding_epoch,
+        }
+    }
+
+    pub(crate) fn binding_coordinate(&self) -> PeerBindingCoordinate {
+        PeerBindingCoordinate {
+            device_id: self.device_id().to_string(),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: self.binding_epoch,
+        }
+    }
+
+    pub(crate) fn binding_key(&self) -> String {
+        self.binding_coordinate().key()
     }
 
     fn worker_matches(&self, peer: &PeerConnection) -> bool {
@@ -141,6 +212,8 @@ impl PeerOwnerToken {
                 None,
             )),
             installation: Arc::new(()),
+            binding_namespace: [0u8; 16],
+            binding_epoch: 0,
             worker: None,
         }
     }
@@ -284,12 +357,19 @@ impl Default for PeerRegistry {
 
 impl PeerRegistry {
     pub(super) fn new(local_device_id: String) -> Self {
+        let mut binding_namespace = [0u8; 16];
+        if getrandom::getrandom(&mut binding_namespace).is_err() {
+            use rand::RngCore;
+            rand::thread_rng().fill_bytes(&mut binding_namespace);
+        }
         Self {
             peers: DashMap::new(),
             mutation: Mutex::new(()),
             canonical_bootstrap: parking_lot::RwLock::new(None),
             canonical_fact_graph: parking_lot::RwLock::new(None),
             local_device_id,
+            binding_namespace,
+            next_binding_epoch: AtomicU64::new(1),
             command_tx: std::sync::OnceLock::new(),
             speculative_promotion_tx: std::sync::OnceLock::new(),
             retired_closes: Arc::new(Mutex::new(Vec::new())),
@@ -501,6 +581,8 @@ impl PeerRegistry {
         let _mutation = self.mutation.lock();
         let current = self.peers.get(owner.device_id())?;
         if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || self.binding_namespace != owner.binding_namespace
+            || current.value().binding_epoch != owner.binding_epoch
             || !owner.worker_matches(&current.value().peer)
         {
             return None;
@@ -663,10 +745,45 @@ impl PeerRegistry {
             && self.policy_admits(owner.device_id())
     }
 
+    /// Capture the exact current authenticated owner for a durable-effect
+    /// delivery.  The worker is stamped while holding the registry mutation
+    /// fence, so a later callback cannot silently fall back to a replacement
+    /// selected by the same device id.
+    pub(crate) fn authenticated_owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(device_id)?;
+        let peer = &current.value().peer;
+        let worker = peer.current_worker()?;
+        if !peer.owns_authenticated_worker(&worker) || !peer.state.read().authenticated {
+            return None;
+        }
+        Some(PeerOwnerToken {
+            peer: Arc::clone(peer),
+            installation: Arc::clone(&current.value().installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: current.value().binding_epoch,
+            worker: Some(worker),
+        })
+    }
+
+    /// Run a synchronous durable-effect operation under the exact owner
+    /// fence.  This named seam exists so durable outbox integrations cannot
+    /// accidentally substitute a device-only lookup for a current-owner
+    /// check.
+    pub(crate) fn with_current_durable_outbox<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce() -> R,
+    ) -> Option<R> {
+        self.with_current(owner, |_| effect())
+    }
+
     pub(crate) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {
         self.peers.get(device_id).map(|entry| PeerOwnerToken {
             peer: Arc::clone(&entry.value().peer),
             installation: Arc::clone(&entry.value().installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: entry.value().binding_epoch,
             worker: None,
         })
     }
@@ -696,6 +813,8 @@ impl PeerRegistry {
             owner: PeerOwnerToken {
                 peer: Arc::clone(peer),
                 installation: Arc::clone(&current.value().installation),
+                binding_namespace: self.binding_namespace,
+                binding_epoch: current.value().binding_epoch,
                 worker: None,
             },
             witness: expected.clone(),
@@ -1407,6 +1526,8 @@ impl PeerRegistry {
             .map(|entry| PeerOwnerToken {
                 peer: Arc::clone(&entry.value().peer),
                 installation: Arc::clone(&entry.value().installation),
+                binding_namespace: self.binding_namespace,
+                binding_epoch: entry.value().binding_epoch,
                 worker: None,
             })
             .collect()
@@ -1479,6 +1600,16 @@ impl PeerRegistry {
         if peer.registry_retired() {
             return None;
         }
+        let binding_epoch = self
+            .next_binding_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                if value == 0 || value == u64::MAX {
+                    None
+                } else {
+                    Some(value + 1)
+                }
+            })
+            .ok()?;
         let replaced = self
             .peers
             .insert(
@@ -1486,6 +1617,7 @@ impl PeerRegistry {
                 PeerRegistryEntry {
                     peer: Arc::clone(&peer),
                     installation: Arc::new(()),
+                    binding_epoch,
                 },
             )
             .map(|entry| entry.peer);

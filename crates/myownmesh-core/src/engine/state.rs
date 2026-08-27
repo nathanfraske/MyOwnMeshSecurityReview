@@ -83,9 +83,10 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use super::peer_registry::{PeerOwnerToken, PeerRegistry};
+use super::peer_registry::{PeerBindingEpoch, PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 use crate::semantic::store::{DurableSemanticStore, ProvisionalCustody};
+use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
 
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
@@ -1368,6 +1369,7 @@ pub struct NetworkState {
     /// retaining independent on-disk state.
     durable_semantic_store: DurableSemanticStore,
     durable_provisional: Mutex<Vec<ProvisionalCustody>>,
+    durable_proof_outbox: DurableProofOutbox,
     pub current_phase: RwLock<MeshPhase>,
 
     pub events_tx: broadcast::Sender<MeshEvent>,
@@ -1837,6 +1839,7 @@ impl NetworkState {
         let durable_root = instance_root
             .clone()
             .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
+        let durable_proof_outbox = DurableProofOutbox::new(durable_root.clone(), &config.id);
         let durable_semantic_store = DurableSemanticStore::new(durable_root, &config.id);
         let (initial_graph, durable_provisional) =
             match durable_semantic_store.restore(&verified_bootstrap) {
@@ -1877,6 +1880,7 @@ impl NetworkState {
             fact_graph,
             durable_semantic_store,
             durable_provisional: Mutex::new(durable_provisional),
+            durable_proof_outbox,
             current_phase: RwLock::new(MeshPhase::Joining),
             events_tx,
             application_gateway: crate::application_gateway::ApplicationGateway::new(
@@ -2471,6 +2475,165 @@ impl NetworkState {
     /// Number of exact provisional custody claims paired with unresolved facts.
     pub fn semantic_provisional_custody_count(&self) -> usize {
         self.durable_provisional.lock().len()
+    }
+
+    /// Capture the authenticated owner that a durable outbox record may bind
+    /// to. The durable record remains provider-neutral; this method captures
+    /// only the exact live transport witness for one attempt.
+    pub(crate) fn capture_durable_outbox_owner(
+        &self,
+        target: &str,
+    ) -> Option<(PeerOwnerToken, PeerBindingEpoch)> {
+        let owner = self.peers.authenticated_owner(target)?;
+        let epoch = owner.binding_epoch();
+        Some((owner, epoch))
+    }
+
+    /// Return all Pending records restored from the exact semantic store
+    /// slot. The caller schedules these same delivery ids; it never invents a
+    /// replacement id after restart.
+    pub(crate) fn pending_durable_proof_outbox(&self) -> Result<Vec<ProofRecord>> {
+        self.durable_proof_outbox
+            .pending(self.mesh_context_id)
+            .map_err(|error| Error::Network(format!("durable proof replay: {error}")))
+    }
+
+    /// Build a record from facts already admitted by this network's
+    /// authoritative graph and bind it to the exact current owner.
+    pub(crate) fn new_durable_proof_outbox_record(
+        &self,
+        owner: &PeerOwnerToken,
+        fact_ids: &[crate::semantic::FactId],
+    ) -> Result<ProofRecord> {
+        let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
+            .map_err(|error| Error::Network(format!("durable proof target rejected: {error}")))?;
+        let graph = self.fact_graph.read();
+        for fact_id in fact_ids {
+            if graph.get(fact_id).is_none() {
+                return Err(Error::Network(format!(
+                    "durable proof fact {fact_id} is absent"
+                )));
+            }
+        }
+        ProofRecord::pending(
+            self.mesh_context_id,
+            target,
+            fact_ids.to_vec(),
+            owner.device_id(),
+            owner.binding_key(),
+        )
+        .map_err(|error| Error::Network(format!("durable proof record: {error}")))
+    }
+
+    /// Rebuild the exact typed wire delivery for a persisted Pending record.
+    /// Records retain canonical FactIds rather than duplicate signed bodies;
+    /// replay therefore resolves every body from the authoritative graph and
+    /// rechecks the stable context/target/content-derived delivery identity.
+    pub(crate) fn materialize_durable_proof_delivery(
+        &self,
+        record: &ProofRecord,
+    ) -> Result<crate::protocol::ProofDeliveryMessage> {
+        if record.context_id != self.mesh_context_id || !record.is_pending() {
+            return Err(Error::Network(
+                "durable proof record is not Pending in this mesh context".to_string(),
+            ));
+        }
+        let graph = self.fact_graph.read();
+        let mut facts = Vec::with_capacity(record.fact_ids.len());
+        for fact_id in &record.fact_ids {
+            let fact = graph
+                .get(fact_id)
+                .cloned()
+                .ok_or_else(|| Error::Network(format!("durable proof fact {fact_id} is absent")))?;
+            facts.push(fact);
+        }
+        drop(graph);
+
+        let delivery = crate::protocol::ProofDeliveryMessage::new(
+            record.context_id,
+            record.target.clone(),
+            facts,
+        )
+        .map_err(|error| Error::Network(format!("durable proof delivery: {error}")))?;
+        if delivery.delivery_id != record.delivery_id {
+            return Err(Error::Network(
+                "durable proof delivery identity changed during replay".to_string(),
+            ));
+        }
+        Ok(delivery)
+    }
+
+    /// Persist one exact canonical proof record before send admission.
+    /// Duplicate delivery ids return the existing record idempotently.
+    pub(crate) fn admit_durable_proof_outbox(&self, record: ProofRecord) -> Result<ProofRecord> {
+        if record.context_id != self.mesh_context_id {
+            return Err(Error::Network(
+                "durable proof context does not match this network".to_string(),
+            ));
+        }
+        self.durable_proof_outbox
+            .enqueue(record)
+            .map_err(|error| Error::Network(format!("durable proof enqueue: {error}")))
+    }
+
+    /// CAS-rebind a Pending record to the exact authenticated installation.
+    /// The registry mutation fence encloses the durable mutation, so a
+    /// replacement cannot race the binding decision and the id is retained.
+    pub(crate) fn rebind_durable_proof_outbox(
+        &self,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+    ) -> Result<bool> {
+        if record.context_id != self.mesh_context_id
+            || record.target.to_string() != owner.device_id()
+            || !record.is_pending()
+        {
+            return Ok(false);
+        }
+        let new_binding = owner.binding_key();
+        match self.peers.with_current_durable_outbox(owner, || {
+            self.durable_proof_outbox.rebind(
+                record.context_id,
+                record.delivery_id,
+                &record.owner,
+                &record.binding,
+                owner.device_id(),
+                new_binding,
+            )
+        }) {
+            Some(result) => result
+                .map(|_| true)
+                .map_err(|error| Error::Network(format!("durable proof rebind: {error}"))),
+            None => Ok(false),
+        }
+    }
+
+    /// Settle only an exact ACK while the owner installation and binding
+    /// remain current. The semantic outbox retains its Settled tombstone, so
+    /// an identical ACK is idempotent while stale owners remain no-ops.
+    pub(crate) fn settle_durable_proof_outbox_ack(
+        &self,
+        owner: &PeerOwnerToken,
+        record: &ProofRecord,
+        delivery_id: ProofDeliveryId,
+    ) -> Result<bool> {
+        if record.context_id != self.mesh_context_id
+            || record.delivery_id != delivery_id
+            || record.target.to_string() != owner.device_id()
+            || record.owner != owner.device_id()
+            || record.binding != owner.binding_key()
+        {
+            return Ok(false);
+        }
+        match self.peers.with_current_durable_outbox(owner, || {
+            self.durable_proof_outbox
+                .settle(self.mesh_context_id, delivery_id)
+        }) {
+            Some(result) => {
+                result.map_err(|error| Error::Network(format!("durable proof settle: {error}")))
+            }
+            None => Ok(false),
+        }
     }
 
     /// Read observations for this live joined network instance.
@@ -4695,6 +4858,51 @@ mod arc03_peer_registry_tests {
         assert!(registry.get_if_current(&stale_owner).is_none());
         assert!(registry.get_if_current(&replacement).is_some());
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn v4_r3_durable_owner_epoch_rejects_replacement() {
+        let registry = PeerRegistry::default();
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "r3-owner-epoch".to_string(),
+                None,
+            )))
+            .is_none());
+        let first = registry
+            .owner("r3-owner-epoch")
+            .expect("first exact owner exists");
+        let epoch = first.binding_epoch();
+        assert!(epoch.matches(&first));
+        assert!(registry
+            .with_current_durable_outbox(&first, || ())
+            .is_some());
+
+        assert!(registry
+            .install(Arc::new(PeerConnection::new(
+                "r3-owner-epoch".to_string(),
+                None,
+            )))
+            .is_some());
+        let replacement = registry
+            .owner("r3-owner-epoch")
+            .expect("replacement exact owner exists");
+        assert!(!epoch.matches(&replacement));
+        assert_ne!(
+            first.binding_coordinate(),
+            replacement.binding_coordinate(),
+            "replacement must have a distinct serializable binding coordinate"
+        );
+        let persisted = serde_json::to_string(&first.binding_coordinate()).expect("encode binding");
+        let restored: crate::engine::peer_registry::PeerBindingCoordinate =
+            serde_json::from_str(&persisted).expect("decode binding");
+        assert_eq!(restored, first.binding_coordinate());
+        assert!(registry
+            .with_current_durable_outbox(&first, || ())
+            .is_none());
+        assert!(registry
+            .with_current_durable_outbox(&replacement, || ())
+            .is_some());
     }
 
     #[test]
