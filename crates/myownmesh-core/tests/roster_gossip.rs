@@ -97,9 +97,14 @@ async fn bring_up_pair(
     let broker = LocalBroker::new();
     let a_id = Arc::new(Identity::ephemeral());
     let b_id = Arc::new(Identity::ephemeral());
+    // The durable semantic slot is keyed by config.id, not only by the wire
+    // network_id.  Keep each scenario and endpoint on a distinct slot while
+    // preserving the exact network_id used for roster/signaling semantics.
+    let a_config_id = format!("{network_id}-a");
+    let b_config_id = format!("{network_id}-b");
 
     let (a_state, a_driver) = spawn_network(
-        fresh_network("a", network_id),
+        fresh_network(&a_config_id, network_id),
         a_id.clone(),
         transport.clone(),
     )
@@ -109,7 +114,7 @@ async fn bring_up_pair(
         .await
         .expect("a open participation");
     let (b_state, b_driver) = spawn_network(
-        fresh_network("b", network_id),
+        fresh_network(&b_config_id, network_id),
         b_id.clone(),
         transport.clone(),
     )
