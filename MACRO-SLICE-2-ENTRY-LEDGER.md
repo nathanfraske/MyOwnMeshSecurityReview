@@ -138,7 +138,7 @@ Status: discharged at source commit `7f0fdd8`.
 This is a separate, bounded semantic record accompanying the R3 discharge;
 it does not create another residual or widen the transport lane. It is bound
 to source commit
-`fc984e3e60d372f176e0d4cf8c91322be26b7db0`. A Role-cell Resolution is the
+`bfb561a525a1794f56f6a987a66c91d0629a26fa`. A Role-cell Resolution is the
 only persistent selector for a multi-head AuthorityUse lineage. A
 distinct-author Membership payload Resolution remains payload-local and
 cannot join Role lineage. Self-authored Closed Membership retains its author
@@ -146,6 +146,12 @@ AuthorityUse edge and must fork with a concurrent Role revoke; an
 OpenParticipation Resolution remains payload-local and adds no persistent
 subject lineage. An unresolved fork stays fail-closed and its losing
 RoleGrant remains inactive.
+
+Within that Role-cell boundary, `selected_authority_branch` chooses the unique
+causally maximal matching Role-cell Resolution in the sole current-head
+ancestry, independently of FactId or parent traversal order. Zero matching
+selectors or multiple incomparable maximal selectors fail closed; redundant
+ancestor parents cannot revive an older selector.
 
 The closure is evidenced by
 `authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers`,
@@ -161,12 +167,16 @@ The closure is evidenced by
 `finite_authority_fork_projection_converges_for_every_arrival_permutation`,
 `self_authored_membership_keeps_a_role_authority_fork_explicit`,
 `self_authored_membership_resolution_cannot_select_the_role_loser`, and
-`self_authored_membership_resolution_is_order_independent_after_role_regrant`.
+`self_authored_membership_resolution_is_order_independent_after_role_regrant`,
+`stale_selector_follows_newer_typed_role_resolution`, and
+`stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor`
+(12 schedules).
 Together they persist exact role-cell authority selection, reject payload
 resolution as an AuthorityUse selector while retaining only local witnesses,
 require complete typed resolution before regrant, preserve the self-authored
-Membership authority edge, keep the loser inactive, and prove both the 120-
-and 720-permutation projection controls.
+Membership authority edge, keep the loser inactive, reject stale selectors,
+and prove the 12-schedule stale-selector, 120-permutation, and 720-permutation
+controls.
 
 ### R4 — driver-side pre-normalization attributes a departure to the named device
 
