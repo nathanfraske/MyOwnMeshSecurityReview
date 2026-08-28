@@ -395,6 +395,191 @@ fn cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order()
 }
 
 #[test]
+fn second_order_payload_fork_converges_without_authority_join() {
+    let root_key = key(128);
+    let controller_key = key(129);
+    let authority_a_key = key(130);
+    let authority_d_key = key(131);
+    let bootstrap = bootstrap(128, 128);
+    let controller = author(&controller_key);
+    let authority_a = author(&authority_a_key);
+    let authority_d = author(&authority_d_key);
+    let target = author(&key(132));
+    let mut base = FactGraph::from_bootstrap(&bootstrap);
+
+    let grant_controller = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_controller.clone())
+        .expect("G controller grant admits");
+    let grant_a = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: authority_a.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_a).expect("A owner grant admits");
+    let grant_d = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: authority_d.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_d).expect("D owner grant admits");
+
+    let operation = authored(
+        &base,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &base,
+        &authority_a_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let membership = authored(
+        &base,
+        &authority_d_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let evict = authored(
+        &base,
+        &authority_d_key,
+        FactBody::Evict {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = base.clone();
+    for branch in [
+        operation.clone(),
+        revoke.clone(),
+        membership.clone(),
+        evict.clone(),
+    ] {
+        fork.admit(branch)
+            .expect("concurrent second-order branch admits");
+    }
+    let mut authority_heads = fork.authority_use_heads(&controller);
+    authority_heads.sort();
+    assert_eq!(authority_heads.len(), 4);
+    let membership_cell = ExclusiveCell::membership(controller.clone());
+    let mut payload_heads = fork.cell_heads(&membership_cell);
+    payload_heads.sort();
+    assert_eq!(payload_heads.len(), 2);
+    assert!(payload_heads.contains(&membership.id));
+    assert!(payload_heads.contains(&evict.id));
+    let membership_resolution = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: membership_cell,
+            cited_heads: payload_heads,
+            selected_head: evict.id,
+        },
+        Vec::new(),
+    );
+
+    let candidates = [operation, revoke, membership, evict, membership_resolution];
+    let mut order = [0, 1, 2, 3, 4];
+    let mut orders = Vec::new();
+    fn permutations(order: &mut [usize; 5], start: usize, output: &mut Vec<[usize; 5]>) {
+        if start == order.len() {
+            output.push(*order);
+            return;
+        }
+        for index in start..order.len() {
+            order.swap(start, index);
+            permutations(order, start + 1, output);
+            order.swap(start, index);
+        }
+    }
+    permutations(&mut order, 0, &mut orders);
+    assert_eq!(
+        orders.len(),
+        120,
+        "the control covers every O/R/M/E/Q arrival permutation"
+    );
+
+    let mut expected_q_admitted = None;
+    let mut expected_projection = None;
+    for permutation in orders {
+        let mut graph = base.clone();
+        for index in permutation {
+            assert!(matches!(
+                graph.admit(candidates[index].clone()),
+                Ok(Admission::Inserted | Admission::Quarantined { .. })
+            ));
+        }
+        let retry = graph.retry_quarantined();
+        assert!(matches!(
+            retry,
+            Ok(_) | Err(myownmesh_core::semantic::SemanticError::IncompleteResolution)
+        ));
+        assert!(graph.quarantined().next().is_none());
+        let q_admitted = graph.get(&candidates[4].id).is_some();
+        if let Some(previous) = expected_q_admitted {
+            assert_eq!(q_admitted, previous);
+        } else {
+            expected_q_admitted = Some(q_admitted);
+        }
+        assert_eq!(
+            graph.ids().count(),
+            7 + usize::from(q_admitted),
+            "only Q's explicit safe/rejected outcome varies the admitted count"
+        );
+        assert!(graph
+            .projection()
+            .is_conflicted(&ExclusiveCell::role(controller.clone())));
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            None,
+            "C remains revoked/conflicted"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&target),
+            None,
+            "the O/RoleGrant(X) branch remains inactive"
+        );
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            None,
+            "Q never invents an AuthorityUse(C) branch selection"
+        );
+        if !q_admitted {
+            assert_eq!(graph.authority_use_heads(&controller).len(), 4);
+        }
+        if let Some(previous) = &expected_projection {
+            assert_eq!(graph.projection(), *previous);
+        } else {
+            expected_projection = Some(graph.projection());
+        }
+    }
+}
+
+#[test]
 fn incomparable_heads_fail_closed_until_full_head_resolution() {
     let root_key = key(11);
     let left_controller_key = key(12);

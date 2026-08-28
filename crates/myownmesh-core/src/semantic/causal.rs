@@ -588,7 +588,10 @@ impl FactGraph {
                 fact.content
                     .authority_uses
                     .iter()
-                    .any(|use_| &use_.subject == subject)
+                    .any(|use_| {
+                        &use_.subject == subject
+                            && !Self::is_payload_local_resolution(&fact.content.body, subject)
+                    })
                     .then_some(*id)
             })
             .collect();
@@ -599,6 +602,32 @@ impl FactGraph {
                     .any(|other| candidate != other && self.is_ancestor(candidate, other))
             })
             .collect()
+    }
+
+    /// A Membership/OpenParticipation resolution may need to carry an
+    /// AuthorityUse witness for its payload subject, but that witness is not a
+    /// persistent Role-lineage edge.  Otherwise the payload resolution would
+    /// collapse an unrelated Role fork into one apparent head and revive a
+    /// losing branch.  The author edge (and all Role-cell resolution edges)
+    /// remains part of the graph-derived relation.
+    fn is_payload_local_resolution(body: &FactBody, subject: &DeviceId) -> bool {
+        match body {
+            FactBody::Resolution {
+                cell:
+                    ExclusiveCell::Membership {
+                        subject: cell_subject,
+                    },
+                ..
+            }
+            | FactBody::Resolution {
+                cell:
+                    ExclusiveCell::OpenParticipation {
+                        subject: cell_subject,
+                    },
+                ..
+            } => cell_subject == subject,
+            _ => false,
+        }
     }
 
     pub(crate) fn raw_cell_heads(&self, cell: &super::ExclusiveCell) -> Vec<FactId> {
@@ -639,11 +668,20 @@ impl FactGraph {
             .body
             .authority_use_subjects(&fact.content.author)
         {
-            if !self.authority_lineage(&subject).is_singular() {
-                // Concurrent signed uses are an explicit authority fork. A
-                // later Resolution can supersede the fork because it becomes
-                // the sole AuthorityUse head and cites both branches.
-                return false;
+            let payload_local = Self::is_payload_local_resolution(&fact.content.body, &subject);
+            let lineage = self.authority_lineage(&subject);
+            if !payload_local && !lineage.is_singular() {
+                let common_ancestor = lineage
+                    .heads()
+                    .iter()
+                    .all(|head| fact.id == *head || self.is_ancestor(&fact.id, head));
+                if !common_ancestor {
+                    // Concurrent signed uses are an explicit authority fork.
+                    // A later Resolution can supersede the fork because it
+                    // becomes the sole AuthorityUse head and cites both
+                    // branches. Common causal ancestors remain authoritative.
+                    return false;
+                }
             }
             let Some(use_) = fact
                 .content
@@ -657,15 +695,17 @@ impl FactGraph {
             if use_.predecessors != expected {
                 return false;
             }
-            if let Some(selected_branch) = self.authority_lineage(&subject).selected_branch() {
-                if fact.id != selected_branch
-                    && !self.is_ancestor(&selected_branch, &fact.id)
-                    && !self.is_ancestor(&fact.id, &selected_branch)
-                {
-                    // A typed resolution permanently selects one cited branch.
-                    // Its losing sibling cannot regain authority merely because a
-                    // later fact carries a syntactically current predecessor set.
-                    return false;
+            if !payload_local {
+                if let Some(selected_branch) = lineage.selected_branch() {
+                    if fact.id != selected_branch
+                        && !self.is_ancestor(&selected_branch, &fact.id)
+                        && !self.is_ancestor(&fact.id, &selected_branch)
+                    {
+                        // A typed resolution permanently selects one cited branch.
+                        // Its losing sibling cannot regain authority merely because a
+                        // later fact carries a syntactically current predecessor set.
+                        return false;
+                    }
                 }
             }
         }
@@ -727,11 +767,10 @@ impl FactGraph {
             .copied()
             .filter(|id| {
                 self.facts.get(id).is_some_and(|parent| {
-                    parent
-                        .content
-                        .authority_uses
-                        .iter()
-                        .any(|use_| &use_.subject == subject)
+                    parent.content.authority_uses.iter().any(|use_| {
+                        &use_.subject == subject
+                            && !Self::is_payload_local_resolution(&parent.content.body, subject)
+                    })
                 })
             })
             .collect();
@@ -1797,6 +1836,183 @@ mod tests {
                     "an ordinary fact cannot merge incomparable AuthorityUse heads"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn payload_resolution_does_not_join_a_transitive_role_fork() {
+        let (bootstrap, root_key) = closed(80);
+        let controller_key = key(81);
+        let owner_a_key = key(82);
+        let owner_d_key = key(83);
+        let target_key = key(84);
+        let controller = device(&controller_key);
+        let owner_a = device(&owner_a_key);
+        let owner_d = device(&owner_d_key);
+        let target = device(&target_key);
+
+        let grant_controller = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let grant_a = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: owner_a.clone(),
+                role: Role::Owner,
+            },
+            vec![grant_controller.id],
+            &[
+                (device(&root_key), vec![grant_controller.id]),
+                (owner_a.clone(), Vec::new()),
+            ],
+        );
+        let grant_d = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: owner_d.clone(),
+                role: Role::Owner,
+            },
+            vec![grant_a.id],
+            &[
+                (device(&root_key), vec![grant_a.id]),
+                (owner_d.clone(), Vec::new()),
+            ],
+        );
+        let role_branch = fact_with_authority_predecessors(
+            &bootstrap,
+            &controller_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            vec![grant_controller.id],
+            &[
+                (controller.clone(), vec![grant_controller.id]),
+                (target.clone(), Vec::new()),
+            ],
+        );
+        let revoke_branch = fact_with_authority_predecessors(
+            &bootstrap,
+            &owner_a_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+            vec![grant_a.id, grant_controller.id],
+            &[
+                (owner_a.clone(), vec![grant_a.id]),
+                (controller.clone(), vec![grant_controller.id]),
+            ],
+        );
+        let membership_branch = fact_with_authority_predecessors(
+            &bootstrap,
+            &owner_d_key,
+            FactBody::MembershipAdmit {
+                target: controller.clone(),
+            },
+            vec![grant_d.id, grant_controller.id],
+            &[
+                (owner_d.clone(), vec![grant_d.id]),
+                (controller.clone(), vec![grant_controller.id]),
+            ],
+        );
+        let evict_branch = fact_with_authority_predecessors(
+            &bootstrap,
+            &owner_d_key,
+            FactBody::Evict {
+                target: controller.clone(),
+            },
+            vec![grant_d.id, grant_controller.id],
+            &[
+                (owner_d.clone(), vec![grant_d.id]),
+                (controller.clone(), vec![grant_controller.id]),
+            ],
+        );
+        let mut cited_heads = vec![membership_branch.id, evict_branch.id];
+        cited_heads.sort();
+        let resolution = fact_with_authority_predecessors(
+            &bootstrap,
+            &owner_a_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::membership(controller.clone()),
+                cited_heads: cited_heads.clone(),
+                selected_head: evict_branch.id,
+            },
+            vec![
+                role_branch.id,
+                revoke_branch.id,
+                membership_branch.id,
+                evict_branch.id,
+            ],
+            &[
+                (owner_a.clone(), vec![revoke_branch.id]),
+                (
+                    controller.clone(),
+                    vec![
+                        role_branch.id,
+                        revoke_branch.id,
+                        membership_branch.id,
+                        evict_branch.id,
+                    ],
+                ),
+            ],
+        );
+        for branch in [
+            &grant_controller,
+            &grant_a,
+            &grant_d,
+            &role_branch,
+            &revoke_branch,
+            &membership_branch,
+            &evict_branch,
+            &resolution,
+        ] {
+            branch.verify().expect("fixture remains canonically signed");
+        }
+
+        let mut base = FactGraph::from_bootstrap(&bootstrap);
+        base.admit(grant_controller)
+            .expect("controller grant admits");
+        base.admit(grant_a).expect("first Owner grant admits");
+        base.admit(grant_d).expect("second Owner grant admits");
+        let role_branch_id = role_branch.id;
+        let branches = [role_branch, revoke_branch, membership_branch, evict_branch];
+        let mut expected_heads = cited_heads.clone();
+        expected_heads.extend([branches[0].id, branches[1].id]);
+        expected_heads.sort();
+        for order in [[0usize, 1, 2, 3], [3, 2, 1, 0], [2, 0, 3, 1]] {
+            let mut graph = base.clone();
+            for index in order {
+                let branch = &branches[index];
+                graph.facts.insert(branch.id, branch.clone());
+            }
+            graph
+                .admit(resolution.clone())
+                .expect("payload resolution admits against exact payload heads");
+            let lineage = graph.authority_lineage(&controller);
+            assert_eq!(lineage.heads(), expected_heads.as_slice());
+            assert_eq!(
+                lineage.selected_branch(),
+                None,
+                "a payload resolution cannot select the Role lineage"
+            );
+            assert!(graph.fact_is_authoritative(&resolution.id));
+            assert!(
+                !graph.fact_is_authoritative(&role_branch_id),
+                "the losing Role branch remains inactive"
+            );
+            assert_eq!(graph.evaluator().effective_role(&target), None);
+            assert_eq!(
+                graph.evaluator().effective_membership(&controller),
+                Some(false)
+            );
         }
     }
 

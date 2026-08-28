@@ -1104,6 +1104,301 @@ fn cross_cell_resolution_cannot_select_a_role_authority_fork() {
 }
 
 #[test]
+fn second_order_payload_resolution_cannot_join_the_role_authority_fork() {
+    let root_key = key(128);
+    let controller_key = key(129);
+    let authority_a_key = key(130);
+    let authority_d_key = key(131);
+    let bootstrap = closed_bootstrap(128, 128);
+    let controller = author(&controller_key);
+    let authority_a = author(&authority_a_key);
+    let authority_d = author(&authority_d_key);
+    let target = author(&key(132));
+    let mut base = FactGraph::from_bootstrap(&bootstrap);
+
+    let grant_controller = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_controller.clone())
+        .expect("G controller grant admits");
+    let grant_a = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: authority_a.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_a.clone()).expect("A owner grant admits");
+    let grant_d = authored(
+        &base,
+        &root_key,
+        FactBody::RoleGrant {
+            target: authority_d.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    base.admit(grant_d.clone()).expect("D owner grant admits");
+    assert_eq!(
+        base.evaluator().effective_role(&controller),
+        Some(Role::Controller)
+    );
+    assert_eq!(
+        base.evaluator().effective_role(&authority_a),
+        Some(Role::Owner)
+    );
+    assert_eq!(
+        base.evaluator().effective_role(&authority_d),
+        Some(Role::Owner)
+    );
+
+    // O, R, M, and E are all authored from the same singular base. O uses C;
+    // R uses A; M and E use D, while all four carry C's exact G predecessor.
+    let operation = authored(
+        &base,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &base,
+        &authority_a_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let membership = authored(
+        &base,
+        &authority_d_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let evict = authored(
+        &base,
+        &authority_d_key,
+        FactBody::Evict {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = base.clone();
+    for branch in [
+        operation.clone(),
+        revoke.clone(),
+        membership.clone(),
+        evict.clone(),
+    ] {
+        fork.admit(branch)
+            .expect("concurrent second-order branch admits");
+    }
+    let authority_heads = fork.authority_use_heads(&controller);
+    assert_eq!(
+        authority_heads.len(),
+        4,
+        "O/R/M/E form the complete AuthorityUse(C) conflict set"
+    );
+    let membership_cell = ExclusiveCell::membership(controller.clone());
+    let mut payload_heads = fork.cell_heads(&membership_cell);
+    payload_heads.sort();
+    let mut expected_payload_heads = vec![membership.id, evict.id];
+    expected_payload_heads.sort();
+    assert_eq!(
+        payload_heads, expected_payload_heads,
+        "M/E are the exact ordinary Membership(C) payload heads"
+    );
+
+    let resolution = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: membership_cell,
+            cited_heads: payload_heads.clone(),
+            selected_head: evict.id,
+        },
+        Vec::new(),
+    );
+    let controller_use = resolution
+        .content
+        .authority_uses
+        .iter()
+        .find(|authority_use| authority_use.subject == controller)
+        .expect("Q carries AuthorityUse(C)");
+    assert_eq!(
+        controller_use.predecessors, authority_heads,
+        "Q carries every O/R/M/E AuthorityUse(C) predecessor"
+    );
+
+    let admission = fork.admit(resolution);
+    assert!(
+        matches!(
+            admission,
+            Ok(Admission::Inserted) | Err(SemanticError::IncompleteResolution)
+        ),
+        "Q is either rejected or remains a payload-local resolution"
+    );
+    assert!(
+        fork.projection()
+            .is_conflicted(&ExclusiveCell::role(controller.clone())),
+        "R/E keep C's role cell conflicted"
+    );
+    assert_eq!(
+        fork.evaluator().effective_role(&controller),
+        None,
+        "C remains revoked under the unresolved role authority fork"
+    );
+    assert_eq!(
+        fork.evaluator().effective_role(&target),
+        None,
+        "O/RoleGrant(X) remains inactive after the payload attempt"
+    );
+    assert_eq!(
+        fork.authority_lineage(&controller).selected_branch(),
+        None,
+        "no payload resolution invents a selected AuthorityUse(C) branch"
+    );
+}
+
+#[test]
+fn open_participation_payload_fork_stays_in_its_ordinary_cell() {
+    let subject_key = key(133);
+    let subject = author(&subject_key);
+    let bootstrap =
+        VerifiedBootstrap::open("semantic-open-payload-fork").expect("open bootstrap verifies");
+    let cell = ExclusiveCell::open_participation(subject.clone());
+    let base = FactGraph::from_bootstrap(&bootstrap);
+    let joined = authored(
+        &base,
+        &subject_key,
+        FactBody::OpenParticipation {
+            device_id: subject.clone(),
+            joined: true,
+        },
+        Vec::new(),
+    );
+    let left = authored(
+        &base,
+        &subject_key,
+        FactBody::OpenParticipation {
+            device_id: subject.clone(),
+            joined: false,
+        },
+        Vec::new(),
+    );
+    let left_id = left.id;
+    let joined_id = joined.id;
+    let mut graph = base;
+    graph.admit(joined).expect("open participation fact admits");
+    graph
+        .admit(left)
+        .expect("concurrent open participation fact admits");
+    assert_eq!(graph.cell_heads(&cell).len(), 2);
+    assert!(graph.projection().is_conflicted(&cell));
+
+    let mut payload_heads = graph.cell_heads(&cell);
+    payload_heads.sort();
+    let mut expected_payload_heads = vec![joined_id, left_id];
+    expected_payload_heads.sort();
+    assert_eq!(
+        payload_heads, expected_payload_heads,
+        "OpenParticipation exposes the exact two ordinary payload heads"
+    );
+    let authority_heads = graph.authority_use_heads(&subject);
+    assert!(
+        authority_heads.is_empty(),
+        "OpenParticipation has no AuthorityUse(subject) lineage heads"
+    );
+    let resolution = authored(
+        &graph,
+        &subject_key,
+        FactBody::Resolution {
+            cell: cell.clone(),
+            cited_heads: payload_heads,
+            selected_head: left_id,
+        },
+        Vec::new(),
+    );
+    let subject_use = resolution
+        .content
+        .authority_uses
+        .iter()
+        .find(|authority_use| authority_use.subject == subject)
+        .expect("the canonical payload Q carries only an empty subject-use witness");
+    assert_eq!(
+        subject_use.predecessors, authority_heads,
+        "OpenParticipation Q carries no subject-use predecessor witness"
+    );
+    let admission = graph.admit(resolution);
+    let q_inserted = matches!(&admission, Ok(Admission::Inserted));
+    assert!(
+        matches!(
+            &admission,
+            Ok(Admission::Inserted) | Err(SemanticError::IncompleteResolution)
+        ),
+        "OpenParticipation Q is rejected or remains payload-local"
+    );
+    assert_eq!(
+        graph.authority_lineage(&subject).selected_branch(),
+        None,
+        "OpenParticipation Q cannot invent an AuthorityUse branch selection"
+    );
+    if q_inserted {
+        assert_eq!(
+            graph.evaluator().effective_open_participation(&subject),
+            Some(false),
+            "a payload-local Q selects only its OpenParticipation cell"
+        );
+    } else {
+        assert_eq!(
+            graph.authority_lineage(&subject).heads(),
+            &[],
+            "rejected Q leaves AuthorityUse(subject) lineage empty"
+        );
+        assert_eq!(
+            graph.evaluator().effective_open_participation(&subject),
+            None,
+            "a rejected Q leaves the conflicting payload fail-closed"
+        );
+    }
+
+    // Closed role authority cannot be composed into this Open graph: the
+    // profile rejects governance RoleGrant facts before any role loser could
+    // be introduced or projected.
+    let role_payload = fact(
+        &bootstrap,
+        &subject_key,
+        FactBody::RoleGrant {
+            target: subject.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        graph.admit(role_payload),
+        Err(SemanticError::DomainMismatch),
+        "Open domain cannot compose the Closed Role-fork schedule"
+    );
+    assert_eq!(
+        graph.evaluator().effective_open_participation(&subject),
+        if q_inserted { Some(false) } else { None },
+        "Open projection remains determined only by its ordinary payload result"
+    );
+}
+
+#[test]
 fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
     let root_key = key(69);
     let controller_key = key(70);
