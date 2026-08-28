@@ -10,6 +10,7 @@ use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
 use myownmesh_core::{NetworkConfig, ServicesConfig};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -79,6 +80,28 @@ pub enum MfaCmd {
     /// Enroll a TOTP authenticator for a network on this device. Prints the
     /// secret, an `otpauth://` URI (for a QR), and one-time recovery codes.
     Enroll { network: String },
+    /// Prepare an enrollment without settling it.
+    Prepare { network: String },
+    /// Query one exact enrollment transaction.
+    Query {
+        network: String,
+        transaction_id: String,
+    },
+    /// Re-deliver one exact prepared enrollment.
+    Redeliver {
+        network: String,
+        transaction_id: String,
+    },
+    /// Commit one exact prepared enrollment.
+    Commit {
+        network: String,
+        transaction_id: String,
+    },
+    /// Abort one exact prepared enrollment.
+    Abort {
+        network: String,
+        transaction_id: String,
+    },
     /// Report whether this device holds a custody lock for a network.
     Status { network: String },
     /// Remove the custody lock (requires a valid current code).
@@ -267,7 +290,53 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             mfa_code,
         },
         CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Enroll { network })) => {
-            Request::GovernanceMfaEnroll { network }
+            return run_mfa_enroll(network).await;
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Prepare { network })) => {
+            return run_mfa_material(Request::GovernanceMfaPrepare { network }, None).await;
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Query {
+            network,
+            transaction_id,
+        })) => {
+            return run_mfa_transaction(Request::GovernanceMfaQuery {
+                network,
+                transaction_id,
+            })
+            .await
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Redeliver {
+            network,
+            transaction_id,
+        })) => {
+            return run_mfa_material(
+                Request::GovernanceMfaRedeliver {
+                    network,
+                    transaction_id: transaction_id.clone(),
+                },
+                Some(transaction_id),
+            )
+            .await;
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Commit {
+            network,
+            transaction_id,
+        })) => {
+            return run_mfa_transaction(Request::GovernanceMfaCommit {
+                network,
+                transaction_id,
+            })
+            .await;
+        }
+        CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Abort {
+            network,
+            transaction_id,
+        })) => {
+            return run_mfa_transaction(Request::GovernanceMfaAbort {
+                network,
+                transaction_id,
+            })
+            .await;
         }
         CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Status { network })) => {
             Request::GovernanceMfaStatus { network }
@@ -301,6 +370,343 @@ fn print_response(response: Response) -> Result<()> {
     let body = response.data.unwrap_or(Value::Null);
     println!("{}", serde_json::to_string_pretty(&body)?);
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MfaEnrollmentData {
+    secret: String,
+    otpauth_uri: String,
+    recovery_codes: Vec<String>,
+    transaction_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct MfaTransactionData {
+    network: String,
+    transaction_id: String,
+    state: String,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    otpauth_uri: Option<String>,
+    #[serde(default)]
+    recovery_codes: Option<Vec<String>>,
+}
+
+fn response_error(response: &Response) -> anyhow::Error {
+    anyhow!(
+        "{}",
+        response
+            .error
+            .as_deref()
+            .unwrap_or("daemon refused the MFA request")
+    )
+}
+
+fn parse_mfa_enrollment(
+    response: &Response,
+    expected_transaction_id: Option<&str>,
+) -> Result<MfaEnrollmentData> {
+    if !response.ok {
+        return Err(response_error(response));
+    }
+    let data = response
+        .data
+        .clone()
+        .ok_or_else(|| anyhow!("MFA enrollment response has no data"))?;
+    let enrollment: MfaEnrollmentData =
+        serde_json::from_value(data).context("malformed MFA enrollment material")?;
+    if enrollment.transaction_id.trim().is_empty()
+        || enrollment.secret.trim().is_empty()
+        || enrollment.otpauth_uri.trim().is_empty()
+        || !enrollment.otpauth_uri.starts_with("otpauth://")
+        || enrollment.recovery_codes.is_empty()
+        || enrollment
+            .recovery_codes
+            .iter()
+            .any(|code| code.trim().is_empty())
+    {
+        bail!("MFA enrollment response has incomplete or malformed material");
+    }
+    if let Some(expected) = expected_transaction_id {
+        if enrollment.transaction_id != expected {
+            bail!(
+                "MFA response transaction_id '{}' does not match requested transaction '{}'",
+                enrollment.transaction_id,
+                expected
+            );
+        }
+    }
+    Ok(enrollment)
+}
+
+fn parse_mfa_transaction(
+    response: &Response,
+    expected_network: &str,
+    expected_transaction_id: &str,
+) -> Result<MfaTransactionData> {
+    if !response.ok {
+        return Err(response_error(response));
+    }
+    let data = response
+        .data
+        .clone()
+        .ok_or_else(|| anyhow!("MFA transaction response has no data"))?;
+    let transaction: MfaTransactionData =
+        serde_json::from_value(data).context("malformed MFA transaction response")?;
+    if transaction.network != expected_network
+        || transaction.transaction_id != expected_transaction_id
+    {
+        bail!(
+            "MFA response identity ({}, {}) does not match requested ({}, {})",
+            transaction.network,
+            transaction.transaction_id,
+            expected_network,
+            expected_transaction_id
+        );
+    }
+    match transaction.state.as_str() {
+        "prepared" => {
+            if transaction
+                .secret
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+                || transaction
+                    .otpauth_uri
+                    .as_deref()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+                || transaction.recovery_codes.as_ref().is_none_or(|codes| {
+                    codes.is_empty() || codes.iter().any(|code| code.trim().is_empty())
+                })
+            {
+                bail!("prepared MFA transaction has incomplete recovery material");
+            }
+        }
+        "committed" | "absent" => {
+            if transaction.secret.is_some()
+                || transaction.otpauth_uri.is_some()
+                || transaction.recovery_codes.is_some()
+            {
+                bail!(
+                    "terminal MFA transaction '{}' unexpectedly carries recovery material",
+                    transaction.state
+                );
+            }
+        }
+        other => bail!("unknown MFA transaction state '{other}'"),
+    }
+    Ok(transaction)
+}
+
+fn recovery_failure(
+    network: &str,
+    transaction_id: &str,
+    detail: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow!(
+        "MFA transaction '{transaction_id}' for network '{network}' could not be settled: {detail}; use `myownmesh ctl governance mfa query {network} {transaction_id}` and, if it is prepared, `myownmesh ctl governance mfa redeliver {network} {transaction_id}`"
+    )
+}
+
+fn render_json_and_flush<T: Serialize>(value: &T) -> Result<()> {
+    use std::io::Write as _;
+    let rendered = serde_json::to_string_pretty(value)?;
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    stdout.write_all(rendered.as_bytes())?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+async fn settle_mfa_with<S, Fut>(
+    network: String,
+    transaction_id: String,
+    mut send: S,
+) -> Result<MfaTransactionData>
+where
+    S: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let commit_request = || Request::GovernanceMfaCommit {
+        network: network.clone(),
+        transaction_id: transaction_id.clone(),
+    };
+    match send(commit_request()).await {
+        Ok(response) => {
+            let transaction = parse_mfa_transaction(&response, &network, &transaction_id)
+                .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+            match transaction.state.as_str() {
+                "committed" => return Ok(transaction),
+                "prepared" => {}
+                "absent" => {
+                    return Err(recovery_failure(
+                        &network,
+                        &transaction_id,
+                        "the exact transaction is absent",
+                    ));
+                }
+                _ => unreachable!("validated transaction state"),
+            }
+        }
+        Err(_) => return query_then_maybe_retry(network, transaction_id, &mut send).await,
+    }
+
+    retry_commit_then_query(network, transaction_id, &mut send).await
+}
+
+async fn query_then_maybe_retry<S, Fut>(
+    network: String,
+    transaction_id: String,
+    send: &mut S,
+) -> Result<MfaTransactionData>
+where
+    S: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let response = send(Request::GovernanceMfaQuery {
+        network: network.clone(),
+        transaction_id: transaction_id.clone(),
+    })
+    .await
+    .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+    let transaction = parse_mfa_transaction(&response, &network, &transaction_id)
+        .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+    match transaction.state.as_str() {
+        "committed" => Ok(transaction),
+        "prepared" => retry_commit_then_query(network, transaction_id, send).await,
+        "absent" => Err(recovery_failure(
+            &network,
+            &transaction_id,
+            "the exact transaction is absent",
+        )),
+        _ => unreachable!("validated transaction state"),
+    }
+}
+
+async fn retry_commit_then_query<S, Fut>(
+    network: String,
+    transaction_id: String,
+    send: &mut S,
+) -> Result<MfaTransactionData>
+where
+    S: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let response = match send(Request::GovernanceMfaCommit {
+        network: network.clone(),
+        transaction_id: transaction_id.clone(),
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => return final_mfa_query(network, transaction_id, send).await,
+    };
+    let transaction = parse_mfa_transaction(&response, &network, &transaction_id)
+        .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+    match transaction.state.as_str() {
+        "committed" => Ok(transaction),
+        "prepared" => final_mfa_query(network, transaction_id, send).await,
+        "absent" => Err(recovery_failure(
+            &network,
+            &transaction_id,
+            "the exact transaction is absent",
+        )),
+        _ => unreachable!("validated transaction state"),
+    }
+}
+
+async fn final_mfa_query<S, Fut>(
+    network: String,
+    transaction_id: String,
+    send: &mut S,
+) -> Result<MfaTransactionData>
+where
+    S: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+{
+    let response = send(Request::GovernanceMfaQuery {
+        network: network.clone(),
+        transaction_id: transaction_id.clone(),
+    })
+    .await
+    .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+    let transaction = parse_mfa_transaction(&response, &network, &transaction_id)
+        .map_err(|error| recovery_failure(&network, &transaction_id, error))?;
+    if transaction.state == "committed" {
+        Ok(transaction)
+    } else {
+        Err(recovery_failure(
+            &network,
+            &transaction_id,
+            format!(
+                "final exact query returned '{}'; recovery remains available",
+                transaction.state
+            ),
+        ))
+    }
+}
+
+async fn enroll_with<S, Fut, O>(
+    network: String,
+    mut send: S,
+    mut render: O,
+) -> Result<MfaTransactionData>
+where
+    S: FnMut(Request) -> Fut,
+    Fut: std::future::Future<Output = Result<Response>>,
+    O: FnMut(&MfaEnrollmentData) -> Result<()>,
+{
+    let response = send(Request::GovernanceMfaPrepare {
+        network: network.clone(),
+    })
+    .await?;
+    let enrollment = parse_mfa_enrollment(&response, None)?;
+    render(&enrollment)?;
+    settle_mfa_with(network, enrollment.transaction_id, send).await
+}
+
+async fn run_mfa_enroll(network: String) -> Result<()> {
+    let final_state = enroll_with(
+        network,
+        |request| async move { roundtrip(&request).await },
+        render_json_and_flush,
+    )
+    .await?;
+    render_json_and_flush(&final_state)
+}
+
+async fn run_mfa_material(request: Request, expected_transaction_id: Option<String>) -> Result<()> {
+    let response = roundtrip(&request).await?;
+    let enrollment = parse_mfa_enrollment(&response, expected_transaction_id.as_deref())?;
+    render_json_and_flush(&enrollment)
+}
+
+async fn run_mfa_transaction(request: Request) -> Result<()> {
+    let (network, transaction_id) = match &request {
+        Request::GovernanceMfaQuery {
+            network,
+            transaction_id,
+        }
+        | Request::GovernanceMfaCommit {
+            network,
+            transaction_id,
+        }
+        | Request::GovernanceMfaAbort {
+            network,
+            transaction_id,
+        } => (network, transaction_id),
+        _ => bail!("not an MFA transaction request"),
+    };
+    let response = roundtrip(&request).await?;
+    if response.ok {
+        parse_mfa_transaction(&response, network, transaction_id)?;
+    }
+    print_response(response)
 }
 
 /// Run a `services` subcommand. `status` is a plain request; `enable` /
@@ -534,4 +940,264 @@ async fn connect_socket() -> Result<LocalSocketStream> {
     LocalSocketStream::connect(name)
         .await
         .context("connect daemon socket — is `myownmesh serve` running?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    fn enrollment_response(transaction_id: &str) -> Response {
+        Response::ok(serde_json::json!({
+            "secret": "JBSWY3DPEHPK3PXP",
+            "otpauth_uri": "otpauth://totp/MyOwnMesh:laptop?secret=JBSWY3DPEHPK3PXP",
+            "recovery_codes": ["alpha-beta", "gamma-delta"],
+            "transaction_id": transaction_id,
+        }))
+    }
+
+    fn transaction_response(network: &str, transaction_id: &str, state: &str) -> Response {
+        let mut data = serde_json::json!({
+            "network": network,
+            "transaction_id": transaction_id,
+            "state": state,
+        });
+        if state == "prepared" {
+            data["secret"] = serde_json::json!("JBSWY3DPEHPK3PXP");
+            data["otpauth_uri"] =
+                serde_json::json!("otpauth://totp/MyOwnMesh:laptop?secret=JBSWY3DPEHPK3PXP");
+            data["recovery_codes"] = serde_json::json!(["alpha-beta", "gamma-delta"]);
+        }
+        Response::ok(data)
+    }
+
+    fn request_operation(request: &Request) -> String {
+        serde_json::to_value(request)
+            .expect("request serializes")
+            .get("op")
+            .and_then(Value::as_str)
+            .expect("request operation")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn mfa_enroll_displays_and_flushes_material_before_commit() {
+        let network = "mesh".to_owned();
+        let transaction_id = "txn-1";
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_send = Arc::clone(&seen);
+        let mut responses = VecDeque::from([
+            Ok(enrollment_response(transaction_id)),
+            Ok(transaction_response(
+                network.as_str(),
+                transaction_id,
+                "committed",
+            )),
+        ]);
+        let displayed_and_flushed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let displayed_by_send = Arc::clone(&displayed_and_flushed);
+        let displayed_by_render = Arc::clone(&displayed_and_flushed);
+        let final_state = enroll_with(
+            network,
+            move |request| {
+                let operation = request_operation(&request);
+                if operation == "governance_mfa_commit" {
+                    assert!(
+                        displayed_by_send.load(std::sync::atomic::Ordering::SeqCst),
+                        "commit cannot be sent before material is rendered and flushed"
+                    );
+                }
+                seen_by_send.lock().unwrap().push(operation);
+                let response = responses.pop_front().expect("scripted response");
+                async move { response }
+            },
+            move |material| {
+                assert_eq!(material.transaction_id, transaction_id);
+                displayed_by_render.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await
+        .expect("enrollment settles");
+        assert_eq!(final_state.state, "committed");
+        assert!(displayed_and_flushed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["governance_mfa_prepare", "governance_mfa_commit"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mfa_lost_commit_ack_queries_exact_committed_transaction() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_send = Arc::clone(&seen);
+        let mut responses = VecDeque::from([
+            Ok(enrollment_response("txn-2")),
+            Err(anyhow!("lost commit acknowledgement")),
+            Ok(transaction_response("mesh", "txn-2", "committed")),
+        ]);
+        let final_state = enroll_with(
+            "mesh".into(),
+            move |request| {
+                seen_by_send
+                    .lock()
+                    .unwrap()
+                    .push(request_operation(&request));
+                let response = responses.pop_front().expect("scripted response");
+                async move { response }
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("query resolves committed transaction");
+        assert_eq!(final_state.state, "committed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "governance_mfa_prepare",
+                "governance_mfa_commit",
+                "governance_mfa_query"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mfa_prepared_query_retries_one_exact_commit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_send = Arc::clone(&seen);
+        let mut responses = VecDeque::from([
+            Ok(enrollment_response("txn-3")),
+            Err(anyhow!("commit response lost")),
+            Ok(transaction_response("mesh", "txn-3", "prepared")),
+            Ok(transaction_response("mesh", "txn-3", "committed")),
+        ]);
+        let final_state = enroll_with(
+            "mesh".into(),
+            move |request| {
+                seen_by_send
+                    .lock()
+                    .unwrap()
+                    .push(request_operation(&request));
+                let response = responses.pop_front().expect("scripted response");
+                async move { response }
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("prepared query permits one retry");
+        assert_eq!(final_state.state, "committed");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "governance_mfa_prepare",
+                "governance_mfa_commit",
+                "governance_mfa_query",
+                "governance_mfa_commit"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mfa_ambiguous_retry_queries_once_after_second_ambiguous_commit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_send = Arc::clone(&seen);
+        let mut responses = VecDeque::from([
+            Ok(enrollment_response("txn-4")),
+            Err(anyhow!("first commit acknowledgement lost")),
+            Ok(transaction_response("mesh", "txn-4", "prepared")),
+            Err(anyhow!("retry commit acknowledgement lost")),
+            Ok(transaction_response("mesh", "txn-4", "committed")),
+        ]);
+        let final_state = enroll_with(
+            "mesh".into(),
+            move |request| {
+                let value = serde_json::to_value(&request).expect("request serializes");
+                seen_by_send.lock().unwrap().push(value);
+                let response = responses.pop_front().expect("scripted response");
+                async move { response }
+            },
+            |_| Ok(()),
+        )
+        .await
+        .expect("final exact query resolves committed transaction");
+        assert_eq!(final_state.state, "committed");
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.iter()
+                .map(|request| request["op"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "governance_mfa_prepare",
+                "governance_mfa_commit",
+                "governance_mfa_query",
+                "governance_mfa_commit",
+                "governance_mfa_query"
+            ]
+        );
+        for request in seen.iter().skip(1) {
+            assert_eq!(request["network"], "mesh");
+            assert_eq!(request["transaction_id"], "txn-4");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_material_never_reaches_commit() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_by_send = Arc::clone(&seen);
+        let malformed = Response::ok(serde_json::json!({
+            "secret": "",
+            "otpauth_uri": "not-an-otpauth-uri",
+            "recovery_codes": [],
+            "transaction_id": "txn-bad",
+        }));
+        let mut responses = VecDeque::from([Ok(malformed)]);
+        let result = enroll_with(
+            "mesh".into(),
+            move |request| {
+                seen_by_send
+                    .lock()
+                    .unwrap()
+                    .push(request_operation(&request));
+                let response = responses.pop_front().expect("scripted response");
+                async move { response }
+            },
+            |_| panic!("malformed material must not be rendered"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*seen.lock().unwrap(), ["governance_mfa_prepare"]);
+    }
+
+    #[test]
+    fn mfa_transaction_subcommands_preserve_exact_wire_mapping() {
+        assert_eq!(
+            request_operation(&Request::GovernanceMfaQuery {
+                network: "mesh".into(),
+                transaction_id: "txn".into()
+            }),
+            "governance_mfa_query"
+        );
+        assert_eq!(
+            request_operation(&Request::GovernanceMfaRedeliver {
+                network: "mesh".into(),
+                transaction_id: "txn".into()
+            }),
+            "governance_mfa_redeliver"
+        );
+        assert_eq!(
+            request_operation(&Request::GovernanceMfaCommit {
+                network: "mesh".into(),
+                transaction_id: "txn".into()
+            }),
+            "governance_mfa_commit"
+        );
+        assert_eq!(
+            request_operation(&Request::GovernanceMfaAbort {
+                network: "mesh".into(),
+                transaction_id: "txn".into()
+            }),
+            "governance_mfa_abort"
+        );
+    }
 }
