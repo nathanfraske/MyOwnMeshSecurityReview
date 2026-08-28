@@ -138,11 +138,12 @@ Status: discharged at source commit `7f0fdd8`.
 This is a separate, bounded semantic record accompanying the R3 discharge;
 it does not create another residual or widen the transport lane. It is bound
 to source commit
-`f566e5a1dc73edb97b8e72c3c34273f781416504` (`Restrict authority fork
-resolution to role cells`). Only a Role-cell Resolution may resolve a
-multi-head AuthorityUse lineage. Membership and OpenParticipation payload
-resolutions cannot synthesize an AuthorityUse join; an unresolved fork stays
-fail-closed and its losing RoleGrant remains inactive.
+`dc64c2d3ccd774c4eadce24c93b011083f62b4a7`. Only a Role-cell Resolution may
+resolve a multi-head AuthorityUse lineage. Membership and OpenParticipation
+payload resolutions may carry payload-local AuthorityUse witnesses, but those
+witnesses are non-persistent Role-lineage edges: they cannot synthesize or
+select an AuthorityUse join. An unresolved fork stays fail-closed and its
+losing RoleGrant remains inactive.
 
 The closure is evidenced by
 `authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers`,
@@ -150,12 +151,16 @@ The closure is evidenced by
 `finite_authority_fork_requires_complete_resolution_before_regrant`,
 `cross_cell_resolution_cannot_select_a_role_authority_fork`,
 `cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order`,
-and the `720`-permutation projection control
+`payload_resolution_does_not_join_a_transitive_role_fork`,
+`second_order_payload_resolution_cannot_join_the_role_authority_fork`,
+`second_order_payload_fork_converges_without_authority_join`,
+`open_participation_payload_fork_stays_in_its_ordinary_cell`, and the
+`720`-permutation projection control
 `finite_authority_fork_projection_converges_for_every_arrival_permutation`.
 Together they persist exact role-cell authority selection, reject payload
-resolution as an AuthorityUse selector, require complete typed resolution
-before regrant, keep the loser inactive, and prove arrival-order-independent
-projection.
+resolution as an AuthorityUse selector while retaining only local witnesses,
+require complete typed resolution before regrant, keep the loser inactive, and
+prove both the 120- and 720-permutation projection controls.
 
 ### R4 — driver-side pre-normalization attributes a departure to the named device
 
