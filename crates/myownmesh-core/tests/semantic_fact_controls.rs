@@ -1806,17 +1806,56 @@ fn stale_selector_follows_newer_typed_role_resolution() {
         .admit(q.clone())
         .expect("Q membership resolution admits");
     settled.admit(r.clone()).expect("R role revoke admits");
-    let role_resolution = authored(
-        &settled,
-        &owner_a_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
-            cited_heads: vec![q_id, r_id],
-            selected_head: r_id,
-        },
+    // Pick from a bounded, deterministic set of valid redundant-support
+    // profiles until the production IDs make the old LIFO walk observable:
+    // R must sort after T2, so pending.pop() would visit R first, follow its
+    // older T0 path, and potentially select the stale branch before T2's
+    // explicit R selector is considered.
+    let redundant_supports = [
         Vec::new(),
-    );
+        vec![membership_m.id],
+        vec![eviction_v.id],
+        vec![role_selection.id],
+        vec![regrant.id],
+        vec![owner_grant.id],
+        vec![membership_m.id, role_selection.id],
+        vec![eviction_v.id, role_selection.id],
+        vec![membership_m.id, regrant.id],
+        vec![eviction_v.id, regrant.id],
+        vec![role_selection.id, owner_grant.id],
+        vec![regrant.id, owner_grant.id],
+        vec![membership_m.id, eviction_v.id, role_selection.id],
+        vec![membership_m.id, eviction_v.id, regrant.id],
+        vec![role_selection.id, regrant.id, owner_grant.id],
+        vec![
+            membership_m.id,
+            eviction_v.id,
+            role_selection.id,
+            regrant.id,
+            owner_grant.id,
+        ],
+    ];
+    let role_resolution = redundant_supports
+        .into_iter()
+        .map(|support| {
+            authored(
+                &settled,
+                &owner_a_key,
+                FactBody::Resolution {
+                    cell: ExclusiveCell::role(controller.clone()),
+                    cited_heads: vec![q_id, r_id],
+                    selected_head: r_id,
+                },
+                support,
+            )
+        })
+        .find(|candidate| r_id > candidate.id)
+        .expect("bounded redundant support profiles produce R.id > T2.id");
     let role_resolution_id = role_resolution.id;
+    assert!(
+        r_id > role_resolution_id,
+        "R must sort after T2 so the old first-hit walk follows R -> T0"
+    );
     let mut after_selection = settled.clone();
     after_selection
         .admit(role_resolution.clone())

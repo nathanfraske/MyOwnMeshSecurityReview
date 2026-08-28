@@ -51,6 +51,20 @@ fn authored(
     .expect("projection authoring witness fact signs")
 }
 
+fn authored_with_sorted_support(
+    graph: &FactGraph,
+    key: &SigningKey,
+    body: FactBody,
+    support: Vec<FactId>,
+) -> SignedFact {
+    let author = author(key);
+    let witness = graph.authoring_witness(&body, &author);
+    let mut content = FactContent::from_authoring_witness(graph, body, &witness, support);
+    content.parents.sort();
+    content.parents.dedup();
+    SignedFact::sign(content, key).expect("projection redundant-support fact signs")
+}
+
 #[test]
 fn effective_membership_restoration_supersedes_stand_down_in_any_arrival_order() {
     let root_key = key(72);
@@ -936,15 +950,36 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     // T2 is signed by a distinct Owner and selects R.  U2 is a later root
     // regrant whose causal parents retain both the redundant R ancestor and
     // the exact T2 selector.
-    let t2 = authored(
-        &settled,
-        &owner_a_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
-            cited_heads: qr_heads,
-            selected_head: r.id,
-        },
-        Vec::new(),
+    // FactId is a SHA-256 digest, so the old traversal's first-hit order is
+    // not implied by causality.  Choose from the finite 32 subsets of known
+    // ancestors as redundant support; every option remains a valid signed
+    // T2 with the same cell, cited heads, and selected R branch.
+    let redundant_supports = [m.id, v.id, t0.id, regrant.id, grant_owner_a.id];
+    let mut t2_options = Vec::new();
+    for mask in 0u32..(1u32 << redundant_supports.len()) {
+        let support = redundant_supports
+            .iter()
+            .enumerate()
+            .filter_map(|(index, id)| ((mask & (1u32 << index)) != 0).then_some(*id))
+            .collect();
+        t2_options.push(authored_with_sorted_support(
+            &settled,
+            &owner_a_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(controller.clone()),
+                cited_heads: qr_heads.clone(),
+                selected_head: r.id,
+            },
+            support,
+        ));
+    }
+    let t2 = t2_options
+        .into_iter()
+        .find(|candidate| r.id > candidate.id)
+        .expect("bounded redundant support choices produce R > T2");
+    assert!(
+        r.id > t2.id,
+        "R.id > T2.id makes the old first-hit traversal visit R first"
     );
     let mut after_t2 = settled.clone();
     after_t2
