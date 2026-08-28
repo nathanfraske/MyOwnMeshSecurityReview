@@ -1361,6 +1361,68 @@ fn open_participation_payload_fork_stays_in_its_ordinary_cell() {
             Some(false),
             "a payload-local Q selects only its OpenParticipation cell"
         );
+
+        let nested_joined = authored(
+            &graph,
+            &subject_key,
+            FactBody::OpenParticipation {
+                device_id: subject.clone(),
+                joined: true,
+            },
+            Vec::new(),
+        );
+        let nested_left = authored(
+            &graph,
+            &subject_key,
+            FactBody::OpenParticipation {
+                device_id: subject.clone(),
+                joined: false,
+            },
+            Vec::new(),
+        );
+        let nested_cell = ExclusiveCell::open_participation(subject.clone());
+        graph
+            .admit(nested_joined.clone())
+            .expect("nested OpenParticipation branch admits");
+        graph
+            .admit(nested_left.clone())
+            .expect("nested OpenParticipation fork admits");
+        let mut nested_heads = graph.cell_heads(&nested_cell);
+        nested_heads.sort();
+        let nested_resolution = authored(
+            &graph,
+            &subject_key,
+            FactBody::Resolution {
+                cell: nested_cell,
+                cited_heads: nested_heads,
+                selected_head: nested_left.id,
+            },
+            Vec::new(),
+        );
+        let nested_subject_use = nested_resolution
+            .content
+            .authority_uses
+            .iter()
+            .find(|authority_use| authority_use.subject == subject)
+            .expect("nested payload Q carries an empty subject-use witness");
+        assert!(nested_subject_use.predecessors.is_empty());
+        graph
+            .admit(nested_resolution)
+            .expect("nested self-authored Open resolution admits");
+        assert!(
+            graph.authority_use_heads(&subject).is_empty(),
+            "nested payload resolutions never create AuthorityUse(subject) heads"
+        );
+        assert_eq!(
+            graph.authority_lineage(&subject).selected_branch(),
+            None,
+            "nested payload Q cannot select an authority branch"
+        );
+        assert_eq!(
+            graph.evaluator().effective_open_participation(&subject),
+            Some(false),
+            "nested payload projection follows its selected OpenParticipation head"
+        );
     } else {
         assert_eq!(
             graph.authority_lineage(&subject).heads(),
@@ -1615,4 +1677,236 @@ fn finite_authority_fork_requires_complete_resolution_before_regrant() {
         None,
         "O remains permanently inactive after Q selects R and N regrants C"
     );
+}
+
+#[test]
+fn self_authored_membership_resolution_cannot_select_the_role_loser() {
+    let root_key = key(140);
+    let controller_key = key(141);
+    let future_target = author(&key(143));
+    let bootstrap = closed_bootstrap(140, 140);
+    let controller = author(&controller_key);
+
+    let mut source = FactGraph::from_bootstrap(&bootstrap);
+    let grant = authored(
+        &source,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    source.admit(grant).expect("G controller grant admits");
+
+    // M and V are concurrent facts from the same C-authority base.  V is an
+    // Evict, so it advances both the Role(C) and Membership(C) cells while M
+    // advances only Membership(C).
+    let membership_m = authored(
+        &source,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let eviction_v = authored(
+        &source,
+        &root_key,
+        FactBody::Evict {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = source.clone();
+    fork.admit(membership_m.clone())
+        .expect("M membership head admits");
+    fork.admit(eviction_v.clone())
+        .expect("V eviction head admits");
+    let mut authority_heads = fork.authority_use_heads(&controller);
+    authority_heads.sort();
+    let mut expected_authority_heads = vec![membership_m.id, eviction_v.id];
+    expected_authority_heads.sort();
+    assert_eq!(authority_heads, expected_authority_heads);
+    assert_eq!(fork.evaluator().effective_role(&controller), None);
+    assert_eq!(fork.evaluator().effective_membership(&controller), None);
+    let role_selection = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: authority_heads,
+            selected_head: eviction_v.id,
+        },
+        Vec::new(),
+    );
+    fork.admit(role_selection.clone())
+        .expect("typed Role(C) selection of V admits");
+    assert_eq!(
+        fork.evaluator().effective_membership(&controller),
+        Some(false),
+        "the typed Role(C) selection projects V's eviction before Q"
+    );
+    let regrant = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    fork.admit(regrant.clone())
+        .expect("causal Owner regrant admits");
+    let post_n = fork.clone();
+
+    // Q and R are authored from the same exact post-N graph, so their arrival
+    // order cannot choose an authority branch.
+    let payload = post_n.clone();
+    let mut payload_heads = vec![membership_m.id, eviction_v.id];
+    payload_heads.sort();
+    let mut expected_payload_heads = vec![membership_m.id, eviction_v.id];
+    expected_payload_heads.sort();
+    assert_eq!(payload_heads, expected_payload_heads);
+    let q = authored(
+        &payload,
+        &controller_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::membership(controller.clone()),
+            cited_heads: payload_heads,
+            selected_head: membership_m.id,
+        },
+        Vec::new(),
+    );
+    let r = authored(
+        &payload,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let q_id = q.id;
+    let r_id = r.id;
+    let mut settled = post_n.clone();
+    settled
+        .admit(q.clone())
+        .expect("Q membership resolution admits");
+    settled.admit(r.clone()).expect("R role revoke admits");
+    let role_resolution = authored(
+        &settled,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![q_id, r_id],
+            selected_head: r_id,
+        },
+        Vec::new(),
+    );
+    let mut after_selection = settled.clone();
+    after_selection
+        .admit(role_resolution.clone())
+        .expect("typed Role(C) resolution over Q/R admits");
+    let regrant_after_selection = authored(
+        &after_selection,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    after_selection
+        .admit(regrant_after_selection.clone())
+        .expect("post-selection Owner regrant admits");
+    let future = authored(
+        &after_selection,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: future_target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+
+    for order in [[q.clone(), r.clone()], [r.clone(), q.clone()]] {
+        let mut graph = source.clone();
+        for fact in [
+            membership_m.clone(),
+            eviction_v.clone(),
+            role_selection.clone(),
+            regrant.clone(),
+        ] {
+            graph.admit(fact).expect("post-N Q/R fact admits");
+        }
+        for fact in order {
+            graph.admit(fact).expect("post-N Q/R fact admits");
+        }
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            None,
+            "R revokes C even when Q arrives first"
+        );
+        assert_eq!(
+            graph.evaluator().effective_membership(&controller),
+            None,
+            "the Q/R AuthorityUse fork keeps Membership(C) fail-closed"
+        );
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            None,
+            "the concurrent Q/R fork has no selected Role(C) branch"
+        );
+        assert!(
+            !graph
+                .evaluator()
+                .admits_closed_session(&controller, &controller),
+            "the revoked Role(C) keeps closed-session admission fail-closed"
+        );
+        let mut authority_heads = graph.authority_use_heads(&controller);
+        authority_heads.sort();
+        let mut expected_authority_heads = vec![q_id, r_id];
+        expected_authority_heads.sort();
+        assert_eq!(
+            authority_heads, expected_authority_heads,
+            "Q and R form the complete concurrent AuthorityUse(C) heads"
+        );
+
+        graph
+            .admit(role_resolution.clone())
+            .expect("typed Role(C) resolution selects R from the complete Q/R fork");
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            Some(r_id),
+            "the typed Role(C) resolution, not payload Q, selects R"
+        );
+        graph
+            .admit(regrant_after_selection.clone())
+            .expect("the causal post-selection Owner regrant admits");
+        graph
+            .admit(future.clone())
+            .expect("post-regrant controller operation admits");
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            Some(Role::Owner),
+            "N restores C as Owner without reviving Q"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&future_target),
+            Some(Role::Member),
+            "the regranted Owner can author a future operation"
+        );
+        assert_eq!(
+            graph.evaluator().effective_membership(&controller),
+            None,
+            "Q's membership restoration remains suppressed after regrant"
+        );
+        assert_eq!(
+            graph
+                .projection()
+                .value(&ExclusiveCell::membership(controller.clone())),
+            None,
+            "Q cannot become the effective Membership(C) projection"
+        );
+    }
 }
