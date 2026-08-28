@@ -369,10 +369,10 @@ impl FactGraph {
         let FactBody::Resolution { cell, .. } = body else {
             return false;
         };
-        Self::resolution_authority_subject(cell) == Some(subject)
-    }
-
-    fn resolution_authority_subject(cell: &ExclusiveCell) -> Option<&DeviceId> {
+        // A payload resolution may carry the exact AuthorityUse predecessor
+        // set for its own subject. This is separate from the Role-only rule
+        // below that allows a resolution to select a persistent authority
+        // branch across later re-grants.
         match cell {
             ExclusiveCell::Role {
                 subject: cell_subject,
@@ -382,8 +382,19 @@ impl FactGraph {
             }
             | ExclusiveCell::OpenParticipation {
                 subject: cell_subject,
+            } => cell_subject == subject,
+            ExclusiveCell::Decision { .. } => false,
+        }
+    }
+
+    fn resolution_authority_subject(cell: &ExclusiveCell) -> Option<&DeviceId> {
+        match cell {
+            ExclusiveCell::Role {
+                subject: cell_subject,
             } => Some(cell_subject),
-            ExclusiveCell::Decision { .. } => None,
+            ExclusiveCell::Membership { .. }
+            | ExclusiveCell::OpenParticipation { .. }
+            | ExclusiveCell::Decision { .. } => None,
         }
     }
 
@@ -2190,13 +2201,34 @@ mod tests {
             &[(participant.clone(), Vec::new())],
         );
         open_graph
-            .admit(participation_resolution)
+            .admit(participation_resolution.clone())
             .expect("self-authored participation resolution admits");
         assert_eq!(
             open_graph
                 .evaluator()
                 .effective_open_participation(&participant),
             Some(true)
+        );
+        assert_eq!(
+            open_graph.authority_lineage(&participant).selected_branch(),
+            None,
+            "Open payload resolution must not select an authority branch"
+        );
+        let stale_payload_resolution = fact_with_authority_predecessors(
+            &open,
+            &participant_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::open_participation(participant.clone()),
+                cited_heads: vec![participation.id, left.id],
+                selected_head: left.id,
+            },
+            vec![participation_resolution.id, participation.id, left.id],
+            &[(participant.clone(), Vec::new())],
+        );
+        assert_eq!(
+            open_graph.admit(stale_payload_resolution),
+            Err(SemanticError::ResolutionNotCurrent),
+            "Open payload resolution must use the exact current cell heads"
         );
         let foreign_resolution = fact(
             &open,

@@ -255,6 +255,146 @@ fn finite_authority_fork_projection_converges_for_every_arrival_permutation() {
 }
 
 #[test]
+fn cross_cell_payload_resolution_preserves_authority_fork_in_any_arrival_order() {
+    let root_key = key(118);
+    let controller_key = key(119);
+    let bootstrap = bootstrap(118, 118);
+    let controller = author(&controller_key);
+    let target = author(&key(120));
+    let mut source = FactGraph::from_bootstrap(&bootstrap);
+
+    let grant = authored(
+        &source,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    source
+        .admit(grant.clone())
+        .expect("G controller grant admits");
+    let operation = authored(
+        &source,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &source,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = source.clone();
+    fork.admit(operation.clone())
+        .expect("O controller operation admits");
+    fork.admit(revoke.clone()).expect("R root revoke admits");
+    let authority_heads = fork.authority_use_heads(&controller);
+    assert_eq!(
+        authority_heads.len(),
+        2,
+        "G/O/R establishes the concurrent AuthorityUse fork before the payload"
+    );
+
+    // This payload cites the exact AuthorityUse(C) fork but resolves a
+    // different exclusive cell. It must not turn O into a selected authority
+    // branch or make O's RoleGrant(X) effective.
+    let membership_resolution = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::membership(controller.clone()),
+            cited_heads: authority_heads,
+            selected_head: operation.id,
+        },
+        Vec::new(),
+    );
+    let candidates = [grant, operation, revoke];
+    let mut order = [0, 1, 2];
+    let mut orders = Vec::new();
+    fn permutations(order: &mut [usize; 3], start: usize, output: &mut Vec<[usize; 3]>) {
+        if start == order.len() {
+            output.push(*order);
+            return;
+        }
+        for index in start..order.len() {
+            order.swap(start, index);
+            permutations(order, start + 1, output);
+            order.swap(start, index);
+        }
+    }
+    permutations(&mut order, 0, &mut orders);
+    assert_eq!(
+        orders.len(),
+        6,
+        "the control covers every G/O/R arrival order"
+    );
+
+    let mut expected = None;
+    for permutation in orders {
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        for index in permutation {
+            assert!(matches!(
+                graph.admit(candidates[index].clone()),
+                Ok(Admission::Inserted | Admission::Quarantined { .. })
+            ));
+        }
+        graph
+            .retry_quarantined()
+            .expect("G/O/R dependencies eventually resolve");
+        assert!(graph.quarantined().next().is_none());
+        assert_eq!(graph.ids().count(), candidates.len());
+
+        // Attempt the exact same cross-cell payload only after every G/O/R
+        // fact is present. Rejection here is intentionally distinct from a
+        // missing-parent quarantine: a complete AuthorityUse fork still
+        // cannot be resolved through Membership(C).
+        assert_eq!(
+            graph.admit(membership_resolution.clone()),
+            Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+            "Membership(C) payload resolution is rejected after the fork is complete"
+        );
+        assert_eq!(
+            graph.ids().count(),
+            3,
+            "rejected cross-cell payload does not enter the canonical graph"
+        );
+        assert_eq!(
+            graph.authority_lineage(&controller).heads().len(),
+            2,
+            "every arrival order preserves the unresolved AuthorityUse(C) fork"
+        );
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            None,
+            "Membership(C) cannot select an AuthorityUse(C) branch"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            None,
+            "the revoked controller remains inactive"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&target),
+            None,
+            "the losing O/RoleGrant(X) remains inactive"
+        );
+        if let Some(previous) = &expected {
+            assert_eq!(graph.projection(), *previous);
+        } else {
+            expected = Some(graph.projection());
+        }
+    }
+}
+
+#[test]
 fn incomparable_heads_fail_closed_until_full_head_resolution() {
     let root_key = key(11);
     let left_controller_key = key(12);

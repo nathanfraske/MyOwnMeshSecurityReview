@@ -987,6 +987,123 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
 }
 
 #[test]
+fn cross_cell_resolution_cannot_select_a_role_authority_fork() {
+    let root_key = key(124);
+    let controller_key = key(125);
+    let bootstrap = closed_bootstrap(124, 124);
+    let controller = author(&controller_key);
+    let target = author(&key(126));
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+
+    let grant = authored(
+        &graph,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(grant.clone())
+        .expect("G controller grant admits");
+    let operation = authored(
+        &graph,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &graph,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    graph
+        .admit(operation.clone())
+        .expect("O controller operation admits");
+    graph.admit(revoke.clone()).expect("R root revoke admits");
+    let authority_heads = graph.authority_use_heads(&controller);
+    assert_eq!(
+        authority_heads.len(),
+        2,
+        "G/O/R establishes the concurrent AuthorityUse fork before the payload"
+    );
+
+    // A Membership(C) resolution may cite the exact AuthorityUse(C) fork,
+    // but it is not a typed selection of that lineage. The cross-cell
+    // payload is rejected before it can collapse the fork.
+    let membership_resolution = authored(
+        &graph,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::membership(controller.clone()),
+            cited_heads: authority_heads.clone(),
+            selected_head: operation.id,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        graph.admit(membership_resolution),
+        Err(SemanticError::IncompleteResolution),
+        "Membership(C) cannot bypass the AuthorityUse(C) resolution type"
+    );
+    assert_eq!(
+        graph.authority_lineage(&controller).heads().len(),
+        2,
+        "the rejected payload leaves the exact AuthorityUse(C) fork intact"
+    );
+    assert!(
+        !graph.authority_lineage(&controller).is_singular(),
+        "an unresolved AuthorityUse(C) fork remains non-singular"
+    );
+    assert_eq!(
+        graph.authority_lineage(&controller).selected_branch(),
+        None,
+        "a Membership(C) payload cannot select AuthorityUse(C)"
+    );
+    assert_eq!(
+        graph.evaluator().effective_role(&controller),
+        None,
+        "the revoked controller remains inactive"
+    );
+    assert_eq!(
+        graph.evaluator().effective_role(&target),
+        None,
+        "the losing O/RoleGrant(X) remains inactive"
+    );
+
+    // OpenParticipation resolutions are profile-gated. Even when a caller
+    // can construct the typed payload and cite the exact fork, Closed
+    // admission must reject it before it can affect either projection.
+    let open_resolution = authored(
+        &graph,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::open_participation(controller.clone()),
+            cited_heads: authority_heads,
+            selected_head: revoke.id,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        graph.admit(open_resolution),
+        Err(SemanticError::DomainMismatch),
+        "Closed graphs cannot use OpenParticipation(C) to select authority"
+    );
+    assert_eq!(
+        graph.evaluator().effective_role(&target),
+        None,
+        "a rejected participation payload leaves the role loser inactive"
+    );
+}
+
+#[test]
 fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
     let root_key = key(69);
     let controller_key = key(70);
