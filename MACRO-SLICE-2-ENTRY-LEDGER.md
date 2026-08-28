@@ -41,17 +41,33 @@ be answered by anyone: there is no unresolved R4 choice left at the 7.3 gate. A
 discharge is evidence that the defect is closed, and it is not a ratification of
 R4 by the operator.
 
-### R1 — `STORE_LOCK` is process-local
+### R1 — durable semantic owner/store
 
-Custody-store mutations are serialized by a process-wide mutex with no file
-lock. The deployment invariant is one writable MyOwnMesh daemon per state
-directory; two daemons sharing one secrets directory are outside the current
-guarantee.
+The durable semantic owner is the single writer for one semantic slot. Its
+cross-process lease is held for the owner lifetime, its snapshot combines the
+canonical fact graph, projection commitment, provisional custody, and proof
+records, and publication is atomic. A live replacement cannot open the slot;
+after a hard-dead owner the kernel-owned lease is released and the next owner
+can reopen and continue from the last complete snapshot.
 
-Owner: the Macro-slice 2 durable-store work. This is not discharged by adding a
-custody-only file lock.
+The closing implementation is the durable-store sequence `f2a0f31` (store),
+`d6dd84d` (semantic facts and provisional custody), `1a8285b` (durable proof
+outbox), and hardening in `f29207d`, `eaba95b`, and `57ca3c5`, integrated at
+`55bafe5`.
 
-Status: open.
+Closing controls are
+`semantic::store::child_process_contention_and_hard_death_release_the_writer`,
+`semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`,
+`semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`,
+`durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`,
+and
+`durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append`.
+These cover live-owner exclusion, hard-death reopen, graph/custody/proof union,
+restart reconstruction, and stale-owner shutdown fencing.
+
+Owner: the Macro-slice 2 durable-store work.
+
+Status: discharged at `55bafe5`.
 
 ### R2 — hard process death can strand a provisional enrollment
 
@@ -64,7 +80,28 @@ recovery codes were never delivered.
 Owner: the Macro-slice 2 durable-state work. The target is durable provisional
 recovery, not a retry protocol or custody transaction framework.
 
-Status: open.
+The package-level regression control
+`crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`
+now drives both sides of the boundary with a real child process and pipe
+barriers: a prepared enrollment is hard-stopped before its acknowledgement,
+while a delivered enrollment is acknowledged before the child keeps it. The
+production custody record carries its exact process incarnation and OS owner
+lease, startup reclaims only lease-free provisional records before exposing the
+control socket, and `HandoffGuard` retains exact rollback custody through
+`Wrote::Sent` until the delivered disposition commits it. Recovery probes the
+exact persisted-secret lease for every provisional record; process-nonce
+equality is diagnostic, not liveness.
+
+Closing controls are the package-level child hard-death control above,
+`custody::tests::v4_r2_hard_death_recovery_removes_only_an_old_process_provisional`,
+`custody::tests::v4_r2_committed_handoff_survives_restart_recovery`,
+`custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, and
+`control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_rolls_back`.
+Together they distinguish prepared from delivered material, preserve committed
+custody across restart, reclaim same-process orphans by kernel-lease truth, and
+roll back a sent-but-unsettled response on task cancellation.
+
+Status: discharged at source commit `7f0fdd8`.
 
 ### R3 — an offline evicted Device has no durable proof delivery
 
@@ -389,7 +426,7 @@ evidence, not its sole copy.
 
 | Residual | Discharged at | Closing control |
 | --- | --- | --- |
-| R1 | — | — |
-| R2 | — | — |
+| R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
+| R2 | `7f0fdd8` | `v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `custody::tests::v4_r2_hard_death_recovery_removes_only_an_old_process_provisional`, `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`, `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, `control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_rolls_back` |
 | R3 | — | — |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |
