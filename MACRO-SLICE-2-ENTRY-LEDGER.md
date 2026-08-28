@@ -138,7 +138,7 @@ Status: discharged at source commit `7f0fdd8`.
 This is a separate, bounded semantic record accompanying the R3 discharge;
 it does not create another residual or widen the transport lane. It is bound
 to source commit
-`bfb561a525a1794f56f6a987a66c91d0629a26fa`. A Role-cell Resolution is the
+`0bf6057`. A Role-cell Resolution is the
 only persistent selector for a multi-head AuthorityUse lineage. A
 distinct-author Membership payload Resolution remains payload-local and
 cannot join Role lineage. Self-authored Closed Membership retains its author
@@ -152,6 +152,11 @@ causally maximal matching Role-cell Resolution in the sole current-head
 ancestry, independently of FactId or parent traversal order. Zero matching
 selectors or multiple incomparable maximal selectors fail closed; redundant
 ancestor parents cannot revive an older selector.
+
+Both stale-selector controls choose a bounded deterministic valid redundant-
+support T2 and assert `R.id > T2.id`. Canonical sorted parents plus the old
+`Vec::pop` traversal would visit `R` to the older T0 first, while the fixed
+selector chooses the newer maximal T2.
 
 The closure is evidenced by
 `authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers`,
