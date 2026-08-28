@@ -47,11 +47,35 @@ struct SourceLease {
     live: Arc<AtomicUsize>,
 }
 
+struct AccountingProvider {
+    live: Arc<AtomicUsize>,
+    refuse_relays: Arc<AtomicBool>,
+}
+
+struct AccountingLease {
+    live: Arc<AtomicUsize>,
+}
+
+impl AccountingProvider {
+    fn lease(&self) -> Box<dyn DeliveryLease> {
+        self.live.fetch_add(1, Ordering::SeqCst);
+        Box::new(AccountingLease {
+            live: Arc::clone(&self.live),
+        })
+    }
+}
+
 impl DeliveryLease for NoopLease {
     fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {}
 }
 
 impl DeliveryLease for SourceLease {
+    fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl DeliveryLease for AccountingLease {
     fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
         self.live.fetch_sub(1, Ordering::SeqCst);
     }
@@ -71,6 +95,99 @@ impl DeliveryLease for CountingLease {
                 self.stats.shutdown.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}
+        }
+    }
+}
+
+impl DeliveryProvider for AccountingProvider {
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_session_identity(
+        &self,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_session_record(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_session_set_node(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_session_set_growth(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_attempt_record(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_attempt_key(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_attempt_map_growth(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve_relay_map_growth(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(self.lease())
+    }
+
+    fn reserve(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        if self.refuse_relays.load(Ordering::SeqCst) {
+            Err(DeliveryRefusal::Provider("remote pressure".into()))
+        } else {
+            Ok(self.lease())
         }
     }
 }
@@ -536,4 +653,143 @@ fn relay_selection_and_reconnect_generation_are_explicit_controls() {
         room_a, room_b,
         "a successor network cannot reuse the old room ABA"
     );
+}
+
+#[test]
+fn remote_pressure_refusal_releases_all_attempt_custody() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let refuse_relays = Arc::new(AtomicBool::new(true));
+    let store = DeliveryStore::new(Arc::new(AccountingProvider {
+        live: Arc::clone(&live),
+        refuse_relays: Arc::clone(&refuse_relays),
+    }));
+    let (session, _) = store.open_session();
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        21077,
+        Vec::new(),
+        "pressure-refusal".into(),
+        1,
+    );
+    let report = store.admit(
+        "pressure-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+
+    assert_eq!(report.accepted_sessions, 0);
+    assert_eq!(report.refused.len(), 1);
+    assert!(report.attempt_refusal.is_some());
+    assert!(store.pending(&session).is_empty());
+    assert!(
+        live.load(Ordering::SeqCst) > 0,
+        "the live attempt is retryable"
+    );
+    assert_eq!(
+        store.finish_attempt("pressure-attempt", DeliveryTerminal::Cancelled),
+        0
+    );
+    store.close_session(session, DeliveryTerminal::Shutdown);
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "a refused remote emission leaves no provider-owned attacker work"
+    );
+}
+
+#[test]
+fn refused_emission_reconnects_and_drains_after_pressure_clears() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let refuse_relays = Arc::new(AtomicBool::new(true));
+    let store = DeliveryStore::new(Arc::new(AccountingProvider {
+        live: Arc::clone(&live),
+        refuse_relays: Arc::clone(&refuse_relays),
+    }));
+    let (old, _) = store.open_session();
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        21077,
+        Vec::new(),
+        "retry-after-pressure".into(),
+        2,
+    );
+    let event_id = event.id.clone();
+    let report = store.admit(
+        "retry-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+    assert_eq!(report.accepted_sessions, 0);
+    store.close_session(old, DeliveryTerminal::Cancelled);
+    refuse_relays.store(false, Ordering::SeqCst);
+
+    let (fresh, refusals) = store.open_session();
+    assert!(refusals.is_empty());
+    assert_eq!(store.pending(&fresh), vec![event_id.clone()]);
+    assert!(store.settle(&fresh, &event_id, DeliveryTerminal::Accepted));
+    store.close_session(fresh, DeliveryTerminal::Shutdown);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn last_carrier_copy_releases_provider_custody_exactly_once() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let store = DeliveryStore::new(Arc::new(AccountingProvider {
+        live: Arc::clone(&live),
+        refuse_relays: Arc::new(AtomicBool::new(false)),
+    }));
+    let (first, _) = store.open_session();
+    let (second, _) = store.open_session();
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        21077,
+        Vec::new(),
+        "last-copy".into(),
+        3,
+    );
+    let event_id = event.id.clone();
+    let report = store.admit(
+        "last-copy-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+    assert_eq!(report.accepted_sessions, 2);
+    assert!(store.settle(&first, &event_id, DeliveryTerminal::Accepted));
+    assert!(
+        live.load(Ordering::SeqCst) > 0,
+        "the second relay still owns a copy"
+    );
+    assert!(store.settle(&second, &event_id, DeliveryTerminal::Accepted));
+    store.close_session(first, DeliveryTerminal::Shutdown);
+    store.close_session(second, DeliveryTerminal::Shutdown);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn source_closure_cancels_pending_attempt_and_releases_custody() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let store = DeliveryStore::new(Arc::new(AccountingProvider {
+        live: Arc::clone(&live),
+        refuse_relays: Arc::new(AtomicBool::new(false)),
+    }));
+    let (session, _) = store.open_session();
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        21077,
+        Vec::new(),
+        "source-closure".into(),
+        4,
+    );
+    let event_id = event.id.clone();
+    let report = store.admit(
+        "source-closure-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+    assert_eq!(report.accepted_sessions, 1);
+    assert_eq!(store.pending(&session), vec![event_id]);
+    assert!(live.load(Ordering::SeqCst) > 0);
+
+    assert_eq!(
+        store.shutdown(),
+        1,
+        "source closure cancels the live carrier"
+    );
+    assert_eq!(live.load(Ordering::SeqCst), 0);
 }

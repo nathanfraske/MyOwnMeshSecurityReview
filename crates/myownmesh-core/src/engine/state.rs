@@ -3207,10 +3207,12 @@ impl NetworkState {
         {
             return Ok(false);
         }
-        match self.peers.with_current_durable_outbox(owner, || {
-            self.durable_proof_outbox
-                .settle(self.mesh_context_id, delivery_id)
-        }) {
+        match self
+            .peers
+            .with_current_durable_outbox_unclaimed(owner, delivery_id, || {
+                self.durable_proof_outbox
+                    .settle(self.mesh_context_id, delivery_id)
+            }) {
             Some(result) => {
                 result.map_err(|error| Error::Network(format!("durable proof settle: {error}")))
             }

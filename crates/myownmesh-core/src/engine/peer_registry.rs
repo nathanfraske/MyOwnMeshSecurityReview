@@ -102,6 +102,21 @@ pub struct PeerOwnerToken {
     worker: Option<Arc<crate::transport::WebRtcConnectorWorker>>,
 }
 
+/// Weak delayed-work witness for one exact peer installation.
+///
+/// Unlike [`PeerOwnerToken`], this carries no custody while a timer is
+/// asleep. Upgrade reconstructs the exact token only while the peer,
+/// installation marker, and (when stamped) worker are all still alive; the
+/// normal registry fences then perform the currentness and replacement checks.
+#[derive(Clone)]
+pub(super) struct WeakPeerOwnerToken {
+    peer: Weak<PeerConnection>,
+    installation: Weak<()>,
+    binding_namespace: [u8; 16],
+    binding_epoch: u64,
+    worker: Option<Weak<crate::transport::WebRtcConnectorWorker>>,
+}
+
 /// A restart-serializable coordinate for one exact peer installation.  The
 /// Arc installation identity is deliberately not persisted; this value is
 /// only a durable witness that must be re-bound to a live owner under the
@@ -154,6 +169,18 @@ impl PeerOwnerToken {
         }
     }
 
+    /// Downgrade delayed work to an exact witness that carries no peer,
+    /// installation, or worker ownership while it waits.
+    pub(super) fn downgrade(&self) -> WeakPeerOwnerToken {
+        WeakPeerOwnerToken {
+            peer: Arc::downgrade(&self.peer),
+            installation: Arc::downgrade(&self.installation),
+            binding_namespace: self.binding_namespace,
+            binding_epoch: self.binding_epoch,
+            worker: self.worker.as_ref().map(Arc::downgrade),
+        }
+    }
+
     pub(super) fn worker(&self) -> Option<&Arc<crate::transport::WebRtcConnectorWorker>> {
         self.worker.as_ref()
     }
@@ -199,6 +226,25 @@ impl PeerOwnerToken {
             binding_epoch: 0,
             worker: None,
         }
+    }
+}
+
+impl WeakPeerOwnerToken {
+    /// Reconstitute strong exact custody only for a still-live installation.
+    /// A stamped worker is mandatory when its original worker is stamped; a
+    /// timer can therefore never silently fall back to an un-stamped owner.
+    pub(super) fn upgrade(&self) -> Option<PeerOwnerToken> {
+        let worker = match self.worker.as_ref() {
+            Some(worker) => Some(worker.upgrade()?),
+            None => None,
+        };
+        Some(PeerOwnerToken {
+            peer: self.peer.upgrade()?,
+            installation: self.installation.upgrade()?,
+            binding_namespace: self.binding_namespace,
+            binding_epoch: self.binding_epoch,
+            worker,
+        })
     }
 }
 
@@ -738,6 +784,30 @@ impl PeerRegistry {
         effect: impl FnOnce() -> R,
     ) -> Option<R> {
         self.with_current(owner, |_| effect())
+    }
+
+    /// Run a generic durable settlement only when no speculative sidecar owns
+    /// the exact delivery. The installation and sidecar check share this
+    /// mutation fence, so a promoted owner cannot settle a delivery after a
+    /// candidate has bound it, nor can a stale owner redirect the operation.
+    pub(super) fn with_current_durable_outbox_unclaimed<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        delivery_id: crate::semantic::ProofDeliveryId,
+        effect: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        let current = self.peers.get(owner.device_id())?;
+        if !Arc::ptr_eq(&current.value().installation, &owner.installation)
+            || !owner.worker_matches(&current.value().peer)
+            || current
+                .value()
+                .peer
+                .speculative_proof_delivery_owned(delivery_id)
+        {
+            return None;
+        }
+        Some(effect())
     }
 
     pub(crate) fn owner(&self, device_id: &str) -> Option<PeerOwnerToken> {

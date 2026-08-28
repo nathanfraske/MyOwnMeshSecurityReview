@@ -18,7 +18,10 @@ use crate::config::{MeshConfig, NetworkConfig, TopologyMode};
 use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
 use crate::engine::state::{NetworkCmd, NetworkState};
-use crate::engine::{join_open_participation, spawn_network_in_mesh_scope};
+use crate::engine::{
+    create_network_in_mesh_scope, import_network_in_mesh_scope, join_open_participation,
+    spawn_network_in_mesh_scope,
+};
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, MeshPhase};
 use crate::identity::Identity;
@@ -203,15 +206,7 @@ impl MeshHandle {
     /// until [`JoinedNetwork::leave`] is called (or the
     /// `JoinedNetwork` is dropped).
     pub async fn join(&self, mut config: NetworkConfig) -> Result<JoinedNetwork> {
-        if self
-            .mesh
-            .inner
-            .transport
-            .connector_resource_report()
-            .is_none()
-        {
-            return Err(Error::ConnectorPolicyRequired);
-        }
+        self.require_connector_capable()?;
         // Normalize the network id so signaling derivation is
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
@@ -229,7 +224,84 @@ impl MeshHandle {
             let _ = driver.await;
             return Err(error);
         }
-        let rpc = Rpc::attach(&state)?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    /// Create and join a new Closed network through the Mesh-owned authority.
+    ///
+    /// The creation record is signed and persisted before the engine becomes
+    /// observable. `creation_id` is caller-owned semantic input; it does not
+    /// select a resource provider or bypass the Mesh's existing scopes.
+    pub async fn create_network(
+        &self,
+        mut config: NetworkConfig,
+        creation_id: [u8; 32],
+    ) -> Result<JoinedNetwork> {
+        self.require_connector_capable()?;
+        config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
+        let (state, driver) = create_network_in_mesh_scope(
+            config.clone(),
+            self.mesh.inner.identity.clone(),
+            self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
+            &self.mesh.inner.local_application_resources,
+            creation_id,
+        )
+        .await?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    /// Import and join an existing Closed network through the Mesh-owned
+    /// authority. The expected context fences the import; the supplied record
+    /// remains the only authority-bearing bootstrap input.
+    pub async fn import_network(
+        &self,
+        mut config: NetworkConfig,
+        expected_context_id: crate::semantic::MeshContextId,
+        record: crate::semantic::BootstrapRecord,
+    ) -> Result<JoinedNetwork> {
+        self.require_connector_capable()?;
+        config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
+        let (state, driver) = import_network_in_mesh_scope(
+            config.clone(),
+            self.mesh.inner.identity.clone(),
+            self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
+            &self.mesh.inner.local_application_resources,
+            expected_context_id,
+            record,
+        )
+        .await?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    fn require_connector_capable(&self) -> Result<()> {
+        if self
+            .mesh
+            .inner
+            .transport
+            .connector_resource_report()
+            .is_none()
+        {
+            return Err(Error::ConnectorPolicyRequired);
+        }
+        Ok(())
+    }
+
+    async fn finish_joined_network(
+        &self,
+        config: NetworkConfig,
+        state: Arc<NetworkState>,
+        driver: tokio::task::JoinHandle<()>,
+    ) -> Result<JoinedNetwork> {
+        let rpc = match Rpc::attach(&state) {
+            Ok(rpc) => rpc,
+            Err(error) => {
+                state.request_shutdown();
+                let _ = driver.await;
+                return Err(error.into());
+            }
+        };
 
         // Fan-out per-network events into the mesh-wide broadcaster.
         let mesh_events_tx = self.mesh.inner.events_tx.clone();

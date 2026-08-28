@@ -239,7 +239,25 @@ fn test_departure_control() -> crate::protocol::SessionControl {
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
 /// driver task (waitable for clean shutdown).
+#[cfg(feature = "transport-lab")]
 pub async fn spawn_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    spawn_network_impl(config, identity, transport).await
+}
+
+#[cfg(not(feature = "transport-lab"))]
+pub async fn spawn_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    spawn_network_impl(config, identity, transport).await
+}
+
+async fn spawn_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
     transport: Transport,
@@ -262,7 +280,27 @@ pub async fn spawn_network(
 /// Create and durably install the local Closed bootstrap before exposing an
 /// engine for it. The creation id is caller-owned semantic input; the local
 /// signing key is the only authority root accepted by this profile.
+#[cfg(feature = "transport-lab")]
 pub async fn create_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    creation_id: [u8; 32],
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    create_network_impl(config, identity, transport, creation_id).await
+}
+
+#[cfg(not(feature = "transport-lab"))]
+pub async fn create_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    creation_id: [u8; 32],
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    create_network_impl(config, identity, transport, creation_id).await
+}
+
+async fn create_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
     transport: Transport,
@@ -291,7 +329,29 @@ pub async fn create_network_in_instance_root(
 /// Import and durably install a caller-provided bootstrap only after it has
 /// matched the locally expected semantic context. The expected context id is
 /// an import constraint, never a replacement for record verification.
+#[cfg(feature = "transport-lab")]
 pub async fn import_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    import_network_impl(config, identity, transport, expected_context_id, record).await
+}
+
+#[cfg(not(feature = "transport-lab"))]
+pub async fn import_network(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    import_network_impl(config, identity, transport, expected_context_id, record).await
+}
+
+async fn import_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
     transport: Transport,
@@ -368,6 +428,58 @@ pub(crate) async fn spawn_network_in_mesh_scope(
     .await
 }
 
+/// Create a Closed network below the already-issued Mesh scopes.
+///
+/// This is the handle facade's only creation seam. Keeping bootstrap
+/// verification and driver construction below the caller's exact scopes means
+/// creation cannot silently install a second process authority owner.
+pub(crate) async fn create_network_in_mesh_scope(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    mesh_scope: &MeshRuntimeResourceScope,
+    local_resources: &LocalApplicationResourceScope,
+    creation_id: [u8; 32],
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = create_local_bootstrap(&config, &identity, None, creation_id)?;
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        mesh_scope,
+        local_resources,
+        bootstrap,
+        None,
+    )
+    .await
+}
+
+/// Import a Closed network below the already-issued Mesh scopes.
+///
+/// The expected context is an import constraint; the persisted record remains
+/// the authority-bearing input and is verified before the driver is exposed.
+pub(crate) async fn import_network_in_mesh_scope(
+    config: NetworkConfig,
+    identity: Arc<Identity>,
+    transport: Transport,
+    mesh_scope: &MeshRuntimeResourceScope,
+    local_resources: &LocalApplicationResourceScope,
+    expected_context_id: MeshContextId,
+    record: BootstrapRecord,
+) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+    let bootstrap = import_local_bootstrap(&config, None, expected_context_id, record)?;
+    spawn_network_in_mesh_scope_with_verified_bootstrap(
+        config,
+        identity,
+        transport,
+        mesh_scope,
+        local_resources,
+        bootstrap,
+        None,
+    )
+    .await
+}
+
 async fn spawn_network_with_verified_bootstrap(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -420,7 +532,17 @@ async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
 /// Open network joins once; a persisted negative participation head re-enters
 /// through the causal rejoin API; an already-positive head is left untouched.
 /// Closed networks have no local Open lifecycle fact to manufacture.
+#[cfg(feature = "transport-lab")]
 pub async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
+    join_open_participation_impl(state).await
+}
+
+#[cfg(not(feature = "transport-lab"))]
+pub(crate) async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
+    join_open_participation_impl(state).await
+}
+
+async fn join_open_participation_impl(state: &Arc<NetworkState>) -> Result<()> {
     if !matches!(
         state.verified_bootstrap().policy(),
         VerifiedProjectPolicy::Open
@@ -21974,6 +22096,42 @@ mod tests {
         .expect("W1 proof send does not hang")
         .expect("the proof is sent only by W1");
         drop(work);
+
+        // The promoted W0 channel is a real production inbound route, but it
+        // is not the carrier bound to this durable proof.  Drive the same
+        // generic message reducer used by that route with an otherwise exact
+        // ACK and prove that it cannot settle W1's sidecar obligation or
+        // trigger its Deny/retirement path.
+        let promoted_ack = serde_json::to_vec(&MeshMessage::ProofAck(
+            ProofAckMessage::for_delivery(&delivery),
+        ))
+        .expect("the promoted-W0 ACK serializes");
+        handle_exact_promoted_message(&state, &owner, &_w0, Bytes::from(promoted_ack)).await;
+        assert!(
+            state
+                .pending_durable_proof_outbox()
+                .expect("the promoted-W0 ACK leaves the durable proof observable")
+                .iter()
+                .any(|current| current.delivery_id == delivery.delivery_id),
+            "a generic promoted-W0 ACK cannot settle the W1-bound proof"
+        );
+        assert!(
+            fixture
+                .peer
+                .speculative_is_exact(correlation_w1, &candidate_w1),
+            "a generic promoted-W0 ACK cannot retire W1"
+        );
+        assert!(
+            fixture
+                .peer
+                .speculative_is_exact(correlation_w2, &candidate_w2),
+            "a generic promoted-W0 ACK cannot affect W2"
+        );
+        assert_eq!(
+            fixture.peer.promoted_channel_count(),
+            1,
+            "a generic promoted-W0 ACK leaves W0 promoted"
+        );
 
         let wrong_context = ProofAckMessage {
             context_id: crate::semantic::MeshContextId::from_bytes([0xA1; 32]),

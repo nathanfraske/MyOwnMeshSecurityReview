@@ -61,6 +61,73 @@ impl AuthorityUse {
     }
 }
 
+/// The semantic owner's typed authority relation for one subject.
+///
+/// `heads` is the complete current AuthorityUse head set, calculated from the
+/// causal graph rather than copied from a caller. An ordinary operation is
+/// authorizable only when this relation is singular (or empty for the
+/// bootstrap root). A typed `Resolution` may cite the complete conflicting
+/// set and select one branch; once admitted, that resolution is itself the
+/// sole lineage head for descendants and re-grants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AuthorityLineage {
+    subject: DeviceId,
+    heads: Vec<FactId>,
+    selected_branch: Option<FactId>,
+}
+
+impl AuthorityLineage {
+    pub(crate) fn from_heads(
+        subject: DeviceId,
+        mut heads: Vec<FactId>,
+        selected_branch: Option<FactId>,
+    ) -> Self {
+        heads.sort();
+        heads.dedup();
+        Self {
+            subject,
+            heads,
+            selected_branch,
+        }
+    }
+
+    pub fn subject(&self) -> &DeviceId {
+        &self.subject
+    }
+
+    pub fn heads(&self) -> &[FactId] {
+        &self.heads
+    }
+
+    pub fn effective_head(&self) -> Option<FactId> {
+        (self.heads.len() == 1).then_some(self.heads[0])
+    }
+
+    /// Return the branch selected by the effective typed resolution, when
+    /// this lineage descends from one. The selection remains attached to the
+    /// subject relation even after a later regrant replaces the raw head.
+    pub fn selected_branch(&self) -> Option<FactId> {
+        self.selected_branch
+    }
+
+    /// Whether this relation has at most one effective head. An empty
+    /// relation is the bootstrap state; an ordinary relation must be
+    /// singular before it can authorize another ordinary operation.
+    pub fn is_singular(&self) -> bool {
+        self.heads.len() <= 1
+    }
+
+    /// Return the complete conflict set when this relation is forked. A
+    /// lineage resolution must cite this exact set.
+    pub fn complete_conflict_set(&self) -> Option<&[FactId]> {
+        self.is_conflicted().then_some(self.heads.as_slice())
+    }
+
+    pub fn is_conflicted(&self) -> bool {
+        self.heads.len() > 1
+    }
+}
+
 impl DeviceId {
     pub fn from_public_key_bytes(bytes: [u8; 32]) -> Result<Self, String> {
         VerifyingKey::from_bytes(&bytes)

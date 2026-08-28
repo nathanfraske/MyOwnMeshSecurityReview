@@ -773,7 +773,7 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
-        identity,
+        identity.clone(),
         support::test_transport(),
         root.path().to_path_buf(),
     )
@@ -823,6 +823,33 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
 
     reopened.request_shutdown();
     reopened_driver.await.expect("reopened lifecycle shutdown");
+    drop(reopened);
+
+    // A second lifecycle boundary must preserve the exact terminal tombstone;
+    // no pending record or fresh ACK may be manufactured after settlement.
+    let (reopened_again, reopened_again_driver) = spawn_network_in_instance_root(
+        config,
+        identity,
+        support::test_transport(),
+        root.path().to_path_buf(),
+    )
+    .await
+    .expect("reopen after exact terminal settlement");
+    attach_local(&reopened_again, &broker);
+    let terminal_again = wait_for_durable_record_state(
+        &reopened_again,
+        record.delivery_id,
+        ProofRecordState::Settled,
+    )
+    .await;
+    assert_exact_delivery_metadata(&terminal_again, &rebound);
+    assert!(pending_durable_proofs(&reopened_again)
+        .expect("terminal record remains excluded from replay")
+        .is_empty());
+    reopened_again.request_shutdown();
+    reopened_again_driver
+        .await
+        .expect("second reopened lifecycle shutdown");
     target_state.request_shutdown();
     target_driver.await.expect("target lifecycle shutdown");
 }
@@ -1279,10 +1306,10 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
         target,
         member,
         e0_facts,
-        _context,
+        context,
         config,
         broker,
-        _target_root,
+        target_root,
     ) = create_fixture(&root, "r3-supersede").await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
@@ -1296,12 +1323,44 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
     admit_durable_proof(&state, e0.clone()).expect("persist E0 before send");
     assert_eq!(e0_delivery.delivery_id, e0.delivery_id);
 
-    // ACK loss is represented by shutting down with E0 still Pending. A
-    // sender restart restores that exact durable obligation, not a new id.
+    // ACK loss is represented by shutting down with E0 still Pending. Close
+    // both endpoint lifecycles so the resumed delivery crosses a genuine
+    // authenticated target boundary rather than reusing a live connection.
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
     state.request_shutdown();
     driver.await.expect("sender restart boundary");
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("target endpoint restart boundary");
     drop(owner);
     drop(state);
+    drop(target_state);
+
+    // Recreate the same target identity and durable root with only the
+    // pre-eviction roster facts.  Attach it before the sender resumes so the
+    // next authenticated session is the sole replay trigger.
+    let restarted_target_identity =
+        Arc::new(Identity::from_signing_key(target_signing_key, "r3-target"));
+    let (restarted_target, restarted_target_driver) = import_network_in_instance_root(
+        config.clone(),
+        restarted_target_identity,
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        context,
+        target_bootstrap,
+    )
+    .await
+    .expect("recreate target endpoint from the same identity");
+    for fact in e0_facts.iter().take(2).cloned() {
+        ingest_semantic_fact(&restarted_target, fact).await;
+    }
+    restarted_target
+        .compact_semantic_state()
+        .expect("recreated target commits the authenticated roster grants");
+    attach_local(&restarted_target, &broker);
+
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
         identity,
@@ -1427,8 +1486,10 @@ async fn r3_stale_e0_is_superseded_before_e1_reconnect_replay() {
 
     reopened.request_shutdown();
     reopened_driver.await.expect("reconnect lifecycle shutdown");
-    target_state.request_shutdown();
-    target_driver.await.expect("target lifecycle shutdown");
+    restarted_target.request_shutdown();
+    restarted_target_driver
+        .await
+        .expect("recreated target lifecycle shutdown");
 }
 
 #[tokio::test]

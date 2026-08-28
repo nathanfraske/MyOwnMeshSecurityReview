@@ -32,7 +32,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
@@ -109,6 +109,8 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inbound exchange connections are dropped after this much idle.
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_DISCOVERED_PEERS: usize = 1024;
+const OUTBOUND_QUEUE_CAP: usize = 128;
 
 /// Cadence of the local re-announce tick: every interval, each peer
 /// still present in the mDNS cache is re-surfaced to the engine as a
@@ -180,6 +182,7 @@ where
         // at the first nonzero generation so the first adoption is usable.
         conn_gen: AtomicU64::new(1),
         inbound_tx,
+        cancel: watch::channel(false).0,
     });
 
     let mut tasks = Vec::new();
@@ -223,6 +226,7 @@ where
         discovery,
         tasks,
         stopped: AtomicBool::new(false),
+        cancel: shared.cancel.clone(),
     })
 }
 
@@ -232,6 +236,7 @@ pub struct MdnsDriverHandle {
     discovery: Arc<Discovery>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     stopped: AtomicBool,
+    cancel: watch::Sender<bool>,
 }
 
 impl MdnsDriverHandle {
@@ -239,6 +244,7 @@ impl MdnsDriverHandle {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
+        let _ = self.cancel.send(true);
         // Goodbye first (peers get PeerLeft promptly), then shut the
         // backend down (closes the browse stream), then abort the
         // tokio tasks parked on accept/recv.
@@ -273,6 +279,7 @@ struct Shared {
     conns: Mutex<HashMap<String, ConnHandle>>,
     conn_gen: AtomicU64,
     inbound_tx: InboundSink<MdnsInbound>,
+    cancel: watch::Sender<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,7 +291,7 @@ struct PeerEntry {
 #[derive(Clone)]
 struct ConnHandle {
     generation: u64,
-    tx: mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>>,
+    tx: mpsc::Sender<OwnedSignal<String, ErasedOwner>>,
 }
 
 fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
@@ -306,7 +313,16 @@ fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
 
 async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<DiscoveryEvent>) {
     // Stream closes when the backend shuts down.
-    while let Some(event) = browse_rx.recv().await {
+    let mut cancel = shared.cancel.subscribe();
+    loop {
+        let event = tokio::select! {
+            event = browse_rx.recv() => event,
+            _ = cancel.changed() => return,
+        };
+        let Some(event) = event else { break };
+        if *cancel.borrow() {
+            return;
+        }
         match event {
             DiscoveryEvent::Resolved {
                 key,
@@ -326,6 +342,13 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 }
                 addrs.sort();
                 let entry = PeerEntry { addrs, port };
+                let peers = shared.peers.lock();
+                let known = peers.contains_key(&advert.peer);
+                let at_capacity = peers.len() >= MAX_DISCOVERED_PEERS;
+                drop(peers);
+                if !known && at_capacity {
+                    continue;
+                }
                 shared.key_to_peer.lock().insert(key, advert.peer.clone());
                 shared.peers.lock().insert(advert.peer.clone(), entry);
                 debug!(peer = %&advert.peer[..advert.peer.len().min(16)], "mdns peer resolved");
@@ -344,10 +367,17 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 // carries an independently authenticated binding to the device
                 // key, none of this carrier's presence or withdrawal is a
                 // carrier-established identity.
-                let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
-                    attribution: CarrierAttribution::SenderClaimed,
-                    device_id: advert.peer,
-                });
+                if shared
+                    .inbound_tx
+                    .send(MdnsInbound::PeerAnnounced {
+                        attribution: CarrierAttribution::SenderClaimed,
+                        device_id: advert.peer,
+                    })
+                    .is_err()
+                {
+                    let _ = shared.cancel.send(true);
+                    return;
+                }
             }
             DiscoveryEvent::Removed { key } => {
                 let peer = shared.key_to_peer.lock().remove(&key);
@@ -355,10 +385,17 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                     shared.peers.lock().remove(&peer);
                     shared.conns.lock().remove(&peer);
                     debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
-                    let _ = shared.inbound_tx.send(MdnsInbound::PeerLeft {
-                        device_id: peer,
-                        attribution: CarrierAttribution::SenderClaimed,
-                    });
+                    if shared
+                        .inbound_tx
+                        .send(MdnsInbound::PeerLeft {
+                            device_id: peer,
+                            attribution: CarrierAttribution::SenderClaimed,
+                        })
+                        .is_err()
+                    {
+                        let _ = shared.cancel.send(true);
+                        return;
+                    }
                 }
             }
         }
@@ -369,7 +406,14 @@ async fn run_outbound(
     shared: Arc<Shared>,
     mut source: Box<dyn OutboundSource<MdnsOutbound, Owner = ErasedOwner>>,
 ) {
-    while let Some(outbound) = source.recv().await {
+    let mut cancel = shared.cancel.subscribe();
+    loop {
+        let Some(outbound) = (tokio::select! {
+            outbound = source.recv() => outbound,
+            _ = cancel.changed() => return,
+        }) else {
+            break;
+        };
         // Dispatched on a borrow. Only the directed arm builds anything, and it
         // is handed the whole owned signal so the encoded line inherits the
         // funding instead of becoming an unowned allocation beside it. The two
@@ -401,6 +445,8 @@ async fn run_outbound(
             outbound.accept();
         }
     }
+    let _ = shared.cancel.send(true);
+    shared.discovery.shutdown();
 }
 
 fn register(shared: &Shared) -> bool {
@@ -461,14 +507,18 @@ async fn send_directed(
     let commit = line.commit_unit();
     let existing = shared.conns.lock().get(&to).cloned();
     let line = match existing {
-        Some(handle) => match handle.tx.send(line) {
+        Some(handle) => match handle.tx.try_send(line) {
             Ok(()) => {
                 if let Some(commit) = &commit {
                     commit.accept();
                 }
                 return true;
             }
-            Err(returned) => returned.0,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!(peer = %&to[..to.len().min(16)], "mdns connection outbound queue is full or closed");
+                return false;
+            }
+            Err(mpsc::error::TrySendError::Closed(returned)) => returned,
         },
         None => line,
     };
@@ -504,7 +554,7 @@ async fn send_directed(
                 debug!(peer = %&to[..to.len().min(16)], "mdns connection identity space exhausted");
                 return false;
             };
-            match tx.send(line) {
+            match tx.send(line).await {
                 Ok(()) => {
                     if let Some(commit) = &commit {
                         commit.accept();
@@ -533,10 +583,10 @@ fn adopt_stream(
     shared: &Arc<Shared>,
     stream: TcpStream,
     known_peer: Option<String>,
-) -> Option<mpsc::UnboundedSender<OwnedSignal<String, ErasedOwner>>> {
+) -> Option<mpsc::Sender<OwnedSignal<String, ErasedOwner>>> {
     let generation = next_connection_generation(&shared.conn_gen)?;
     let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::unbounded_channel::<OwnedSignal<String, ErasedOwner>>();
+    let (tx, rx) = mpsc::channel::<OwnedSignal<String, ErasedOwner>>(OUTBOUND_QUEUE_CAP);
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
     let registered_as = Arc::new(Mutex::new(None::<String>));
@@ -556,8 +606,9 @@ fn adopt_stream(
     {
         let shared = shared.clone();
         let registered_as = registered_as.clone();
+        let cancel = shared.cancel.subscribe();
         tokio::spawn(async move {
-            run_writer(write_half, rx).await;
+            run_writer(write_half, rx, cancel).await;
             // Deregister — only our own generation; a newer connection
             // may have replaced this entry already.
             if let Some(peer) = registered_as.lock().clone() {
@@ -574,6 +625,7 @@ fn adopt_stream(
     {
         let shared = shared.clone();
         let tx = tx.clone();
+        let registered_as = registered_as.clone();
         tokio::spawn(async move {
             run_reader(&shared, read_half, |from| {
                 let mut reg = registered_as.lock();
@@ -615,10 +667,15 @@ fn adopt_stream(
 /// still queued, releasing those owners together.
 async fn run_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    mut rx: mpsc::UnboundedReceiver<OwnedSignal<String, ErasedOwner>>,
+    mut rx: mpsc::Receiver<OwnedSignal<String, ErasedOwner>>,
+    mut cancel: watch::Receiver<bool>,
 ) {
     loop {
-        match timeout(CONN_IDLE_TIMEOUT, rx.recv()).await {
+        let next = tokio::select! {
+            next = timeout(CONN_IDLE_TIMEOUT, rx.recv()) => next,
+            _ = cancel.changed() => return,
+        };
+        match next {
             Ok(Some(line)) => {
                 if write_half.write_all(line.value().as_bytes()).await.is_err() {
                     return;
@@ -642,8 +699,13 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
             return;
         }
     };
+    let mut cancel = shared.cancel.subscribe();
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => Some(accepted),
+            _ = cancel.changed() => return,
+        };
+        match accepted.expect("listener accept branch selected") {
             Ok((stream, _remote)) => {
                 if adopt_stream(&shared, stream, None).is_none() {
                     debug!("mdns accepted connection identity space exhausted");
@@ -664,13 +726,19 @@ async fn run_reader(
 ) {
     let mut reader = BufReader::new(read_half);
     let mut buf: Vec<u8> = Vec::new();
+    let mut cancel = shared.cancel.subscribe();
     loop {
+        if *cancel.borrow() {
+            return;
+        }
         buf.clear();
-        let read = timeout(
-            INBOUND_IDLE_TIMEOUT,
-            read_bounded_line(&mut reader, &mut buf),
-        )
-        .await;
+        let read = tokio::select! {
+            read = timeout(
+                INBOUND_IDLE_TIMEOUT,
+                read_bounded_line(&mut reader, &mut buf),
+            ) => read,
+            _ = cancel.changed() => return,
+        };
         match read {
             Ok(Ok(true)) => {}
             // EOF, oversized/garbage frame, io error, or idle timeout —
@@ -715,6 +783,7 @@ async fn run_reader(
             },
         };
         if shared.inbound_tx.send(inbound).is_err() {
+            let _ = shared.cancel.send(true);
             return;
         }
     }
@@ -751,8 +820,15 @@ async fn read_bounded_line(
 }
 
 async fn run_reannounce(shared: Arc<Shared>) {
+    let mut cancel = shared.cancel.subscribe();
     loop {
-        sleep(REANNOUNCE_INTERVAL).await;
+        tokio::select! {
+            _ = sleep(REANNOUNCE_INTERVAL) => {}
+            _ = cancel.changed() => return,
+        }
+        if *cancel.borrow() {
+            return;
+        }
         // Registration retry — covers a register() that failed at
         // start (no usable interface yet) or a transient daemon error.
         if !shared.registered.load(Ordering::SeqCst) {
@@ -766,10 +842,17 @@ async fn run_reannounce(shared: Arc<Shared>) {
         // peers, so this is noise, not harm.
         let peers: Vec<String> = shared.peers.lock().keys().cloned().collect();
         for device_id in peers {
-            let _ = shared.inbound_tx.send(MdnsInbound::PeerAnnounced {
-                device_id,
-                attribution: CarrierAttribution::SenderClaimed,
-            });
+            if shared
+                .inbound_tx
+                .send(MdnsInbound::PeerAnnounced {
+                    device_id,
+                    attribution: CarrierAttribution::SenderClaimed,
+                })
+                .is_err()
+            {
+                let _ = shared.cancel.send(true);
+                return;
+            }
         }
     }
 }

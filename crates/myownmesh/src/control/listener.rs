@@ -22,8 +22,8 @@ use interprocess::local_socket::{
 
 /// Default control socket name (Unix abstract or Windows named-pipe
 /// segment). Overridable via `config.daemon.control_socket`.
-#[allow(dead_code)]
-pub fn default_socket_name() -> String {
+#[cfg(not(unix))]
+fn default_socket_name() -> String {
     "myownmesh.sock".to_string()
 }
 
@@ -60,10 +60,14 @@ pub(super) fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener
         SocketTarget::Path(p) => {
             #[cfg(unix)]
             prepare_owner_only_socket_parent(p)?;
-            // Remove stale socket if present so re-binds succeed.
+            // Remove a stale socket if present so re-binds succeed. Never
+            // unlink an arbitrary operator-owned path named like the socket:
+            // a configured endpoint is input, and rebinding it must not turn
+            // a daemon restart into a file-deletion primitive. Symlinks are
+            // rejected by the socket-type check rather than followed.
             #[cfg(unix)]
             {
-                let _ = std::fs::remove_file(p);
+                remove_stale_socket(p)?;
             }
             p.as_path()
                 .to_fs_name::<GenericFilePath>()
@@ -129,6 +133,27 @@ pub(super) fn bind_listener(target: &SocketTarget) -> Result<LocalSocketListener
         verify_owner_only_socket_path(path)?;
     }
     Ok(listener)
+}
+
+#[cfg(unix)]
+fn remove_stale_socket(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "refusing to replace non-socket control endpoint {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.uid() == unsafe { libc::geteuid() },
+        "refusing to remove control socket not owned by the daemon user"
+    );
+    std::fs::remove_file(path)
+        .with_context(|| format!("remove stale control socket {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(windows)]

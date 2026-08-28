@@ -1058,3 +1058,149 @@ fn membership_admit_uses_controller_tier_with_owner_counterfactual() {
         .admit(owner_admit)
         .expect("Owner remains a valid higher-tier member-admission signer");
 }
+
+#[test]
+fn finite_authority_fork_requires_complete_resolution_before_regrant() {
+    let root_key = key(110);
+    let controller_key = key(111);
+    let target = author(&key(112));
+    let future_target = author(&key(113));
+    let bootstrap = closed_bootstrap(110, 110);
+    let controller = author(&controller_key);
+    let mut source = FactGraph::from_bootstrap(&bootstrap);
+
+    // G grants C. O and R are then authored from the same exact G base: O is
+    // the controller's operation, while R revokes that controller. Their
+    // AuthorityUse(C) records therefore form an incomparable fork.
+    let grant = authored(
+        &source,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    source
+        .admit(grant.clone())
+        .expect("G controller grant admits");
+    let operation = authored(
+        &source,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &source,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = source.clone();
+    fork.admit(operation.clone())
+        .expect("O controller operation admits");
+    fork.admit(revoke.clone()).expect("R root revoke admits");
+    assert_eq!(fork.authority_use_heads(&controller).len(), 2);
+    assert_eq!(fork.evaluator().effective_role(&target), None);
+    assert_eq!(fork.evaluator().effective_role(&controller), None);
+
+    // No ordinary operation may smuggle a choice through the unresolved fork.
+    let blocked = authored(
+        &fork,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: future_target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        fork.admit(blocked),
+        Err(SemanticError::UnauthorizedRoleGrant),
+        "the unresolved AuthorityUse fork fails closed"
+    );
+
+    let incomplete = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![operation.id],
+            selected_head: operation.id,
+        },
+        vec![operation.id],
+    );
+    assert_eq!(
+        fork.admit(incomplete),
+        Err(SemanticError::IncompleteResolution),
+        "Q must cite every incomparable AuthorityUse(C) head"
+    );
+    let wrong = fact(
+        &bootstrap,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![operation.id, revoke.id],
+            selected_head: grant.id,
+        },
+        vec![operation.id, revoke.id],
+    );
+    assert_eq!(
+        fork.admit(wrong),
+        Err(SemanticError::ResolutionSelectionNotCited),
+        "Q cannot select a head outside the complete conflict set"
+    );
+
+    // Q selects R. N is the only later regrant; O remains a historical loser.
+    let resolution = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![operation.id, revoke.id],
+            selected_head: revoke.id,
+        },
+        Vec::new(),
+    );
+    fork.admit(resolution)
+        .expect("Q complete resolution selecting R admits");
+    let regrant = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    fork.admit(regrant).expect("N regrant admits");
+    let future = authored(
+        &fork,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: future_target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    fork.admit(future)
+        .expect("post-N controller operation admits");
+    assert_eq!(
+        fork.evaluator().effective_role(&controller),
+        Some(Role::Controller)
+    );
+    assert_eq!(
+        fork.evaluator().effective_role(&future_target),
+        Some(Role::Member)
+    );
+    assert_eq!(
+        fork.evaluator().effective_role(&target),
+        None,
+        "O remains permanently inactive after Q selects R and N regrants C"
+    );
+}

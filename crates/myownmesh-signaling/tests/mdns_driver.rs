@@ -30,6 +30,26 @@ fn driver_config(network: &str, device: &str) -> MdnsDriverConfig {
     }
 }
 
+#[test]
+fn advertised_profile_excludes_other_room_and_recipient() {
+    use myownmesh_signaling::mdns::wire::{frame_is_for_us, Frame, PROTOCOL_VERSION};
+
+    let frame = Frame {
+        v: PROTOCOL_VERSION,
+        room: "room-a".into(),
+        from: "peer-a".into(),
+        to: "device-b".into(),
+        msg: SignalingMessage::Offer {
+            peer_id: "device-b".into(),
+            offer_id: "attempt-1".into(),
+            sdp: "v=0".into(),
+        },
+    };
+    assert!(frame_is_for_us(&frame, "room-a", "device-b"));
+    assert!(!frame_is_for_us(&frame, "room-b", "device-b"));
+    assert!(!frame_is_for_us(&frame, "room-a", "device-c"));
+}
+
 async fn wait_for_announce(
     rx: &mut mpsc::UnboundedReceiver<MdnsInbound>,
     expect_peer: &str,

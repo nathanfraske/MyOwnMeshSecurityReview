@@ -104,6 +104,12 @@ jobs:
             v4_arc03j_native_local_ice_restart_commits_exact_replacement \
             -- --test-threads=1 --ignored
 
+      - name: Speculative W0/W1/W2 exact proof outcome
+        run: |
+          cargo test -p myownmesh-core --lib --features "transport-lab" \
+            v4_b2_speculative_proof_ack_is_bound_to_exact_w1 \
+            -- --test-threads=1 --ignored
+
   # Validate the static-musl appliance daemons actually cross-compile on every
   # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
   # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,

@@ -66,12 +66,85 @@ pub(in crate::control) enum ProvisionalHandoff {
     MfaEnrollment(myownmesh_core::custody::ProvisionalEnrollment),
 }
 
+/// Keeps a provisional handoff armed across the response write itself.
+///
+/// The write and the ordinary settlement are adjacent in the connection loop,
+/// but the task can still be dropped at that boundary (for example while the
+/// runtime is tearing down the connection).  The payloads each have an exact
+/// synchronous drop path, so this guard closes the small gap without spawning
+/// an unowned cleanup task.  A successful write takes the value out before
+/// committing; a failed write keeps it armed until the existing asynchronous
+/// close has completed.
+#[must_use = "a provisional handoff must remain armed until its write is settled"]
+pub(in crate::control) struct HandoffGuard {
+    handoff: Option<ProvisionalHandoff>,
+}
+
+impl HandoffGuard {
+    pub(in crate::control) fn new(handoff: ProvisionalHandoff) -> Self {
+        Self {
+            handoff: Some(handoff),
+        }
+    }
+
+    pub(in crate::control) async fn settle(&mut self, state: &Arc<ControlState>, sent: bool) {
+        if sent {
+            if let Some(handoff) = self.handoff.take() {
+                handoff.commit();
+            }
+            return;
+        }
+
+        // Keep the guard itself armed while an exact realtime close awaits.
+        // If the task is cancelled at that await, its flow has already been
+        // removed from the exact client's table and the local `flow` is dropped
+        // by cancellation, while the guard's second lookup is harmless.
+        let realtime = match self.handoff.as_ref() {
+            Some(ProvisionalHandoff::RealtimeFlow { client, capability }) => {
+                Some((client.clone(), capability.clone()))
+            }
+            _ => None,
+        };
+        if let Some((client, capability)) = realtime {
+            let Some(flow) = client.take_realtime_flow(&capability) else {
+                self.handoff.take();
+                return;
+            };
+            if let Some(net) = state.registry.get(flow.network()) {
+                let _ = flow.close_through(&net).await;
+            } else {
+                // Dropping the exact owned flow invokes its synchronous native
+                // cleanup even when the network has already gone away.
+                drop(flow);
+            }
+            self.handoff.take();
+            return;
+        }
+
+        // RPC and MFA rollback have no cancellation point: dropping the exact
+        // value withdraws the filed stream or runs the armed custody rollback.
+        if let Some(handoff) = self.handoff.take() {
+            handoff.roll_back(state).await;
+        }
+    }
+}
+
+impl Drop for HandoffGuard {
+    fn drop(&mut self) {
+        let Some(handoff) = self.handoff.take() else {
+            return;
+        };
+        handoff.rollback_on_drop();
+    }
+}
+
 impl ProvisionalHandoff {
     /// Settle against the write disposition.
     ///
     /// `sent` is true only for [`Wrote::Sent`](super::Wrote::Sent) — a refused
     /// line and an ended socket are both "the client does not have this", and
     /// both roll back. Nothing here consults a duration or retries anything.
+    #[cfg(test)]
     pub(in crate::control) async fn settle(self, state: &Arc<ControlState>, sent: bool) {
         if sent {
             self.commit();
@@ -134,11 +207,36 @@ impl ProvisionalHandoff {
             }
         }
     }
+
+    /// Synchronous exact fallback for a task dropped before settlement.
+    ///
+    /// This path deliberately does not try to await a network operation.  The
+    /// realtime table removal is exact and dropping the returned owned flow
+    /// invokes its existing synchronous native cleanup; the RPC and MFA
+    /// payloads have the same exact Drop contracts.  Normal refusal still uses
+    /// [`Self::roll_back`] so it can await and report the explicit close.
+    fn rollback_on_drop(self) {
+        match self {
+            Self::None => {}
+            Self::RealtimeFlow { client, capability } => {
+                drop(client.take_realtime_flow(&capability));
+            }
+            Self::RpcStream(pending) => drop(pending),
+            Self::MfaEnrollment(provisional) => drop(provisional),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::{
+        settle_provisional_handoff, AdmittedLineOut, ConnectionCancel, ControlOut, DispatchBarrier,
+        FrameAdmission, Wrote,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static MFA_TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     /// One registered client, and the reading half of its writer.
     ///
@@ -278,6 +376,97 @@ mod tests {
             client.take_realtime_flow(&capability).is_some(),
             "the client holds the capability, so the flow it names is the \
              daemon's to keep"
+        );
+    }
+
+    /// A task dropped after the response write but before its ordinary settle
+    /// still withdraws the exact flow.  This is the hard-death edge that a
+    /// direct `ProvisionalHandoff` value cannot cover: the value itself has no
+    /// synchronous Drop cleanup, while the connection task can disappear at
+    /// this boundary.
+    #[tokio::test]
+    async fn v4_r2_handoff_guard_drop_rolls_back_exact_realtime_flow() {
+        let state = crate::control::joinless_control_state().await;
+        let (client, _writer) = registered_client(&state);
+        let capability = install_flow(
+            &state,
+            &client,
+            "device-b",
+            b"flow-a",
+            "the registry installs one flow on a registered client",
+        );
+
+        {
+            let _guard = HandoffGuard::new(ProvisionalHandoff::RealtimeFlow {
+                client: client.clone(),
+                capability: capability.clone(),
+            });
+            // The connection task may be dropped here, immediately after the
+            // socket write has completed and before the normal settle call.
+        }
+
+        assert!(
+            client.take_realtime_flow(&capability).is_none(),
+            "dropping the armed handoff removes only its exact flow"
+        );
+    }
+
+    /// The production MFA handoff has the same hard-death boundary: the
+    /// encoded line is written successfully, then the connection task can be
+    /// dropped before the normal `Wrote::Sent` settlement.  The barrier makes
+    /// that interleave deterministic and the exact armed enrollment Drop is
+    /// the only cleanup used by the aborted task.
+    #[tokio::test]
+    async fn v4_r2_mfa_sent_write_aborted_before_settle_rolls_back() {
+        let mut state = crate::control::joinless_control_state().await;
+        let (barrier, arrived, _release) = DispatchBarrier::paired();
+        Arc::get_mut(&mut state)
+            .expect("the test state has one owner before the task starts")
+            .before_provisional_settle = Some(barrier);
+
+        let network = format!(
+            "v4-r2-mfa-handoff-{}-{}",
+            std::process::id(),
+            MFA_TEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let frames = FrameAdmission::new(
+            state
+                .mesh
+                .local_application_resource_scope()
+                .expect("the MFA response owner scope is available"),
+            None,
+        );
+        let ((reply, output), provisional) =
+            crate::control::dispatch::governance::mfa_enroll(&frames, network.clone())
+                .expect("the production MFA dispatch installs the provisional enrollment");
+        let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+            .expect("the production MFA response is admitted before writing");
+        let cancel = ConnectionCancel::runtime(&state.clients);
+        let mut sink = tokio::io::sink();
+        let wrote = super::super::write_admitted_line(&mut sink, &cancel, line).await;
+        assert!(
+            matches!(&wrote, Ok(Wrote::Sent)),
+            "the control write reached Sent"
+        );
+        assert!(
+            myownmesh_core::custody::is_enrolled(&network),
+            "the enrollment is live while the response handoff is paused"
+        );
+
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            let mut guard = HandoffGuard::new(provisional);
+            settle_provisional_handoff(&task_state, &mut guard, &wrote).await;
+        });
+        arrived
+            .await
+            .expect("the production handoff reached its post-write barrier");
+        task.abort();
+        let _ = task.await;
+
+        assert!(
+            !myownmesh_core::custody::is_enrolled(&network),
+            "aborting before Wrote::Sent settlement removes the exact enrollment"
         );
     }
 }

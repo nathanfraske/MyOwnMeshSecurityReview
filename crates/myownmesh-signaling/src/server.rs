@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
@@ -66,6 +66,10 @@ const STORED_RETENTION: Duration = Duration::from_secs(15 * 60);
 /// Hard cap on how many events a single `REQ` can replay, so a broad
 /// filter can't dump the whole buffer onto a new subscriber.
 const MAX_REPLAY_PER_REQ: usize = 500;
+
+/// Bound each connection's pending wire frames. A slow or dead subscriber
+/// must not turn relay fanout into an unbounded allocation path.
+const OUTBOUND_QUEUE_CAP: usize = 128;
 
 /// How many rate-limit violations a connection may rack up before the
 /// relay closes it. Generous enough to ride out a legitimate burst,
@@ -150,6 +154,7 @@ impl SignalingServerHandle {
 
     /// Stop the relay, aborting its accept loop and connection tasks.
     pub fn stop(self) {
+        self.hub.shutdown();
         self.task.abort();
         self.heartbeat.abort();
     }
@@ -157,6 +162,7 @@ impl SignalingServerHandle {
 
 impl Drop for SignalingServerHandle {
     fn drop(&mut self) {
+        self.hub.shutdown();
         self.task.abort();
         self.heartbeat.abort();
     }
@@ -240,7 +246,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
         }
     };
     let (mut write, mut read) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(OUTBOUND_QUEUE_CAP);
 
     // Per-IP admission control happens at register time.
     let Some(conn_id) = hub.register(out_tx.clone(), peer.ip()) else {
@@ -263,7 +269,23 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
         }
     });
 
-    while let Some(frame) = read.next().await {
+    let mut shutdown = hub.shutdown_signal();
+    if *shutdown.borrow() {
+        hub.unregister(conn_id);
+        writer.abort();
+        return Ok(());
+    }
+    loop {
+        let frame = tokio::select! {
+            frame = read.next() => frame,
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(frame) = frame else { break };
         match frame {
             // `on_client_message` returns false when the connection has
             // earned a disconnect (sustained rate-limit abuse).
@@ -275,7 +297,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
             // Keep long-lived idle connections alive — split streams
             // don't auto-pong, so we answer pings ourselves.
             Ok(WsMessage::Ping(p)) => {
-                let _ = out_tx.send(WsMessage::Pong(p));
+                let _ = out_tx.try_send(WsMessage::Pong(p));
             }
             Ok(WsMessage::Close(_)) => break,
             Ok(_) => {}
@@ -294,6 +316,7 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
 #[derive(Clone)]
 struct Hub {
     inner: Arc<Mutex<HubInner>>,
+    shutdown: watch::Sender<bool>,
 }
 
 struct HubInner {
@@ -316,7 +339,7 @@ struct HubInner {
 }
 
 struct ConnEntry {
-    out: mpsc::UnboundedSender<WsMessage>,
+    out: OutboundSender,
     /// subscription id → its filter set (OR semantics across filters).
     subs: HashMap<String, Vec<Value>>,
     ip: IpAddr,
@@ -326,6 +349,37 @@ struct ConnEntry {
     event_bucket: TokenBucket,
     req_bucket: TokenBucket,
     strikes: u32,
+}
+
+#[derive(Clone)]
+enum OutboundSender {
+    Bounded(mpsc::Sender<WsMessage>),
+    Unbounded(mpsc::UnboundedSender<WsMessage>),
+}
+
+impl OutboundSender {
+    fn try_send(&self, message: WsMessage) -> std::result::Result<(), ()> {
+        match self {
+            Self::Bounded(sender) => sender.try_send(message).map_err(|_| ()),
+            Self::Unbounded(sender) => sender.send(message).map_err(|_| ()),
+        }
+    }
+}
+
+trait IntoOutboundSender {
+    fn into_outbound_sender(self) -> OutboundSender;
+}
+
+impl IntoOutboundSender for mpsc::Sender<WsMessage> {
+    fn into_outbound_sender(self) -> OutboundSender {
+        OutboundSender::Bounded(self)
+    }
+}
+
+impl IntoOutboundSender for mpsc::UnboundedSender<WsMessage> {
+    fn into_outbound_sender(self) -> OutboundSender {
+        OutboundSender::Unbounded(self)
+    }
 }
 
 struct StoredEvent {
@@ -342,6 +396,7 @@ struct Presence {
 
 impl Hub {
     fn new(limits: Limits) -> Self {
+        let (shutdown, _) = watch::channel(false);
         Self {
             inner: Arc::new(Mutex::new(HubInner {
                 next_id: 1,
@@ -354,11 +409,20 @@ impl Hub {
                 connections_total: 0,
                 events_relayed: 0,
             })),
+            shutdown,
         }
     }
 
-    fn register(&self, out: mpsc::UnboundedSender<WsMessage>, ip: IpAddr) -> Option<u64> {
+    fn register<S: IntoOutboundSender>(&self, out: S, ip: IpAddr) -> Option<u64> {
         self.inner.lock().register(out, ip)
+    }
+
+    fn shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     fn unregister(&self, id: u64) {
@@ -381,7 +445,7 @@ impl Hub {
 }
 
 impl HubInner {
-    fn register(&mut self, out: mpsc::UnboundedSender<WsMessage>, ip: IpAddr) -> Option<u64> {
+    fn register<S: IntoOutboundSender>(&mut self, out: S, ip: IpAddr) -> Option<u64> {
         if self.limits.max_connections_per_ip > 0 {
             let n = self.ip_counts.get(&ip).copied().unwrap_or(0);
             if n >= self.limits.max_connections_per_ip {
@@ -394,7 +458,7 @@ impl HubInner {
         self.conns.insert(
             id,
             ConnEntry {
-                out,
+                out: out.into_outbound_sender(),
                 subs: HashMap::new(),
                 ip,
                 present: Vec::new(),
@@ -515,7 +579,7 @@ impl HubInner {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.strikes += 1;
             if conn.strikes > STRIKE_LIMIT {
-                let _ = conn.out.send(WsMessage::Text(
+                let _ = conn.out.try_send(WsMessage::Text(
                     json!(["NOTICE", "rate limit exceeded — closing"]).to_string(),
                 ));
                 return false;
@@ -544,7 +608,7 @@ impl HubInner {
                     && conn.subs.len() >= self.limits.max_subscriptions as usize
                 {
                     if let Some(conn) = self.conns.get(&conn_id) {
-                        let _ = conn.out.send(WsMessage::Text(
+                        let _ = conn.out.try_send(WsMessage::Text(
                             json!(["CLOSED", subid, "rate-limited: too many subscriptions"])
                                 .to_string(),
                         ));
@@ -584,11 +648,11 @@ impl HubInner {
         let replayed = replay.len();
         for ev in replay {
             let ev_value = serde_json::to_value(&ev).unwrap_or(Value::Null);
-            let _ = out.send(WsMessage::Text(
+            let _ = out.try_send(WsMessage::Text(
                 json!(["EVENT", subid, ev_value]).to_string(),
             ));
         }
-        let _ = out.send(WsMessage::Text(json!(["EOSE", subid]).to_string()));
+        let _ = out.try_send(WsMessage::Text(json!(["EOSE", subid]).to_string()));
         trace!(%subid, replayed, "signaling REQ");
     }
 
@@ -616,7 +680,7 @@ impl HubInner {
         if !event.verify() {
             trace!("signaling: dropping EVENT with bad id/signature");
             if let Some(conn) = self.conns.get(&conn_id) {
-                let _ = conn.out.send(WsMessage::Text(
+                let _ = conn.out.try_send(WsMessage::Text(
                     json!(["OK", event.id, false, "invalid: bad signature"]).to_string(),
                 ));
             }
@@ -652,7 +716,7 @@ impl HubInner {
 
         let delivered = fanout(&self.conns, ev_val, &event, None);
         if let Some(conn) = self.conns.get(&conn_id) {
-            let _ = conn.out.send(WsMessage::Text(
+            let _ = conn.out.try_send(WsMessage::Text(
                 json!(["OK", event.id, true, ""]).to_string(),
             ));
         }
@@ -686,7 +750,7 @@ fn fanout(
         for (subid, filters) in &conn.subs {
             if matches_any(filters, ev) {
                 let frame = json!(["EVENT", subid, ev_value]).to_string();
-                if conn.out.send(WsMessage::Text(frame)).is_ok() {
+                if conn.out.try_send(WsMessage::Text(frame)).is_ok() {
                     delivered += 1;
                 }
             }

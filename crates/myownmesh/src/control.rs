@@ -56,7 +56,6 @@ impl AdmittedRequest {
 /// below this line decides those, and nothing in there knows the protocol.
 mod listener;
 
-pub use listener::default_socket_name;
 use listener::{bind_listener, resolve_socket, verify_local_peer};
 
 /// The request and response vocabulary itself: every `op` a client may send,
@@ -155,6 +154,12 @@ pub(crate) struct ControlHooks {
     /// cancellation or provide a production synchronization path.
     #[cfg(test)]
     before_begin_closing: Option<Arc<DispatchBarrier>>,
+    /// Pauses after a provisional response has been written and before its
+    /// handoff is committed or rolled back. The handoff guard remains armed
+    /// across this exact edge, so a test can terminate the connection task and
+    /// prove that the write cannot strand its sole custody owner.
+    #[cfg(test)]
+    before_provisional_settle: Option<Arc<DispatchBarrier>>,
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -174,12 +179,9 @@ pub(crate) struct DispatchBarrier {
 impl DispatchBarrier {
     /// The barrier and the two ends a control drives it by.
     ///
-    /// Gated to match its one caller. The terminal-shutdown control that drives
-    /// this needs a real accepted connection over a Unix socket, so it does not
-    /// exist on Windows -- and neither, therefore, does anything that builds a
-    /// barrier for it. The type itself stays available to both, because
-    /// `ControlHooks` names it on every platform.
-    #[cfg(unix)]
+    /// Available to every test target. Existing Unix-only controls continue to
+    /// use the same one-shot barrier, while pure sink controls can exercise an
+    /// exact lifecycle edge on Windows as well.
     fn paired() -> (
         Arc<Self>,
         tokio::sync::oneshot::Receiver<()>,
@@ -428,6 +430,25 @@ where
     }
 }
 
+/// Cross the production write boundary and settle one provisional handoff.
+///
+/// The test-only barrier is deliberately between the successful write/flush
+/// and the exact settlement. In a release build this is just the existing
+/// settlement call; no timer, retry, or detached cleanup task is introduced.
+async fn settle_provisional_handoff(
+    state: &Arc<ControlState>,
+    provisional: &mut handoff::HandoffGuard,
+    wrote: &Result<Wrote>,
+) {
+    #[cfg(test)]
+    if let Some(barrier) = &state.before_provisional_settle {
+        barrier.pass().await;
+    }
+    provisional
+        .settle(state, matches!(wrote, Ok(Wrote::Sent)))
+        .await;
+}
+
 /// One value a connection-long mode keeps, and the funding for exactly the
 /// buffers it owns.
 ///
@@ -642,6 +663,8 @@ async fn serve_with_hooks(
         before_rpc_call: hooks.before_rpc_call,
         #[cfg(test)]
         before_begin_closing: hooks.before_begin_closing,
+        #[cfg(test)]
+        before_provisional_settle: hooks.before_provisional_settle,
     });
     #[cfg(not(test))]
     let _ = hooks;
@@ -978,6 +1001,9 @@ struct ControlState {
     /// to `Closing`.
     #[cfg(test)]
     before_begin_closing: Option<Arc<DispatchBarrier>>,
+    /// See [`ControlHooks::before_provisional_settle`].
+    #[cfg(test)]
+    before_provisional_settle: Option<Arc<DispatchBarrier>>,
 }
 
 /// One control surface with nothing joined, for the controls that are about
@@ -1026,6 +1052,7 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         at_events_stream_entry: None,
         before_rpc_call: None,
         before_begin_closing: None,
+        before_provisional_settle: None,
     })
 }
 
@@ -1654,13 +1681,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The capability naming this flow is the client's only copy, so
                 // the flow is not this daemon's until the line carrying it has
                 // actually been written.
                 let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote.context("realtime response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -1713,14 +1739,13 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     client_capability,
                 )
                 .await;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The request id is the client's only handle on this stream.
                 // Until the setup line is written, the stream is filed but
                 // nothing forwards it; the settle below either starts the
                 // forwarding or withdraws the stream.
                 let wrote = write_variable(&mut writer, &json_lines, &cancel, variable).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote.context("RPC stream setup response line was not admitted")? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -2078,6 +2103,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
             Request::GovernanceMfaEnroll { network } => {
                 let ((reply, output), provisional) =
                     dispatch::governance::mfa_enroll(&json_lines, network)?;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The lock is already installed. It has to be: a success
                 // response has to name an enrollment that exists, and deferring
                 // the write until this line would let two clients both be told
@@ -2098,9 +2124,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         }
                     };
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
-                provisional
-                    .settle(&state, matches!(wrote, Ok(Wrote::Sent)))
-                    .await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -3585,6 +3609,7 @@ mod terminal_shutdown_tests {
                 at_events_stream_entry: None,
                 before_rpc_call: Some(rpc_barrier),
                 before_begin_closing: Some(shutdown_barrier),
+                before_provisional_settle: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3751,6 +3776,7 @@ mod terminal_shutdown_tests {
                 at_events_stream_entry: None,
                 before_rpc_call: None,
                 before_begin_closing: None,
+                before_provisional_settle: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3905,6 +3931,7 @@ mod terminal_shutdown_tests {
                 at_events_stream_entry: Some(barrier),
                 before_rpc_call: None,
                 before_begin_closing: None,
+                before_provisional_settle: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -4067,6 +4094,7 @@ mod terminal_shutdown_tests {
                 at_events_stream_entry: None,
                 before_rpc_call: None,
                 before_begin_closing: None,
+                before_provisional_settle: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)

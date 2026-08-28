@@ -160,6 +160,47 @@ async fn ephemeral_events_are_not_stored() {
     server.stop();
 }
 
+#[tokio::test]
+async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
+    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let (mut sub, _) = connect_async(&url).await.unwrap();
+    let (mut pubr, _) = connect_async(&url).await.unwrap();
+    sub.send(Message::Text(
+        json!(["REQ", "profile", {"kinds": [1077, 21077], "#r": ["profile-room"]}]).to_string(),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(parse(&next_text(&mut sub).await)[0], "EOSE");
+
+    let unsupported = signed_event(1078, "profile-room", "unsupported", 2000);
+    pubr.send(Message::Text(json!(["EVENT", unsupported]).to_string()))
+        .await
+        .unwrap();
+    assert_eq!(parse(&next_text(&mut pubr).await)[0], "OK");
+
+    let received = tokio::time::timeout(Duration::from_millis(250), async {
+        while let Some(message) = sub.next().await {
+            if let Message::Text(text) = message.unwrap() {
+                let frame = parse(&text);
+                if frame[0] == "EVENT" {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        !received,
+        "only the advertised presence/negotiation profiles match"
+    );
+    server.stop();
+}
+
 // The headline test: two real Nostr drivers, pointed ONLY at a
 // self-hosted relay, discover each other — proving the relay works "in
 // place of Nostr" with zero driver changes.

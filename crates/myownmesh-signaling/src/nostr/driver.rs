@@ -56,6 +56,8 @@ impl AttemptOutcomeSink for UnmeteredAttemptOutcomeSink {
     fn outcome(&self, _outcome: AttemptOutcome) {}
 }
 
+const INBOUND_SINK_CLOSED: &str = "inbound sink closed";
+
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
 pub struct NostrDriverConfig {
@@ -269,6 +271,7 @@ where
     // signaling to actually come back after a network change before it
     // renegotiates (see `relay_connected` on `DriverShared`).
     let relay_connected = Arc::new(watch::channel(0u64).0);
+    let shutdown = watch::channel(false).0;
     let shared = Arc::new(DriverShared {
         identity,
         room_handle,
@@ -284,6 +287,7 @@ where
         presence_tx,
         force_reconnect: force_reconnect.clone(),
         relay_connected: relay_connected.clone(),
+        shutdown: shutdown.clone(),
     });
     {
         let mut relays = shared.relays.lock();
@@ -361,6 +365,7 @@ where
         force_reconnect,
         relay_connected,
         delivery,
+        shutdown,
     }
 }
 
@@ -371,6 +376,7 @@ pub struct NostrDriverHandle {
     force_reconnect: Arc<watch::Sender<u64>>,
     relay_connected: Arc<watch::Sender<u64>>,
     delivery: Arc<DeliveryStore>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl NostrDriverHandle {
@@ -393,6 +399,7 @@ impl NostrDriverHandle {
     }
 
     pub fn stop(self) {
+        let _ = self.shutdown.send(true);
         self.delivery.shutdown();
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -419,6 +426,7 @@ impl NostrDriverHandle {
 
 impl Drop for NostrDriverHandle {
     fn drop(&mut self) {
+        let _ = self.shutdown.send(true);
         self.delivery.shutdown();
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -448,6 +456,7 @@ struct DriverShared {
     /// offers/candidates would reach nobody (the "0 remote candidates
     /// arrived" stall). See `engine::network_watch::on_network_change`.
     relay_connected: Arc<watch::Sender<u64>>,
+    shutdown: watch::Sender<bool>,
     // Outbound *directed* events (offers / answers / candidates) removed;
     // while every relay socket was mid-reconnect; DeliveryStore owns live attempts.
     // A reconnecting session registers fresh per-relay custody entries.
@@ -556,6 +565,7 @@ async fn run_relay(
     // task started can't fire a spurious immediate reconnect.
     let mut force_rx = shared.force_reconnect.subscribe();
     force_rx.borrow_and_update();
+    let mut shutdown_rx = shared.shutdown.subscribe();
     // Tracks consecutive connect failures so we can dampen the log
     // spam from chronically-broken public relays (DNS no-such-host,
     // 403s, TLS handshake timeouts). Without this, a single bad
@@ -567,7 +577,7 @@ async fn run_relay(
     // Trystero-patch noise suppression.
     let mut consecutive_failures = 0u32;
     loop {
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
         match tokio_tungstenite::connect_async(&url).await {
@@ -583,12 +593,6 @@ async fn run_relay(
                 }
                 consecutive_failures = 0;
                 backoff_attempt = 0;
-                // Tell the engine a relay is freshly up so a network-change
-                // renegotiation can publish into a live relay instead of a
-                // redialing one (the "0 remote candidates arrived" stall).
-                shared
-                    .relay_connected
-                    .send_modify(|g| *g = g.wrapping_add(1));
                 // Count this live session so the fallback supervisor can
                 // tell whether any primary relay is currently connected.
                 // `None` for fallback tasks (they don't gate themselves).
@@ -603,7 +607,17 @@ async fn run_relay(
                         ?error,
                         "relay-session custody refused by provider"
                     );
+                    if let Some(c) = &live {
+                        c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    continue;
                 }
+                // Tell the engine a relay is freshly up only after this exact
+                // session has provider custody. An incomplete profile must
+                // not advertise readiness or enter the receive loop.
+                shared
+                    .relay_connected
+                    .send_modify(|g| *g = g.checked_add(1).unwrap_or(u64::MAX));
                 for refusal in refused {
                     warn!(
                         relay = %short(&url),
@@ -635,6 +649,11 @@ async fn run_relay(
                     c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
+                if matches!(outcome, RelaySessionOutcome::ConsumerClosed) {
+                    let _ = shared.shutdown.send(true);
+                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
                 if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
                     // Engine asked us to redial now (e.g. resume from
                     // sleep). Skip the backoff entirely and reconnect on
@@ -658,7 +677,7 @@ async fn run_relay(
                 consecutive_failures = consecutive_failures.saturating_add(1);
             }
         }
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
         // Reconnect backoff: 2 / 4 / 8 / 16 / 32 s capped at 60 s — the
@@ -678,6 +697,7 @@ async fn run_relay(
                 debug!(relay = %short(&url), "forced reconnect during backoff — redialing now");
                 backoff_attempt = 0;
             }
+            _ = shutdown_rx.changed() => return,
         }
     }
 }
@@ -737,9 +757,10 @@ async fn run_fallback_supervisor(
     // Cancel tokens for the fallback relay tasks currently running.
     let mut active: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
     let mut down_since: Option<Instant> = None;
+    let mut shutdown_rx = shared.shutdown.subscribe();
 
     loop {
-        if cancel.load(SeqCst) {
+        if cancel.load(SeqCst) || *shutdown_rx.borrow() {
             for c in &active {
                 c.store(true, SeqCst);
             }
@@ -783,7 +804,15 @@ async fn run_fallback_supervisor(
             FallbackAction::Hold => {}
         }
 
-        sleep(Duration::from_millis(FALLBACK_POLL_MS)).await;
+        tokio::select! {
+            _ = sleep(Duration::from_millis(FALLBACK_POLL_MS)) => {}
+            _ = shutdown_rx.changed() => {
+                for c in &active {
+                    c.store(true, SeqCst);
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -797,6 +826,8 @@ enum RelaySessionOutcome {
     /// and redial immediately, skipping the backoff. Matched in
     /// [`run_relay`].
     ForcedReconnect,
+    /// The engine-side inbound consumer is gone; do not reconnect this relay.
+    ConsumerClosed,
 }
 
 /// How often the relay read loop wakes on an otherwise-idle socket to
@@ -909,9 +940,10 @@ async fn run_relay_session(
             Ok(notification) => notification,
             Err(error) => return RelaySessionOutcome::Error(error),
         };
+    let mut shutdown_rx = shared.shutdown.subscribe();
 
     loop {
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             // Best-effort clean close so the relay sees our departure
             // immediately (a Close frame, falling back to the TCP FIN
             // from dropping the stream). Bounded so a wedged socket
@@ -933,6 +965,9 @@ async fn run_relay_session(
                     Err(e) => return RelaySessionOutcome::Error(format!("ws read: {e}")),
                 };
                 if let Err(e) = handle_inbound_frame(url, &frame, shared, inbound_tx, session.clone()) {
+                    if e == INBOUND_SINK_CLOSED {
+                        return RelaySessionOutcome::ConsumerClosed;
+                    }
                     trace!(relay = %short(url), "inbound frame parse: {e}");
                 }
             }
@@ -972,6 +1007,9 @@ async fn run_relay_session(
             _ = force_rx.changed() => {
                 return RelaySessionOutcome::ForcedReconnect;
             }
+            _ = shutdown_rx.changed() => {
+                return RelaySessionOutcome::Cancelled;
+            }
             // Idle-wake so a stopped/dropped handle is noticed within one
             // poll interval even on a quiet socket. Without this, a
             // `read.next()` parked on an idle connection could hold the
@@ -993,8 +1031,9 @@ async fn run_relay_session(
 /// dense at startup, settling to a 60s steady-state heartbeat.
 async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut count: usize = 0;
+    let mut shutdown_rx = shared.shutdown.subscribe();
     loop {
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
         let event = OwnedSignal::new(build_announce_event(&shared), Box::new(()) as ErasedOwner);
@@ -1025,11 +1064,14 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         let mut remaining = wait_ms;
         const CHUNK_MS: u64 = 1_000;
         while remaining > 0 {
-            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
                 return;
             }
             let step = remaining.min(CHUNK_MS);
-            sleep(Duration::from_millis(step)).await;
+            tokio::select! {
+                _ = sleep(Duration::from_millis(step)) => {}
+                _ = shutdown_rx.changed() => return,
+            }
             remaining = remaining.saturating_sub(step);
         }
     }
@@ -1042,6 +1084,9 @@ fn handle_inbound_frame(
     inbound_tx: &InboundSink<NostrInbound>,
     session: RelaySessionId,
 ) -> Result<(), String> {
+    if frame.len() > 256 * 1024 {
+        return Err("inbound frame exceeds size cap".to_string());
+    }
     let value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
     let arr = value.as_array().ok_or_else(|| "not an array".to_string())?;
     let tag = arr.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -1112,10 +1157,12 @@ fn handle_inbound_frame(
                     // same sender wrote, so preferring it would buy nothing.
                     // What the tag buys is that this can never cancel an
                     // observation a carrier made itself.
-                    let _ = inbound_tx.send(NostrInbound::PeerAnnounced {
-                        device_id: peer_id,
-                        attribution: CarrierAttribution::SenderClaimed,
-                    });
+                    inbound_tx
+                        .send(NostrInbound::PeerAnnounced {
+                            device_id: peer_id,
+                            attribution: CarrierAttribution::SenderClaimed,
+                        })
+                        .map_err(|_| INBOUND_SINK_CLOSED.to_string())?;
                 }
                 SignalingMessage::Leave { peer_id } => {
                     // Departure rides the ephemeral kind like the rest of
@@ -1132,10 +1179,12 @@ fn handle_inbound_frame(
                     if peer_id == shared.device_id {
                         return Ok(());
                     }
-                    let _ = inbound_tx.send(NostrInbound::PeerLeft {
-                        device_id: peer_id,
-                        attribution: CarrierAttribution::SenderClaimed,
-                    });
+                    inbound_tx
+                        .send(NostrInbound::PeerLeft {
+                            device_id: peer_id,
+                            attribution: CarrierAttribution::SenderClaimed,
+                        })
+                        .map_err(|_| INBOUND_SINK_CLOSED.to_string())?;
                 }
                 other => {
                     if event.kind != SIGNALING_EPHEMERAL_KIND {
@@ -1146,10 +1195,12 @@ fn handle_inbound_frame(
                         );
                         return Ok(());
                     }
-                    let _ = inbound_tx.send(NostrInbound::Message {
-                        from: envelope.from,
-                        msg: other,
-                    });
+                    inbound_tx
+                        .send(NostrInbound::Message {
+                            from: envelope.from,
+                            msg: other,
+                        })
+                        .map_err(|_| INBOUND_SINK_CLOSED.to_string())?;
                 }
             }
         }
@@ -1229,8 +1280,15 @@ async fn run_outbound_pump_v2(
         return;
     };
     drop(rx_guard);
-    while let Some(outbound) = rx.recv().await {
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+    let mut shutdown_rx = shared.shutdown.subscribe();
+    loop {
+        let Some(outbound) = (tokio::select! {
+            outbound = rx.recv() => outbound,
+            _ = shutdown_rx.changed() => break,
+        }) else {
+            break;
+        };
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             break;
         }
         let attempt = outbound_attempt(outbound.value()).map(str::to_owned);
@@ -1270,6 +1328,8 @@ async fn run_outbound_pump_v2(
             }
         }
     }
+    let _ = shared.shutdown.send(true);
+    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
     shared.delivery.shutdown();
 }
 
@@ -1551,6 +1611,7 @@ mod tests {
             presence_tx: watch::channel(None).0,
             force_reconnect: Arc::new(watch::channel(0u64).0),
             relay_connected: Arc::new(watch::channel(0u64).0),
+            shutdown: watch::channel(false).0,
         })
     }
 

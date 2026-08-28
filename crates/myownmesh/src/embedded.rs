@@ -27,6 +27,9 @@ pub enum EmbeddedStartError {
 
     #[error("service policy: {0}")]
     ServicePolicy(#[from] crate::services::ServicePolicyError),
+
+    #[error("custody startup recovery: {0}")]
+    CustodyRecovery(myownmesh_core::Error),
 }
 
 /// A daemon running inside this process. Keep it alive for the daemon's
@@ -189,6 +192,13 @@ async fn start_with_mesh(
     );
 
     info!(device_id = %mesh.identity().display_id(), "identity ready");
+
+    // Recover interrupted provisional custody before any control socket is
+    // spawned. A corrupt store or an unresolvable owner lease is a startup
+    // failure: exposing a live control surface while custody state is
+    // uncertain would turn an interrupted handoff into an authority decision.
+    myownmesh_core::custody::recover_provisional_enrollments()
+        .map_err(EmbeddedStartError::CustodyRecovery)?;
 
     // The registry holds every JoinedNetwork + its signaling driver handle so
     // the control socket can address them by id. Node participation is a

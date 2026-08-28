@@ -1048,6 +1048,19 @@ impl PeerConnection {
         })
     }
 
+    /// Whether any live speculative sidecar owns this exact durable delivery.
+    /// The registry mutation fence supplies the installation check around this
+    /// observation; callers must not use it as a device-level lookup.
+    pub(super) fn speculative_proof_delivery_owned(
+        &self,
+        delivery_id: crate::semantic::ProofDeliveryId,
+    ) -> bool {
+        self.speculative
+            .lock()
+            .iter()
+            .any(|attempt| attempt.proof_delivery == Some(delivery_id))
+    }
+
     pub(super) fn clear_speculative_proof_delivery(
         &self,
         correlation: &str,

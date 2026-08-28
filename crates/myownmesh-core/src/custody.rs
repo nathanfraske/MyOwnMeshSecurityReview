@@ -19,9 +19,13 @@
 //! The gate is [`require`]; enrollment management is [`enroll`] /
 //! [`is_enrolled`] / [`disable`]. Higher layers decide *which* networks must
 //! enroll (e.g. a Fleet mandates it, a Mesh may not) — this module only
-//! enforces the lock once it exists.
+//! enforces the lock once it exists. Provisional installs carry a local
+//! process-incarnation fence, so startup recovery can remove a handoff left
+//! behind by hard process death without removing a live handoff.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use data_encoding::BASE32_NOPAD;
@@ -66,6 +70,11 @@ struct Enrollment {
     /// removed from this list the moment it is consumed.
     recovery_hashes: Vec<String>,
     created_at: u64,
+    /// True only between the durable install and the caller's handoff.
+    #[serde(default)]
+    provisional: bool,
+    #[serde(default)]
+    process_nonce: String,
 }
 
 /// What [`enroll`] hands back to show the user exactly once: the secret (as
@@ -87,7 +96,10 @@ pub struct Enrolled {
 pub fn is_enrolled(network_id: &str) -> bool {
     store_path()
         .ok()
-        .and_then(|p| load_at(&p).ok())
+        .and_then(|p| {
+            recover_provisional_at(&p).ok()?;
+            load_at(&p).ok()
+        })
         .map(|s| s.networks.contains_key(network_id))
         .unwrap_or(false)
 }
@@ -124,6 +136,11 @@ pub struct ProvisionalEnrollment {
     path: PathBuf,
     network_id: String,
     enrolled: Enrolled,
+    /// An OS-held lease for this exact provisional record. The kernel drops
+    /// it when the process dies, which is the cross-process liveness fence
+    /// recovery needs; a nonce in the JSON alone cannot distinguish a live
+    /// process from a different process that merely started later.
+    lease: Option<OwnerLease>,
     /// False once [`Self::keep`] or [`Self::roll_back`] has settled this.
     armed: bool,
 }
@@ -141,10 +158,28 @@ impl ProvisionalEnrollment {
 
     /// The caller has the material, so the installed lock is this device's.
     ///
-    /// Nothing is written: the lock is already on disk, which is the whole point
-    /// of installing before answering. This only disarms the undo.
+    /// Durably hand the installed lock to the caller and disarm the undo.
+    ///
+    /// The handoff is itself atomic. If the process dies during this write,
+    /// restart recovery sees either the old provisional record and removes it,
+    /// or the new committed record and keeps it. The historical `keep` API is
+    /// intentionally infallible for callers that are already sending a
+    /// response; on an I/O error the value stays armed and its `Drop` performs
+    /// the exact rollback instead of stranding an unowned lock.
     pub fn keep(mut self) {
+        if let Err(error) = self.commit() {
+            tracing::warn!(
+                network = %self.network_id,
+                "a provisional MFA enrollment could not be committed: {error}"
+            );
+        }
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        commit_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)?;
+        self.lease.take();
         self.armed = false;
+        Ok(())
     }
 
     /// The caller does not have the material, so remove exactly this lock.
@@ -160,6 +195,7 @@ impl ProvisionalEnrollment {
     /// removal is exact and idempotent: it removes this record or nothing.
     pub fn roll_back(mut self) -> Result<()> {
         remove_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)?;
+        self.lease.take();
         self.armed = false;
         Ok(())
     }
@@ -177,6 +213,7 @@ impl Drop for ProvisionalEnrollment {
                 "a provisional MFA enrollment could not be rolled back: {error}"
             );
         }
+        self.lease.take();
     }
 }
 
@@ -191,9 +228,9 @@ impl Drop for ProvisionalEnrollment {
 /// [`install_provisional_enroll`] and settles it against whether the handoff
 /// actually happened.
 pub fn enroll(network_id: &str, account: &str) -> Result<Enrolled> {
-    let provisional = install_provisional_enroll(network_id, account)?;
+    let mut provisional = install_provisional_enroll(network_id, account)?;
     let enrolled = provisional.enrolled.clone();
-    provisional.keep();
+    provisional.commit()?;
     Ok(enrolled)
 }
 
@@ -203,7 +240,20 @@ pub fn install_provisional_enroll(
     network_id: &str,
     account: &str,
 ) -> Result<ProvisionalEnrollment> {
-    install_provisional_enroll_at(&store_path()?, network_id, account)
+    let path = store_path()?;
+    recover_provisional_at(&path)?;
+    install_provisional_enroll_at(&path, network_id, account)
+}
+
+/// Remove provisional enrollments whose OS owner lease is no longer held.
+///
+/// Callers may invoke this at daemon startup, and all public custody entry
+/// points perform the same check before reading or mutating the store. A live
+/// provisional handoff in another process is retained by its kernel-held lease;
+/// a record written by a process that died before its response was handed off
+/// is removed. The operation is exact, serialized, and idempotent.
+pub fn recover_provisional_enrollments() -> Result<usize> {
+    recover_provisional_at(&store_path()?)
 }
 
 /// The gate. `Ok(())` when the network has no enrollment on this device (the
@@ -212,14 +262,18 @@ pub fn install_provisional_enroll(
 /// otherwise. Custody-affecting governance authoring calls this before it
 /// signs.
 pub fn require(network_id: &str, code: Option<&str>) -> Result<()> {
-    require_at(&store_path()?, network_id, code)
+    let path = store_path()?;
+    recover_provisional_at(&path)?;
+    require_at(&path, network_id, code)
 }
 
 /// Remove the custody lock for `network_id` — but only on presentation of a
 /// valid code, so the lock can't be undone by someone who doesn't already
 /// satisfy it.
 pub fn disable(network_id: &str, code: &str) -> Result<()> {
-    disable_at(&store_path()?, network_id, code)
+    let path = store_path()?;
+    recover_provisional_at(&path)?;
+    disable_at(&path, network_id, code)
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +297,332 @@ pub fn disable(network_id: &str, code: &str) -> Result<()> {
 /// enrollment because of it would turn one panic into a permanently unusable
 /// custody store.
 static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PROCESS_NONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// A process-owned lease for one exact provisional record. The file is
+/// deliberately retained only as long as its owner is live; its advisory
+/// kernel lock is the authority and the contents are diagnostic metadata,
+/// never a liveness decision. The record secret is part of the lease path, so
+/// disabling this record permits a successor to acquire a distinct lease even
+/// while a stale same-process handle still awaits its exact rollback.
+struct OwnerLease {
+    file: File,
+    #[cfg(windows)]
+    overlapped: Box<WinOverlapped>,
+}
+
+impl OwnerLease {
+    fn acquire(path: &Path, network_id: &str, record_secret: &str, nonce: &str) -> Result<Self> {
+        let lease_path = owner_lease_path(path, network_id, record_secret);
+        if let Some(parent) = lease_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Custody(format!("create custody lease dir: {e}")))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lease_path)
+            .map_err(|e| Error::Custody(format!("open custody owner lease: {e}")))?;
+        #[cfg(unix)]
+        if !try_lock_owner_file(&file)
+            .map_err(|e| Error::Custody(format!("lock custody owner lease: {e}")))?
+        {
+            return Err(Error::Custody(format!(
+                "a live process owns the provisional custody lease for {network_id}"
+            )));
+        }
+        #[cfg(windows)]
+        let overlapped = try_lock_owner_file(&file)
+            .map_err(|e| Error::Custody(format!("lock custody owner lease: {e}")))?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(Error::Custody(
+            "cross-process custody leases are unsupported on this platform".into(),
+        ));
+
+        let mut lease = Self {
+            file,
+            #[cfg(windows)]
+            overlapped,
+        };
+        lease
+            .file
+            .set_len(0)
+            .and_then(|_| {
+                lease
+                    .file
+                    .write_all(format!("{} {nonce}\n", std::process::id()).as_bytes())
+            })
+            .and_then(|_| lease.file.sync_data())
+            .map_err(|e| Error::Custody(format!("write custody owner lease: {e}")))?;
+        restrict_file(&lease_path);
+        Ok(lease)
+    }
+}
+
+impl Drop for OwnerLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_owner_file(&self.file);
+        #[cfg(windows)]
+        unlock_owner_file(&self.file, &mut self.overlapped);
+        // Retain the stable pathname. Removing it after unlock allows a
+        // contender to lock the old inode/handle before unlink while another
+        // process creates and locks a replacement file. The kernel lock, not
+        // pathname lifetime, is the liveness authority.
+    }
+}
+
+/// The shared custody file is one logical map even when two processes mutate
+/// different network keys. This lease serializes the complete load/check/
+/// mutate/save transaction across processes; it is never unlinked, so every
+/// contender always refers to the same inode.
+struct WriterLease {
+    file: File,
+    #[cfg(windows)]
+    overlapped: Box<WinOverlapped>,
+}
+
+impl WriterLease {
+    fn acquire(path: &Path) -> Result<Self> {
+        let lease_path = writer_lease_path(path);
+        if let Some(parent) = lease_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::Custody(format!("create writer lease dir: {e}")))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lease_path)
+            .map_err(|e| Error::Custody(format!("open custody writer lease: {e}")))?;
+        restrict_file(&lease_path);
+        #[cfg(unix)]
+        lock_writer_file(&file)
+            .map_err(|e| Error::Custody(format!("lock custody writer lease: {e}")))?;
+        #[cfg(windows)]
+        let overlapped = lock_writer_file(&file)
+            .map_err(|e| Error::Custody(format!("lock custody writer lease: {e}")))?;
+        #[cfg(not(any(unix, windows)))]
+        return Err(Error::Custody(
+            "cross-process custody leases are unsupported on this platform".into(),
+        ));
+        Ok(Self {
+            file,
+            #[cfg(windows)]
+            overlapped,
+        })
+    }
+}
+
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unlock_owner_file(&self.file);
+        #[cfg(windows)]
+        unlock_owner_file(&self.file, &mut self.overlapped);
+    }
+}
+
+fn owner_lease_path(path: &Path, network_id: &str, record_secret: &str) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(network_id.as_bytes());
+    digest.update([0]);
+    digest.update(record_secret.as_bytes());
+    path.with_file_name(format!(
+        "{}.{}.lease",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("custody"),
+        hex::encode(digest.finalize())
+    ))
+}
+
+fn writer_lease_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        "{}.writer.lock",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("custody")
+    ))
+}
+
+#[cfg(unix)]
+fn try_lock_owner_file(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        if flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 {
+            Ok(true)
+        } else if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+            Ok(false)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_owner_file(file: &File) {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_UN: i32 = 8;
+        let _ = flock(file.as_raw_fd(), LOCK_UN);
+    }
+}
+
+#[cfg(unix)]
+fn lock_writer_file(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    unsafe {
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        const LOCK_EX: i32 = 2;
+        if flock(file.as_raw_fd(), LOCK_EX) == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WinOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+// SAFETY: The OVERLAPPED value is allocated in a Box and is never moved after
+// LockFileEx receives its address. Moving the owning Box between threads keeps
+// that address stable. `event` is always null, so there is no event handle or
+// other pointed-to state to transfer. Windows associates the byte-range lock
+// with the file handle, and UnlockFileEx accepts that same handle from the
+// thread that owns the moved lease. The lease remains uniquely owned, so no
+// concurrent access to the OVERLAPPED value is possible.
+unsafe impl Send for WinOverlapped {}
+
+#[cfg(windows)]
+fn try_lock_owner_file(file: &File) -> io::Result<Box<WinOverlapped>> {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unsafe extern "system" {
+            fn LockFileEx(
+                file: *mut std::ffi::c_void,
+                flags: u32,
+                reserved: u32,
+                low: u32,
+                high: u32,
+                overlapped: *mut WinOverlapped,
+            ) -> i32;
+        }
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+        let mut overlapped = Box::new(WinOverlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        });
+        if LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut *overlapped,
+        ) != 0
+        {
+            Ok(overlapped)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn unlock_owner_file(file: &File, overlapped: &mut WinOverlapped) {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unsafe extern "system" {
+            fn UnlockFileEx(
+                file: *mut std::ffi::c_void,
+                reserved: u32,
+                low: u32,
+                high: u32,
+                overlapped: *mut WinOverlapped,
+            ) -> i32;
+        }
+        let _ = UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, overlapped);
+    }
+}
+
+#[cfg(windows)]
+fn lock_writer_file(file: &File) -> io::Result<Box<WinOverlapped>> {
+    use std::os::windows::io::AsRawHandle;
+    unsafe {
+        unsafe extern "system" {
+            fn LockFileEx(
+                file: *mut std::ffi::c_void,
+                flags: u32,
+                reserved: u32,
+                low: u32,
+                high: u32,
+                overlapped: *mut WinOverlapped,
+            ) -> i32;
+        }
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+        let mut overlapped = Box::new(WinOverlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: 0,
+            offset_high: 0,
+            event: std::ptr::null_mut(),
+        });
+        if LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut *overlapped,
+        ) != 0
+        {
+            Ok(overlapped)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn unlock_owner_file(_file: &File) {}
 
 fn store_guard() -> std::sync::MutexGuard<'static, ()> {
     STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn store_transaction_guard(
+    path: &Path,
+) -> Result<(std::sync::MutexGuard<'static, ()>, WriterLease)> {
+    let serialized = store_guard();
+    let writer = WriterLease::acquire(path)?;
+    Ok((serialized, writer))
 }
 
 fn install_provisional_enroll_at(
@@ -253,7 +630,8 @@ fn install_provisional_enroll_at(
     network_id: &str,
     account: &str,
 ) -> Result<ProvisionalEnrollment> {
-    let _serialized = store_guard();
+    recover_provisional_at(path)?;
+    let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
     if store.networks.contains_key(network_id) {
         return Err(Error::Custody(format!(
@@ -265,12 +643,15 @@ fn install_provisional_enroll_at(
     let recovery_codes = gen_recovery_codes();
     let recovery_hashes = recovery_codes.iter().map(|c| hash_code(c)).collect();
     let otpauth_uri = provisioning_uri(&secret_b32, account);
+    let lease = OwnerLease::acquire(path, network_id, &secret_b32, process_nonce())?;
     store.networks.insert(
         network_id.to_string(),
         Enrollment {
             secret_b32: secret_b32.clone(),
             recovery_hashes,
             created_at: now_unix(),
+            provisional: true,
+            process_nonce: process_nonce().to_string(),
         },
     );
     // Written before anything is answered, so what comes back names a lock that
@@ -285,8 +666,101 @@ fn install_provisional_enroll_at(
             otpauth_uri,
             recovery_codes,
         },
+        lease: Some(lease),
         armed: true,
     })
+}
+
+/// Commit the exact installed record, preserving the same generation fence
+/// used by rollback. A stale handle can never commit a successor, and a
+/// record already committed by an earlier idempotent handoff is left alone.
+fn commit_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()> {
+    let (_serialized, _writer) = store_transaction_guard(path)?;
+    let mut store = load_at(path)?;
+    let Some(installed) = store.networks.get_mut(network_id) else {
+        return Ok(());
+    };
+    if !constant_eq(installed.secret_b32.as_bytes(), secret_b32.as_bytes())
+        || !installed.provisional
+        || installed.process_nonce != process_nonce()
+    {
+        return Ok(());
+    }
+    installed.provisional = false;
+    installed.process_nonce.clear();
+    save_at(path, &store)
+}
+
+/// Recover only records whose provisional owner belongs to a dead process.
+///
+/// Liveness is decided by the kernel-held owner lease, not by comparing the
+/// diagnostic process nonce.
+fn recover_provisional_at(path: &Path) -> Result<usize> {
+    #[cfg(not(any(unix, windows)))]
+    return Err(Error::Custody(
+        "cross-process custody recovery is unsupported on this platform".into(),
+    ));
+
+    let (_serialized, _writer) = store_transaction_guard(path)?;
+    let mut store = load_at(path)?;
+    let mut stale = Vec::new();
+    let mut leases = Vec::new();
+    for (network_id, enrollment) in &store.networks {
+        // The nonce is diagnostic metadata only. A failed rollback may release
+        // its OS lease while leaving the current process nonce on disk, so
+        // every provisional record must still be checked against its exact
+        // per-secret kernel lease.
+        if !enrollment.provisional {
+            continue;
+        }
+        let lease_path = owner_lease_path(path, network_id, &enrollment.secret_b32);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lease_path)
+            .map_err(|e| Error::Custody(format!("open custody recovery lease: {e}")))?;
+        #[cfg(unix)]
+        let acquired = try_lock_owner_file(&file)
+            .map_err(|e| Error::Custody(format!("lock custody recovery lease: {e}")))?;
+        #[cfg(windows)]
+        let overlapped = match try_lock_owner_file(&file) {
+            Ok(overlapped) => Some(overlapped),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(33) =>
+            {
+                None
+            }
+            Err(error) => {
+                return Err(Error::Custody(format!(
+                    "lock custody recovery lease: {error}"
+                )));
+            }
+        };
+        #[cfg(windows)]
+        let acquired = overlapped.is_some();
+        #[cfg(not(any(unix, windows)))]
+        let acquired = false;
+        if acquired {
+            stale.push(network_id.clone());
+            leases.push(OwnerLease {
+                file,
+                #[cfg(windows)]
+                overlapped: overlapped.expect("acquired lease has lock state"),
+            });
+        }
+    }
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    for network_id in &stale {
+        store.networks.remove(network_id);
+    }
+    save_at(path, &store)?;
+    drop(leases);
+    Ok(stale.len())
 }
 
 /// Remove `network_id`'s lock, but only while it is still the exact one
@@ -298,7 +772,7 @@ fn install_provisional_enroll_at(
 /// first attempt failed, whose material *was* delivered. Constant-time, for the
 /// same reason every other comparison against stored custody material here is.
 fn remove_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()> {
-    let _serialized = store_guard();
+    let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
     let Some(installed) = store.networks.get(network_id) else {
         // Already gone — disabled, or rolled back once already. Same end state.
@@ -314,9 +788,9 @@ fn remove_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()
 
 #[cfg(test)]
 fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
-    let provisional = install_provisional_enroll_at(path, network_id, account)?;
+    let mut provisional = install_provisional_enroll_at(path, network_id, account)?;
     let enrolled = provisional.enrolled.clone();
-    provisional.keep();
+    provisional.commit()?;
     Ok(enrolled)
 }
 
@@ -375,7 +849,7 @@ fn require_at(path: &Path, network_id: &str, code: Option<&str>) -> Result<()> {
     // A recovery code is *consumed* on match, which makes this a store mutation
     // like any other: two gates racing on the same code could otherwise both
     // read it unused and both be admitted by it.
-    let _serialized = store_guard();
+    let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
     let Some(enr) = store.networks.get_mut(network_id) else {
         return Ok(()); // not enrolled on this device → the gate is a no-op
@@ -397,7 +871,7 @@ fn disable_at(path: &Path, network_id: &str, code: &str) -> Result<()> {
     // previous shape authorized through the lock-taking gate and reacquired for
     // the removal, and that gap was enough for a disable to delete an
     // enrollment nobody had authorized it against.
-    let _serialized = store_guard();
+    let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
     let Some(enrollment) = store.networks.get(network_id) else {
         // Nothing is installed, so there is nothing to remove and nothing to
@@ -537,6 +1011,12 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn process_nonce() -> &'static str {
+    PROCESS_NONCE
+        .get_or_init(|| hex::encode(random_bytes(16)))
+        .as_str()
 }
 
 fn store_path() -> Result<PathBuf> {
@@ -837,6 +1317,117 @@ mod tests {
             "and it is still satisfied by the secret its own caller was shown"
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A live owner lease preserves its provisional record even if its
+    /// diagnostic process nonce differs; hard-death reclamation is covered by
+    /// the cross-process R2 control.
+    #[test]
+    fn v4_r2_hard_death_recovery_removes_only_an_old_process_provisional() {
+        let path = tmp();
+        let net = "fleet-hard-death";
+
+        let live = install_provisional_enroll_at(&path, net, "laptop").expect("install");
+        assert_eq!(
+            recover_provisional_at(&path).expect("live recovery"),
+            0,
+            "startup recovery must not steal a handoff owned by this process"
+        );
+
+        // A different nonce alone is not evidence of a dead owner: the live
+        // kernel lease remains authoritative and must preserve this record.
+        let mut store = load_at(&path).expect("read installed record");
+        store
+            .networks
+            .get_mut(net)
+            .expect("installed network")
+            .process_nonce = "dead-process-incarnation".into();
+        save_at(&path, &store).expect("persist crash snapshot");
+
+        assert_eq!(
+            recover_provisional_at(&path).expect("live recovery"),
+            0,
+            "the next recovery pass cannot steal a record with a live lease"
+        );
+        assert!(is_enrolled_at(&path, net));
+        drop(live);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A process nonce is only diagnostic metadata. If rollback released the
+    /// exact owner lease but failed before removing its durable record, a
+    /// recovery pass in the same process must still reclaim that orphan.
+    #[test]
+    fn v4_r2_current_nonce_without_owner_lease_is_recovered() {
+        let path = tmp();
+        let net = "fleet-current-nonce-orphan";
+        let secret_b32 = BASE32_NOPAD.encode(&[0x42; SECRET_LEN]);
+        let lease_path = owner_lease_path(&path, net, &secret_b32);
+        assert!(
+            !lease_path.exists(),
+            "the control starts with no live exact-secret owner lease"
+        );
+        let mut store = CustodyStore::default();
+        store.networks.insert(
+            net.into(),
+            Enrollment {
+                secret_b32: secret_b32.clone(),
+                recovery_hashes: Vec::new(),
+                created_at: now_unix(),
+                provisional: true,
+                process_nonce: process_nonce().to_owned(),
+            },
+        );
+        save_at(&path, &store).expect("materialize current-nonce orphan");
+
+        let before = load_at(&path).expect("read materialized orphan");
+        assert_eq!(
+            before
+                .networks
+                .get(net)
+                .expect("orphaned network")
+                .process_nonce,
+            process_nonce(),
+            "the control must exercise the nonce-equality case"
+        );
+        assert_eq!(
+            recover_provisional_at(&path).expect("recover current-nonce orphan"),
+            1,
+            "recovery follows the exact kernel lease, not diagnostic nonce equality"
+        );
+        assert!(
+            !load_at(&path)
+                .expect("read recovered store")
+                .networks
+                .contains_key(net),
+            "an orphaned provisional record is removed even in the current process"
+        );
+
+        let _ = std::fs::remove_file(lease_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The commit side of the restart transaction is just as important as
+    /// rollback: an atomic handoff leaves a committed record that a later
+    /// recovery pass preserves, and the exact handle is no longer armed.
+    #[test]
+    fn v4_r2_committed_handoff_survives_restart_recovery() {
+        let path = tmp();
+        let net = "fleet-committed-restart";
+
+        let mut provisional = install_provisional_enroll_at(&path, net, "phone").expect("install");
+        provisional.commit().expect("commit handoff");
+        let store = load_at(&path).expect("read committed record");
+        let enrollment = store.networks.get(net).expect("committed network");
+        assert!(!enrollment.provisional);
+        assert!(enrollment.process_nonce.is_empty());
+        assert_eq!(
+            recover_provisional_at(&path).expect("restart recovery"),
+            0,
+            "committed custody is not provisional recovery input"
+        );
+        assert!(is_enrolled_at(&path, net));
         let _ = std::fs::remove_file(&path);
     }
 

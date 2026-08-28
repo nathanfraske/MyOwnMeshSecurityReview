@@ -5,8 +5,8 @@
 use ed25519_dalek::SigningKey;
 
 use myownmesh_core::semantic::{
-    AttestationDecision, CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph,
-    FactId, Role, SignedFact, VerifiedBootstrap,
+    Admission, AttestationDecision, CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent,
+    FactGraph, FactId, Role, SignedFact, VerifiedBootstrap,
 };
 
 fn key(seed: u8) -> SigningKey {
@@ -116,6 +116,142 @@ fn effective_membership_restoration_supersedes_stand_down_in_any_arrival_order()
         !permuted.projection().is_stood_down(&target),
         "only the effective, proof-descending membership restoration clears stand-down"
     );
+}
+
+#[test]
+fn finite_authority_fork_projection_converges_for_every_arrival_permutation() {
+    let root_key = key(114);
+    let controller_key = key(115);
+    let target = author(&key(116));
+    let future_target = author(&key(117));
+    let bootstrap = bootstrap(114, 114);
+    let controller = author(&controller_key);
+    let mut source = FactGraph::from_bootstrap(&bootstrap);
+
+    let grant = authored(
+        &source,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    source
+        .admit(grant.clone())
+        .expect("G controller grant admits");
+    let operation = authored(
+        &source,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &source,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = source.clone();
+    fork.admit(operation.clone()).expect("O operation admits");
+    fork.admit(revoke.clone()).expect("R revoke admits");
+    let resolution = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![operation.id, revoke.id],
+            selected_head: revoke.id,
+        },
+        Vec::new(),
+    );
+    fork.admit(resolution.clone())
+        .expect("Q selects the revoke branch");
+    let regrant = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    fork.admit(regrant.clone()).expect("N regrant admits");
+    let future = authored(
+        &fork,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: future_target.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+
+    let candidates = [grant, operation, revoke, resolution, regrant, future];
+    let mut expected = None;
+    let mut order = [0, 1, 2, 3, 4, 5];
+    let mut orders = Vec::new();
+    fn permutations(order: &mut [usize; 6], start: usize, output: &mut Vec<[usize; 6]>) {
+        if start == order.len() {
+            output.push(*order);
+            return;
+        }
+        for index in start..order.len() {
+            order.swap(start, index);
+            permutations(order, start + 1, output);
+            order.swap(start, index);
+        }
+    }
+    permutations(&mut order, 0, &mut orders);
+    assert_eq!(
+        orders.len(),
+        720,
+        "the control covers every arrival permutation"
+    );
+
+    for permutation in orders {
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        for index in permutation {
+            assert!(matches!(
+                graph.admit(candidates[index].clone()),
+                Ok(Admission::Inserted | Admission::Quarantined { .. })
+            ));
+        }
+        graph
+            .retry_quarantined()
+            .expect("all finite causal dependencies eventually resolve");
+        assert!(graph.quarantined().next().is_none());
+        assert_eq!(graph.ids().count(), candidates.len());
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            Some(Role::Controller)
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&future_target),
+            Some(Role::Member)
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&target),
+            None,
+            "the losing O branch never regains authority"
+        );
+        assert_eq!(
+            graph
+                .projection()
+                .value(&ExclusiveCell::role(controller.clone())),
+            Some(candidates[4].id)
+        );
+        if let Some(previous) = &expected {
+            assert_eq!(graph.projection(), *previous);
+        } else {
+            expected = Some(graph.projection());
+        }
+    }
 }
 
 #[test]

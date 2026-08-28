@@ -65,7 +65,7 @@ use crate::PROTOCOL_VERSION;
 
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
-use super::peer_registry::PeerOwnerToken;
+use super::peer_registry::{PeerOwnerToken, WeakPeerOwnerToken};
 use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
@@ -182,8 +182,14 @@ pub(super) async fn initiate(
         );
         warn!(peer = %device_id, "send hello failed: {e}");
     }
-    schedule_hello_retries(Arc::downgrade(state), owner.clone(), hello_msg);
-    schedule_watchdog(Arc::downgrade(state), owner.clone());
+    let delayed_device_id = device_id.to_string();
+    schedule_hello_retries(
+        Arc::downgrade(state),
+        owner.downgrade(),
+        hello_msg,
+        delayed_device_id.clone(),
+    );
+    schedule_watchdog(Arc::downgrade(state), owner.downgrade(), delayed_device_id);
 }
 
 /// Re-send the same hello at each tick of
@@ -202,12 +208,19 @@ async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
     }
 }
 
-fn schedule_hello_retries(state: Weak<NetworkState>, owner: PeerOwnerToken, hello: MeshMessage) {
+fn schedule_hello_retries(
+    state: Weak<NetworkState>,
+    owner: WeakPeerOwnerToken,
+    hello: MeshMessage,
+    device_id: String,
+) {
     tokio::spawn(async move {
-        let device_id = owner.device_id().to_string();
         for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let Some(state) = state.upgrade() else {
+                return;
+            };
+            let Some(owner) = owner.upgrade() else {
                 return;
             };
             if shutdown_requested_now(&state).await {
@@ -241,11 +254,13 @@ fn schedule_hello_retries(state: Weak<NetworkState>, owner: PeerOwnerToken, hell
     });
 }
 
-fn schedule_watchdog(state: Weak<NetworkState>, owner: PeerOwnerToken) {
+fn schedule_watchdog(state: Weak<NetworkState>, owner: WeakPeerOwnerToken, device_id: String) {
     tokio::spawn(async move {
-        let device_id = owner.device_id().to_string();
         tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)).await;
         let Some(state) = state.upgrade() else {
+            return;
+        };
+        let Some(owner) = owner.upgrade() else {
             return;
         };
         if shutdown_requested_now(&state).await {
@@ -1041,6 +1056,43 @@ pub async fn send_local_approve(state: &Arc<NetworkState>, device_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Delayed handshake work owns only weak exact identities while its timer
+    /// is asleep.  The empty state witness makes both tasks return at their
+    /// first wake without waiting for either production delay; dropping the
+    /// installation immediately proves that neither scheduled task retained
+    /// the peer or its installation marker.
+    #[tokio::test]
+    async fn v4_handshake_delayed_work_does_not_retain_retired_owner() {
+        let state = crate::engine::build_test_state("timer-owner-weak-custody");
+        crate::engine::insert_session_less_peer(&state, "timer-owner", None);
+        let owner = state
+            .peers
+            .owner("timer-owner")
+            .expect("timer owner exists");
+        let weak_owner = owner.downgrade();
+        let hello = MeshMessage::Deny(DenyMessage { reason: None });
+        schedule_hello_retries(
+            Weak::new(),
+            weak_owner.clone(),
+            hello,
+            "timer-owner".to_string(),
+        );
+        schedule_watchdog(Weak::new(), weak_owner.clone(), "timer-owner".to_string());
+
+        assert!(weak_owner.upgrade().is_some());
+        let removed = state
+            .peers
+            .remove_if_current(&owner)
+            .expect("the authoritative retirement removes the timer owner");
+        drop(removed);
+        drop(owner);
+        state.shutdown().await;
+        assert!(
+            weak_owner.upgrade().is_none(),
+            "scheduled retry/watchdog work retains no retired owner custody"
+        );
+    }
 
     fn auth_response(signature: &str) -> AuthResponseMessage {
         AuthResponseMessage {
