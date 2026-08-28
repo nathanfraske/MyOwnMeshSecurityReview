@@ -821,6 +821,233 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
 }
 
 #[test]
+fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor() {
+    let root_key = key(160);
+    let controller_key = key(161);
+    let owner_a_key = key(162);
+    let bootstrap = bootstrap(160, 160);
+    let controller = author(&controller_key);
+
+    let mut source = FactGraph::from_bootstrap(&bootstrap);
+    let grant_controller = authored(
+        &source,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    source
+        .admit(grant_controller)
+        .expect("controller grant admits");
+
+    // T0 selects the old V branch.  M and V deliberately arrive as a fork;
+    // neither branch is authoritative until a typed Role selector chooses it.
+    let m = authored(
+        &source,
+        &controller_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let v = authored(
+        &source,
+        &root_key,
+        FactBody::Evict {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = source.clone();
+    fork.admit(m.clone()).expect("M fork head admits");
+    fork.admit(v.clone()).expect("V fork head admits");
+    let mut old_heads = fork.authority_use_heads(&controller);
+    old_heads.sort();
+    let mut expected_old_heads = vec![m.id, v.id];
+    expected_old_heads.sort();
+    assert_eq!(old_heads, expected_old_heads);
+    let t0 = authored(
+        &fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: old_heads,
+            selected_head: v.id,
+        },
+        Vec::new(),
+    );
+    fork.admit(t0.clone()).expect("T0 old selector admits");
+
+    let regrant = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    fork.admit(regrant.clone()).expect("causal regrant admits");
+    let grant_owner_a = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: author(&owner_a_key),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    fork.admit(grant_owner_a.clone())
+        .expect("distinct Owner A grant admits");
+
+    // Q/R is the post-regrant fork.  Q is a payload selector for M, while R
+    // is a role revoke.  They must not gain authority merely by arrival order.
+    let mut payload_heads = vec![m.id, v.id];
+    payload_heads.sort();
+    let q = authored(
+        &fork,
+        &controller_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::membership(controller.clone()),
+            cited_heads: payload_heads,
+            selected_head: m.id,
+        },
+        Vec::new(),
+    );
+    let r = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut settled = fork.clone();
+    settled.admit(q.clone()).expect("Q payload selector admits");
+    settled.admit(r.clone()).expect("R role fork head admits");
+    let mut qr_heads = settled.authority_use_heads(&controller);
+    qr_heads.sort();
+    let mut expected_qr_heads = vec![q.id, r.id];
+    expected_qr_heads.sort();
+    assert_eq!(qr_heads, expected_qr_heads);
+
+    // T2 is signed by a distinct Owner and selects R.  U2 is a later root
+    // regrant whose causal parents retain both the redundant R ancestor and
+    // the exact T2 selector.
+    let t2 = authored(
+        &settled,
+        &owner_a_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: qr_heads,
+            selected_head: r.id,
+        },
+        Vec::new(),
+    );
+    let mut after_t2 = settled.clone();
+    after_t2
+        .admit(t2.clone())
+        .expect("T2 Owner A selector admits");
+    let u2 = authored(
+        &after_t2,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Owner,
+        },
+        vec![r.id],
+    );
+    assert!(
+        u2.content.parents.contains(&r.id) && u2.content.parents.contains(&t2.id),
+        "U2 retains the redundant R/T2 causal evidence"
+    );
+
+    let r_id = r.id;
+    let candidates = [m, v, t0, regrant, grant_owner_a, q, r, t2, u2];
+    let old_traversal_order = [0usize, 1, 2, 3, 4, 5, 6, 7, 8];
+    let mut reference = source.clone();
+    for index in old_traversal_order {
+        assert!(matches!(
+            reference.admit(candidates[index].clone()),
+            Ok(Admission::Inserted | Admission::Quarantined { .. })
+        ));
+    }
+    reference
+        .retry_quarantined()
+        .expect("old traversal-order counterfactual settles");
+    assert!(reference.quarantined().next().is_none());
+    assert_eq!(
+        reference.authority_lineage(&controller).selected_branch(),
+        Some(r_id),
+        "the fixed traversal counterfactual selects R through T2"
+    );
+    assert_eq!(
+        reference.evaluator().effective_membership(&controller),
+        None,
+        "Q/M is suppressed in the fixed traversal counterfactual"
+    );
+    let reference_projection = reference.projection();
+
+    // These schedules cover causal, reverse, selector-first, fork-first, and
+    // interleaved arrivals while keeping the control bounded at twelve runs.
+    let schedules = [
+        [0usize, 1, 2, 3, 4, 5, 6, 7, 8],
+        [8, 7, 6, 5, 4, 3, 2, 1, 0],
+        [2, 1, 0, 3, 6, 5, 4, 7, 8],
+        [8, 6, 7, 5, 4, 3, 2, 1, 0],
+        [1, 0, 4, 3, 2, 6, 5, 7, 8],
+        [3, 2, 1, 0, 4, 5, 6, 7, 8],
+        [6, 5, 4, 2, 1, 0, 7, 8, 3],
+        [7, 8, 6, 5, 4, 3, 2, 1, 0],
+        [4, 0, 2, 1, 8, 7, 6, 5, 3],
+        [5, 6, 2, 3, 0, 1, 4, 7, 8],
+        [8, 7, 3, 4, 5, 6, 2, 1, 0],
+        [2, 3, 5, 6, 7, 8, 1, 0, 4],
+    ];
+    assert_eq!(schedules.len(), 12, "bounded meaningful arrival schedules");
+
+    for schedule in schedules {
+        let mut graph = source.clone();
+        for index in schedule {
+            assert!(matches!(
+                graph.admit(candidates[index].clone()),
+                Ok(Admission::Inserted | Admission::Quarantined { .. })
+            ));
+        }
+        graph
+            .retry_quarantined()
+            .expect("quarantined dependencies converge to one projection");
+        assert!(graph.quarantined().next().is_none());
+        assert_eq!(graph.ids().count(), source.len() + candidates.len());
+        assert_eq!(graph.projection(), reference_projection);
+        assert_eq!(
+            graph.authority_lineage(&controller).selected_branch(),
+            Some(r_id),
+            "T2 selects R regardless of arrival order"
+        );
+        assert_eq!(
+            graph
+                .projection()
+                .value(&ExclusiveCell::membership(controller.clone())),
+            None,
+            "public projection does not select Q/M"
+        );
+        assert_eq!(
+            graph.evaluator().effective_role(&controller),
+            Some(Role::Owner),
+            "public evaluator observes U2 while Q/M stays suppressed"
+        );
+        assert_eq!(
+            graph.evaluator().effective_membership(&controller),
+            None,
+            "Q/M remains suppressed after the later U2 regrant"
+        );
+    }
+}
+
+#[test]
 fn incomparable_heads_fail_closed_until_full_head_resolution() {
     let root_key = key(11);
     let left_controller_key = key(12);

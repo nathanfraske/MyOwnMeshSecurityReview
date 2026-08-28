@@ -727,6 +727,7 @@ impl FactGraph {
         };
         let mut pending = vec![*head];
         let mut visited = BTreeSet::new();
+        let mut selectors = Vec::new();
         while let Some(id) = pending.pop() {
             if !visited.insert(id) {
                 continue;
@@ -748,12 +749,23 @@ impl FactGraph {
                     }
                 };
                 if cell_subject == Some(subject) {
-                    return Some(*selected_head);
+                    selectors.push((id, *selected_head));
                 }
             }
             pending.extend(fact.content.parents.iter().copied());
         }
-        None
+        let maximal = selectors
+            .iter()
+            .filter(|(candidate, _)| {
+                !selectors
+                    .iter()
+                    .any(|(other, _)| candidate != other && self.is_ancestor(candidate, other))
+            })
+            .collect::<Vec<_>>();
+        let [(_, selected)] = maximal.as_slice() else {
+            return None;
+        };
+        Some(*selected)
     }
 
     fn authority_use_heads_from_parents(
@@ -2033,7 +2045,9 @@ mod tests {
     fn self_authored_membership_keeps_a_role_authority_fork_explicit() {
         let (bootstrap, root_key) = closed(86);
         let controller_key = key(87);
+        let owner_a_key = key(88);
         let controller = device(&controller_key);
+        let owner_a = device(&owner_a_key);
 
         let grant_controller = fact(
             &bootstrap,
@@ -2108,6 +2122,22 @@ mod tests {
         graph
             .admit(regrant.clone())
             .expect("causal Owner regrant admits");
+        let grant_owner_a = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: owner_a.clone(),
+                role: Role::Owner,
+            },
+            vec![regrant.id],
+            &[
+                (device(&root_key), vec![regrant.id]),
+                (owner_a.clone(), Vec::new()),
+            ],
+        );
+        graph
+            .admit(grant_owner_a.clone())
+            .expect("distinct Owner A grant admits");
         assert_eq!(
             graph.authority_lineage(&controller).selected_branch(),
             Some(evict.id)
@@ -2141,9 +2171,9 @@ mod tests {
             FactBody::RoleRevoke {
                 target: controller.clone(),
             },
-            vec![regrant.id],
+            vec![grant_owner_a.id, regrant.id],
             &[
-                (device(&root_key), vec![regrant.id]),
+                (device(&root_key), vec![grant_owner_a.id]),
                 (controller.clone(), vec![regrant.id]),
             ],
         );
@@ -2162,24 +2192,24 @@ mod tests {
             "the self-authored payload is suppressed by the Role fork"
         );
 
-        let role_resolution = fact_with_authority_predecessors(
+        let newer_resolution = fact_with_authority_predecessors(
             &bootstrap,
-            &root_key,
+            &owner_a_key,
             FactBody::Resolution {
                 cell: ExclusiveCell::role(controller.clone()),
                 cited_heads: explicit_heads.clone(),
                 selected_head: late_revoke_id,
             },
-            explicit_heads.clone(),
+            [vec![grant_owner_a.id], explicit_heads.clone()].concat(),
             &[
-                (device(&root_key), vec![late_revoke_id]),
+                (owner_a.clone(), vec![grant_owner_a.id]),
                 (controller.clone(), explicit_heads),
             ],
         );
-        let role_resolution_id = role_resolution.id;
+        let newer_resolution_id = newer_resolution.id;
         graph
-            .admit(role_resolution)
-            .expect("Role resolution selects the current root revoke");
+            .admit(newer_resolution)
+            .expect("Owner A selects the current root revoke");
         let later_regrant = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
@@ -2187,11 +2217,16 @@ mod tests {
                 target: controller.clone(),
                 role: Role::Owner,
             },
-            vec![role_resolution_id],
+            vec![late_revoke_id, newer_resolution_id],
             &[
-                (device(&root_key), vec![role_resolution_id]),
-                (controller.clone(), vec![role_resolution_id]),
+                (device(&root_key), vec![late_revoke_id]),
+                (controller.clone(), vec![newer_resolution_id]),
             ],
+        );
+        assert!(
+            later_regrant.content.parents.contains(&late_revoke_id)
+                && later_regrant.content.parents.contains(&newer_resolution_id),
+            "U2 retains the redundant R/T2 parent set"
         );
         graph
             .admit(later_regrant)

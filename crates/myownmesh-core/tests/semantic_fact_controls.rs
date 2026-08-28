@@ -1680,12 +1680,14 @@ fn finite_authority_fork_requires_complete_resolution_before_regrant() {
 }
 
 #[test]
-fn self_authored_membership_resolution_cannot_select_the_role_loser() {
+fn stale_selector_follows_newer_typed_role_resolution() {
     let root_key = key(140);
     let controller_key = key(141);
+    let owner_a_key = key(142);
     let future_target = author(&key(143));
     let bootstrap = closed_bootstrap(140, 140);
     let controller = author(&controller_key);
+    let owner_a = author(&owner_a_key);
 
     let mut source = FactGraph::from_bootstrap(&bootstrap);
     let grant = authored(
@@ -1712,7 +1714,7 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
     );
     let eviction_v = authored(
         &source,
-        &root_key,
+        &controller_key,
         FactBody::Evict {
             target: controller.clone(),
         },
@@ -1758,11 +1760,22 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
     );
     fork.admit(regrant.clone())
         .expect("causal Owner regrant admits");
-    let post_n = fork.clone();
+    let owner_grant = authored(
+        &fork,
+        &root_key,
+        FactBody::RoleGrant {
+            target: owner_a.clone(),
+            role: Role::Owner,
+        },
+        Vec::new(),
+    );
+    fork.admit(owner_grant.clone())
+        .expect("GA owner grant admits");
+    let post_ga = fork.clone();
 
-    // Q and R are authored from the same exact post-N graph, so their arrival
+    // Q and R are authored from the same exact post-GA graph, so their arrival
     // order cannot choose an authority branch.
-    let payload = post_n.clone();
+    let payload = post_ga.clone();
     let mut payload_heads = vec![membership_m.id, eviction_v.id];
     payload_heads.sort();
     let mut expected_payload_heads = vec![membership_m.id, eviction_v.id];
@@ -1788,14 +1801,14 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
     );
     let q_id = q.id;
     let r_id = r.id;
-    let mut settled = post_n.clone();
+    let mut settled = post_ga.clone();
     settled
         .admit(q.clone())
         .expect("Q membership resolution admits");
     settled.admit(r.clone()).expect("R role revoke admits");
     let role_resolution = authored(
         &settled,
-        &root_key,
+        &owner_a_key,
         FactBody::Resolution {
             cell: ExclusiveCell::role(controller.clone()),
             cited_heads: vec![q_id, r_id],
@@ -1803,6 +1816,7 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
         },
         Vec::new(),
     );
+    let role_resolution_id = role_resolution.id;
     let mut after_selection = settled.clone();
     after_selection
         .admit(role_resolution.clone())
@@ -1814,7 +1828,7 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
             target: controller.clone(),
             role: Role::Owner,
         },
-        Vec::new(),
+        vec![r_id],
     );
     after_selection
         .admit(regrant_after_selection.clone())
@@ -1836,8 +1850,9 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
             eviction_v.clone(),
             role_selection.clone(),
             regrant.clone(),
+            owner_grant.clone(),
         ] {
-            graph.admit(fact).expect("post-N Q/R fact admits");
+            graph.admit(fact).expect("post-GA Q/R fact admits");
         }
         for fact in order {
             graph.admit(fact).expect("post-N Q/R fact admits");
@@ -1883,6 +1898,19 @@ fn self_authored_membership_resolution_cannot_select_the_role_loser() {
         graph
             .admit(regrant_after_selection.clone())
             .expect("the causal post-selection Owner regrant admits");
+        let successor = graph
+            .get(&regrant_after_selection.id)
+            .expect("U2 remains in the public graph");
+        assert!(
+            successor.content.parents.contains(&r_id)
+                && successor.content.parents.contains(&role_resolution_id),
+            "U2 retains both the redundant R and causally newer T2 parents"
+        );
+        assert_eq!(
+            graph.authority_lineage(&controller).effective_head(),
+            Some(regrant_after_selection.id),
+            "the effective lineage follows the causally newer U2 successor"
+        );
         graph
             .admit(future.clone())
             .expect("post-regrant controller operation admits");
