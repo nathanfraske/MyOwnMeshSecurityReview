@@ -66,9 +66,9 @@ impl AuthorityUse {
 /// `heads` is the complete current AuthorityUse head set, calculated from the
 /// causal graph rather than copied from a caller. An ordinary operation is
 /// authorizable only when this relation is singular (or empty for the
-/// bootstrap root). A typed `Resolution` may cite the complete conflicting
-/// set and select one branch; once admitted, that resolution is itself the
-/// sole lineage head for descendants and re-grants.
+/// bootstrap root). A typed `AuthorityLineageResolution` may cite the
+/// complete conflicting set and select one branch; once admitted, that
+/// resolution is itself the sole lineage head for descendants and re-grants.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AuthorityLineage {
     subject: DeviceId,
@@ -334,6 +334,14 @@ pub enum FactBody {
         cited_heads: Vec<FactId>,
         selected_head: FactId,
     },
+    /// Explicit selector for a subject's AuthorityLineage. Unlike an
+    /// ordinary cell resolution, this relation may cite heads from different
+    /// exclusive cells, but it must carry the complete current lineage set.
+    AuthorityLineageResolution {
+        subject: DeviceId,
+        cited_heads: Vec<FactId>,
+        selected_head: FactId,
+    },
 }
 
 impl FactBody {
@@ -346,6 +354,13 @@ impl FactBody {
                 ..
             }
             | Self::Resolution {
+                cited_heads: evidence,
+                ..
+            } => {
+                evidence.sort();
+                evidence.dedup();
+            }
+            Self::AuthorityLineageResolution {
                 cited_heads: evidence,
                 ..
             } => {
@@ -367,7 +382,8 @@ impl FactBody {
             Self::Attestation { contributions, .. } => {
                 require_sorted_unique(contributions, "attestation contributions")
             }
-            Self::Resolution { cited_heads, .. } => {
+            Self::Resolution { cited_heads, .. }
+            | Self::AuthorityLineageResolution { cited_heads, .. } => {
                 require_sorted_unique(cited_heads, "resolution cited heads")
             }
             _ => Ok(()),
@@ -400,6 +416,7 @@ impl FactBody {
             Self::EvictionProof { .. } | Self::SelfStandDown { .. } => Vec::new(),
             Self::Attestation { proposal, .. } => vec![ExclusiveCell::decision(*proposal)],
             Self::Resolution { cell, .. } => vec![cell.clone()],
+            Self::AuthorityLineageResolution { .. } => Vec::new(),
         }
     }
 
@@ -424,6 +441,9 @@ impl FactBody {
                     ExclusiveCell::Decision { .. } => {}
                 }
                 subjects
+            }
+            Self::AuthorityLineageResolution { subject, .. } => {
+                vec![author.clone(), subject.clone()]
             }
             _ => Vec::new(),
         };
@@ -450,7 +470,8 @@ impl FactBody {
                 ids.extend(contributions.iter().copied());
                 ids
             }
-            Self::Resolution { cited_heads, .. } => cited_heads.clone(),
+            Self::Resolution { cited_heads, .. }
+            | Self::AuthorityLineageResolution { cited_heads, .. } => cited_heads.clone(),
             _ => Vec::new(),
         };
         support.sort();
@@ -524,6 +545,16 @@ impl FactBody {
             } => {
                 out.tag("resolution");
                 cell.encode(out);
+                out.list_ids(cited_heads);
+                out.id(*selected_head);
+            }
+            Self::AuthorityLineageResolution {
+                subject,
+                cited_heads,
+                selected_head,
+            } => {
+                out.tag("authority_lineage_resolution");
+                out.device(subject);
                 out.list_ids(cited_heads);
                 out.id(*selected_head);
             }

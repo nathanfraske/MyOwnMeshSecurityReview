@@ -93,10 +93,10 @@ exact persisted-secret lease for every provisional record; process-nonce
 equality is diagnostic, not liveness.
 
 Closing controls are the package-level child hard-death control above,
-`custody::tests::v4_r2_hard_death_recovery_removes_only_an_old_process_provisional`,
+`custody::tests::v4_r2_hard_death_recovery_preserves_prepared_transaction`,
 `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`,
 `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, and
-`control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_rolls_back`.
+`control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared`.
 Together they distinguish prepared from delivered material, preserve committed
 custody across restart, reclaim same-process orphans by kernel-lease truth, and
 roll back a sent-but-unsettled response on task cancellation.
@@ -134,6 +134,11 @@ Macro-slice 2 semantic proof work.
 Status: discharged at source commit `7f0fdd8`.
 
 ### AuthorityLineage - bounded persistent closure record
+
+**Status: PROVISIONAL.** The typed AuthorityLineage controls below are
+implementation evidence only and remain pending the independent typed audit
+and a green result at the exact integration head. They do not amend the R1
+discharge or turn an unresolved HOLD into an acceptance.
 
 This is a separate, bounded semantic record accompanying the R3 discharge;
 it does not create another residual or widen the transport lane. It is bound
@@ -469,6 +474,30 @@ That is the point of naming them in the signaling crate's public surface rather
 than hiding a buffer inside a driver — the choice appears in the source of
 whoever made it.
 
+## Exact resource matrix for the remaining carrier/server state
+
+This matrix is an accounting boundary, not a claim that every allocation in a
+carrier library is already provider-metered. A row names the retaining state,
+its producer and consumer, the exact admission/refusal point, and the owner
+that releases it. Provider dimensions are named only where a provider seam
+exists; backend-owned queues and a separately deployed relay are explicitly
+marked **no provider** rather than assigned guessed byte prices.
+
+| State class | Producer | Consumer | Provider scope / dimensions | Admission / refusal | Queued / executing / terminal / shutdown owners | Pressure control | Provider baseline |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **mDNS discovery / resolve:** backend `DiscoveryEvent`; resolved `PeerEntry` and `key_to_peer`; directed `OwnedSignal<String>` | `Discovery::start` backend; `run_browse` TXT/SRV resolution; engine `OutboundSource` | `run_browse` parser and peer maps; engine `InboundSink<MdnsInbound>`; per-connection writer | Backend discovery queue is **no provider** and remains the named upstream residual. `Shared.peers` is structurally capped, but `key_to_peer` has no independent cap/provider lease and is also a named residual. Directed lines retain their engine owner; any attached provider charge is made before engine-mailbox admission | `wire::parse_advert`, room/version/address validation, `MAX_DISCOVERED_PEERS`, and sink acceptance. Invalid/full records drop; a full/closed directed queue drops its owned line | Backend owns discovery events; `Shared.peers`/`key_to_peer` own resolved state; writer owns queued `OwnedSignal`. `MdnsDriverHandle::stop` cancels, unregisters/shuts down discovery, aborts tasks, and drops maps/owners | `MAX_DISCOVERED_PEERS = 1024`; per-connection `OUTBOUND_QUEUE_CAP = 128`; bounded frame line. Dependency-owned discovery depth and uncapped backend-key mapping remain HOLD items | No signaling-side provider delta. Attached engine ownership returns to its pre-arrival baseline after invalid/full/drop and stop |
+| **Nostr replay / parsing:** inbound WebSocket frame and decoded `Value`/`NostrEvent`; exact directed attempt, session, relay-entry, and correlation records | Relay socket read; `DeliveryStore::admit`; `open_session` | `handle_inbound_frame` and `InboundSink<NostrInbound>`; `run_relay_session`; `DeliveryStore` retry/reconnect state | Attached `DeliveryProvider` scope is one attempt, one relay session, and one `(attempt, session)` entry. `DeliveryRetention` independently names encoded-event, attempt key/entry, relay entry, session identity/entry, and residual claims across `AccountedMemoryBytes`, `QueuedBytes`, `StorageObject`, and `OpaqueDependencyResidual` | 256-KiB frame cap, JSON/envelope/kind/tag checks, and sink acceptance precede retention. Provider refusal precedes map insertion/frame encoding; one refused relay is not an attempt terminal while another relay lives | Socket task parses/writes; exact attempt owns source/correlation; each relay session owns session/relay-entry leases. Accepted, typed refusal, replacement, ACK, cancellation, and shutdown settle exact owners; driver stop cancels sessions and store | No pre-parse dedup ring or unbounded refusal queue; provider admission is per attempt/session/relay and reconnect rebinds exact current identity | Attached provider `in_use` returns to pre-admission baseline after refusal, ACK, replacement, or shutdown. Standalone compatibility mode is explicitly unmetered |
+| **Relay per-connection I/O / replay:** server `ConnEntry`, bounded outbound queue, subscriptions, stored replay deque, per-REQ replay vector | `HubInner::handle_event` fan-out; `HubInner::handle_req` stored-plus-live replay; client frames | Per-connection writer; `serve_conn`; `handle_req` sends replay and `EOSE` | Self-hosted `server.rs` is a separate deployment with **no MyOwnMesh `FiniteResourceProvider` scope**. Its limits are server policy/OS accounting, not mesh dimensions | Bounded `try_send`; rate/filter/subscription/message limits reject or drop. Replay dedupes and truncates to `MAX_REPLAY_PER_REQ`; storage admits only replayable events under its cap | `HubInner` owns connection/subscription/presence state; writer owns queued frames; connection owns replay output until send. Unregister and hub shutdown release exact state | `MAX_STORED_EVENTS = 8192`, 15-minute retention, `MAX_REPLAY_PER_REQ = 500`, queue 128, and per-connection limits | No mesh-provider baseline is claimed; baseline is configured store/presence plus empty per-connection queue after pruning |
+| **Server registration / shutdown:** listener accept, `conns`, `ip_counts`, presence ownership, IDs, shutdown watch | Listener accepts socket; `HubInner::register` creates `ConnEntry` | `serve_conn` reader/writer; `HubInner::unregister` removes exact connection and current presence ownership | **No provider:** relay has no semantic mesh slot or attached finite resource scope. OS listener/socket/runtime allocations are outside mesh dimensions | `max_connections_per_ip` refusal sends bounded NOTICE then closes; shutdown, failed upgrade, or closed socket never enters `conns`; successful registration is the sole record admission | `HubInner` owns registration/IP/presence maps; `serve_conn` owns socket; writer owns queue; unregister is terminal cleanup; shutdown watch ends readers and writers | Default `max_connections_per_ip = 64`, plus message/rate/subscription/filter ceilings and OS listener admission | No mesh-provider delta is promised. Server baseline is zero connections, empty IP/presence maps, no writer queues after shutdown; deployment-level OS accounting remains HOLD |
+
+**R1 and HOLD are preserved.** R1 remains discharged at `55bafe5`; this
+matrix does not reopen it. The mDNS backend queue and self-hosted-relay
+no-provider allocations remain HOLD until their owning dependency or
+deployment supplies a typed, independently verified accounting boundary. The
+Nostr client row is provider-owned only when an attached `DeliveryProvider`
+is supplied; its standalone unmetered provider is not evidence of finite
+production capacity.
+
 ## Scope ceiling
 
 No repository-wide discovery pass, downstream consumer migration, custody-only
@@ -487,6 +516,6 @@ evidence, not its sole copy.
 | Residual | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
-| R2 | `7f0fdd8` | `v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `custody::tests::v4_r2_hard_death_recovery_removes_only_an_old_process_provisional`, `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`, `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, `control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_rolls_back` |
+| R2 | `7f0fdd8` | `v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `custody::tests::v4_r2_hard_death_recovery_preserves_prepared_transaction`, `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`, `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, `control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared` |
 | R3 | `7f0fdd8` | `durable_proof_delivery_r3` (full suite, including `r3_pending_proof_is_persisted_before_send_and_replayed_after_restart` and its second-reopen terminal-tombstone control), `v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `closed_network_governance::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |

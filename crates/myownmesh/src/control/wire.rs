@@ -271,6 +271,31 @@ pub enum Request {
     GovernanceMfaEnroll {
         network: String,
     },
+    /// Prepare a new enrollment and return its exact transaction identity.
+    /// The enrollment remains prepared until an explicit commit or abort.
+    GovernanceMfaPrepare {
+        network: String,
+    },
+    /// Query one exact enrollment transaction without selecting a successor.
+    GovernanceMfaQuery {
+        network: String,
+        transaction_id: String,
+    },
+    /// Re-deliver the exact material for one prepared transaction.
+    GovernanceMfaRedeliver {
+        network: String,
+        transaction_id: String,
+    },
+    /// Commit one exact enrollment transaction, idempotently.
+    GovernanceMfaCommit {
+        network: String,
+        transaction_id: String,
+    },
+    /// Abort one exact enrollment transaction, idempotently.
+    GovernanceMfaAbort {
+        network: String,
+        transaction_id: String,
+    },
     /// Whether this device holds a custody enrollment for `network`.
     GovernanceMfaStatus {
         network: String,

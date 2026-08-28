@@ -686,14 +686,18 @@ fn provider_bookkeeping_unit() -> ResourceClaim {
 
 /// The exact provider reservation for the owned correlation String of one
 /// promoted channel, including that lease's bookkeeping record.
-#[cfg(test)]
-pub(crate) fn session_correlation_reservation_charge_for_test(correlation: &str) -> ResourceClaim {
+fn session_correlation_reservation_charge(correlation: &str) -> ResourceClaim {
     let correlation = correlation.to_owned();
     crate::resource::FiniteResourceProvider::reservation_planning_charge(
         crate::runtime::peer_session::PromotedSession::channel_correlation_claim(&correlation)
             .expect("channel correlation claim is representable"),
     )
     .expect("channel correlation planning charge is representable")
+}
+
+#[cfg(test)]
+pub(crate) fn session_correlation_reservation_charge_for_test(correlation: &str) -> ResourceClaim {
+    session_correlation_reservation_charge(correlation)
 }
 
 /// The individual provider reservations for one promoted channel and its
@@ -732,12 +736,13 @@ pub(crate) fn session_channel_retained_reservation_charges_for_test(
     charges
 }
 
-/// What a first promoted session costs the provider: four separate reservations
-/// for its flow root, logical record, leased-map entry, and validity lineage.
+/// What a first promoted session costs the provider: five separate reservations
+/// for its flow root, logical record, leased-map entry, validity lineage, and
+/// owned channel correlation.
 ///
 /// Each call to `reservation_planning_charge` includes the provider bookkeeping
 /// record for that one lease; combining the bare claims first would undercount.
-pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
+fn session_reservation_charge_for_correlation(correlation: &str) -> ResourceClaim {
     let flow_root = crate::resource::FiniteResourceProvider::reservation_planning_charge(
         crate::runtime::peer_session::PromotedSession::channel_claim()
             .expect("the channel flow-root claim is `size_of` arithmetic and cannot overflow"),
@@ -754,11 +759,18 @@ pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
     )
     .expect("the map-entry claim plus its provider record is representable");
     let validity = session_validity_reservation_charge_for_test();
+    let correlation = session_correlation_reservation_charge(correlation);
     flow_root
         .checked_add(logical)
         .and_then(|claim| claim.checked_add(map_entry))
         .and_then(|claim| claim.checked_add(validity))
-        .expect("the four first-session reservations compose")
+        .and_then(|claim| claim.checked_add(correlation))
+        .expect("the five first-session reservations compose")
+}
+
+#[cfg(test)]
+pub(crate) fn session_reservation_charge_for_test() -> ResourceClaim {
+    session_reservation_charge_for_correlation("aaaaaaaaaaaaa")
 }
 
 fn session_validity_reservation_charge_for_test() -> ResourceClaim {
@@ -785,7 +797,15 @@ fn session_validity_reservation_charge_for_test() -> ResourceClaim {
 /// unrelated term happened to leave. Deriving it here is what stops a fixture
 /// from restating a number the broker owns.
 pub fn session_reservation_planning_claim() -> ResourceClaim {
-    session_reservation_charge_for_test()
+    session_reservation_planning_claim_for_correlation("aaaaaaaaaaaaa")
+}
+
+/// The exact reservation one promoted session takes for a supplied channel
+/// correlation. Production minting uses an eight-byte random value encoded as
+/// 13 base32 characters; accepting the actual string lets an external fixture
+/// derive the same owned allocation instead of guessing its capacity.
+pub fn session_reservation_planning_claim_for_correlation(correlation: &str) -> ResourceClaim {
+    session_reservation_charge_for_correlation(correlation)
 }
 
 /// What the fixture's own scaffolding costs, before a single session.

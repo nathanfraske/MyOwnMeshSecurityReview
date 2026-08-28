@@ -6,6 +6,10 @@ use crate::resource::LocalApplicationResourceScope;
 use super::{ApplicationGateway, GatewayRefusal};
 
 impl ApplicationGateway {
+    pub(crate) fn rpc_resource_scope_planning_charge() -> crate::resource::ResourceClaim {
+        crate::resource::FiniteResourceProvider::scope_planning_charge()
+    }
+
     pub(crate) fn rpc(&self) -> Option<crate::resource::FundedArc<crate::rpc::RpcInner>> {
         self.rpc.read().clone()
     }

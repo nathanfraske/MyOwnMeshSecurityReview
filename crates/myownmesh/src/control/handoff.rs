@@ -2,31 +2,25 @@
 //!
 //! Three operations answer with the caller's *only* copy of something: the
 //! capability naming a realtime flow, the coordinate naming a started RPC
-//! stream, and the secret and recovery codes of an MFA enrollment. None of the
-//! three is queryable afterwards. If the response line is refused, or the
-//! socket ends before it is written, the daemon is left holding live state
-//! whose only handle went nowhere — a flow nobody can close, a stream nobody
-//! can read, a custody lock nobody can satisfy.
+//! stream, and the secret and recovery codes of an MFA enrollment. If the
+//! response line is refused, or the socket ends before it is written, the
+//! daemon releases only the exact local handle; durable MFA custody remains
+//! available to the explicit transaction protocol.
+//! Realtime and RPC handoffs are settled by the connection loop; MFA custody
+//! is settled only by its explicit transaction command.
 //!
-//! So each of those three hands its new state back to the connection loop
-//! rather than keeping it, and the loop settles it against the one fact only
-//! the loop has: whether the answer was actually written.
-//!
-//! Two of the three are not the daemon's until the loop commits them. The MFA
-//! enrollment is the exception and is deliberately the other way round: the lock
-//! is installed *before* the response, so a success response names a lock that
-//! already exists, and what the loop settles is whether to keep or remove it.
+//! Two of the three are not the daemon's until the loop commits them. MFA is
+//! different: the lock is installed *before* the response, and the loop only
+//! releases its local handle. The durable transaction is settled later by an
+//! explicit commit or abort command.
 //! Deferring the write instead would let two clients both be told they enrolled,
 //! because neither installed lock would exist to refuse the other.
 //!
-//! This is deliberately not a transaction framework. There is one value, it
-//! moves, and it has exactly two outcomes. Operations with queryable or
-//! idempotent results — labels, ordinary governance mutations, dials, joins —
-//! do not use it and do not need it.
+//! MFA's durable transaction is queryable and idempotent. This local guard
+//! only owns handoff handles for realtime and RPC operations. Queryable and
+//! idempotent domain operations do not use this local handoff.
 
 use std::sync::Arc;
-
-use tracing::warn;
 
 use super::ControlState;
 
@@ -64,6 +58,8 @@ pub(in crate::control) enum ProvisionalHandoff {
     /// A custody lock that is installed but whose material has not been
     /// delivered.
     MfaEnrollment(myownmesh_core::custody::ProvisionalEnrollment),
+    /// Material recovered from the durable prepared transaction table.
+    MfaRecovered(myownmesh_core::custody::PreparedEnrollment),
 }
 
 /// Keeps a provisional handoff armed across the response write itself.
@@ -142,8 +138,8 @@ impl ProvisionalHandoff {
     /// Settle against the write disposition.
     ///
     /// `sent` is true only for [`Wrote::Sent`](super::Wrote::Sent) — a refused
-    /// line and an ended socket are both "the client does not have this", and
-    /// both roll back. Nothing here consults a duration or retries anything.
+    /// line and an ended socket release the local owner. MFA remains durable
+    /// and is settled only by its explicit command; no timer or retry is used.
     #[cfg(test)]
     pub(in crate::control) async fn settle(self, state: &Arc<ControlState>, sent: bool) {
         if sent {
@@ -161,11 +157,11 @@ impl ProvisionalHandoff {
             // is reading, and only now does the client hold the coordinate that
             // names what it will carry.
             Self::RpcStream(pending) => pending.spawn(),
-            // Nothing is written and nothing can fail: the lock was installed
-            // before the response named it, so a caller told it enrolled is
-            // holding the secret to a lock that already exists. This only
-            // disarms the undo that owned it until now.
-            Self::MfaEnrollment(provisional) => provisional.keep(),
+            // A response write never commits MFA custody. It only releases
+            // this process-local handle; the durable Prepared record remains
+            // available until the client explicitly commits or aborts it.
+            Self::MfaEnrollment(provisional) => drop(provisional),
+            Self::MfaRecovered(prepared) => drop(prepared),
         }
     }
 
@@ -191,20 +187,13 @@ impl ProvisionalHandoff {
             // Dropping the pending forward drops the filed stream's receiver,
             // which withdraws it, and no task was ever spawned to outlive it.
             Self::RpcStream(pending) => drop(pending),
-            // The lock exists and its secret went nowhere, so remove exactly
-            // that lock — by its installed identity, so a rollback that runs
-            // after the operator enrolled again leaves the successor alone. A
-            // store this cannot reach is reported here rather than only inside
-            // the drop, which has nowhere to say it.
-            Self::MfaEnrollment(provisional) => {
-                let network = provisional.network_id().to_owned();
-                if let Err(error) = provisional.roll_back() {
-                    warn!(
-                        %network,
-                        "an unhanded MFA enrollment could not be removed: {error}"
-                    );
-                }
-            }
+            // This local handoff never settles durable MFA custody; it only
+            // releases the exact local handle. Transaction commands decide the
+            // durable state, including the recovered material path.
+            // NotSent is not an implicit custody decision. The same exact
+            // transaction can be queried, redelivered, committed, or aborted.
+            Self::MfaEnrollment(provisional) => drop(provisional),
+            Self::MfaRecovered(prepared) => drop(prepared),
         }
     }
 
@@ -223,6 +212,7 @@ impl ProvisionalHandoff {
             }
             Self::RpcStream(pending) => drop(pending),
             Self::MfaEnrollment(provisional) => drop(provisional),
+            Self::MfaRecovered(prepared) => drop(prepared),
         }
     }
 }
@@ -413,11 +403,11 @@ mod tests {
 
     /// The production MFA handoff has the same hard-death boundary: the
     /// encoded line is written successfully, then the connection task can be
-    /// dropped before the normal `Wrote::Sent` settlement.  The barrier makes
-    /// that interleave deterministic and the exact armed enrollment Drop is
-    /// the only cleanup used by the aborted task.
+    /// dropped before the normal response bookkeeping. The barrier makes that
+    /// interleave deterministic, and the exact transaction remains prepared
+    /// until the explicit abort below.
     #[tokio::test]
-    async fn v4_r2_mfa_sent_write_aborted_before_settle_rolls_back() {
+    async fn v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared() {
         let mut state = crate::control::joinless_control_state().await;
         let (barrier, arrived, _release) = DispatchBarrier::paired();
         Arc::get_mut(&mut state)
@@ -439,6 +429,12 @@ mod tests {
         let ((reply, output), provisional) =
             crate::control::dispatch::governance::mfa_enroll(&frames, network.clone())
                 .expect("the production MFA dispatch installs the provisional enrollment");
+        let transaction_id = match &provisional {
+            ProvisionalHandoff::MfaEnrollment(provisional) => {
+                provisional.transaction_id().to_owned()
+            }
+            _ => panic!("MFA dispatch returned an unexpected handoff"),
+        };
         let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
             .expect("the production MFA response is admitted before writing");
         let cancel = ConnectionCancel::runtime(&state.clients);
@@ -465,8 +461,22 @@ mod tests {
         let _ = task.await;
 
         assert!(
+            myownmesh_core::custody::is_enrolled(&network),
+            "dropping the response handoff leaves the prepared enrollment durable"
+        );
+        let prepared =
+            match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
+                .expect("the exact prepared transaction remains queryable")
+            {
+                myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => prepared,
+                other => panic!("response drop changed exact custody state: {other:?}"),
+            };
+        prepared
+            .abort()
+            .expect("the explicit client abort removes the exact enrollment");
+        assert!(
             !myownmesh_core::custody::is_enrolled(&network),
-            "aborting before Wrote::Sent settlement removes the exact enrollment"
+            "explicit abort, rather than Wrote::Sent, removes the enrollment"
         );
     }
 }

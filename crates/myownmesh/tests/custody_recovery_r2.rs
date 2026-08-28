@@ -1,15 +1,13 @@
 //! R2 process-death control for provisional MFA enrollment.
 //!
-//! The enrollment record is installed before its response is observable, but
-//! it must become permanent only at the response's `Wrote::Sent` boundary. A
-//! hard-dead child cannot run a Rust `Drop`, so this control keeps the two
-//! orderings separate across a real process boundary: a prepared enrollment
-//! must not strand a lock, while one whose material was acknowledged by the
-//! caller must survive restart.
+//! The enrollment record is installed before its response is observable and
+//! remains `Prepared` across every write outcome. A hard-dead child cannot run
+//! a Rust `Drop`, so restart can query or re-deliver exact material, and only
+//! an explicit commit or abort is terminal.
 //!
 //! The pipe is the lifecycle barrier. The parent blocks on the child's
 //! explicit marker and then kills it; there are no timing guesses, polling
-//! loops, sleeps, or test-side rollback calls for the prepared case.
+//! loops, or sleeps. Explicit abort/commit calls below model client commands.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -47,7 +45,10 @@ fn read_marker(reader: &mut BufReader<std::process::ChildStdout>) -> String {
         );
         let marker = line.trim_end();
         if marker == "PREPARED"
+            || marker.starts_with("PREPARED ")
             || marker == "KEPT"
+            || marker == "COMMITTED"
+            || marker == "ACKED"
             || (marker.starts_with("DELIVERED ") && marker.len() > "DELIVERED ".len())
         {
             return marker.to_owned();
@@ -66,7 +67,11 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     // Drop cannot run in the child, so restart must recover this provisional
     // record rather than treating it as a delivered enrollment.
     let (mut prepared, mut prepared_out) = spawn_child(home.path(), "prepared");
-    assert_eq!(read_marker(&mut prepared_out), "PREPARED");
+    let prepared_marker = read_marker(&mut prepared_out);
+    let prepared_transaction = prepared_marker
+        .strip_prefix("PREPARED ")
+        .expect("prepared marker carries the exact transaction identity");
+    assert!(!prepared_transaction.is_empty());
     assert!(
         myownmesh_core::custody::is_enrolled(network),
         "prepared child must first prove that its durable lock exists"
@@ -74,35 +79,66 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     prepared.kill().expect("hard-stop prepared child");
     prepared.wait().expect("reap prepared child");
     assert!(
-        !myownmesh_core::custody::is_enrolled(network),
-        "restart must not strand a lock for material that never crossed Wrote::Sent"
+        myownmesh_core::custody::is_enrolled(network),
+        "restart preserves the prepared lock until an explicit terminal command"
     );
+    match myownmesh_core::custody::enrollment_transaction(network, prepared_transaction)
+        .expect("query prepared transaction after hard death")
+    {
+        myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => {
+            let duplicate = prepared.clone();
+            prepared
+                .abort()
+                .expect("explicit abort settles the pre-publication transaction");
+            duplicate
+                .abort()
+                .expect("duplicate exact abort is idempotent");
+        }
+        other => panic!("prepared hard death changed exact state: {other:?}"),
+    }
+    assert!(!myownmesh_core::custody::is_enrolled(network));
 
-    // The delivered ordering uses the same child-side installation, but the
-    // parent acknowledges the material before the child calls keep(). This is
-    // the production equivalent of Wrote::Sent and must survive the child's
-    // clean restart boundary.
+    // Material delivery is not a commit. Kill the child after the exact
+    // material marker and before an explicit commit, then query and settle
+    // the same transaction from durable storage.
     let (mut delivered, mut delivered_out) = spawn_child(home.path(), "delivered");
     let marker = read_marker(&mut delivered_out);
-    let recovery_code = marker
+    let delivered_fields = marker
         .strip_prefix("DELIVERED ")
-        .expect("delivered enrollment marker carries one recovery code");
+        .expect("delivered enrollment marker carries material and transaction");
+    let (recovery_code, delivered_transaction) = delivered_fields
+        .rsplit_once(' ')
+        .expect("delivered marker carries an exact transaction identity");
     assert!(
         !recovery_code.is_empty(),
         "the delivered marker must carry observable enrollment material"
     );
     assert!(myownmesh_core::custody::is_enrolled(network));
-    delivered
-        .stdin
-        .as_mut()
-        .expect("child stdin")
-        .write_all(b"ACK\n")
-        .expect("acknowledge delivered enrollment");
-    assert_eq!(read_marker(&mut delivered_out), "KEPT");
+    delivered.kill().expect("hard-stop after material delivery");
     delivered.wait().expect("reap delivered child");
+    let redelivered =
+        match myownmesh_core::custody::enrollment_transaction(network, delivered_transaction)
+            .expect("query exact prepared transaction after material-only death")
+        {
+            myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => prepared,
+            other => panic!("material-only death changed exact state: {other:?}"),
+        };
+    assert_eq!(redelivered.enrolled().recovery_codes[0], recovery_code);
+    let duplicate_commit = redelivered.clone();
+    redelivered
+        .commit()
+        .expect("explicit commit settles the redelivered transaction");
+    duplicate_commit
+        .commit()
+        .expect("duplicate exact commit is idempotent");
+    assert!(matches!(
+        myownmesh_core::custody::enrollment_transaction(network, delivered_transaction)
+            .expect("query exact committed transaction"),
+        myownmesh_core::custody::EnrollmentTransaction::Committed
+    ));
     assert!(
         myownmesh_core::custody::is_enrolled(network),
-        "observably delivered enrollment remains after restart"
+        "explicitly committed enrollment remains after restart"
     );
 
     // Cleanup uses the material that was deliberately observable only in the
@@ -110,6 +146,123 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     myownmesh_core::custody::disable(network, recovery_code)
         .expect("disable delivered enrollment during test cleanup");
     assert!(!myownmesh_core::custody::is_enrolled(network));
+
+    // A durable commit can itself be followed by process death before the
+    // client receives its final acknowledgement. Querying the same identity
+    // after restart must resolve that lost ACK as Committed.
+    let (mut committed, mut committed_out) = spawn_child(home.path(), "commit-before-ack");
+    let marker = read_marker(&mut committed_out);
+    let committed_fields = marker
+        .strip_prefix("DELIVERED ")
+        .expect("commit-before-ack marker carries material and transaction");
+    let (committed_code, committed_transaction) = committed_fields
+        .rsplit_once(' ')
+        .expect("commit-before-ack marker carries transaction identity");
+    committed
+        .stdin
+        .as_mut()
+        .expect("commit-before-ack child stdin")
+        .write_all(b"COMMIT\n")
+        .expect("request explicit child commit");
+    assert_eq!(read_marker(&mut committed_out), "COMMITTED");
+    committed
+        .kill()
+        .expect("hard-stop after durable commit before final ACK");
+    committed.wait().expect("reap committed child");
+    assert!(matches!(
+        myownmesh_core::custody::enrollment_transaction(network, committed_transaction)
+            .expect("query lost final ACK transaction"),
+        myownmesh_core::custody::EnrollmentTransaction::Committed
+    ));
+    myownmesh_core::custody::disable(network, committed_code)
+        .expect("disable committed enrollment during test cleanup");
+    assert!(!myownmesh_core::custody::is_enrolled(network));
+
+    // Commit and abort race on the same exact prepared transaction. The
+    // settlement API returns the state actually established under its writer
+    // guard, so both command replies must agree with the one durable winner.
+    // A stale clone is then exercised against a successor to prove that the
+    // exact transaction fence cannot settle the successor by network alone.
+    let race_network = "r2-atomic-settlement";
+    let provisional =
+        myownmesh_core::custody::install_provisional_enroll(race_network, "r2-atomic")
+            .expect("install atomic settlement enrollment");
+    let race_transaction = provisional.transaction_id().to_owned();
+    drop(provisional);
+    let prepared =
+        match myownmesh_core::custody::enrollment_transaction(race_network, &race_transaction)
+            .expect("query atomic settlement transaction")
+        {
+            myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => prepared,
+            other => panic!("atomic settlement did not start Prepared: {other:?}"),
+        };
+    let stale = prepared.clone();
+    let cleanup_code = prepared.enrolled().recovery_codes[0].clone();
+    let commit_candidate = prepared.clone();
+    let abort_candidate = prepared;
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let commit_gate = std::sync::Arc::clone(&gate);
+    let abort_gate = std::sync::Arc::clone(&gate);
+    let commit_thread = std::thread::spawn(move || {
+        commit_gate.wait();
+        commit_candidate.settle(myownmesh_core::custody::EnrollmentSettlementRequest::Commit)
+    });
+    let abort_thread = std::thread::spawn(move || {
+        abort_gate.wait();
+        abort_candidate.settle(myownmesh_core::custody::EnrollmentSettlementRequest::Abort)
+    });
+    gate.wait();
+    let commit_result = commit_thread
+        .join()
+        .expect("commit command does not panic")
+        .expect("commit command reaches the atomic settlement API");
+    let abort_result = abort_thread
+        .join()
+        .expect("abort command does not panic")
+        .expect("abort command reaches the atomic settlement API");
+    assert_eq!(
+        commit_result, abort_result,
+        "every racing reply reports the same exact durable winner"
+    );
+    let final_state =
+        match myownmesh_core::custody::enrollment_transaction(race_network, &race_transaction)
+            .expect("query atomic settlement winner")
+        {
+            myownmesh_core::custody::EnrollmentTransaction::Committed => {
+                myownmesh_core::custody::EnrollmentSettlementResult::Committed
+            }
+            myownmesh_core::custody::EnrollmentTransaction::Absent => {
+                myownmesh_core::custody::EnrollmentSettlementResult::Absent
+            }
+            myownmesh_core::custody::EnrollmentTransaction::Prepared(_) => {
+                panic!("racing terminal commands left the transaction Prepared")
+            }
+        };
+    assert_eq!(commit_result, final_state);
+
+    if final_state == myownmesh_core::custody::EnrollmentSettlementResult::Committed {
+        myownmesh_core::custody::disable(race_network, &cleanup_code)
+            .expect("disable committed race winner");
+    }
+    let successor =
+        myownmesh_core::custody::install_provisional_enroll(race_network, "r2-successor")
+            .expect("install successor after exact race terminal");
+    let successor_transaction = successor.transaction_id().to_owned();
+    assert_eq!(
+        stale
+            .settle(myownmesh_core::custody::EnrollmentSettlementRequest::Commit)
+            .expect("stale exact settlement is a no-op"),
+        myownmesh_core::custody::EnrollmentSettlementResult::Absent
+    );
+    assert!(myownmesh_core::custody::is_enrolled(race_network));
+    successor
+        .abort()
+        .expect("abort exact successor after stale settlement control");
+    assert!(matches!(
+        myownmesh_core::custody::enrollment_transaction(race_network, &successor_transaction)
+            .expect("query successor after cleanup"),
+        myownmesh_core::custody::EnrollmentTransaction::Absent
+    ));
 }
 
 #[test]
@@ -126,14 +279,14 @@ fn child_provisional_enrollment() {
         .expect("child installs provisional enrollment");
 
     if mode == "prepared" {
-        println!("PREPARED");
+        println!("PREPARED {}", provisional.transaction_id());
     } else {
         let code = provisional
             .enrolled()
             .recovery_codes
             .first()
             .expect("enrollment has a recovery code");
-        println!("DELIVERED {code}");
+        println!("DELIVERED {code} {}", provisional.transaction_id());
     }
     std::io::stdout()
         .flush()
@@ -143,9 +296,23 @@ fn child_provisional_enrollment() {
     std::io::stdin()
         .read_line(&mut ack)
         .expect("parent lifecycle acknowledgement");
-    if mode == "delivered" && ack.trim() == "ACK" {
-        provisional.keep();
-        println!("KEPT");
+    if (mode == "delivered" || mode == "commit-before-ack") && ack.trim() == "COMMIT" {
+        provisional
+            .commit()
+            .expect("explicit child commit settles the exact transaction");
+        println!("COMMITTED");
         std::io::stdout().flush().expect("flush kept marker");
+        if mode == "commit-before-ack" {
+            let mut final_ack = String::new();
+            std::io::stdin()
+                .read_line(&mut final_ack)
+                .expect("parent final acknowledgement");
+            if final_ack.trim() == "ACK" {
+                println!("ACKED");
+                std::io::stdout()
+                    .flush()
+                    .expect("flush final acknowledgement");
+            }
+        }
     }
 }

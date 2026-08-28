@@ -595,6 +595,111 @@ pub mod transport_lab {
     #[derive(Clone)]
     pub struct ProofOwner(super::peer_registry::PeerOwnerToken);
 
+    /// A one-shot transport-lab park at the capability replay send boundary.
+    ///
+    /// The proof replay runs before this boundary in the production command
+    /// handler. Keeping the park as an opaque owner/context-bound witness lets
+    /// an integration control observe that ordering without exposing a
+    /// command receiver or permitting an arbitrary peer to be named.
+    pub struct CapabilityReplayPark(Arc<CapabilityReplayParkInner>);
+
+    struct CapabilityReplayParkInner {
+        context_id: crate::semantic::MeshContextId,
+        device_id: String,
+        entered: tokio::sync::Notify,
+        released: tokio::sync::Notify,
+        is_released: std::sync::atomic::AtomicBool,
+    }
+
+    static CAPABILITY_REPLAY_PARK: std::sync::OnceLock<
+        parking_lot::Mutex<Option<std::sync::Weak<CapabilityReplayParkInner>>>,
+    > = std::sync::OnceLock::new();
+
+    fn capability_replay_park_slot(
+    ) -> &'static parking_lot::Mutex<Option<std::sync::Weak<CapabilityReplayParkInner>>> {
+        CAPABILITY_REPLAY_PARK.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    impl CapabilityReplayParkInner {
+        fn matches(
+            &self,
+            state: &Arc<NetworkState>,
+            owner: &super::peer_registry::PeerOwnerToken,
+        ) -> bool {
+            self.context_id == state.mesh_context_id() && self.device_id == owner.device_id()
+        }
+
+        async fn hold(&self) {
+            self.entered.notify_one();
+            if self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let released = self.released.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if !self.is_released.load(std::sync::atomic::Ordering::Acquire) {
+                released.await;
+            }
+        }
+    }
+
+    /// Install a one-shot park for this exact network context and peer owner.
+    #[doc(hidden)]
+    pub fn install_capability_replay_park_for_lab(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+    ) -> CapabilityReplayPark {
+        let inner = Arc::new(CapabilityReplayParkInner {
+            context_id: state.mesh_context_id(),
+            device_id: owner.0.device_id().to_string(),
+            entered: tokio::sync::Notify::new(),
+            released: tokio::sync::Notify::new(),
+            is_released: std::sync::atomic::AtomicBool::new(false),
+        });
+        let slot = capability_replay_park_slot();
+        let mut current = slot.lock();
+        assert!(
+            current
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_none(),
+            "only one capability replay park may be installed at a time"
+        );
+        *current = Some(Arc::downgrade(&inner));
+        drop(current);
+        CapabilityReplayPark(inner)
+    }
+
+    /// Wait until the matching production capability replay reaches the park.
+    #[doc(hidden)]
+    pub async fn wait_capability_replay_park_for_lab(park: &CapabilityReplayPark) {
+        park.0.entered.notified().await;
+    }
+
+    /// Release the matching production capability replay to perform its send.
+    #[doc(hidden)]
+    pub fn release_capability_replay_park_for_lab(park: &CapabilityReplayPark) {
+        park.0
+            .is_released
+            .store(true, std::sync::atomic::Ordering::Release);
+        park.0.released.notify_waiters();
+    }
+
+    pub(super) async fn hold_capability_replay_park(
+        state: &Arc<NetworkState>,
+        owner: &super::peer_registry::PeerOwnerToken,
+    ) {
+        let park = capability_replay_park_slot()
+            .lock()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(park) = park {
+            if park.matches(state, owner) {
+                park.hold().await;
+            }
+        }
+    }
+
     /// Capture the current exact owner for a transport-lab control. A later
     /// replacement does not make this witness current again.
     #[doc(hidden)]
@@ -603,6 +708,27 @@ pub mod transport_lab {
         device_id: &str,
     ) -> Option<ProofOwner> {
         state.peers.owner(device_id).map(ProofOwner)
+    }
+
+    /// Re-enter the production promotion fence for one exact owner.
+    ///
+    /// This is a transport-lab control for the lazy-promotion boundary: owner
+    /// installation and promotion are separate lifecycle steps, so an
+    /// integration fixture must not enqueue `ReplayCapabilities` directly or
+    /// infer that promotion from the presence of an owner entry. The registry
+    /// operation below performs the exact-owner check and, when it promotes,
+    /// enqueues the same replay command as every production caller.
+    #[doc(hidden)]
+    pub fn promote_exact_owner_for_lab(state: &Arc<NetworkState>, owner: &ProofOwner) -> bool {
+        state
+            .peers
+            .with_live_session_state(
+                &owner.0,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+                |_session, _session_state| (),
+            )
+            .is_some()
     }
 
     /// Enumerate Pending records restored from this exact network's durable
@@ -1260,8 +1386,14 @@ async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
         // channel because no local caller is waiting on it — the session it names
         // is what asked, by coming into existence owing an advertisement.
         NetworkCmd::ReplayCapabilities { owner } => {
-            replay_local_capabilities_to_owner(state, &owner).await;
+            // Reconcile and persist every exact proof obligation before the
+            // unrelated capability replay can yield on transport. Preparation
+            // owns the current-owner/binding fence and releases its guard
+            // before the proof send; a reconnect therefore cannot observe an
+            // unprepared Pending record or race a stale replay behind this
+            // capability await.
             replay_pending_durable_proofs(state, &owner).await;
+            replay_local_capabilities_to_owner(state, &owner).await;
         }
         // ---- governance ops ----
         NetworkCmd::ProposeTransition {
@@ -5714,6 +5846,13 @@ async fn replay_pending_durable_proofs(
             return;
         }
     };
+    // Phase one is deliberately a complete synchronous reconciliation pass:
+    // every restored record is materialized and prepared (or terminalized as
+    // Superseded) before any proof transport can yield.  A Ready admission
+    // owns its exact provider/owner guard; keeping it in this bounded vector
+    // holds that custody until phase two, after all later records have crossed
+    // their own currentness fences.
+    let mut ready = Vec::with_capacity(records.len());
     for record in records {
         if record.target.to_string() != owner.device_id() || !record.is_pending() {
             continue;
@@ -5758,10 +5897,16 @@ async fn replay_pending_durable_proofs(
                 continue;
             }
         };
+        ready.push((record.delivery_id, admission));
+    }
+    // Phase two is the only part allowed to await transport.  Guards from the
+    // complete preparation pass are consumed by the send helper before its
+    // first await, so capability replay cannot interleave with reconciliation.
+    for (delivery_id, admission) in ready {
         if let Err(error) = send_prepared_durable_proof(state, admission).await {
             debug!(
                 peer = %owner.device_id(),
-                delivery = %record.delivery_id,
+                delivery = %delivery_id,
                 %error,
                 "durable proof replay send failed; record remains pending"
             );
@@ -8048,6 +8193,8 @@ async fn replay_local_capabilities_to_owner(
     if owed != Some(true) {
         return;
     }
+    #[cfg(feature = "transport-lab")]
+    transport_lab::hold_capability_replay_park(state, owner).await;
     // Cloned out and the guard dropped on this statement: the send awaits, and
     // the value that goes out is the one current at the moment of the send.
     if !send_capabilities_to_owner(state, owner, &caps).await {

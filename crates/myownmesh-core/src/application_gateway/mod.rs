@@ -22,6 +22,7 @@ mod mailbox;
 mod principal;
 mod rpc;
 
+pub use capabilities::capability_advert_planning_claim;
 pub use frame::json_input_work_claim;
 pub use principal::LocalPrincipalCapability;
 

@@ -884,13 +884,47 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
     forward
         .admit(revoke.clone())
         .expect("the root revoke branch admits");
-    let mut reverse = seeded;
+    let mut reverse = seeded.clone();
     reverse
         .admit(revoke.clone())
         .expect("the root revoke branch admits first");
     reverse
         .admit(operation.clone())
         .expect("the controller branch admits second");
+
+    // A selector that omits a current AuthorityUse head remains invalid even
+    // when its signed AuthorityUse(C) predecessor set is complete. Deliver
+    // it through production quarantine first, then retry after both omitted
+    // heads arrive; retry rejects and clears it rather than repairing the
+    // citation set from arrival order.
+    let omitted_head = fact(
+        &bootstrap,
+        &controller_key,
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
+            cited_heads: vec![operation.id],
+            selected_head: operation.id,
+        },
+        vec![operation.id, revoke.id],
+    );
+    let mut quarantined = seeded;
+    assert!(matches!(
+        quarantined.admit(omitted_head),
+        Ok(Admission::Quarantined { .. })
+    ));
+    assert_eq!(quarantined.quarantined().count(), 1);
+    quarantined
+        .admit(revoke.clone())
+        .expect("the omitted selector's revoke parent admits");
+    quarantined
+        .admit(operation.clone())
+        .expect("the omitted selector's operation parent admits");
+    assert_eq!(
+        quarantined.retry_quarantined(),
+        Err(SemanticError::IncompleteResolution),
+        "complete AuthorityUse predecessors cannot hide an omitted current head"
+    );
+    assert_eq!(quarantined.quarantined().count(), 0);
 
     assert_eq!(
         forward.authority_use_heads(&controller),
@@ -947,37 +981,170 @@ fn authority_use_fork_requires_explicit_typed_selection_across_arrival_orders() 
         authored(
             graph,
             &root_key,
-            FactBody::Resolution {
-                cell: ExclusiveCell::role(controller.clone()),
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
                 cited_heads: vec![operation.id, revoke.id],
                 selected_head,
             },
             Vec::new(),
         )
     };
+    let ordinary_role_selection = authored(
+        &forward,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::role(controller.clone()),
+            cited_heads: vec![operation.id, revoke.id],
+            selected_head: operation.id,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        forward.admit(ordinary_role_selection),
+        Err(SemanticError::IncompleteResolution),
+        "ordinary Role(C) resolution cannot select the cross-cell O lineage"
+    );
+    assert_eq!(
+        forward.authority_lineage(&controller).heads().len(),
+        2,
+        "ordinary Role(C) resolution leaves AuthorityLineage(C) unresolved"
+    );
+    assert_eq!(
+        forward.authority_lineage(&controller).selected_branch(),
+        None,
+        "ordinary Role(C) resolution cannot collapse AuthorityLineage(C)"
+    );
     let selection_operation = make_selection(&forward, operation.id);
     let selection_operation_reverse = make_selection(&reverse, operation.id);
     assert_eq!(
         selection_operation.id, selection_operation_reverse.id,
         "typed AuthorityUse selection has one identity in either arrival order"
     );
+    let selection_operation_id = selection_operation.id;
     forward
         .admit(selection_operation)
         .expect("the typed selection of the controller branch admits");
+    assert_eq!(
+        forward.authority_lineage(&controller).selected_branch(),
+        Some(operation.id),
+        "typed AuthorityLineage(C) selection records the selected O authority branch"
+    );
+    assert_eq!(
+        forward.evaluator().effective_role(&controller),
+        None,
+        "selecting O in Role(C) cannot cross-select a role for C"
+    );
+    assert_eq!(
+        forward.evaluator().effective_membership(&controller),
+        None,
+        "selecting O leaves C's same-cell membership projection unchanged"
+    );
+    assert!(
+        !forward
+            .evaluator()
+            .admits_closed_session(&controller, &controller),
+        "selecting O cannot make revoked C eligible for a closed session"
+    );
     assert_eq!(
         forward.evaluator().effective_role(&target),
         Some(Role::Member),
         "the selected AuthorityUse branch is effective"
     );
+    let regrant_after_o = authored(
+        &forward,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    forward
+        .admit(regrant_after_o.clone())
+        .expect("the root can regrant C after selecting O");
+    assert_eq!(
+        forward.authority_lineage(&controller).effective_head(),
+        Some(regrant_after_o.id),
+        "the later regrant advances the selected O lineage"
+    );
+    assert_eq!(
+        forward.evaluator().effective_role(&controller),
+        Some(Role::Controller),
+        "the selected O lineage permits C's later regrant"
+    );
+    assert_eq!(
+        forward.evaluator().effective_role(&target),
+        Some(Role::Member),
+        "a regrant cannot discard the selected O branch"
+    );
 
     let selection_revoke = make_selection(&reverse, revoke.id);
+    let selection_revoke_id = selection_revoke.id;
     reverse
         .admit(selection_revoke)
         .expect("the typed selection of the revoke branch admits");
     assert_eq!(
+        reverse.authority_lineage(&controller).selected_branch(),
+        Some(revoke.id),
+        "typed Role(C) selection records the selected R authority branch"
+    );
+    assert_eq!(
+        reverse.evaluator().effective_role(&controller),
+        None,
+        "selecting R keeps revoked C's role cell inactive"
+    );
+    assert_eq!(
+        reverse.evaluator().effective_membership(&controller),
+        None,
+        "selecting R keeps C's membership cell explicitly absent"
+    );
+    assert!(
+        !reverse
+            .evaluator()
+            .admits_closed_session(&controller, &controller),
+        "selecting R keeps closed-session admission fail-closed"
+    );
+    assert_eq!(
         reverse.evaluator().effective_role(&target),
         None,
         "the unselected controller branch remains permanently ineffective"
+    );
+    let regrant_after_r = authored(
+        &reverse,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    reverse
+        .admit(regrant_after_r.clone())
+        .expect("the root can regrant C after selecting R");
+    assert_eq!(
+        reverse.authority_lineage(&controller).effective_head(),
+        Some(regrant_after_r.id),
+        "the later regrant advances the selected R lineage"
+    );
+    assert_eq!(
+        reverse.evaluator().effective_role(&controller),
+        Some(Role::Controller),
+        "the selected R lineage permits C's later regrant"
+    );
+    assert_eq!(
+        reverse.evaluator().effective_role(&target),
+        None,
+        "the later regrant cannot revive the losing O operation"
+    );
+    assert!(
+        reverse
+            .evaluator()
+            .admits_closed_session(&controller, &controller),
+        "the selected R lineage admits C only after the explicit regrant"
+    );
+    assert_ne!(
+        selection_operation_id, selection_revoke_id,
+        "selecting opposite AuthorityUse branches has distinct typed facts"
     );
     assert_eq!(
         reverse.authority_use_heads(&controller).len(),
@@ -1634,15 +1801,15 @@ fn finite_authority_fork_requires_complete_resolution_before_regrant() {
     let resolution = authored(
         &fork,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: vec![operation.id, revoke.id],
             selected_head: revoke.id,
         },
         Vec::new(),
     );
     fork.admit(resolution)
-        .expect("Q complete resolution selecting R admits");
+        .expect("Q complete AuthorityLineage(C) resolution selecting R admits");
     let regrant = authored(
         &fork,
         &root_key,
@@ -1735,15 +1902,15 @@ fn stale_selector_follows_newer_typed_role_resolution() {
     let role_selection = authored(
         &fork,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: authority_heads,
             selected_head: eviction_v.id,
         },
         Vec::new(),
     );
     fork.admit(role_selection.clone())
-        .expect("typed Role(C) selection of V admits");
+        .expect("typed AuthorityLineage(C) selection of V admits");
     assert_eq!(
         fork.evaluator().effective_membership(&controller),
         Some(false),
@@ -1841,8 +2008,8 @@ fn stale_selector_follows_newer_typed_role_resolution() {
             authored(
                 &settled,
                 &owner_a_key,
-                FactBody::Resolution {
-                    cell: ExclusiveCell::role(controller.clone()),
+                FactBody::AuthorityLineageResolution {
+                    subject: controller.clone(),
                     cited_heads: vec![q_id, r_id],
                     selected_head: r_id,
                 },
@@ -1859,7 +2026,7 @@ fn stale_selector_follows_newer_typed_role_resolution() {
     let mut after_selection = settled.clone();
     after_selection
         .admit(role_resolution.clone())
-        .expect("typed Role(C) resolution over Q/R admits");
+        .expect("typed AuthorityLineage(C) resolution over Q/R admits");
     let regrant_after_selection = authored(
         &after_selection,
         &root_key,
@@ -1928,11 +2095,11 @@ fn stale_selector_follows_newer_typed_role_resolution() {
 
         graph
             .admit(role_resolution.clone())
-            .expect("typed Role(C) resolution selects R from the complete Q/R fork");
+            .expect("typed AuthorityLineage(C) resolution selects R from the complete Q/R fork");
         assert_eq!(
             graph.authority_lineage(&controller).selected_branch(),
             Some(r_id),
-            "the typed Role(C) resolution, not payload Q, selects R"
+            "the typed AuthorityLineage(C) resolution, not payload Q, selects R"
         );
         graph
             .admit(regrant_after_selection.clone())

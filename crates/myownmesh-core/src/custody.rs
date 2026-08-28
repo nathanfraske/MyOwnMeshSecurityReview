@@ -14,14 +14,17 @@
 //!
 //! Scope is per `(device, network)`: each owner device enrolls its own
 //! secret; there is no shared "fleet password" to leak. Enrollment lives in
-//! `~/.myownmesh/.secrets/custody.json` (0600), never gossiped.
+//! `~/.myownmesh/.secrets/custody.json` (0600), never gossiped. A prepared
+//! handoff also keeps its one-time recovery material in that protected file
+//! until the handoff is explicitly committed or aborted, so a process restart
+//! can re-deliver the exact transaction rather than silently losing custody.
 //!
 //! The gate is [`require`]; enrollment management is [`enroll`] /
 //! [`is_enrolled`] / [`disable`]. Higher layers decide *which* networks must
 //! enroll (e.g. a Fleet mandates it, a Mesh may not) — this module only
-//! enforces the lock once it exists. Provisional installs carry a local
-//! process-incarnation fence, so startup recovery can remove a handoff left
-//! behind by hard process death without removing a live handoff.
+//! enforces the lock once it exists. Prepared installs carry a process-local
+//! lease for diagnostics and duplicate admission, but durable recovery is
+//! driven by the transaction record rather than lease death.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -70,17 +73,54 @@ struct Enrollment {
     /// removed from this list the moment it is consumed.
     recovery_hashes: Vec<String>,
     created_at: u64,
-    /// True only between the durable install and the caller's handoff.
+    /// The durable transaction phase. A prepared record is visible before
+    /// the caller's handoff and remains exact-retryable until it is committed
+    /// or explicitly aborted.
+    #[serde(default)]
+    phase: EnrollmentPhase,
+    /// Stable identity of this one enrollment transaction. It is deliberately
+    /// independent of the process nonce: a stale handle must not commit or
+    /// abort a successor that reused the network key.
+    #[serde(default)]
+    transaction_id: String,
+    /// The exact one-time material needed to re-deliver a prepared handoff.
+    /// This is present only while `phase` is `Prepared` and is cleared by a
+    /// successful commit. The enclosing custody file is mode 0600.
+    #[serde(default)]
+    prepared_recovery_codes: Vec<String>,
+    /// Authenticator account label needed to reconstruct the exact URI when a
+    /// prepared handoff is re-delivered after a restart.
+    #[serde(default)]
+    prepared_account: String,
+    /// Pre-phase-format compatibility marker. `phase` is authoritative for
+    /// new records; this remains readable so an old prepared record is not
+    /// mistaken for a committed one during migration.
     #[serde(default)]
     provisional: bool,
     #[serde(default)]
     process_nonce: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+enum EnrollmentPhase {
+    Prepared,
+    Committed,
+}
+
+impl Default for EnrollmentPhase {
+    fn default() -> Self {
+        // A record written before the explicit phase existed was a committed
+        // enrollment unless it also carried the old provisional marker. New
+        // writes always set the phase explicitly below.
+        Self::Committed
+    }
+}
+
 /// What [`enroll`] hands back to show the user exactly once: the secret (as
 /// base32 and as an `otpauth://` URI for QR rendering) and the cleartext
-/// recovery codes. None of the cleartext is persisted — only the secret and
-/// the recovery-code *hashes* live on disk.
+/// recovery codes. Prepared records persist the exact cleartext one-time
+/// material in the mode-0600 custody file for crash redelivery; a successful
+/// commit clears that copy and retains only its hashes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Enrolled {
     pub secret_b32: String,
@@ -107,42 +147,160 @@ pub fn is_enrolled(network_id: &str) -> bool {
 /// One enrollment that is **installed** but is not yet its caller's.
 ///
 /// Custody material is the one thing a caller cannot ask for twice: the secret
-/// and the recovery codes are shown exactly once and are never recoverable from
-/// disk. That makes both orderings wrong on their own. Writing after the
+/// and the recovery codes are shown exactly once. A prepared record also keeps
+/// that exact material in the protected custody file for crash redelivery.
+/// Writing after the
 /// response is sent lets a device be told it is locked when the write then
 /// failed and it is not; never writing until then lets two callers both be told
 /// they are locked, because neither one exists to refuse the other.
 ///
 /// So the lock is installed *first*, under the store's serializing lock, and
-/// this value is the
-/// rollback that owns it until the material has been handed over. A successful
+/// this value identifies it until the material has been handed over. A successful
 /// response therefore names a lock that already exists, and an install that
 /// failed is an error response rather than a promise.
 ///
-/// **Armed while it lives.** The undo runs on drop, so an unwind between the
-/// install and the handoff cannot strand a lock whose secret went nowhere —
-/// which, since `disable` requires a valid code, is a lock nobody could satisfy
-/// and nobody could remove. [`Self::keep`] disarms it; [`Self::roll_back`]
-/// performs it now and reports what happened.
+/// **Explicit settlement.** The transaction remains prepared when this value
+/// is dropped or its process dies. [`Self::commit`] makes it committed and
+/// [`Self::abort`] removes it; only these explicit transitions alter durable
+/// custody.
 ///
-/// **Exactly this record.** The undo compares the currently-installed secret
-/// against the one it installed and removes only on equality, so a rollback that
-/// runs late cannot take a successor's lock away: a second enrollment carries 20
-/// fresh random bytes, and the comparison fails.
-#[must_use = "an enrollment that is neither kept nor rolled back is undone on drop"]
+/// **Exactly this record.** Both transitions compare the currently-installed
+/// secret and transaction ID against the exact handle, so a stale handle cannot
+/// settle a successor.
+#[must_use = "a prepared enrollment must be explicitly committed or aborted"]
 pub struct ProvisionalEnrollment {
     /// The store this was installed in — held so the undo cannot be pointed at
     /// a different one, and so the controls never touch the real one.
     path: PathBuf,
     network_id: String,
+    transaction_id: String,
     enrolled: Enrolled,
     /// An OS-held lease for this exact provisional record. The kernel drops
     /// it when the process dies, which is the cross-process liveness fence
     /// recovery needs; a nonce in the JSON alone cannot distinguish a live
     /// process from a different process that merely started later.
     lease: Option<OwnerLease>,
-    /// False once [`Self::keep`] or [`Self::roll_back`] has settled this.
-    armed: bool,
+}
+
+// Prepared records intentionally retain the one-time recovery material until
+// explicit settlement; committed records clear it from durable storage.
+
+/// Return the exact durable state of one enrollment transaction.
+#[derive(Debug, Clone, Serialize)]
+pub enum EnrollmentTransaction {
+    /// The exact transaction material remains available for redelivery.
+    Prepared(PreparedEnrollment),
+    /// The exact transaction committed and its recovery material was cleared.
+    Committed,
+    /// No record matches both supplied identities.
+    Absent,
+}
+
+/// The one explicit terminal operation allowed for a prepared transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentSettlementRequest {
+    /// Publish the prepared enrollment as committed custody.
+    Commit,
+    /// Remove the exact prepared enrollment.
+    Abort,
+}
+
+/// The actual durable terminal state observed after an exact settlement.
+///
+/// This is deliberately independent of the requested operation: a concurrent
+/// loser reports the state established by the winner rather than claiming that
+/// its own requested transition occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentSettlementResult {
+    /// The exact transaction is committed, including an idempotent retry.
+    Committed,
+    /// The exact transaction is absent, including an idempotent abort or a
+    /// stale transaction that cannot touch a successor.
+    Absent,
+}
+
+/// Return the state of one exact transaction without selecting or mutating any
+/// other enrollment. A stale transaction ID therefore observes `Absent` even
+/// when a successor is installed for the same network.
+pub fn enrollment_transaction(
+    network_id: &str,
+    transaction_id: &str,
+) -> Result<EnrollmentTransaction> {
+    enrollment_transaction_at(&store_path()?, network_id, transaction_id)
+}
+
+/// Return every prepared transaction whose exact material can be re-delivered.
+///
+/// This is a durable read: it does not acquire or require the original
+/// process's owner lease, and it never changes a prepared record. The caller
+/// must explicitly call [`PreparedEnrollment::commit`] after handing the
+/// material to its recipient, or [`PreparedEnrollment::abort`] to discard it.
+pub fn prepared_enrollments() -> Result<Vec<PreparedEnrollment>> {
+    prepared_enrollments_at(&store_path()?)
+}
+
+/// A prepared custody transaction recovered from durable storage.
+///
+/// The transaction identity, TOTP secret, and one-time recovery codes are
+/// reconstructed from the exact prepared record. It has no process lease, so
+/// a new process may explicitly commit or abort the same transaction after a
+/// crash. Dropping this value is not an abort; only the explicit methods alter
+/// durable custody.
+#[derive(Debug, Clone, Serialize)]
+pub struct PreparedEnrollment {
+    network_id: String,
+    transaction_id: String,
+    enrolled: Enrolled,
+    /// The exact durable store from which this handle was recovered.
+    ///
+    /// This is process-local query context, not part of the public wire or
+    /// serialized enrollment material. Keeping it on the handle ensures an
+    /// explicit settlement addresses the same injected store that produced
+    /// the handle, rather than re-resolving the process-global default.
+    #[serde(skip_serializing)]
+    path: PathBuf,
+}
+
+impl PreparedEnrollment {
+    /// The network this prepared transaction locks.
+    pub fn network_id(&self) -> &str {
+        &self.network_id
+    }
+
+    /// The stable identity of this exact durable handoff transaction.
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    /// The exact material that may be re-delivered to the caller.
+    pub fn enrolled(&self) -> &Enrolled {
+        &self.enrolled
+    }
+
+    /// Settle this exact prepared transaction under one writer guard and
+    /// return the actual durable terminal state.
+    pub fn settle(
+        self,
+        request: EnrollmentSettlementRequest,
+    ) -> Result<EnrollmentSettlementResult> {
+        settle_exact_at(
+            &self.path,
+            &self.network_id,
+            &self.transaction_id,
+            &self.enrolled.secret_b32,
+            request,
+        )
+    }
+
+    /// Commit this exact prepared transaction, idempotently.
+    pub fn commit(self) -> Result<EnrollmentSettlementResult> {
+        self.settle(EnrollmentSettlementRequest::Commit)
+    }
+
+    /// Explicitly abort this exact prepared transaction, idempotently.
+    pub fn abort(self) -> Result<EnrollmentSettlementResult> {
+        self.settle(EnrollmentSettlementRequest::Abort)
+    }
 }
 
 impl ProvisionalEnrollment {
@@ -156,63 +314,68 @@ impl ProvisionalEnrollment {
         &self.network_id
     }
 
-    /// The caller has the material, so the installed lock is this device's.
-    ///
-    /// Durably hand the installed lock to the caller and disarm the undo.
-    ///
-    /// The handoff is itself atomic. If the process dies during this write,
-    /// restart recovery sees either the old provisional record and removes it,
-    /// or the new committed record and keeps it. The historical `keep` API is
-    /// intentionally infallible for callers that are already sending a
-    /// response; on an I/O error the value stays armed and its `Drop` performs
-    /// the exact rollback instead of stranding an unowned lock.
-    pub fn keep(mut self) {
-        if let Err(error) = self.commit() {
-            tracing::warn!(
-                network = %self.network_id,
-                "a provisional MFA enrollment could not be committed: {error}"
-            );
-        }
+    /// The stable identity of this exact durable handoff transaction.
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
     }
 
-    fn commit(&mut self) -> Result<()> {
-        commit_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)?;
+    /// The caller has the material, so commit the prepared transaction.
+    ///
+    /// The durable transition is fallible and the error is returned to the
+    /// caller. A failed commit leaves the durable Prepared record intact so
+    /// it can be queried and retried after the error.
+    pub fn commit(mut self) -> Result<()> {
+        let result = settle_exact_at(
+            &self.path,
+            &self.network_id,
+            &self.transaction_id,
+            &self.enrolled.secret_b32,
+            EnrollmentSettlementRequest::Commit,
+        )
+        .map(|_| ());
+        // Do not let `Drop` turn a durable commit error into an implicit
+        // abort. The prepared record is the recovery source for a retry.
         self.lease.take();
-        self.armed = false;
-        Ok(())
+        result
+    }
+
+    /// Compatibility spelling for callers that describe the commit as the
+    /// successful handoff. Unlike the historical method, durable failure is
+    /// propagated rather than logged and discarded.
+    pub fn keep(self) -> Result<()> {
+        self.commit()
     }
 
     /// The caller does not have the material, so remove exactly this lock.
     ///
     /// Reported rather than swallowed, so a daemon whose store it could not
-    /// reach says so. The drop below runs the same removal for the paths that
-    /// cannot report — an unwind, or a caller that dropped the value.
+    /// reach says so. Dropping the handle does not perform this transition;
+    /// an unwind or process exit leaves the durable record available instead.
     ///
-    /// Disarmed only once the removal has actually happened. A failed explicit
-    /// rollback that gave up ownership would leave the very lock this exists to
-    /// remove installed and unowned; instead the value stays armed, so the drop
-    /// that immediately follows tries once more. The retry is safe because the
-    /// removal is exact and idempotent: it removes this record or nothing.
-    pub fn roll_back(mut self) -> Result<()> {
-        remove_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)?;
+    /// A failed explicit abort leaves the Prepared record available for an
+    /// exact retry; the operation is idempotent and never removes a successor.
+    pub fn abort(mut self) -> Result<()> {
+        settle_exact_at(
+            &self.path,
+            &self.network_id,
+            &self.transaction_id,
+            &self.enrolled.secret_b32,
+            EnrollmentSettlementRequest::Abort,
+        )?;
         self.lease.take();
-        self.armed = false;
         Ok(())
+    }
+
+    /// Compatibility spelling for the explicit prepared-transaction abort.
+    pub fn roll_back(self) -> Result<()> {
+        self.abort()
     }
 }
 
 impl Drop for ProvisionalEnrollment {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        if let Err(error) = remove_exact_at(&self.path, &self.network_id, &self.enrolled.secret_b32)
-        {
-            tracing::warn!(
-                network = %self.network_id,
-                "a provisional MFA enrollment could not be rolled back: {error}"
-            );
-        }
+        // Dropping a handle is not an implicit transition. Prepared custody
+        // remains durable and re-deliverable until explicit commit or abort.
         self.lease.take();
     }
 }
@@ -228,13 +391,13 @@ impl Drop for ProvisionalEnrollment {
 /// [`install_provisional_enroll`] and settles it against whether the handoff
 /// actually happened.
 pub fn enroll(network_id: &str, account: &str) -> Result<Enrolled> {
-    let mut provisional = install_provisional_enroll(network_id, account)?;
+    let provisional = install_provisional_enroll(network_id, account)?;
     let enrolled = provisional.enrolled.clone();
     provisional.commit()?;
     Ok(enrolled)
 }
 
-/// Install an enrollment whose rollback the caller owns. See
+/// Install an enrollment whose explicit commit or abort the caller owns. See
 /// [`ProvisionalEnrollment`].
 pub fn install_provisional_enroll(
     network_id: &str,
@@ -245,13 +408,12 @@ pub fn install_provisional_enroll(
     install_provisional_enroll_at(&path, network_id, account)
 }
 
-/// Remove provisional enrollments whose OS owner lease is no longer held.
+/// Validate the durable prepared-enrollment store without expiring records.
 ///
 /// Callers may invoke this at daemon startup, and all public custody entry
-/// points perform the same check before reading or mutating the store. A live
-/// provisional handoff in another process is retained by its kernel-held lease;
-/// a record written by a process that died before its response was handed off
-/// is removed. The operation is exact, serialized, and idempotent.
+/// points perform the same check before reading or mutating the store. A
+/// prepared handoff remains available after its creating process dies; only an
+/// exact explicit commit or abort changes that state.
 pub fn recover_provisional_enrollments() -> Result<usize> {
     recover_provisional_at(&store_path()?)
 }
@@ -643,6 +805,7 @@ fn install_provisional_enroll_at(
     let recovery_codes = gen_recovery_codes();
     let recovery_hashes = recovery_codes.iter().map(|c| hash_code(c)).collect();
     let otpauth_uri = provisioning_uri(&secret_b32, account);
+    let transaction_id = BASE32_NOPAD.encode(&random_bytes(16)).to_lowercase();
     let lease = OwnerLease::acquire(path, network_id, &secret_b32, process_nonce())?;
     store.networks.insert(
         network_id.to_string(),
@@ -650,6 +813,10 @@ fn install_provisional_enroll_at(
             secret_b32: secret_b32.clone(),
             recovery_hashes,
             created_at: now_unix(),
+            phase: EnrollmentPhase::Prepared,
+            transaction_id: transaction_id.clone(),
+            prepared_recovery_codes: recovery_codes.clone(),
+            prepared_account: account.to_string(),
             provisional: true,
             process_nonce: process_nonce().to_string(),
         },
@@ -661,106 +828,73 @@ fn install_provisional_enroll_at(
     Ok(ProvisionalEnrollment {
         path: path.to_path_buf(),
         network_id: network_id.to_string(),
+        transaction_id,
         enrolled: Enrolled {
             secret_b32,
             otpauth_uri,
             recovery_codes,
         },
         lease: Some(lease),
-        armed: true,
     })
 }
 
 /// Commit the exact installed record, preserving the same generation fence
 /// used by rollback. A stale handle can never commit a successor, and a
 /// record already committed by an earlier idempotent handoff is left alone.
-fn commit_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()> {
+fn settle_exact_at(
+    path: &Path,
+    network_id: &str,
+    transaction_id: &str,
+    secret_b32: &str,
+    request: EnrollmentSettlementRequest,
+) -> Result<EnrollmentSettlementResult> {
     let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
-    let Some(installed) = store.networks.get_mut(network_id) else {
-        return Ok(());
+    let Some(installed) = store.networks.get(network_id) else {
+        return Ok(EnrollmentSettlementResult::Absent);
     };
     if !constant_eq(installed.secret_b32.as_bytes(), secret_b32.as_bytes())
-        || !installed.provisional
-        || installed.process_nonce != process_nonce()
+        || !constant_eq(
+            installed.transaction_id.as_bytes(),
+            transaction_id.as_bytes(),
+        )
     {
-        return Ok(());
+        return Ok(EnrollmentSettlementResult::Absent);
     }
-    installed.provisional = false;
-    installed.process_nonce.clear();
-    save_at(path, &store)
+    if !is_prepared(installed) {
+        return Ok(EnrollmentSettlementResult::Committed);
+    }
+    match request {
+        EnrollmentSettlementRequest::Commit => {
+            let installed = store
+                .networks
+                .get_mut(network_id)
+                .expect("exact prepared record remains under writer guard");
+            installed.phase = EnrollmentPhase::Committed;
+            installed.provisional = false;
+            installed.prepared_recovery_codes.clear();
+            installed.prepared_account.clear();
+            installed.process_nonce.clear();
+            save_at(path, &store)?;
+            Ok(EnrollmentSettlementResult::Committed)
+        }
+        EnrollmentSettlementRequest::Abort => {
+            store.networks.remove(network_id);
+            save_at(path, &store)?;
+            Ok(EnrollmentSettlementResult::Absent)
+        }
+    }
 }
 
-/// Recover only records whose provisional owner belongs to a dead process.
+/// Validate the durable store without expiring prepared transactions.
 ///
-/// Liveness is decided by the kernel-held owner lease, not by comparing the
-/// diagnostic process nonce.
+/// Prepared custody is recoverable material, so neither owner-lease death nor
+/// a changed process nonce is permission to delete it. The explicit abort path
+/// is the only prepared-to-absent transition.
 fn recover_provisional_at(path: &Path) -> Result<usize> {
-    #[cfg(not(any(unix, windows)))]
-    return Err(Error::Custody(
-        "cross-process custody recovery is unsupported on this platform".into(),
-    ));
-
-    let (_serialized, _writer) = store_transaction_guard(path)?;
-    let mut store = load_at(path)?;
-    let mut stale = Vec::new();
-    let mut leases = Vec::new();
-    for (network_id, enrollment) in &store.networks {
-        // The nonce is diagnostic metadata only. A failed rollback may release
-        // its OS lease while leaving the current process nonce on disk, so
-        // every provisional record must still be checked against its exact
-        // per-secret kernel lease.
-        if !enrollment.provisional {
-            continue;
-        }
-        let lease_path = owner_lease_path(path, network_id, &enrollment.secret_b32);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lease_path)
-            .map_err(|e| Error::Custody(format!("open custody recovery lease: {e}")))?;
-        #[cfg(unix)]
-        let acquired = try_lock_owner_file(&file)
-            .map_err(|e| Error::Custody(format!("lock custody recovery lease: {e}")))?;
-        #[cfg(windows)]
-        let overlapped = match try_lock_owner_file(&file) {
-            Ok(overlapped) => Some(overlapped),
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(33) =>
-            {
-                None
-            }
-            Err(error) => {
-                return Err(Error::Custody(format!(
-                    "lock custody recovery lease: {error}"
-                )));
-            }
-        };
-        #[cfg(windows)]
-        let acquired = overlapped.is_some();
-        #[cfg(not(any(unix, windows)))]
-        let acquired = false;
-        if acquired {
-            stale.push(network_id.clone());
-            leases.push(OwnerLease {
-                file,
-                #[cfg(windows)]
-                overlapped: overlapped.expect("acquired lease has lock state"),
-            });
-        }
-    }
-    if stale.is_empty() {
-        return Ok(0);
-    }
-    for network_id in &stale {
-        store.networks.remove(network_id);
-    }
-    save_at(path, &store)?;
-    drop(leases);
-    Ok(stale.len())
+    let _serialized = store_guard();
+    let _ = load_at(path)?;
+    Ok(0)
 }
 
 /// Remove `network_id`'s lock, but only while it is still the exact one
@@ -771,24 +905,91 @@ fn recover_provisional_at(path: &Path) -> Result<usize> {
 /// the time it runs — including a successor the operator enrolled after the
 /// first attempt failed, whose material *was* delivered. Constant-time, for the
 /// same reason every other comparison against stored custody material here is.
-fn remove_exact_at(path: &Path, network_id: &str, secret_b32: &str) -> Result<()> {
-    let (_serialized, _writer) = store_transaction_guard(path)?;
+fn is_prepared(enrollment: &Enrollment) -> bool {
+    enrollment.phase == EnrollmentPhase::Prepared || enrollment.provisional
+}
+
+fn prepared_enrollments_at(path: &Path) -> Result<Vec<PreparedEnrollment>> {
+    let _serialized = store_guard();
+    let store = load_at(path)?;
+    store
+        .networks
+        .into_iter()
+        .filter_map(|(network_id, enrollment)| {
+            if !is_prepared(&enrollment) {
+                return None;
+            }
+            Some((network_id, enrollment))
+        })
+        .map(|(network_id, enrollment)| {
+            if enrollment.transaction_id.is_empty() {
+                return Err(Error::Custody(format!(
+                    "prepared custody record for {network_id} has no transaction identity"
+                )));
+            }
+            if enrollment.prepared_recovery_codes.is_empty() {
+                return Err(Error::Custody(format!(
+                    "prepared custody record for {network_id} has no re-deliverable recovery material"
+                )));
+            }
+            let enrolled = Enrolled {
+                secret_b32: enrollment.secret_b32.clone(),
+                otpauth_uri: provisioning_uri(
+                    &enrollment.secret_b32,
+                    &enrollment.prepared_account,
+                ),
+                recovery_codes: enrollment.prepared_recovery_codes,
+            };
+            Ok(PreparedEnrollment {
+                network_id,
+                transaction_id: enrollment.transaction_id,
+                enrolled,
+                path: path.to_path_buf(),
+            })
+        })
+        .collect()
+}
+
+fn enrollment_transaction_at(
+    path: &Path,
+    network_id: &str,
+    transaction_id: &str,
+) -> Result<EnrollmentTransaction> {
+    let _serialized = store_guard();
     let mut store = load_at(path)?;
-    let Some(installed) = store.networks.get(network_id) else {
-        // Already gone — disabled, or rolled back once already. Same end state.
-        return Ok(());
+    let Some(enrollment) = store.networks.remove(network_id) else {
+        return Ok(EnrollmentTransaction::Absent);
     };
-    if !constant_eq(installed.secret_b32.as_bytes(), secret_b32.as_bytes()) {
-        // A successor holds this network. It is not this rollback's to remove.
-        return Ok(());
+    if !constant_eq(
+        enrollment.transaction_id.as_bytes(),
+        transaction_id.as_bytes(),
+    ) {
+        return Ok(EnrollmentTransaction::Absent);
     }
-    store.networks.remove(network_id);
-    save_at(path, &store)
+    if is_prepared(&enrollment) {
+        if enrollment.prepared_recovery_codes.is_empty() {
+            return Err(Error::Custody(format!(
+                "prepared custody record for {network_id} has no re-deliverable recovery material"
+            )));
+        }
+        let enrolled = Enrolled {
+            secret_b32: enrollment.secret_b32.clone(),
+            otpauth_uri: provisioning_uri(&enrollment.secret_b32, &enrollment.prepared_account),
+            recovery_codes: enrollment.prepared_recovery_codes,
+        };
+        return Ok(EnrollmentTransaction::Prepared(PreparedEnrollment {
+            network_id: network_id.to_string(),
+            transaction_id: enrollment.transaction_id,
+            enrolled,
+            path: path.to_path_buf(),
+        }));
+    }
+    Ok(EnrollmentTransaction::Committed)
 }
 
 #[cfg(test)]
 fn enroll_at(path: &Path, network_id: &str, account: &str) -> Result<Enrolled> {
-    let mut provisional = install_provisional_enroll_at(path, network_id, account)?;
+    let provisional = install_provisional_enroll_at(path, network_id, account)?;
     let enrolled = provisional.enrolled.clone();
     provisional.commit()?;
     Ok(enrolled)
@@ -1203,7 +1404,7 @@ mod tests {
                     install_provisional_enroll_at(&path, net, "phone").map(|installed| {
                         let material = installed.enrolled().clone();
                         // The response reached its caller, so the lock stands.
-                        installed.keep();
+                        installed.keep().expect("commit concurrent enrollment");
                         material
                     })
                 })
@@ -1237,25 +1438,19 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// An enrollment whose material never reached its caller is removed — and a
-    /// successor is not removed by that undo arriving late.
+    /// A prepared enrollment remains durable when its handle is dropped, and an
+    /// explicit abort cannot remove a successor that arrives later.
     ///
-    /// Both halves of the rollback's contract, in the order production reaches
-    /// them. The lock is installed *before* the response, so a response that is
-    /// refused or whose socket ended leaves a lock nobody holds: `disable`
-    /// requires a valid code, which is exactly what was lost, so nothing could
-    /// ever remove it. The armed drop is what removes it, and the drop rather
-    /// than an explicit call is deliberate — an unwind between the install and
-    /// the handoff must not strand one either.
+    /// The lock is installed *before* the response, so a response that is
+    /// refused or whose socket ended still leaves an exact transaction that a
+    /// later process can query and redeliver. Only an explicit abort removes
+    /// it.
     ///
-    /// The stale-undo half is driven end to end rather than asserted about: the
-    /// first attempt's lock is cleared by the operator's own `disable`, a second
-    /// enrollment is installed and *delivered*, and only then does the first
-    /// attempt's rollback finally run. Keyed on the network alone it would take
-    /// the successor's lock away; keyed on the exact installed secret it finds
-    /// somebody else's 20 random bytes and leaves them alone.
+    /// The stale-transaction half is driven end to end: the first attempt is
+    /// explicitly aborted, a second enrollment is installed and committed, and
+    /// a late abort for the first exact identity cannot affect it.
     #[test]
-    fn v4_r7_core_b1_an_unhanded_enrollment_is_removed_and_a_successor_survives_its_late_undo() {
+    fn v4_r2_prepared_enrollment_redelivers_and_explicit_abort_preserves_successor() {
         let path = tmp();
         let net = "fleet-unhanded";
 
@@ -1266,27 +1461,44 @@ mod tests {
             "the caller is given the whole of what it must show exactly once"
         );
         assert_eq!(unhanded.network_id(), net);
+        let transaction_id = unhanded.transaction_id().to_owned();
+        let original_material = unhanded.enrolled().clone();
         assert!(
             is_enrolled_at(&path, net),
             "non-vacuity: the lock is on disk before anything is answered, which \
              is the ordering the whole repair rests on"
         );
 
-        // The response never reached `Sent`, so the armed rollback runs.
+        // The response never reached `Sent`; dropping the local handle does not
+        // implicitly abort the durable transaction.
         drop(unhanded);
         assert!(
-            !is_enrolled_at(&path, net),
-            "an unhanded enrollment leaves no lock behind"
+            is_enrolled_at(&path, net),
+            "a dropped handle leaves a prepared lock for redelivery"
         );
         assert!(
-            require_at(&path, net, None).is_ok(),
-            "so the gate is a no-op again and this device is not locked out of \
-             its own governance"
+            require_at(&path, net, None).is_err(),
+            "the prepared lock remains an effective custody gate"
         );
+        let recovered = prepared_enrollments_at(&path).expect("recover prepared material");
+        assert_eq!(recovered.len(), 1);
+        let recovered = recovered.into_iter().next().expect("prepared transaction");
+        assert_eq!(recovered.transaction_id(), transaction_id);
+        assert_eq!(
+            recovered.enrolled().secret_b32,
+            original_material.secret_b32
+        );
+        assert_eq!(
+            recovered.enrolled().recovery_codes,
+            original_material.recovery_codes
+        );
+        recovered
+            .abort()
+            .expect("explicitly abort unhanded transaction");
+        assert!(!is_enrolled_at(&path, net));
 
-        // A first attempt that *did* answer, and is then surrendered the
-        // ordinary way — which is what lets a successor exist while the first
-        // attempt's rollback is still owed.
+        // A first attempt that *did* answer, and is then explicitly surrendered
+        // in the ordinary way, lets a successor exist.
         let first = install_provisional_enroll_at(&path, net, "laptop").expect("install again");
         let first_material = first.enrolled().clone();
         let first_secret = BASE32_NOPAD
@@ -1297,13 +1509,13 @@ mod tests {
 
         let successor = install_provisional_enroll_at(&path, net, "laptop").expect("the successor");
         let successor_material = successor.enrolled().clone();
-        successor.keep();
+        successor.keep().expect("commit successor enrollment");
         assert!(
             is_enrolled_at(&path, net),
             "non-vacuity: there is a successor lock for a stale undo to threaten"
         );
 
-        // The late rollback of the first attempt, arriving now.
+        // Dropping the now-stale first handle cannot settle the successor.
         drop(first);
         assert!(
             is_enrolled_at(&path, net),
@@ -1320,11 +1532,10 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A live owner lease preserves its provisional record even if its
-    /// diagnostic process nonce differs; hard-death reclamation is covered by
-    /// the cross-process R2 control.
+    /// A prepared record remains after owner-lease/process death; the lease and
+    /// nonce are not an implicit abort authority.
     #[test]
-    fn v4_r2_hard_death_recovery_removes_only_an_old_process_provisional() {
+    fn v4_r2_hard_death_recovery_preserves_prepared_transaction() {
         let path = tmp();
         let net = "fleet-hard-death";
 
@@ -1355,9 +1566,74 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A process nonce is only diagnostic metadata. If rollback released the
-    /// exact owner lease but failed before removing its durable record, a
-    /// recovery pass in the same process must still reclaim that orphan.
+    /// Concurrent exact terminal requests report the durable winner rather
+    /// than each claiming its own requested transition. The writer lease and
+    /// serialized guard make the race a pair of whole transactions: commit
+    /// wins and both observe `Committed`, or abort wins and both observe
+    /// `Absent`.
+    #[test]
+    fn v4_r2_concurrent_settlement_reports_actual_durable_winner() {
+        let path = tmp();
+        let net = "fleet-settlement-race";
+
+        let provisional = install_provisional_enroll_at(&path, net, "laptop").expect("install");
+        let transaction_id = provisional.transaction_id().to_owned();
+        drop(provisional);
+
+        let prepared = match enrollment_transaction_at(&path, net, &transaction_id)
+            .expect("query prepared transaction")
+        {
+            EnrollmentTransaction::Prepared(prepared) => prepared,
+            other => panic!("expected prepared transaction, got {other:?}"),
+        };
+        let competing = match enrollment_transaction_at(&path, net, &transaction_id)
+            .expect("query competing prepared transaction")
+        {
+            EnrollmentTransaction::Prepared(prepared) => prepared,
+            other => panic!("expected competing prepared transaction, got {other:?}"),
+        };
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let commit_barrier = std::sync::Arc::clone(&barrier);
+        let abort_barrier = std::sync::Arc::clone(&barrier);
+        let commit_thread = std::thread::spawn(move || {
+            commit_barrier.wait();
+            prepared.commit()
+        });
+        let abort_thread = std::thread::spawn(move || {
+            abort_barrier.wait();
+            competing.abort()
+        });
+        let commit_state = commit_thread
+            .join()
+            .expect("commit settlement does not panic")
+            .expect("commit settlement succeeds");
+        let abort_state = abort_thread
+            .join()
+            .expect("abort settlement does not panic")
+            .expect("abort settlement succeeds");
+
+        assert_eq!(
+            commit_state, abort_state,
+            "both callers observe the same actual durable winner"
+        );
+        assert!(matches!(
+            commit_state,
+            EnrollmentSettlementResult::Committed | EnrollmentSettlementResult::Absent
+        ));
+        let final_state = enrollment_transaction_at(&path, net, &transaction_id)
+            .expect("query final settlement state");
+        match (commit_state, final_state) {
+            (EnrollmentSettlementResult::Committed, EnrollmentTransaction::Committed)
+            | (EnrollmentSettlementResult::Absent, EnrollmentTransaction::Absent) => {}
+            (state, durable) => panic!("settlement result {state:?} disagrees with {durable:?}"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A process nonce is only diagnostic metadata. A prepared record remains
+    /// queryable even when its owner lease is absent.
     #[test]
     fn v4_r2_current_nonce_without_owner_lease_is_recovered() {
         let path = tmp();
@@ -1375,6 +1651,10 @@ mod tests {
                 secret_b32: secret_b32.clone(),
                 recovery_hashes: Vec::new(),
                 created_at: now_unix(),
+                phase: EnrollmentPhase::Prepared,
+                transaction_id: "orphaned-transaction".into(),
+                prepared_recovery_codes: vec!["abcde-fghij".into()],
+                prepared_account: "laptop".into(),
                 provisional: true,
                 process_nonce: process_nonce().to_owned(),
             },
@@ -1393,16 +1673,19 @@ mod tests {
         );
         assert_eq!(
             recover_provisional_at(&path).expect("recover current-nonce orphan"),
-            1,
-            "recovery follows the exact kernel lease, not diagnostic nonce equality"
+            0,
+            "recovery never expires a prepared transaction"
         );
-        assert!(
-            !load_at(&path)
-                .expect("read recovered store")
-                .networks
-                .contains_key(net),
-            "an orphaned provisional record is removed even in the current process"
-        );
+        let recovered = prepared_enrollments_at(&path).expect("read prepared transaction");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].transaction_id(), "orphaned-transaction");
+        recovered
+            .into_iter()
+            .next()
+            .expect("prepared transaction")
+            .abort()
+            .expect("explicitly abort orphaned transaction");
+        assert!(!is_enrolled_at(&path, net));
 
         let _ = std::fs::remove_file(lease_path);
         let _ = std::fs::remove_file(&path);
@@ -1410,18 +1693,29 @@ mod tests {
 
     /// The commit side of the restart transaction is just as important as
     /// rollback: an atomic handoff leaves a committed record that a later
-    /// recovery pass preserves, and the exact handle is no longer armed.
+    /// recovery pass preserves, while clearing the re-delivery material.
     #[test]
     fn v4_r2_committed_handoff_survives_restart_recovery() {
         let path = tmp();
         let net = "fleet-committed-restart";
 
-        let mut provisional = install_provisional_enroll_at(&path, net, "phone").expect("install");
+        let provisional = install_provisional_enroll_at(&path, net, "phone").expect("install");
+        let transaction_id = provisional.transaction_id().to_owned();
         provisional.commit().expect("commit handoff");
         let store = load_at(&path).expect("read committed record");
         let enrollment = store.networks.get(net).expect("committed network");
-        assert!(!enrollment.provisional);
+        assert_eq!(enrollment.phase, EnrollmentPhase::Committed);
         assert!(enrollment.process_nonce.is_empty());
+        assert!(enrollment.prepared_recovery_codes.is_empty());
+        assert!(enrollment.prepared_account.is_empty());
+        assert!(matches!(
+            enrollment_transaction_at(&path, net, &transaction_id).expect("query committed"),
+            EnrollmentTransaction::Committed
+        ));
+        assert!(matches!(
+            enrollment_transaction_at(&path, net, "stale-transaction").expect("query stale"),
+            EnrollmentTransaction::Absent
+        ));
         assert_eq!(
             recover_provisional_at(&path).expect("restart recovery"),
             0,

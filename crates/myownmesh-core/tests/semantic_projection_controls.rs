@@ -4,6 +4,7 @@
 
 use ed25519_dalek::SigningKey;
 
+use myownmesh_core::protocol::FactBundleMessage;
 use myownmesh_core::semantic::{
     Admission, AttestationDecision, CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent,
     FactGraph, FactId, Role, SignedFact, VerifiedBootstrap,
@@ -177,8 +178,8 @@ fn finite_authority_fork_projection_converges_for_every_arrival_permutation() {
     let resolution = authored(
         &fork,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: vec![operation.id, revoke.id],
             selected_head: revoke.id,
         },
@@ -644,8 +645,8 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
     let role_selection = authored(
         &fork,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: authority_heads,
             selected_head: eviction_v.id,
         },
@@ -696,8 +697,8 @@ fn self_authored_membership_resolution_is_order_independent_after_role_regrant()
     let role_resolution = authored(
         &settled,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: vec![q_id, r_id],
             selected_head: r_id,
         },
@@ -885,8 +886,8 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
     let t0 = authored(
         &fork,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::role(controller.clone()),
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
             cited_heads: old_heads,
             selected_head: v.id,
         },
@@ -965,8 +966,8 @@ fn stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor()
         t2_options.push(authored_with_sorted_support(
             &settled,
             &owner_a_key,
-            FactBody::Resolution {
-                cell: ExclusiveCell::role(controller.clone()),
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
                 cited_heads: qr_heads.clone(),
                 selected_head: r.id,
             },
@@ -1857,4 +1858,366 @@ fn authoring_witness_supports_controller_to_member_demotion() {
         graph.evaluator().effective_role(&controller),
         Some(Role::Member)
     );
+}
+
+#[test]
+fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
+    let root_key = key(230);
+    let controller_key = key(231);
+    let remote_key = key(232);
+    let future_key = key(233);
+    let bootstrap = bootstrap(230, 230);
+    let controller = author(&controller_key);
+    let remote = author(&remote_key);
+    let future_target = author(&future_key);
+    let role_cell = ExclusiveCell::role(controller.clone());
+
+    let mut seed = FactGraph::from_bootstrap(&bootstrap);
+    let controller_grant = authored(
+        &seed,
+        &root_key,
+        FactBody::RoleGrant {
+            target: controller.clone(),
+            role: Role::Controller,
+        },
+        Vec::new(),
+    );
+    seed.admit(controller_grant.clone())
+        .expect("controller grant admits");
+    let membership = authored(
+        &seed,
+        &root_key,
+        FactBody::MembershipAdmit {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+
+    // Keep a pre-membership O/R fork solely for the ordinary-resolution
+    // negatives below. Membership is an AuthorityUse(C) fact when admitted,
+    // so it must not be introduced into that negative fixture.
+    let negative_operation = authored(
+        &seed,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: remote.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let negative_revoke = authored(
+        &seed,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut negative_fork = seed.clone();
+    negative_fork
+        .admit(negative_operation.clone())
+        .expect("negative O role branch admits");
+    negative_fork
+        .admit(negative_revoke.clone())
+        .expect("negative R role branch admits");
+    let mut negative_heads = vec![negative_operation.id, negative_revoke.id];
+    negative_heads.sort();
+    assert_eq!(
+        negative_fork.authority_use_heads(&controller),
+        negative_heads
+    );
+
+    // A membership-cell Resolution cannot select an AuthorityUse(C) branch.
+    // Construct it while the membership cell is still empty so the rejection
+    // is specifically the ordinary Role-resolution separation, not a stale
+    // membership head check.
+    let cross_cell = authored(
+        &negative_fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: ExclusiveCell::membership(controller.clone()),
+            cited_heads: negative_heads.clone(),
+            selected_head: negative_operation.id,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        negative_fork.admit(cross_cell),
+        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+        "only a typed AuthorityLineageResolution for C can select the AuthorityUse(C) fork"
+    );
+    let ordinary_role_selection = authored(
+        &negative_fork,
+        &root_key,
+        FactBody::Resolution {
+            cell: role_cell.clone(),
+            cited_heads: negative_heads.clone(),
+            selected_head: negative_operation.id,
+        },
+        Vec::new(),
+    );
+    assert_eq!(
+        negative_fork.admit(ordinary_role_selection),
+        Err(myownmesh_core::semantic::SemanticError::IncompleteResolution),
+        "ordinary Role(C) resolution cannot select the cross-cell O lineage"
+    );
+    assert_eq!(
+        negative_fork.authority_lineage(&controller).heads().len(),
+        2,
+        "ordinary Role(C) resolution leaves AuthorityLineage(C) unresolved"
+    );
+    assert_eq!(
+        negative_fork
+            .authority_lineage(&controller)
+            .selected_branch(),
+        None,
+        "ordinary Role(C) resolution cannot collapse AuthorityLineage(C)"
+    );
+
+    // Admit membership first so it is a common ancestor of the positive O/R
+    // fork rather than a third current AuthorityUse(C) head.
+    let mut positive_seed = seed.clone();
+    positive_seed
+        .admit(membership.clone())
+        .expect("membership common ancestor admits");
+    let operation = authored(
+        &positive_seed,
+        &controller_key,
+        FactBody::RoleGrant {
+            target: remote.clone(),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let revoke = authored(
+        &positive_seed,
+        &root_key,
+        FactBody::RoleRevoke {
+            target: controller.clone(),
+        },
+        Vec::new(),
+    );
+    let mut fork = positive_seed.clone();
+    fork.admit(operation.clone()).expect("O role branch admits");
+    fork.admit(revoke.clone()).expect("R role branch admits");
+    let mut expected_heads = vec![operation.id, revoke.id];
+    expected_heads.sort();
+    assert_eq!(fork.authority_use_heads(&controller), expected_heads);
+
+    let selected_o = fork.clone();
+    let resolution_o = authored(
+        &selected_o,
+        &root_key,
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
+            cited_heads: expected_heads.clone(),
+            selected_head: operation.id,
+        },
+        Vec::new(),
+    );
+    let selected_r = fork.clone();
+    let resolution_r = authored(
+        &selected_r,
+        &root_key,
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
+            cited_heads: expected_heads.clone(),
+            selected_head: revoke.id,
+        },
+        Vec::new(),
+    );
+
+    for (selected, losing, resolution, expected_role) in [
+        (operation.id, revoke.id, resolution_o, None),
+        (revoke.id, operation.id, resolution_r, None),
+    ] {
+        let pre_resolution = fork.clone();
+        let mut cited = expected_heads.clone();
+        cited.sort();
+        assert_eq!(
+            pre_resolution.authority_lineage(&controller).heads(),
+            cited.as_slice(),
+            "the selector is built from the complete current AuthorityUse(C) set"
+        );
+        let FactBody::AuthorityLineageResolution {
+            subject,
+            cited_heads,
+            selected_head,
+        } = &resolution.content.body
+        else {
+            panic!("selector fixture must remain an AuthorityLineageResolution");
+        };
+        assert_eq!(subject, &controller);
+        assert_eq!(cited_heads, &cited);
+        assert_eq!(*selected_head, selected);
+        let authority_use = resolution
+            .content
+            .authority_uses
+            .iter()
+            .find(|use_| use_.subject == controller)
+            .expect("selector carries the controller AuthorityUse witness");
+        assert_eq!(authority_use.predecessors, cited);
+
+        let regrant = {
+            let mut graph = pre_resolution.clone();
+            graph
+                .admit(resolution.clone())
+                .expect("complete typed Role(C) resolution admits");
+            authored(
+                &graph,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: controller.clone(),
+                    role: Role::Owner,
+                },
+                Vec::new(),
+            )
+        };
+        let future = {
+            let mut graph = pre_resolution.clone();
+            graph
+                .admit(resolution.clone())
+                .expect("resolution admits for future witness");
+            graph.admit(regrant.clone()).expect("regrant admits");
+            authored(
+                &graph,
+                &controller_key,
+                FactBody::RoleGrant {
+                    target: future_target.clone(),
+                    role: Role::Member,
+                },
+                Vec::new(),
+            )
+        };
+        let candidates = vec![
+            controller_grant.clone(),
+            membership.clone(),
+            operation.clone(),
+            revoke.clone(),
+            resolution.clone(),
+            regrant.clone(),
+            future.clone(),
+        ];
+        let wire = serde_json::to_vec(&FactBundleMessage { facts: candidates })
+            .expect("durable semantic bundle serializes");
+        let decoded: FactBundleMessage =
+            serde_json::from_slice(&wire).expect("durable semantic bundle restores");
+        assert_eq!(decoded.facts.len(), 7);
+
+        let schedules = [
+            [0usize, 1, 2, 3, 4],
+            [4, 3, 2, 1, 0],
+            [2, 0, 4, 1, 3],
+            [3, 1, 0, 4, 2],
+        ];
+        let mut expected_base_projection = None;
+        let mut expected_regrant_projection = None;
+        let mut expected_projection = None;
+        for schedule in schedules {
+            let mut restarted = FactGraph::from_bootstrap(&bootstrap);
+            for index in schedule {
+                assert!(matches!(
+                    restarted.admit(decoded.facts[index].clone()),
+                    Ok(Admission::Inserted | Admission::Quarantined { .. })
+                ));
+            }
+            restarted
+                .retry_quarantined()
+                .expect("restarted graph admits every durable dependency");
+            assert!(restarted.quarantined().next().is_none());
+            assert_eq!(restarted.ids().count(), 5);
+            assert_eq!(
+                restarted.evaluator().effective_role(&controller),
+                expected_role,
+                "selected O/R branch controls C's role"
+            );
+            assert_eq!(
+                restarted.evaluator().effective_membership(&controller),
+                Some(true),
+                "role selection does not rewrite the independent membership cell"
+            );
+            assert_eq!(
+                restarted
+                    .evaluator()
+                    .admits_closed_session(&controller, &remote),
+                expected_role.is_some(),
+                "Closed session admission follows role plus membership projection"
+            );
+            assert_eq!(
+                restarted.authority_lineage(&controller).selected_branch(),
+                Some(selected),
+                "the typed selector remains attached after durable arrival"
+            );
+            assert!(
+                restarted
+                    .authority_lineage(&controller)
+                    .selected_branch()
+                    .is_some_and(|branch| branch != losing),
+                "the losing AuthorityUse branch stays inactive"
+            );
+            let base_projection = restarted.projection();
+            if let Some(previous) = &expected_base_projection {
+                assert_eq!(base_projection, *previous);
+            } else {
+                expected_base_projection = Some(base_projection);
+            }
+
+            // The post-resolution regrant restores only future authority. It
+            // must not change the selected branch or make the losing branch
+            // effective merely because its FactId arrived earlier/later.
+            restarted
+                .admit(decoded.facts[5].clone())
+                .expect("causal Owner regrant admits after restart");
+            assert_eq!(restarted.ids().count(), 6);
+            assert_eq!(
+                restarted.evaluator().effective_role(&controller),
+                Some(Role::Owner),
+                "regrant restores current future authority at the boundary"
+            );
+            assert_eq!(
+                restarted.authority_lineage(&controller).selected_branch(),
+                Some(selected),
+                "regrant preserves the typed selector at the boundary"
+            );
+            assert_eq!(
+                restarted.projection().value(&role_cell),
+                Some(decoded.facts[5].id),
+                "the decoded regrant becomes the effective role-cell head"
+            );
+            let regrant_projection = restarted.projection();
+            if let Some(previous) = &expected_regrant_projection {
+                assert_eq!(regrant_projection, *previous);
+            } else {
+                expected_regrant_projection = Some(regrant_projection);
+            }
+            restarted
+                .admit(decoded.facts[6].clone())
+                .expect("future operation admits under the regrant");
+            assert_eq!(restarted.ids().count(), 7);
+            assert_eq!(
+                restarted.evaluator().effective_role(&controller),
+                Some(Role::Owner),
+                "regrant restores current future authority"
+            );
+            assert_eq!(
+                restarted.evaluator().effective_role(&future_target),
+                Some(Role::Member)
+            );
+            assert_eq!(
+                restarted.authority_lineage(&controller).selected_branch(),
+                Some(selected),
+                "regrant preserves the typed selector lineage"
+            );
+            assert_eq!(
+                restarted.projection().value(&role_cell),
+                Some(decoded.facts[5].id),
+                "regrant is the effective role-cell head, not the losing branch"
+            );
+            if let Some(previous) = &expected_projection {
+                assert_eq!(restarted.projection(), *previous);
+            } else {
+                expected_projection = Some(restarted.projection());
+            }
+        }
+    }
 }

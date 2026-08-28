@@ -40,7 +40,7 @@ use crate::resource::{
     checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
     FundedArc, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
     ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxReceiver,
+    ResourceMailboxItemError, ResourceMailboxReceiver, ResourceUnavailable,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -603,6 +603,34 @@ fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::OpaqueDependencyResidual, 1),
     ])
+}
+
+/// Exact provider planning charge for one locally-attached RPC dispatcher.
+///
+/// This uses the same internal allocation claim that [`Rpc::attach`] acquires,
+/// then applies the provider's own reservation bookkeeping charge. It exists so
+/// an external finite fixture can fund the dispatcher without duplicating the
+/// representation formula used by production admission.
+pub fn rpc_dispatcher_planning_claim() -> Result<ResourceClaim, ResourceUnavailable> {
+    let claim = rpc_inner_claim().map_err(|_| ResourceUnavailable::ProviderInvariant {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    })?;
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
+/// Exact provider planning charge for one [`Rpc::attach`] application child.
+///
+/// Attachment first creates a child application scope and then retains the
+/// dispatcher in that scope. Keep both terms in this planner so a fixture pays
+/// for the same provider bookkeeping that the production constructor performs.
+pub fn rpc_dispatcher_attachment_planning_claim() -> Result<ResourceClaim, ResourceUnavailable> {
+    rpc_dispatcher_planning_claim()?
+        .checked_add(
+            crate::application_gateway::ApplicationGateway::rpc_resource_scope_planning_charge(),
+        )
+        .map_err(|_| ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::OpaqueDependencyResidual,
+        })
 }
 
 /// The layout of what an `Arc<FundedRpcHandler<C>>` holds, with `C` inferred

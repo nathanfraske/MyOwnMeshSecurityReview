@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::transport_lab::{
-    admit_durable_proof, durable_proof_records, materialize_durable_proof_delivery,
-    pending_durable_proofs, proof_owner_for_device, rebind_durable_proof, settle_durable_proof_ack,
-    supersede_durable_proof,
+    admit_durable_proof, durable_proof_records, install_capability_replay_park_for_lab,
+    materialize_durable_proof_delivery, pending_durable_proofs, promote_exact_owner_for_lab,
+    proof_owner_for_device, rebind_durable_proof, release_capability_replay_park_for_lab,
+    settle_durable_proof_ack, supersede_durable_proof, wait_capability_replay_park_for_lab,
 };
 use myownmesh_core::engine::{
     attach_local, create_network_in_instance_root, governance, import_network_in_instance_root,
@@ -26,6 +27,7 @@ use myownmesh_core::semantic::{
     AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, ProofRecord,
     ProofRecordState, SignedFact, VerifiedBootstrap,
 };
+use myownmesh_core::{CapabilityAdvert, Rpc};
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration, Instant};
@@ -215,24 +217,39 @@ fn reissued_stand_down_facts(
     facts
 }
 
-fn regrant_after_eviction_fact(
+fn regrant_after_eviction_facts(
     bootstrap: &VerifiedBootstrap,
     prior: &[SignedFact],
     owner: &Identity,
     target: &Identity,
-) -> SignedFact {
+) -> Vec<SignedFact> {
     let target_id = device(target);
     let mut graph = FactGraph::from_bootstrap(bootstrap);
     for fact in prior.iter().cloned() {
         graph.admit(fact).expect("prior eviction history admits");
     }
-    let regrant = authored(
+    let membership = authored(
         &graph,
         owner,
-        FactBody::MembershipAdmit { target: target_id },
+        FactBody::MembershipAdmit {
+            target: target_id.clone(),
+        },
     );
-    graph.admit(regrant.clone()).expect("causal regrant admits");
-    regrant
+    graph
+        .admit(membership.clone())
+        .expect("causal membership restoration admits");
+    let role = authored(
+        &graph,
+        owner,
+        FactBody::RoleGrant {
+            target: target_id,
+            role: myownmesh_core::semantic::Role::Member,
+        },
+    );
+    graph
+        .admit(role.clone())
+        .expect("causal role restoration admits");
+    vec![membership, role]
 }
 
 struct CrossTargetFacts {
@@ -1535,13 +1552,15 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     // While E0 is paused, durably commit the causal G1 restoration and build
     // its exact successor E1.  The successor includes G1 and a fresh closure,
     // so its delivery identity cannot alias the materialized E0 identity.
-    let g1 = regrant_after_eviction_fact(
+    let g1_facts = regrant_after_eviction_facts(
         state.verified_bootstrap(),
         &facts,
         state.identity.as_ref(),
         &target,
     );
-    ingest_semantic_fact(&state, g1.clone()).await;
+    for fact in g1_facts.iter().cloned() {
+        ingest_semantic_fact(&state, fact).await;
+    }
     state
         .compact_semantic_state()
         .expect("durably commit G1 while E0 is paused");
@@ -1552,7 +1571,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         "G1 clears the old stand-down before E1 is authored"
     );
     let mut g1_history = facts.clone();
-    g1_history.push(g1);
+    g1_history.extend(g1_facts.iter().cloned());
     let e1_facts = reissued_stand_down_facts(
         state.verified_bootstrap(),
         &g1_history,
@@ -1745,10 +1764,10 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         target,
         _member,
         facts,
-        _context,
+        context,
         config,
-        broker,
-        _target_root,
+        _broker,
+        target_root,
     ) = create_fixture(&root, "r3-regrant-race").await;
     assert!(
         !governance::snapshot(&target_state)
@@ -1777,28 +1796,78 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
     );
     assert_eq!(e0_delivery.delivery_id, e0.delivery_id);
 
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
     state.request_shutdown();
-    driver.await.expect("selected E0 lifecycle shutdown");
+    eprintln!("r3 park control: waiting for selected E0 lifecycle shutdown");
+    target_state.request_shutdown();
+    eprintln!("r3 park control: waiting for original target lifecycle shutdown");
+    tokio::time::timeout(Duration::from_secs(20), target_driver)
+        .await
+        .expect("original target lifecycle shutdown timed out")
+        .expect("original target lifecycle shutdown");
+    drop(target_state);
+    tokio::time::timeout(Duration::from_secs(20), driver)
+        .await
+        .expect("selected E0 lifecycle shutdown timed out")
+        .expect("selected E0 lifecycle shutdown");
+    eprintln!("r3 park control: selected E0 lifecycle shutdown completed");
+    eprintln!("r3 park control: original target lifecycle shutdown completed");
+    drop(_broker);
+    let replay_park = install_capability_replay_park_for_lab(&state, &owner);
     drop(owner);
     drop(state);
 
-    // Deterministic resume barrier: reopen without attaching transport, commit
-    // the causal G1 regrant, and only then resume the broker replay path.
-    let (reopened, reopened_driver) = spawn_network_in_instance_root(
-        config.clone(),
-        identity,
-        support::test_transport(),
-        root.path().to_path_buf(),
+    // Deterministic resume barrier: restore the target's pre-eviction roster
+    // first, then reopen the source and commit G1 before transport replay.
+    eprintln!("r3 park control: spawning reopened target network");
+    let (reopened_target, reopened_target_driver) = tokio::time::timeout(
+        Duration::from_secs(20),
+        import_network_in_instance_root(
+            config.clone(),
+            Arc::new(Identity::from_signing_key(target_signing_key, "r3-target")),
+            support::test_transport(),
+            target_root.path().to_path_buf(),
+            context,
+            target_bootstrap,
+        ),
     )
     .await
+    .expect("reopen target before replay timed out")
+    .expect("reopen target before replay");
+    eprintln!("r3 park control: reopened target network spawned");
+    let broker = LocalBroker::new();
+    for fact in facts.iter().take(2).cloned() {
+        ingest_semantic_fact(&reopened_target, fact).await;
+    }
+    reopened_target
+        .compact_semantic_state()
+        .expect("reopened target commits the pre-eviction roster");
+    attach_local(&reopened_target, &broker);
+
+    eprintln!("r3 park control: spawning reopened network");
+    let (reopened, reopened_driver) = tokio::time::timeout(
+        Duration::from_secs(20),
+        spawn_network_in_instance_root(
+            config.clone(),
+            identity,
+            support::test_transport(),
+            root.path().to_path_buf(),
+        ),
+    )
+    .await
+    .expect("reopen before replay timed out")
     .expect("reopen before replay");
-    let g1 = regrant_after_eviction_fact(
+    eprintln!("r3 park control: reopened network spawned");
+    let g1_facts = regrant_after_eviction_facts(
         reopened.verified_bootstrap(),
         &facts,
         reopened.identity.as_ref(),
         &target,
     );
-    ingest_semantic_fact(&reopened, g1).await;
+    for fact in g1_facts.iter().cloned() {
+        ingest_semantic_fact(&reopened, fact).await;
+    }
     reopened
         .compact_semantic_state()
         .expect("durably commit G1 before resume");
@@ -1815,15 +1884,64 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         .expect("E0 remains durable across the regrant");
     assert_exact_delivery_metadata(&selected_before_resume, &e0);
     assert_eq!(selected_before_resume.state, ProofRecordState::Pending);
+    let restored_projection = governance::snapshot(&reopened);
+    assert_eq!(
+        restored_projection.roles.get(target.public_id()),
+        Some(&myownmesh_core::network_state::Role::Member),
+        "G1 restores the target role before the parked replay begins"
+    );
+    assert!(
+        !restored_projection.stood_down.contains(target.public_id()),
+        "G1 restores session policy while E0 is still pending"
+    );
 
-    // Attaching the broker is the only resume action. Replay must inspect the
-    // current proof selection, fence E0 as Superseded, and never send E0.
+    let rpc = Rpc::attach(&reopened).expect("reopened sender funds one RPC dispatcher");
+    let advert = CapabilityAdvert {
+        tags: vec!["r3-capability-debt".to_string()],
+        app_version: Some("r3-park-v1".to_string()),
+        extra: serde_json::json!({"r3": "parked"}),
+    };
+    rpc.advertise(advert.clone())
+        .expect("reopened sender advertises local capability debt");
+    assert_eq!(rpc.capabilities(), advert);
+
+    // Attach the source broker before explicitly re-entering the exact
+    // promotion fence. Replay must inspect the current proof selection, fence
+    // E0 as Superseded, and never send E0.
     attach_local(&reopened, &broker);
-    let _reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    eprintln!("r3 park control: waiting for exact reopened owner promotion");
+    let promotion_deadline = Instant::now() + Duration::from_secs(20);
+    let mut owner_observed = false;
+    let _reopened_owner = loop {
+        if let Some(reopened_owner) = proof_owner_for_device(&reopened, target.public_id()) {
+            owner_observed = true;
+            if promote_exact_owner_for_lab(&reopened, &reopened_owner) {
+                break reopened_owner;
+            }
+        }
+        if Instant::now() >= promotion_deadline {
+            panic!("exact reopened owner promotion was not admitted within 20s (owner_observed={owner_observed})");
+        }
+        sleep(Duration::from_millis(20)).await;
+    };
+    eprintln!("r3 park control: exact reopened owner promotion observed");
+    eprintln!("r3 park control: waiting for capability replay park entry");
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        wait_capability_replay_park_for_lab(&replay_park),
+    )
+    .await
+    .expect("capability replay park entry timed out");
+    eprintln!("r3 park control: capability replay park entry observed");
     let e0_terminal =
         wait_for_durable_record_state(&reopened, e0.delivery_id, ProofRecordState::Superseded)
             .await;
     assert_exact_delivery_metadata(&e0_terminal, &e0);
+    assert_eq!(
+        e0_terminal.state,
+        ProofRecordState::Superseded,
+        "G1 reconciliation durably supersedes E0 before capability send"
+    );
     assert!(
         !pending_durable_proofs(&reopened)
             .expect("enumerate resumed replay")
@@ -1832,16 +1950,52 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         "the selected E0 is never replayed after G1 restoration"
     );
     assert!(
-        !governance::snapshot(&target_state)
+        !governance::snapshot(&reopened_target)
             .stood_down
             .contains(target.public_id()),
         "the stale E0 never reaches the target as a stand-down-causing proof"
     );
 
+    release_capability_replay_park_for_lab(&replay_park);
+    let e0_after_release = durable_proof_records(&reopened)
+        .expect("observe E0 after releasing capability replay")
+        .into_iter()
+        .find(|record| record.delivery_id == e0.delivery_id)
+        .expect("E0 tombstone remains after capability replay release");
+    assert_exact_delivery_metadata(&e0_after_release, &e0);
+    assert_eq!(
+        e0_after_release.state,
+        ProofRecordState::Superseded,
+        "releasing the capability park cannot revive terminal E0"
+    );
+    assert!(
+        !pending_durable_proofs(&reopened)
+            .expect("enumerate replay after capability release")
+            .iter()
+            .any(|record| record.delivery_id == e0.delivery_id),
+        "released capability replay still cannot emit E0"
+    );
+    assert!(
+        !governance::snapshot(&reopened_target)
+            .stood_down
+            .contains(target.public_id()),
+        "releasing the parked capability send preserves the no-E0 terminal"
+    );
+
     reopened.request_shutdown();
-    reopened_driver.await.expect("resumed sender shutdown");
-    target_state.request_shutdown();
-    target_driver.await.expect("target lifecycle shutdown");
+    eprintln!("r3 park control: waiting for resumed sender shutdown");
+    tokio::time::timeout(Duration::from_secs(20), reopened_driver)
+        .await
+        .expect("resumed sender shutdown timed out")
+        .expect("resumed sender shutdown");
+    eprintln!("r3 park control: resumed sender shutdown completed");
+    reopened_target.request_shutdown();
+    eprintln!("r3 park control: waiting for reopened target lifecycle shutdown");
+    tokio::time::timeout(Duration::from_secs(20), reopened_target_driver)
+        .await
+        .expect("reopened target lifecycle shutdown timed out")
+        .expect("reopened target lifecycle shutdown");
+    eprintln!("r3 park control: reopened target lifecycle shutdown completed");
 }
 
 #[tokio::test]

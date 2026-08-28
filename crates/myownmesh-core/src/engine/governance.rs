@@ -64,7 +64,15 @@ fn signed_fact(
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
     let witness = graph.authoring_witness(&body, &author);
-    let content = FactContent::from_authoring_witness(&graph, body, &witness, extra_parents);
+    // Keep the authoring path explicit about the typed AuthorityLineage.  The
+    // witness currently derives these same parents, but carrying the heads
+    // here makes it impossible for a future ordinary-cell-only witness to
+    // omit a cross-cell authority fork or selected branch.
+    let mut authority_parents = extra_parents;
+    for subject in body.authority_use_subjects(&author) {
+        authority_parents.extend(graph.authority_lineage(&subject).heads().iter().copied());
+    }
+    let content = FactContent::from_authoring_witness(&graph, body, &witness, authority_parents);
     SignedFact::sign(content, state.identity.signing_key())
         .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))
 }
@@ -270,7 +278,24 @@ pub(super) fn canonical_policy_admits_from(
         return evaluator.effective_open_participation(&local) == Some(true)
             && evaluator.effective_open_participation(&remote) == Some(true);
     }
-    evaluator.admits_closed_session(&local, &remote)
+    // Session admission uses the projected Role/Member cells below, but a
+    // projected role is not enough when the subject's distinct signed
+    // AuthorityUse relation is forked.  Keep this check separate from cell
+    // resolution: a same-cell Role(C) Resolution is still interpreted by the
+    // sealed evaluator, while an unresolved authority fork fails closed.
+    authority_lineage_is_current(graph, &local)
+        && authority_lineage_is_current(graph, &remote)
+        && evaluator.admits_closed_session(&local, &remote)
+}
+
+/// Whether a subject's typed AuthorityLineage is usable by governance policy.
+///
+/// Empty is the verified bootstrap state; one head is the ordinary current
+/// state (including a typed resolution selecting an authority branch). A
+/// multi-head relation is an unresolved signed fork and must not be turned
+/// into a session decision by consulting a Role cell alone.
+fn authority_lineage_is_current(graph: &crate::semantic::FactGraph, subject: &DeviceId) -> bool {
+    graph.authority_lineage(subject).is_singular()
 }
 
 #[derive(Default)]
@@ -306,7 +331,13 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
 
     for subject in subjects {
         let subject_string = subject.to_string();
-        let role = evaluator.effective_role(&subject);
+        // Role(C) remains a normal exclusive-cell projection.  The typed
+        // AuthorityLineage is an independent currentness fence for the
+        // authority that may author that projection; it is not a replacement
+        // for Role-cell Resolution semantics.
+        let role = authority_lineage_is_current(&graph, &subject)
+            .then(|| evaluator.effective_role(&subject))
+            .flatten();
         let membership = evaluator.effective_membership(&subject);
         let stood_down = evaluator.is_stood_down(&subject);
         let open_participation = evaluator.effective_open_participation(&subject);
@@ -1487,6 +1518,9 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
             }
             crate::semantic::ExclusiveCell::Decision { .. } => {}
         },
+        FactBody::AuthorityLineageResolution { subject, .. } => {
+            super::reconcile_terminal_recovery_policy(state, subject);
+        }
     }
     broadcast_fact_inventory(state).await;
     if changed {

@@ -31,6 +31,26 @@ const FIXTURE_JSON_FRAME_BYTES: usize = 8 * 1024;
 /// refuse everything after it; more would be capacity with no nameable holder.
 const FIXTURE_JSON_CLAIMS_PER_CONNECTOR: u64 = 2;
 
+/// One application owner per libtest worker is the largest concurrent
+/// application workload in the integration fixtures. Each such owner can
+/// retain one RPC dispatcher and one local capability advertisement.
+const FIXTURE_APPLICATIONS_PER_WORKER: u64 = 1;
+
+/// Each fixture worker keeps two live network/application owners (sender and
+/// receiver). This names their local gateway scopes separately from the one
+/// RPC child scope retained by the application workload below.
+const FIXTURE_APPLICATION_SCOPES_PER_WORKER: u64 = 2;
+
+/// The largest encoded capability advert used by the integration fixtures.
+/// The R3 advert is below this exact byte ceiling; its provider charge is
+/// derived by the production gateway planner rather than by a copied formula.
+const FIXTURE_CAPABILITY_ADVERT_BYTES: usize = 128;
+
+/// `mint_attempt` encodes eight random bytes as 13 unpadded base32 characters.
+/// The fixture uses this exact shape to price the promoted channel's owned
+/// correlation allocation through the broker planner.
+const FIXTURE_CHANNEL_CORRELATION: &str = "aaaaaaaaaaaaa";
+
 /// Explicit integration-test resource owner.
 ///
 /// These values cover the known in-process multi-device test fixtures. They
@@ -182,10 +202,40 @@ pub fn test_transport() -> Transport {
         // Unconditional because default-feature connectors promote the same
         // sessions as transport-lab connectors. Omitting this exact broker term
         // would make promotion depend on unrelated residual slack.
-        let grant = myownmesh_core::session_reservation_planning_claim()
-            .checked_scale(connectors)
-            .and_then(|sessions| grant.checked_add(sessions))
-            .expect("the fixture session reservation capacity is representable");
+        let grant = myownmesh_core::session_reservation_planning_claim_for_correlation(
+            FIXTURE_CHANNEL_CORRELATION,
+        )
+        .checked_scale(connectors)
+        .and_then(|sessions| grant.checked_add(sessions))
+        .expect("the fixture session reservation capacity is representable");
+        let applications = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATIONS_PER_WORKER)
+            .expect("fixture application concurrency fits u64");
+        let application_scopes = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATION_SCOPES_PER_WORKER)
+            .expect("fixture local application scope concurrency fits u64");
+        let application_scope_claim =
+            myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+                .checked_scale(application_scopes)
+                .expect("the fixture application scope capacity is representable");
+        // Rpc::attach retains one dispatcher per application and advertise
+        // retains one encoded local advert. Both terms are provider-planned by
+        // the production constructors, and both are bounded by the explicit
+        // one-application-per-worker fixture workload above.
+        let application_claim = myownmesh_core::rpc_dispatcher_attachment_planning_claim()
+            .expect("the fixture RPC dispatcher claim is representable")
+            .checked_scale(applications)
+            .and_then(|claim| {
+                myownmesh_core::capability_advert_planning_claim(FIXTURE_CAPABILITY_ADVERT_BYTES)
+                    .expect("the fixture capability advert claim is representable")
+                    .checked_scale(applications)
+                    .and_then(|adverts| claim.checked_add(adverts))
+            })
+            .expect("the fixture application retention capacity is representable");
+        let grant = grant
+            .checked_add(application_scope_claim)
+            .and_then(|grant| grant.checked_add(application_claim))
+            .expect("the fixture application retention grant is representable");
         ResourceProviderPort::new(FiniteResourceProvider::new(grant))
             .expect("the fixture provider accounts for its process scope")
     });

@@ -408,6 +408,7 @@ pub(super) enum FundedVariableReply {
     UpdaterCheck(myownmesh_updater::FundedUpdaterResult<myownmesh_updater::CheckOutcome>),
     RpcCall(FundedRpcCallOutcome),
     MfaEnrollment(FundedMfaEnrollment),
+    MfaTransaction(FundedMfaTransaction),
     Operation(FundedOperationReply),
 }
 
@@ -476,6 +477,15 @@ pub(super) struct FundedRpcCallOutcome {
 
 pub(super) struct FundedMfaEnrollment {
     result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+    transaction_id: Option<String>,
+    _owner: ResponseOwner,
+}
+
+pub(super) struct FundedMfaTransaction {
+    network: String,
+    transaction_id: String,
+    state: &'static str,
+    material: Option<myownmesh_core::custody::Enrolled>,
     _owner: ResponseOwner,
 }
 
@@ -507,10 +517,28 @@ impl FundedVariableReply {
 
     pub(super) fn mfa_enrollment(
         result: myownmesh_core::Result<myownmesh_core::custody::Enrolled>,
+        transaction_id: Option<String>,
         owner: ResponseOwner,
     ) -> Self {
         Self::MfaEnrollment(FundedMfaEnrollment {
             result,
+            transaction_id,
+            _owner: owner,
+        })
+    }
+
+    pub(super) fn mfa_transaction(
+        network: String,
+        transaction_id: String,
+        state: &'static str,
+        material: Option<myownmesh_core::custody::Enrolled>,
+        owner: ResponseOwner,
+    ) -> Self {
+        Self::MfaTransaction(FundedMfaTransaction {
+            network,
+            transaction_id,
+            state,
+            material,
             _owner: owner,
         })
     }
@@ -523,6 +551,7 @@ impl serde::Serialize for FundedVariableReply {
             Self::UpdaterCheck(value) => serialize_updater_result(serializer, value),
             Self::RpcCall(value) => serialize_rpc_call(serializer, value),
             Self::MfaEnrollment(value) => serialize_mfa_enrollment(serializer, value),
+            Self::MfaTransaction(value) => serialize_mfa_transaction(serializer, value),
             Self::Operation(value) => serialize_operation_reply(serializer, value),
         }
     }
@@ -707,6 +736,7 @@ fn serialize_mfa_enrollment<S: serde::Serializer>(
                 secret: &'a str,
                 otpauth_uri: &'a str,
                 recovery_codes: &'a [String],
+                transaction_id: &'a str,
             }
             let mut response = serializer.serialize_struct("Response", 2)?;
             response.serialize_field("ok", &true)?;
@@ -716,6 +746,7 @@ fn serialize_mfa_enrollment<S: serde::Serializer>(
                     secret: &enrollment.secret_b32,
                     otpauth_uri: &enrollment.otpauth_uri,
                     recovery_codes: &enrollment.recovery_codes,
+                    transaction_id: value.transaction_id.as_deref().unwrap_or_default(),
                 },
             )?;
             response.end()
@@ -727,6 +758,48 @@ fn serialize_mfa_enrollment<S: serde::Serializer>(
             response.end()
         }
     }
+}
+
+fn serialize_mfa_transaction<S: serde::Serializer>(
+    serializer: S,
+    value: &FundedMfaTransaction,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct as _;
+    #[derive(serde::Serialize)]
+    struct TransactionData<'a> {
+        network: &'a str,
+        transaction_id: &'a str,
+        state: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        secret: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        otpauth_uri: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery_codes: Option<&'a [String]>,
+    }
+    let mut response = serializer.serialize_struct("Response", 2)?;
+    response.serialize_field("ok", &true)?;
+    response.serialize_field(
+        "data",
+        &TransactionData {
+            network: &value.network,
+            transaction_id: &value.transaction_id,
+            state: value.state,
+            secret: value
+                .material
+                .as_ref()
+                .map(|material| material.secret_b32.as_str()),
+            otpauth_uri: value
+                .material
+                .as_ref()
+                .map(|material| material.otpauth_uri.as_str()),
+            recovery_codes: value
+                .material
+                .as_ref()
+                .map(|material| material.recovery_codes.as_slice()),
+        },
+    )?;
+    response.end()
 }
 
 fn serialize_rpc_call<S: serde::Serializer>(

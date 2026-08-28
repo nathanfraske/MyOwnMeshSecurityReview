@@ -143,6 +143,7 @@ pub mod topology;
 pub mod transport;
 pub mod verification;
 
+pub use application_gateway::capability_advert_planning_claim;
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
     AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, ServicesConfig,
@@ -178,13 +179,18 @@ pub use resource::{
     RESOURCE_CLASS_COUNT,
 };
 pub use roster::{AuthorizedPeer, Roster};
-pub use rpc::{Rpc, RpcCall, RpcError, RpcResponse};
+pub use rpc::{
+    rpc_dispatcher_attachment_planning_claim, rpc_dispatcher_planning_claim, Rpc, RpcCall,
+    RpcError, RpcResponse,
+};
 pub use runtime::attempt::{
     connector_resource_structural_claims, ConnectorCallbackPolicy, ConnectorResourceOwnerPort,
     ConnectorResourceOwnerReport, ConnectorResourceStructuralClaims, MeshConnectorResourceReport,
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
-pub use runtime::session_broker::session_reservation_planning_claim;
+pub use runtime::session_broker::{
+    session_reservation_planning_claim, session_reservation_planning_claim_for_correlation,
+};
 pub use semantic::{
     CanonicalFact, CellProjection, DurableCheckpoint, EvictionProofReference, ExclusiveCell,
     FactBody, FactContent, FactDomain, FactGraph, FactId, Projection, Role as SemanticRole,

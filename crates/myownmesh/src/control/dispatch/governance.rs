@@ -227,7 +227,7 @@ pub(in crate::control) async fn propose_evict(
     answered(result, owner, admission)
 }
 
-/// Enrol this device in local MFA custody for one network.
+/// Prepare this device's local MFA custody transaction for one network.
 ///
 /// The lock is installed before this answers, so a success response names an
 /// enrollment that already exists: an install this device could not perform is
@@ -235,32 +235,158 @@ pub(in crate::control) async fn propose_evict(
 /// same network at the same moment is refused by the lock the first one
 /// installed rather than by a check neither of them can see.
 ///
-/// The secret and recovery codes are shown exactly once and cannot be recovered
-/// from disk, so a response that is refused or whose socket ended would leave a
-/// lock nobody can satisfy and nobody can remove — `disable` requires a valid
-/// code. The connection loop settles that: the enrollment is kept once the line
-/// carrying its material was sent, and removed by its exact installed identity
-/// otherwise. See [`ProvisionalHandoff`].
-pub(in crate::control) fn mfa_enroll(
+/// The secret and recovery codes are shown exactly once. The durable Prepared
+/// record remains queryable and redeliverable regardless of the response write;
+/// only the exact transaction commit or abort command settles it. See
+/// [`ProvisionalHandoff`].
+pub(in crate::control) fn mfa_prepare(
     admission: &FrameAdmission,
     network: String,
 ) -> Result<(Answer, ProvisionalHandoff)> {
     let owner =
         ResponseOwner::acquire(admission).context("MFA enrollment operation was not admitted")?;
-    let (result, provisional) =
+    let (result, transaction_id, provisional) =
         match myownmesh_core::custody::install_provisional_enroll(&network, &network) {
             Ok(installed) => (
                 Ok(installed.enrolled().clone()),
+                Some(installed.transaction_id().to_owned()),
                 ProvisionalHandoff::MfaEnrollment(installed),
             ),
-            Err(error) => (Err(error), ProvisionalHandoff::None),
+            Err(error) => (Err(error), None, ProvisionalHandoff::None),
         };
     let answer = funded(
-        PreparedReply::Variable(FundedVariableReply::mfa_enrollment(result, owner)),
+        PreparedReply::Variable(FundedVariableReply::mfa_enrollment(
+            result,
+            transaction_id,
+            owner,
+        )),
         admission,
     )
     .context("MFA enrollment response line was not admitted")?;
     Ok((answer, provisional))
+}
+
+/// Legacy enrollment is retained as an alias for the explicit prepare step.
+pub(in crate::control) fn mfa_enroll(
+    admission: &FrameAdmission,
+    network: String,
+) -> Result<(Answer, ProvisionalHandoff)> {
+    mfa_prepare(admission, network)
+}
+
+/// Query one exact transaction. A prepared record is deliberately not
+/// consumed here; only the explicit redelivery/commit/abort commands consume
+/// a recovered material handle.
+pub(in crate::control) fn mfa_query(
+    admission: &FrameAdmission,
+    network: String,
+    transaction_id: String,
+) -> Result<Answer> {
+    let owner =
+        ResponseOwner::acquire(admission).context("MFA transaction query was not admitted")?;
+    let (state, material) =
+        match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id) {
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared)) => {
+                ("prepared", Some(prepared.enrolled().clone()))
+            }
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Committed) => ("committed", None),
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Absent) => ("absent", None),
+            Err(error) => return refused_text(error.to_string(), admission),
+        };
+    funded(
+        PreparedReply::Variable(FundedVariableReply::mfa_transaction(
+            network,
+            transaction_id,
+            state,
+            material,
+            owner,
+        )),
+        admission,
+    )
+}
+
+/// Re-deliver only the exact prepared transaction named by the request.
+pub(in crate::control) fn mfa_redeliver(
+    admission: &FrameAdmission,
+    network: String,
+    transaction_id: String,
+) -> Result<(Answer, ProvisionalHandoff)> {
+    let owner =
+        ResponseOwner::acquire(admission).context("MFA transaction redelivery was not admitted")?;
+    let prepared = match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
+    {
+        Ok(myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared)) => prepared,
+        Ok(myownmesh_core::custody::EnrollmentTransaction::Committed) => {
+            return Ok((
+                refused_text("MFA transaction is already committed".into(), admission)?,
+                ProvisionalHandoff::None,
+            ));
+        }
+        Ok(myownmesh_core::custody::EnrollmentTransaction::Absent) => {
+            return Ok((
+                refused_text("MFA transaction is absent".into(), admission)?,
+                ProvisionalHandoff::None,
+            ));
+        }
+        Err(error) => {
+            return Ok((
+                refused_text(error.to_string(), admission)?,
+                ProvisionalHandoff::None,
+            ));
+        }
+    };
+    let result = Ok(prepared.enrolled().clone());
+    let answer = funded(
+        PreparedReply::Variable(FundedVariableReply::mfa_enrollment(
+            result,
+            Some(transaction_id),
+            owner,
+        )),
+        admission,
+    )?;
+    Ok((answer, ProvisionalHandoff::MfaRecovered(prepared)))
+}
+
+/// Apply one exact idempotent terminal operation and report the resulting
+/// durable state. A stale transaction ID never reaches a successor.
+pub(in crate::control) fn mfa_commit_or_abort(
+    admission: &FrameAdmission,
+    network: String,
+    transaction_id: String,
+    commit: bool,
+) -> Result<Answer> {
+    let owner =
+        ResponseOwner::acquire(admission).context("MFA transaction settlement was not admitted")?;
+    let settlement =
+        match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id) {
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared)) => prepared
+                .settle(if commit {
+                    myownmesh_core::custody::EnrollmentSettlementRequest::Commit
+                } else {
+                    myownmesh_core::custody::EnrollmentSettlementRequest::Abort
+                })
+                .map(|result| match result {
+                    myownmesh_core::custody::EnrollmentSettlementResult::Committed => "committed",
+                    myownmesh_core::custody::EnrollmentSettlementResult::Absent => "absent",
+                }),
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Committed) => Ok("committed"),
+            Ok(myownmesh_core::custody::EnrollmentTransaction::Absent) => Ok("absent"),
+            Err(error) => Err(error),
+        };
+    let state = match settlement {
+        Ok(state) => state,
+        Err(error) => return refused_text(error.to_string(), admission),
+    };
+    funded(
+        PreparedReply::Variable(FundedVariableReply::mfa_transaction(
+            network,
+            transaction_id,
+            state,
+            None,
+            owner,
+        )),
+        admission,
+    )
 }
 
 /// Whether this device holds MFA custody for one network.

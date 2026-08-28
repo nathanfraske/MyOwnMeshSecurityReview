@@ -26,7 +26,8 @@ pub fn dependencies(fact: &SignedFact) -> Vec<FactId> {
             dependencies.push(*proposal);
             dependencies.extend(contributions.iter().copied());
         }
-        FactBody::Resolution { cited_heads, .. } => {
+        FactBody::Resolution { cited_heads, .. }
+        | FactBody::AuthorityLineageResolution { cited_heads, .. } => {
             dependencies.extend(cited_heads.iter().copied())
         }
         _ => {}
@@ -184,34 +185,47 @@ impl FactGraph {
                     return Err(SemanticError::IncompleteResolution);
                 }
             }
-            let authority_subject = Self::resolution_authority_subject(cell);
-            let authority_fork = authority_subject.is_some_and(|subject| {
-                cited.as_slice() == causal.authority_lineage(subject).heads()
-                    && cited.iter().all(|head| {
-                        causal.facts[head]
-                            .content
-                            .authority_uses
-                            .iter()
-                            .any(|use_| use_.subject == *subject)
-                    })
-            });
-            // A typed AuthorityUse fork may span multiple ordinary cells;
-            // its exact current lineage is checked above rather than through
-            // the ordinary same-cell projection rule.
-            if !authority_fork {
-                for head in &cited {
-                    if !super::verify::body_advances_cell(&causal.facts[head].content.body, cell) {
-                        return Err(SemanticError::IncompleteResolution);
-                    }
+            for head in &cited {
+                if !super::verify::body_advances_cell(&causal.facts[head].content.body, cell) {
+                    return Err(SemanticError::IncompleteResolution);
                 }
-                if causal.raw_cell_heads(cell) != cited {
-                    return Err(SemanticError::ResolutionNotCurrent);
+            }
+            if causal.raw_cell_heads(cell) != cited {
+                return Err(SemanticError::ResolutionNotCurrent);
+            }
+        }
+        if let FactBody::AuthorityLineageResolution {
+            subject,
+            cited_heads,
+            selected_head,
+        } = &fact.content.body
+        {
+            if !cited_heads.contains(selected_head) {
+                return Err(SemanticError::ResolutionSelectionNotCited);
+            }
+            let mut cited = cited_heads.clone();
+            cited.sort();
+            cited.dedup();
+            if cited.len() < 2
+                || cited.len() != cited_heads.len()
+                || cited.as_slice() != cited_heads.as_slice()
+            {
+                return Err(SemanticError::IncompleteResolution);
+            }
+            for head in &cited {
+                if !causal.facts.contains_key(head)
+                    || !fact.content.parents.contains(head)
+                    || !causal.facts[head]
+                        .content
+                        .authority_uses
+                        .iter()
+                        .any(|use_| use_.subject == *subject)
+                {
+                    return Err(SemanticError::InvalidAuthorityUse);
                 }
-            } else {
-                // A typed AuthorityUse fork may span multiple ordinary cells;
-                // its cited set is checked against the exact current lineage
-                // above, while the selected branch is applied by authority
-                // projection rather than by an ordinary cell projection.
+            }
+            if cited.as_slice() != causal.authority_lineage(subject).heads() {
+                return Err(SemanticError::ResolutionNotCurrent);
             }
         }
         if let Some(error) = Self::authorization_error(&fact.content.body) {
@@ -260,6 +274,9 @@ impl FactGraph {
                 }
                 (false, _) => {}
             },
+            FactBody::AuthorityLineageResolution { .. } if open => {
+                return Err(SemanticError::DomainMismatch);
+            }
             FactBody::RoleGrant { .. }
             | FactBody::RoleRevoke { .. }
             | FactBody::Evict { .. }
@@ -322,7 +339,10 @@ impl FactGraph {
             FactBody::RoleGrant { .. }
             | FactBody::RoleRevoke { .. }
             | FactBody::Evict { .. }
-            | FactBody::Resolution { .. } => Some(SemanticError::UnauthorizedRoleGrant),
+            | FactBody::Resolution { .. }
+            | FactBody::AuthorityLineageResolution { .. } => {
+                Some(SemanticError::UnauthorizedRoleGrant)
+            }
             FactBody::MembershipAdmit { .. } => Some(SemanticError::UnauthorizedMembershipAdmit),
             FactBody::Attestation { .. } => Some(SemanticError::UnauthorizedAttestation),
             _ => None,
@@ -355,9 +375,16 @@ impl FactGraph {
             let mut actual = use_.predecessors.clone();
             actual.sort();
             actual.dedup();
+            let payload_local = Self::is_payload_local_resolution(
+                &fact.content.body,
+                &fact.content.author,
+                &subject,
+            );
             if actual != expected
                 || (expected.len() > 1
-                    && !Self::resolution_selects_authority_heads(&fact.content.body, &subject))
+                    && !payload_local
+                    && !Self::resolution_selects_authority_heads(&fact.content.body, &subject)
+                    && !self.same_cell_role_resolution(&fact.content.body, &subject, &expected))
             {
                 return Err(error);
             }
@@ -366,36 +393,41 @@ impl FactGraph {
     }
 
     fn resolution_selects_authority_heads(body: &FactBody, subject: &DeviceId) -> bool {
-        let FactBody::Resolution { cell, .. } = body else {
-            return false;
-        };
-        // A payload resolution may carry the exact AuthorityUse predecessor
-        // set for its own subject. This is separate from the Role-only rule
-        // below that allows a resolution to select a persistent authority
-        // branch across later re-grants.
-        match cell {
-            ExclusiveCell::Role {
-                subject: cell_subject,
-            }
-            | ExclusiveCell::Membership {
-                subject: cell_subject,
-            }
-            | ExclusiveCell::OpenParticipation {
-                subject: cell_subject,
-            } => cell_subject == subject,
-            ExclusiveCell::Decision { .. } => false,
-        }
+        matches!(
+            body,
+            FactBody::AuthorityLineageResolution {
+                subject: selected_subject,
+                ..
+            } if selected_subject == subject
+        )
     }
 
-    fn resolution_authority_subject(cell: &ExclusiveCell) -> Option<&DeviceId> {
-        match cell {
-            ExclusiveCell::Role {
+    fn same_cell_role_resolution(
+        &self,
+        body: &FactBody,
+        subject: &DeviceId,
+        expected: &[FactId],
+    ) -> bool {
+        let FactBody::Resolution {
+            cell: ExclusiveCell::Role {
                 subject: cell_subject,
-            } => Some(cell_subject),
-            ExclusiveCell::Membership { .. }
-            | ExclusiveCell::OpenParticipation { .. }
-            | ExclusiveCell::Decision { .. } => None,
-        }
+            },
+            cited_heads,
+            ..
+        } = body
+        else {
+            return false;
+        };
+        cell_subject == subject
+            && cited_heads == expected
+            && expected.iter().all(|head| {
+                self.facts.get(head).is_some_and(|fact| {
+                    super::verify::body_advances_cell(
+                        &fact.content.body,
+                        &ExclusiveCell::role(subject.clone()),
+                    )
+                })
+            })
     }
 
     fn validate_self_stand_down(
@@ -721,6 +753,9 @@ impl FactGraph {
         true
     }
 
+    /// Return a branch selected by the unique latest typed lineage selector.
+    /// Ordinary same-cell resolutions never establish this persistent
+    /// relation; their projection is handled by the exclusive cell itself.
     fn selected_authority_branch(&self, subject: &DeviceId, heads: &[FactId]) -> Option<FactId> {
         let [head] = heads else {
             return None;
@@ -735,20 +770,13 @@ impl FactGraph {
             let Some(fact) = self.facts.get(&id) else {
                 continue;
             };
-            if let FactBody::Resolution {
-                cell,
+            if let FactBody::AuthorityLineageResolution {
+                subject: selected_subject,
                 selected_head,
                 ..
             } = &fact.content.body
             {
-                let cell_subject = match cell {
-                    ExclusiveCell::Role { subject } => Some(subject),
-                    ExclusiveCell::Decision { .. } => None,
-                    ExclusiveCell::Membership { .. } | ExclusiveCell::OpenParticipation { .. } => {
-                        None
-                    }
-                };
-                if cell_subject == Some(subject) {
+                if selected_subject == subject {
                     selectors.push((id, *selected_head));
                 }
             }
@@ -989,6 +1017,11 @@ impl<'a> SemanticEvaluator<'a> {
                 cited_heads,
                 selected_head,
             } => self.resolution_tier(cell, cited_heads, selected_head),
+            FactBody::AuthorityLineageResolution {
+                subject,
+                cited_heads,
+                selected_head,
+            } => self.authority_lineage_resolution_tier(subject, cited_heads, selected_head),
             FactBody::OpenParticipation { device_id, .. }
             | FactBody::SelfStandDown { device_id, .. } => {
                 return author == device_id;
@@ -1020,6 +1053,11 @@ impl<'a> SemanticEvaluator<'a> {
                 cited_heads,
                 selected_head,
             } => Some(self.resolution_tier(cell, cited_heads, selected_head)),
+            FactBody::AuthorityLineageResolution {
+                subject,
+                cited_heads,
+                selected_head,
+            } => Some(self.authority_lineage_resolution_tier(subject, cited_heads, selected_head)),
             _ => None,
         }
     }
@@ -1079,6 +1117,19 @@ impl<'a> SemanticEvaluator<'a> {
     ) -> Role {
         let mut visited = BTreeSet::new();
         self.resolution_tier_with_visited(cell, cited_heads, &mut visited)
+    }
+
+    fn authority_lineage_resolution_tier(
+        &self,
+        subject: &DeviceId,
+        cited_heads: &[FactId],
+        selected_head: &FactId,
+    ) -> Role {
+        self.resolution_tier(
+            &ExclusiveCell::role(subject.clone()),
+            cited_heads,
+            selected_head,
+        )
     }
 
     fn resolution_tier_with_visited(
@@ -1787,8 +1838,8 @@ mod tests {
                 let resolution = fact_with_authority_predecessors(
                     &bootstrap,
                     &root_key,
-                    FactBody::Resolution {
-                        cell: ExclusiveCell::role(controller.clone()),
+                    FactBody::AuthorityLineageResolution {
+                        subject: controller.clone(),
                         cited_heads: cited.clone(),
                         selected_head: selected,
                     },
@@ -1862,6 +1913,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ordinary_role_resolution_cannot_join_cross_cell_authority_heads() {
+        let (bootstrap, root_key) = closed(89);
+        let controller_key = key(90);
+        let target_key = key(91);
+        let controller = device(&controller_key);
+        let target = device(&target_key);
+        let grant_controller = fact(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Controller,
+            },
+            Vec::new(),
+        );
+        let outside_role = fact_with_authority_predecessors(
+            &bootstrap,
+            &controller_key,
+            FactBody::RoleGrant {
+                target: target.clone(),
+                role: Role::Member,
+            },
+            vec![grant_controller.id],
+            &[
+                (controller.clone(), vec![grant_controller.id]),
+                (target.clone(), Vec::new()),
+            ],
+        );
+        let role_revoke = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleRevoke {
+                target: controller.clone(),
+            },
+            vec![grant_controller.id],
+            &[
+                (device(&root_key), vec![grant_controller.id]),
+                (controller.clone(), vec![grant_controller.id]),
+            ],
+        );
+        let role_grant = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::RoleGrant {
+                target: controller.clone(),
+                role: Role::Owner,
+            },
+            vec![grant_controller.id],
+            &[
+                (device(&root_key), vec![grant_controller.id]),
+                (controller.clone(), vec![grant_controller.id]),
+            ],
+        );
+        let mut role_heads = vec![role_revoke.id, role_grant.id];
+        role_heads.sort();
+        let ordinary = fact_with_authority_predecessors(
+            &bootstrap,
+            &root_key,
+            FactBody::Resolution {
+                cell: ExclusiveCell::role(controller.clone()),
+                cited_heads: role_heads.clone(),
+                selected_head: role_revoke.id,
+            },
+            vec![
+                grant_controller.id,
+                outside_role.id,
+                role_revoke.id,
+                role_grant.id,
+            ],
+            &[
+                (device(&root_key), vec![grant_controller.id]),
+                (
+                    controller.clone(),
+                    [vec![outside_role.id], role_heads.clone()].concat(),
+                ),
+            ],
+        );
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        graph
+            .admit(grant_controller)
+            .expect("Controller grant admits");
+        graph.facts.insert(outside_role.id, outside_role.clone());
+        graph.facts.insert(role_revoke.id, role_revoke);
+        graph.facts.insert(role_grant.id, role_grant);
+        assert_eq!(
+            graph.admit(ordinary),
+            Err(SemanticError::UnauthorizedRoleGrant),
+            "ordinary Role resolution cannot join an outside-cell AuthorityUse"
+        );
+        let mut expected_heads = vec![outside_role.id, role_heads[0], role_heads[1]];
+        expected_heads.sort();
+        assert_eq!(
+            graph.authority_lineage(&controller).heads(),
+            expected_heads.as_slice()
+        );
+        assert!(!graph.fact_is_authoritative(&outside_role.id));
+        assert_eq!(
+            graph.evaluator().effective_role(&target),
+            None,
+            "the outside-cell RoleGrant cannot project through the fork"
+        );
     }
 
     #[test]
@@ -2081,8 +2236,8 @@ mod tests {
         let role_resolution = fact_with_authority_predecessors(
             &bootstrap,
             &root_key,
-            FactBody::Resolution {
-                cell: ExclusiveCell::role(controller.clone()),
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
                 cited_heads: role_heads.clone(),
                 selected_head: evict.id,
             },
@@ -2195,8 +2350,8 @@ mod tests {
         let newer_resolution = fact_with_authority_predecessors(
             &bootstrap,
             &owner_a_key,
-            FactBody::Resolution {
-                cell: ExclusiveCell::role(controller.clone()),
+            FactBody::AuthorityLineageResolution {
+                subject: controller.clone(),
                 cited_heads: explicit_heads.clone(),
                 selected_head: late_revoke_id,
             },

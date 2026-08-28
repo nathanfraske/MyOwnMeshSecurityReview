@@ -2100,7 +2100,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceMfaEnroll { network } => {
+            Request::GovernanceMfaEnroll { network }
+            | Request::GovernanceMfaPrepare { network } => {
                 let ((reply, output), provisional) =
                     dispatch::governance::mfa_enroll(&json_lines, network)?;
                 let mut provisional = handoff::HandoffGuard::new(provisional);
@@ -2108,12 +2109,16 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 // response has to name an enrollment that exists, and deferring
                 // the write until this line would let two clients both be told
                 // they enrolled, because neither installed lock would exist to
-                // refuse the other. What is provisional is ownership, not the
-                // write — the enrollment is rollback-owned until this line
-                // reaches `Wrote::Sent`, and settled either way below. The
+                // refuse the other. The durable transaction remains Prepared
+                // across every write outcome; only an explicit transaction
+                // commit or abort decides custody after the client has received
+                // (or declined) this material. The local handle is released
+                // after the response boundary, not used as a commit oracle.
+                // the response boundary; it remains Prepared until an explicit
+                // transaction command. The
                 // secret and the recovery codes are still shown exactly once
-                // and are not recoverable from disk, which is why an unhanded
-                // enrollment has to be removed rather than left installed.
+                // and are recoverable only through the exact transaction query
+                // or redelivery operation.
                 let line =
                     match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
                         Ok(line) => line,
@@ -2126,6 +2131,76 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
                 settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaQuery {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) =
+                    dispatch::governance::mfa_query(&json_lines, network, transaction_id)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction query response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaRedeliver {
+                network,
+                transaction_id,
+            } => {
+                let ((reply, output), provisional) =
+                    dispatch::governance::mfa_redeliver(&json_lines, network, transaction_id)?;
+                let mut provisional = handoff::HandoffGuard::new(provisional);
+                let line =
+                    match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
+                        Ok(line) => line,
+                        Err(error) => {
+                            provisional.settle(&state, false).await;
+                            return Err(error)
+                                .context("MFA redelivery response changed after measurement");
+                        }
+                    };
+                let wrote = write_admitted_line(&mut writer, &cancel, line).await;
+                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
+                match wrote? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaCommit {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) = dispatch::governance::mfa_commit_or_abort(
+                    &json_lines,
+                    network,
+                    transaction_id,
+                    true,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction commit response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::GovernanceMfaAbort {
+                network,
+                transaction_id,
+            } => {
+                let (reply, output) = dispatch::governance::mfa_commit_or_abort(
+                    &json_lines,
+                    network,
+                    transaction_id,
+                    false,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA transaction abort response changed after admission")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
