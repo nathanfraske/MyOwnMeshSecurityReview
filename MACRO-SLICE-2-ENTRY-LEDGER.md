@@ -103,25 +103,49 @@ roll back a sent-but-unsettled response on task cancellation.
 
 Status: discharged at source commit `7f0fdd8`.
 
-### R3 — an offline evicted Device has no durable proof delivery
+### R3 — an offline evicted Device receives a durable proof delivery
 
-Current members refuse an evicted Device and cannot re-admit it: the signed
-eviction converges among current members, `log_evicted` is true, the roster
-mirror removes it, and `current_policy_admits` returns false so auto-approve
-cannot fire. What remains is the Device's own stand-down. That currently rides
-B3's single best-effort denial frame: one attempt, followed by dropping the
-exact peer when the attempt returns, with no receipt, retry, acknowledgement,
-or timer by design.
+Current members still refuse an evicted Device and cannot re-admit it: the
+signed eviction converges among current members, `log_evicted` is true, the
+roster mirror removes it, and `current_policy_admits` returns false, so
+auto-approve cannot fire. The Device's own stand-down is now a typed durable
+proof publication. The sender persists an exact `Pending` record before any
+carrier send, whose fact IDs are the canonical selected-head causal closure;
+materialization is not admission and cannot itself emit the proof.
 
-Deferred control, retained under `--ignored` with its body and 20-second budget
-unchanged:
+The receiver admits only the exact context, target, delivery ID, and complete
+fact closure. Admission updates the semantic graph and projection, then emits
+one matching typed `ProofAck`; the sender settles only that exact record and
+keeps the `Settled` terminal tombstone across a second reopen. A reconnect
+rebinds the record to the current authenticated owner/binding, while a stale
+E0 is superseded before the canonical E1 replay. Generic W0/W2 carrier
+attempts refuse without consuming the demand; the separately funded W1
+sidecar owns D and an exact W1 settlement retires only W1, preserving W0/W2
+and the provider baseline.
+
+The closed-network reconnect control remains
 `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down`.
+The durable proof lane and its transport-lab controls are the implementation
+boundary, not a retry timer or a best-effort denial protocol.
 
 Owner: the typed durable-semantic Signaling Node lane together with the
-Macro-slice 2 semantic proof work. The lane boundary is the first dependency,
-and this is the first residual targeted after that boundary exists.
+Macro-slice 2 semantic proof work.
 
-Status: open.
+Status: discharged at source commit `7f0fdd8`.
+
+### AuthorityLineage - bounded persistent closure record
+
+This is a separate, bounded semantic record accompanying the R3 discharge;
+it does not create another residual or widen the transport lane. At source
+commit `7f0fdd8`, the AuthorityLineage closure is evidenced by
+`authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers`,
+`membership_resolution_does_not_select_authority_lineage_branch`,
+`finite_authority_fork_requires_complete_resolution_before_regrant`, and the
+`720`-permutation projection control
+`finite_authority_fork_projection_converges_for_every_arrival_permutation`.
+Together they persist exact authority-lineage selection, keep membership
+resolution from selecting an authority branch, require complete typed
+resolution before regrant, and prove arrival-order-independent projection.
 
 ### R4 — driver-side pre-normalization attributes a departure to the named device
 
@@ -428,5 +452,5 @@ evidence, not its sole copy.
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
 | R2 | `7f0fdd8` | `v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `custody::tests::v4_r2_hard_death_recovery_removes_only_an_old_process_provisional`, `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`, `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, `control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_rolls_back` |
-| R3 | — | — |
+| R3 | `7f0fdd8` | `durable_proof_delivery_r3` (full suite, including `r3_pending_proof_is_persisted_before_send_and_replayed_after_restart` and its second-reopen terminal-tombstone control), `v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `closed_network_governance::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |
