@@ -138,12 +138,14 @@ Status: discharged at source commit `7f0fdd8`.
 This is a separate, bounded semantic record accompanying the R3 discharge;
 it does not create another residual or widen the transport lane. It is bound
 to source commit
-`dc64c2d3ccd774c4eadce24c93b011083f62b4a7`. Only a Role-cell Resolution may
-resolve a multi-head AuthorityUse lineage. Membership and OpenParticipation
-payload resolutions may carry payload-local AuthorityUse witnesses, but those
-witnesses are non-persistent Role-lineage edges: they cannot synthesize or
-select an AuthorityUse join. An unresolved fork stays fail-closed and its
-losing RoleGrant remains inactive.
+`fc984e3e60d372f176e0d4cf8c91322be26b7db0`. A Role-cell Resolution is the
+only persistent selector for a multi-head AuthorityUse lineage. A
+distinct-author Membership payload Resolution remains payload-local and
+cannot join Role lineage. Self-authored Closed Membership retains its author
+AuthorityUse edge and must fork with a concurrent Role revoke; an
+OpenParticipation Resolution remains payload-local and adds no persistent
+subject lineage. An unresolved fork stays fail-closed and its losing
+RoleGrant remains inactive.
 
 The closure is evidenced by
 `authority_lineage_selection_survives_cross_cell_forks_and_rejects_losers`,
@@ -156,11 +158,15 @@ The closure is evidenced by
 `second_order_payload_fork_converges_without_authority_join`,
 `open_participation_payload_fork_stays_in_its_ordinary_cell`, and the
 `720`-permutation projection control
-`finite_authority_fork_projection_converges_for_every_arrival_permutation`.
+`finite_authority_fork_projection_converges_for_every_arrival_permutation`,
+`self_authored_membership_keeps_a_role_authority_fork_explicit`,
+`self_authored_membership_resolution_cannot_select_the_role_loser`, and
+`self_authored_membership_resolution_is_order_independent_after_role_regrant`.
 Together they persist exact role-cell authority selection, reject payload
 resolution as an AuthorityUse selector while retaining only local witnesses,
-require complete typed resolution before regrant, keep the loser inactive, and
-prove both the 120- and 720-permutation projection controls.
+require complete typed resolution before regrant, preserve the self-authored
+Membership authority edge, keep the loser inactive, and prove both the 120-
+and 720-permutation projection controls.
 
 ### R4 — driver-side pre-normalization attributes a departure to the named device
 
