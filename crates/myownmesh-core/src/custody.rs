@@ -1145,6 +1145,11 @@ fn disable_at(path: &Path, network_id: &str, code: &str) -> Result<()> {
         // successor away.
         return Ok(());
     };
+    if is_prepared(enrollment) {
+        return Err(Error::Custody(format!(
+            "network {network_id} has a Prepared MFA transaction; explicitly abort it before disabling"
+        )));
+    }
     // The verdict itself is spent here. A recovery code needs no consumption
     // write on this path: the same locked mutation removes the record the code
     // would have been burned out of, and saves once.
@@ -1598,6 +1603,68 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Disable is not an alternate abort path: even valid material cannot
+    /// remove a Prepared transaction. The exact material remains recoverable,
+    /// and only an exact explicit Abort permits a distinct successor.
+    #[test]
+    fn v4_r2_disable_refuses_prepared_material_until_explicit_abort() {
+        let path = tmp();
+        let net = "fleet-disable-prepared";
+        let prepared = match prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+            .expect("prepare")
+        {
+            EnrollmentPreparation::Fresh(value) => value,
+            EnrollmentPreparation::Existing(_) => panic!("first prepare was not fresh"),
+        };
+        let transaction_id = prepared.transaction_id().to_owned();
+        let material = prepared.enrolled().clone();
+        let secret = BASE32_NOPAD
+            .decode(material.secret_b32.as_bytes())
+            .expect("prepared secret is base32");
+        let totp = totp_at(&secret, now_unix());
+        assert!(
+            disable_at(&path, net, &totp).is_err(),
+            "a valid TOTP must not turn Prepared into Absent"
+        );
+        assert!(matches!(
+            enrollment_transaction_at(&path, net, &transaction_id)
+                .expect("query after prepared TOTP refusal"),
+            EnrollmentTransaction::Prepared(_)
+        ));
+
+        let recovery_code = material.recovery_codes[0].clone();
+        assert!(
+            disable_at(&path, net, &recovery_code).is_err(),
+            "a valid recovery code must not turn Prepared into Absent"
+        );
+        drop(prepared);
+
+        let recovered = match prepare_or_recover_provisional_enroll_at(&path, net, "other-device")
+            .expect("recover after disable refusals")
+        {
+            EnrollmentPreparation::Existing(value) => value,
+            EnrollmentPreparation::Fresh(_) => panic!("disable refusal rotated Prepared"),
+        };
+        assert_eq!(recovered.transaction_id(), transaction_id);
+        assert_eq!(recovered.enrolled().secret_b32, material.secret_b32);
+        assert_eq!(recovered.enrolled().otpauth_uri, material.otpauth_uri);
+        assert_eq!(recovered.enrolled().recovery_codes, material.recovery_codes);
+        assert_eq!(
+            recovered.abort().expect("explicit abort"),
+            EnrollmentSettlementResult::Absent
+        );
+
+        let successor = match prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+            .expect("successor prepare after explicit abort")
+        {
+            EnrollmentPreparation::Fresh(value) => value,
+            EnrollmentPreparation::Existing(_) => panic!("explicit abort did not clear Prepared"),
+        };
+        assert_ne!(successor.transaction_id(), transaction_id);
+        successor.abort().expect("clean successor");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Explicit Abort, rather than handle drop or lease death, permits a fresh
     /// successor transaction and does not reuse the old transaction identity.
     #[test]
@@ -1687,12 +1754,14 @@ mod tests {
         // A first attempt that *did* answer, and is then explicitly surrendered
         // in the ordinary way, lets a successor exist.
         let first = install_provisional_enroll_at(&path, net, "laptop").expect("install again");
-        let first_material = first.enrolled().clone();
-        let first_secret = BASE32_NOPAD
-            .decode(first_material.secret_b32.as_bytes())
-            .expect("the first secret is base32");
-        disable_at(&path, net, &totp_at(&first_secret, now_unix()))
-            .expect("the operator surrenders the first lock with its own code");
+        let first_transaction = first.transaction_id().to_owned();
+        let stale_first = match enrollment_transaction_at(&path, net, &first_transaction)
+            .expect("query first prepared transaction")
+        {
+            EnrollmentTransaction::Prepared(value) => value,
+            other => panic!("expected first Prepared transaction, got {other:?}"),
+        };
+        first.abort().expect("explicitly abort first transaction");
 
         let successor = install_provisional_enroll_at(&path, net, "laptop").expect("the successor");
         let successor_material = successor.enrolled().clone();
@@ -1702,8 +1771,7 @@ mod tests {
             "non-vacuity: there is a successor lock for a stale undo to threaten"
         );
 
-        // Dropping the now-stale first handle cannot settle the successor.
-        drop(first);
+        // Settling the now-stale recovered handle cannot affect the successor.
         assert!(
             is_enrolled_at(&path, net),
             "the successor's lock is not the first attempt's to remove"
@@ -1715,6 +1783,13 @@ mod tests {
             require_at(&path, net, Some(&totp_at(&successor_secret, now_unix()))).is_ok(),
             "and it is still satisfied by the secret its own caller was shown"
         );
+
+        assert_eq!(
+            stale_first.abort().expect("late exact abort is idempotent"),
+            EnrollmentSettlementResult::Absent,
+            "a stale late abort reports Absent without touching the successor"
+        );
+        assert!(is_enrolled_at(&path, net));
 
         let _ = std::fs::remove_file(&path);
     }

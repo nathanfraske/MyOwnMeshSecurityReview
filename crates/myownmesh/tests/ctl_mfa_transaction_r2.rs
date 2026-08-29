@@ -630,6 +630,195 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "absent"
     );
 
+    // Disable is a terminal custody operation, not a way to bypass the
+    // explicit Prepared -> Commit/Abort transaction protocol. A valid
+    // recovery code must be rejected while the exact transaction remains
+    // Prepared and redeliverable. Only exact Abort may then permit a fresh
+    // generation for this network.
+    let disable_network = "ctl-r2-disable-prepared";
+    let disable_prepared = response(
+        run_ctl(home.path(), &["prepare", disable_network]).await,
+        "ctl mfa prepare before disable",
+    );
+    let disable_data = transaction_data(&disable_prepared, "ctl mfa prepare before disable");
+    let disable_transaction = field(
+        disable_data,
+        "transaction_id",
+        "ctl mfa prepare before disable",
+    )
+    .to_owned();
+    let disable_secret = field(disable_data, "secret", "ctl mfa prepare before disable").to_owned();
+    let disable_otpauth = field(
+        disable_data,
+        "otpauth_uri",
+        "ctl mfa prepare before disable",
+    )
+    .to_owned();
+    let disable_recovery_codes = disable_data
+        .get("recovery_codes")
+        .and_then(Value::as_array)
+        .expect("ctl mfa prepare before disable has recovery codes")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("disable recovery code is a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let disable_code = disable_recovery_codes
+        .first()
+        .expect("prepared enrollment has a valid disable test code")
+        .clone();
+
+    let disable_output = run_ctl(home.path(), &["disable", disable_network, &disable_code]).await;
+    assert!(
+        !disable_output.status.success(),
+        "disable must fail while the exact enrollment is Prepared: stdout={} stderr={}",
+        String::from_utf8_lossy(&disable_output.stdout),
+        String::from_utf8_lossy(&disable_output.stderr)
+    );
+
+    let still_prepared = response(
+        run_ctl(
+            home.path(),
+            &["query", disable_network, &disable_transaction],
+        )
+        .await,
+        "ctl mfa query after rejected disable",
+    );
+    let still_prepared_data =
+        transaction_data(&still_prepared, "ctl mfa query after rejected disable");
+    assert_eq!(
+        field(
+            still_prepared_data,
+            "state",
+            "ctl mfa query after rejected disable",
+        ),
+        "prepared"
+    );
+    assert_eq!(
+        field(
+            still_prepared_data,
+            "transaction_id",
+            "ctl mfa query after rejected disable",
+        ),
+        disable_transaction
+    );
+    assert_eq!(
+        field(
+            still_prepared_data,
+            "secret",
+            "ctl mfa query after rejected disable"
+        ),
+        disable_secret
+    );
+    assert_eq!(
+        field(
+            still_prepared_data,
+            "otpauth_uri",
+            "ctl mfa query after rejected disable",
+        ),
+        disable_otpauth
+    );
+    let still_prepared_codes = still_prepared_data
+        .get("recovery_codes")
+        .and_then(Value::as_array)
+        .expect("rejected disable keeps recovery codes queryable")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("queried disable recovery code is a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(still_prepared_codes, disable_recovery_codes);
+
+    let disable_records = myownmesh_core::custody::prepared_enrollments()
+        .expect("read the prepared record after rejected disable");
+    let matching_disable_records = disable_records
+        .into_iter()
+        .filter(|record| {
+            record.network_id() == disable_network && record.transaction_id() == disable_transaction
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching_disable_records.len(),
+        1,
+        "rejected disable leaves exactly one durable prepared record"
+    );
+    let matching_disable_record = matching_disable_records
+        .into_iter()
+        .next()
+        .expect("the exact prepared record survives rejected disable");
+    assert_eq!(
+        matching_disable_record.enrolled().secret_b32,
+        disable_secret
+    );
+    assert_eq!(
+        matching_disable_record.enrolled().otpauth_uri,
+        disable_otpauth
+    );
+    assert_eq!(
+        matching_disable_record.enrolled().recovery_codes,
+        disable_recovery_codes
+    );
+
+    let disable_abort = response(
+        run_ctl(
+            home.path(),
+            &["abort", disable_network, &disable_transaction],
+        )
+        .await,
+        "ctl mfa abort after rejected disable",
+    );
+    assert_eq!(
+        field(
+            transaction_data(&disable_abort, "ctl mfa abort after rejected disable"),
+            "state",
+            "ctl mfa abort after rejected disable",
+        ),
+        "absent"
+    );
+    let disable_successor = response(
+        run_ctl(home.path(), &["prepare", disable_network]).await,
+        "ctl mfa prepare after exact abort",
+    );
+    let disable_successor_data =
+        transaction_data(&disable_successor, "ctl mfa prepare after exact abort");
+    let disable_successor_transaction = field(
+        disable_successor_data,
+        "transaction_id",
+        "ctl mfa prepare after exact abort",
+    );
+    let disable_successor_secret = field(
+        disable_successor_data,
+        "secret",
+        "ctl mfa prepare after exact abort",
+    );
+    assert_ne!(disable_successor_transaction, disable_transaction);
+    assert_ne!(disable_successor_secret, disable_secret);
+    let disable_successor_abort = response(
+        run_ctl(
+            home.path(),
+            &["abort", disable_network, disable_successor_transaction],
+        )
+        .await,
+        "ctl mfa abort successor after rejected disable",
+    );
+    assert_eq!(
+        field(
+            transaction_data(
+                &disable_successor_abort,
+                "ctl mfa abort successor after rejected disable",
+            ),
+            "state",
+            "ctl mfa abort successor after rejected disable",
+        ),
+        "absent"
+    );
+
     // Enroll is the shipped one-roundtrip user experience: it must explicitly
     // settle its exact prepared transaction before reporting success. The
     // follow-up query proves the returned material was not merely Prepared.
