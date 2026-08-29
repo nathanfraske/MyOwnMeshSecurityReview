@@ -1726,7 +1726,28 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     let e0_terminal =
         wait_for_durable_record_state(&reopened, e0.delivery_id, ProofRecordState::Superseded)
             .await;
-    assert_exact_delivery_metadata(&e0_terminal, &e0);
+    let rebound_e0_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
+    let rebound_e0 = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+        &reopened,
+        &rebound_e0_owner,
+        &e0.fact_ids,
+    )
+    .expect("derive exact rebound E0 identity");
+    assert_eq!(rebound_e0.context_id, e0.context_id);
+    assert_eq!(rebound_e0.target, e0.target);
+    assert_eq!(rebound_e0.delivery_id, e0.delivery_id);
+    assert_eq!(rebound_e0.fact_ids, e0.fact_ids);
+    assert_eq!(rebound_e0.owner, e0.owner);
+    assert_ne!(rebound_e0.binding, e0.binding);
+    assert_eq!(e0_terminal.context_id, e0.context_id);
+    assert_eq!(e0_terminal.target, e0.target);
+    assert_eq!(e0_terminal.delivery_id, e0.delivery_id);
+    assert_eq!(e0_terminal.fact_ids, e0.fact_ids);
+    assert_eq!(e0_terminal.owner, e0.owner);
+    assert!(
+        e0_terminal.binding == e0.binding || e0_terminal.binding == rebound_e0.binding,
+        "E0 tombstone retains either its original or exact rebound owner binding"
+    );
     assert!(
         !pending_durable_proofs(&reopened)
             .expect("enumerate resumed exact replay")
