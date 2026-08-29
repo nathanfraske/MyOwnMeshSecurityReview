@@ -611,7 +611,7 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     let concurrent_abort = response(
         run_ctl(
             home.path(),
-            &["abort", concurrent_network, concurrent_transaction],
+            &["abort", concurrent_network, &concurrent_transaction],
         )
         .await,
         "ctl mfa abort concurrent prepared transaction",
