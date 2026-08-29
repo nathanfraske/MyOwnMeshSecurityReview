@@ -521,9 +521,11 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     // the recovery-aware classification, but they must observe the same
     // exact transaction/material. No response may fabricate a second record.
     let concurrent_network = "ctl-r2-concurrent-prepare";
+    let left_args = ["prepare", concurrent_network];
+    let right_args = ["prepare", concurrent_network];
     let (left, right) = tokio::join!(
-        run_ctl(home.path(), &["prepare", concurrent_network]),
-        run_ctl(home.path(), &["prepare", concurrent_network]),
+        run_ctl(home.path(), &left_args),
+        run_ctl(home.path(), &right_args),
     );
     let left = response(left, "first concurrent ctl mfa prepare");
     let right = response(right, "second concurrent ctl mfa prepare");
