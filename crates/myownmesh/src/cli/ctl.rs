@@ -937,9 +937,137 @@ async fn connect_socket() -> Result<LocalSocketStream> {
         .to_ns_name::<GenericNamespaced>()
         .context("default → ns_name")?;
     let _ = path;
-    LocalSocketStream::connect(name)
+    let stream = LocalSocketStream::connect(name)
         .await
-        .context("connect daemon socket — is `myownmesh serve` running?")
+        .context("connect daemon socket — is `myownmesh serve` running?")?;
+    verify_local_server(&stream)?;
+    Ok(stream)
+}
+
+#[cfg(windows)]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+#[cfg(windows)]
+fn token_user_sid(token: windows_sys::Win32::Foundation::HANDLE) -> Result<Vec<u8>> {
+    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_USER};
+
+    let mut needed = 0_u32;
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    anyhow::ensure!(needed != 0, "measure token user SID");
+    let word = std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; (needed as usize).div_ceil(word)];
+    anyhow::ensure!(
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } != 0,
+        "read token user SID: {}",
+        std::io::Error::last_os_error()
+    );
+    let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let sid_len = unsafe { GetLengthSid(token_user.User.Sid) };
+    anyhow::ensure!(sid_len != 0, "token user SID has no length");
+    Ok(unsafe {
+        std::slice::from_raw_parts(token_user.User.Sid.cast::<u8>(), sid_len as usize).to_vec()
+    })
+}
+
+#[cfg(windows)]
+fn current_process_user_sid() -> Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Security::TOKEN_QUERY,
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut token = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } != 0,
+        "open ctl process token: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = WindowsHandle(token);
+    token_user_sid(token.0)
+}
+
+#[cfg(windows)]
+fn process_user_sid(pid: u32) -> Result<Vec<u8>> {
+    use windows_sys::Win32::{
+        Security::TOKEN_QUERY,
+        System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    anyhow::ensure!(
+        !process.is_null(),
+        "open named-pipe server process {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    let process = WindowsHandle(process);
+    let mut token = std::ptr::null_mut();
+    anyhow::ensure!(
+        unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut token) } != 0,
+        "open named-pipe server token {pid}: {}",
+        std::io::Error::last_os_error()
+    );
+    let token = WindowsHandle(token);
+    token_user_sid(token.0)
+}
+
+#[cfg(windows)]
+fn verify_server_process_user(pid: u32, expected_sid: &[u8]) -> Result<()> {
+    use windows_sys::Win32::Security::EqualSid;
+
+    let server_sid = process_user_sid(pid)?;
+    anyhow::ensure!(
+        unsafe {
+            EqualSid(
+                server_sid.as_ptr().cast_mut().cast(),
+                expected_sid.as_ptr().cast_mut().cast(),
+            )
+        } != 0,
+        "named-pipe server process {pid} is not the ctl user"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_local_server(stream: &LocalSocketStream) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let server_pid = match stream {
+        LocalSocketStream::NamedPipe(pipe) => {
+            let mut pid = 0_u32;
+            anyhow::ensure!(
+                unsafe { GetNamedPipeServerProcessId(pipe.inner().as_raw_handle(), &mut pid) } != 0
+                    && pid != 0,
+                "obtain named-pipe server process identity: {}",
+                std::io::Error::last_os_error()
+            );
+            pid
+        }
+    };
+    let expected_sid = current_process_user_sid()?;
+    verify_server_process_user(server_pid, &expected_sid)
+}
+
+#[cfg(not(windows))]
+fn verify_local_server(_stream: &LocalSocketStream) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1198,6 +1326,63 @@ mod tests {
                 transaction_id: "txn".into()
             }),
             "governance_mfa_abort"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_ctl_verifies_same_user_pipe_server_before_request() {
+        use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced, ListenerOptions};
+
+        let raw_name = format!(
+            "myownmesh-ctl-auth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let name = raw_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name is namespaced");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("same-user test pipe binds");
+        let client_name = raw_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name is namespaced");
+        let client = LocalSocketStream::connect(client_name)
+            .await
+            .expect("same-user ctl connects");
+        verify_local_server(&client).expect("same-user server is verified before request");
+        let server = listener.accept().await.expect("server accepts ctl");
+        drop(server);
+        drop(client);
+        drop(listener);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ctl_refuses_mismatched_or_unverifiable_server_sid() {
+        use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+        let sid = current_process_user_sid().expect("current ctl SID");
+        assert!(!sid.is_empty(), "current ctl SID is non-empty");
+        verify_server_process_user(unsafe { GetCurrentProcessId() }, &sid)
+            .expect("same-principal process SID matches");
+
+        let mut mismatched_sid = sid.clone();
+        *mismatched_sid.last_mut().expect("SID has bytes") ^= 1;
+        let mismatch =
+            verify_server_process_user(unsafe { GetCurrentProcessId() }, &mismatched_sid)
+                .expect_err("mismatched SID is refused");
+        assert!(mismatch.to_string().contains("not the ctl user"));
+
+        assert!(
+            verify_server_process_user(u32::MAX, &sid).is_err(),
+            "an unverifiable server process is refused"
         );
     }
 }

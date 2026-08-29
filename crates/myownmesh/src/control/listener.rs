@@ -347,6 +347,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_endpoint_is_verified_as_exact_owner_only_socket() {
+        use interprocess::local_socket::{tokio::prelude::*, GenericFilePath};
         use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
         let directory = tempfile::tempdir().expect("temporary control root");
@@ -374,7 +375,101 @@ mod tests {
         assert!(metadata.file_type().is_socket());
         assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
         assert_eq!(metadata.mode() & 0o777, 0o600);
+
+        // Exercise the real same-euid path, not only the pathname metadata:
+        // the client connects after bind, the listener accepts it, and the
+        // accepted stream's kernel credentials pass the production verifier.
+        let name = path
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the control socket path is a valid fs name");
+        let client = LocalSocketStream::connect(name)
+            .await
+            .expect("same-euid client connects");
+        let server = listener.accept().await.expect("listener accepts client");
+        verify_local_peer(&server).expect("accepted peer has the daemon euid");
+        drop(server);
+        drop(client);
         drop(listener);
+    }
+
+    /// A socket left by a clean listener drop is replaced, but the replacement
+    /// still receives the exact owner-only mode and ownership checks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_control_replaces_an_owned_stale_socket() {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let parent = directory.path().join("private");
+        let path = parent.join("control.sock");
+        let first = bind_listener(&SocketTarget::Path(path.clone())).expect("first bind");
+        drop(first);
+        let stale = std::fs::symlink_metadata(&path).expect("stale socket remains named");
+        assert!(stale.file_type().is_socket());
+        assert_eq!(stale.uid(), unsafe { libc::geteuid() });
+
+        let replacement = bind_listener(&SocketTarget::Path(path.clone()))
+            .expect("owned stale socket is replaced");
+        let current = std::fs::symlink_metadata(&path).expect("replacement metadata");
+        assert!(current.file_type().is_socket());
+        assert_eq!(current.uid(), unsafe { libc::geteuid() });
+        assert_eq!(current.mode() & 0o777, 0o600);
+        drop(replacement);
+    }
+
+    /// A configured endpoint that is a regular file is never removed or
+    /// replaced as part of listener setup.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_control_refuses_non_socket_without_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let parent = directory.path().join("private");
+        std::fs::create_dir(&parent).expect("create private parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make private parent owner-only");
+        let path = parent.join("control.sock");
+        std::fs::write(&path, b"operator data").expect("create non-socket endpoint");
+        let before = std::fs::read(&path).expect("read non-socket endpoint");
+
+        let Err(error) = bind_listener(&SocketTarget::Path(path.clone())) else {
+            panic!("a regular file must be refused");
+        };
+        assert!(error.to_string().contains("not a socket"));
+        assert_eq!(std::fs::read(&path).expect("endpoint remains"), before);
+    }
+
+    /// A symlink at the configured endpoint is refused via lstat-style
+    /// metadata, never followed and never unlinked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_control_refuses_symlink_without_mutation() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let parent = directory.path().join("private");
+        std::fs::create_dir(&parent).expect("create private parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make private parent owner-only");
+        let target = parent.join("target");
+        let path = parent.join("control.sock");
+        std::fs::write(&target, b"target data").expect("create symlink target");
+        symlink(&target, &path).expect("create symlink endpoint");
+
+        let Err(error) = bind_listener(&SocketTarget::Path(path.clone())) else {
+            panic!("a symlink endpoint must be refused");
+        };
+        assert!(error.to_string().contains("not a socket"));
+        assert!(std::fs::symlink_metadata(&path)
+            .expect("symlink remains")
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(&target).expect("target remains"),
+            b"target data"
+        );
     }
 
     /// A custom socket path does not authorize the daemon to chmod the
@@ -420,6 +515,35 @@ mod tests {
             .expect("current user DACL")
             .to_string_lossy();
         assert!(sddl.starts_with("D:P(A;;GA;;;S-1-"));
+        assert!(!sddl.contains(";;;WD)"));
+        assert!(!sddl.contains(";;;AU)"));
         assert!(!sddl.contains(";;;OW)"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_current_user_pipe_connects_and_is_accepted() {
+        use interprocess::local_socket::{tokio::prelude::*, GenericNamespaced};
+
+        let raw_name = format!(
+            "myownmesh-acl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let listener = bind_listener(&SocketTarget::Name(raw_name.clone())).expect("bind pipe");
+        let name = raw_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name is namespaced");
+        let client = LocalSocketStream::connect(name)
+            .await
+            .expect("same-user client connects");
+        let server = listener.accept().await.expect("pipe accepts client");
+        verify_local_peer(&server).expect("current-user pipe peer is accepted");
+        drop(server);
+        drop(client);
+        drop(listener);
     }
 }

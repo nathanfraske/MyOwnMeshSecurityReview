@@ -14,6 +14,9 @@ categories = ["command-line-utilities", "network-programming"]
 # Releases matrix (`myownmesh-<platform>.{tar.gz,zip}`); see RELEASE.md.
 publish = false
 
+[features]
+transport-lab = ["myownmesh-core/transport-lab"]
+
 [[bin]]
 name = "myownmesh"
 path = "src/main.rs"

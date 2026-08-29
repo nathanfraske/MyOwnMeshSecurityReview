@@ -121,8 +121,11 @@ and
 The exact integration discriminator is
 `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`.
 
-Status: discharged at integration head `6d71567`; hosted CI `33229628657`
-completed all six jobs green and Turing's exact-head source audit is PASS.
+Status: **provisional** at reviewed ledger head `18d8e9112628df0ddb38f3a81f854c1487adffd5`.
+The durable Prepare/Commit/Abort substrate at `6d71567` is accepted as
+non-regression evidence, not an R2 discharge. The production initial-response-
+loss recovery control, concurrent-Prepare identity control, ACL matrix, and
+exact-head hosted CI/source-audit gate remain pending.
 
 ### R3 — an offline evicted Device receives a durable proof delivery
 
@@ -552,6 +555,6 @@ evidence, not its sole copy.
 | Residual | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
-| R2 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::v4_r2_hard_death_recovery_preserves_prepared_transaction`, `crates/myownmesh-core/src/custody.rs::v4_r2_committed_handoff_survives_restart_recovery`, `crates/myownmesh-core/src/custody.rs::v4_r2_current_nonce_without_owner_lease_is_recovered`, `crates/myownmesh/src/control/handoff.rs::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared` |
+| R2 | **Provisional at `18d8e9112628df0ddb38f3a81f854c1487adffd5`; no discharge commit.** The prior `6d71567`/`33229628657` result is accepted substrate/non-regression evidence only; the initial-response-loss, concurrent-Prepare, ACL, and exact-head hosted CI/source-audit gates remain pending. | `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::v4_r2_hard_death_recovery_preserves_prepared_transaction`, `crates/myownmesh-core/src/custody.rs::v4_r2_committed_handoff_survives_restart_recovery`, `crates/myownmesh-core/src/custody.rs::v4_r2_current_nonce_without_owner_lease_is_recovered`, `crates/myownmesh/src/control/handoff.rs::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared` |
 | R3 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`, `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`, `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |

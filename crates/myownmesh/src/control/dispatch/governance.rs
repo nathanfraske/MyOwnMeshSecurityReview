@@ -235,11 +235,46 @@ pub(in crate::control) async fn propose_evict(
 /// same network at the same moment is refused by the lock the first one
 /// installed rather than by a check neither of them can see.
 ///
-/// The secret and recovery codes are shown exactly once. The durable Prepared
-/// record remains queryable and redeliverable regardless of the response write;
-/// only the exact transaction commit or abort command settles it. See
-/// [`ProvisionalHandoff`].
+/// The secret and recovery codes are returned from the exact Prepared record.
+/// That record remains queryable and redeliverable until the exact transaction
+/// commit or abort command settles it; neither response delivery nor a socket
+/// write is a durable custody decision. See [`ProvisionalHandoff`].
 pub(in crate::control) fn mfa_prepare(
+    admission: &FrameAdmission,
+    network: String,
+) -> Result<(Answer, ProvisionalHandoff)> {
+    let owner =
+        ResponseOwner::acquire(admission).context("MFA enrollment operation was not admitted")?;
+    let (result, transaction_id, provisional) =
+        match myownmesh_core::custody::prepare_or_recover_provisional_enroll(&network, &network) {
+            Ok(myownmesh_core::custody::EnrollmentPreparation::Fresh(installed)) => (
+                Ok(installed.enrolled().clone()),
+                Some(installed.transaction_id().to_owned()),
+                ProvisionalHandoff::MfaEnrollment(installed),
+            ),
+            Ok(myownmesh_core::custody::EnrollmentPreparation::Existing(prepared)) => (
+                Ok(prepared.enrolled().clone()),
+                Some(prepared.transaction_id().to_owned()),
+                ProvisionalHandoff::MfaRecovered(prepared),
+            ),
+            Err(error) => (Err(error), None, ProvisionalHandoff::None),
+        };
+    let answer = funded(
+        PreparedReply::Variable(FundedVariableReply::mfa_enrollment(
+            result,
+            transaction_id,
+            owner,
+        )),
+        admission,
+    )
+    .context("MFA enrollment response line was not admitted")?;
+    Ok((answer, provisional))
+}
+
+/// Legacy enrollment remains a strict fresh-install operation. The explicit
+/// Prepare command is the recovery-aware path; keeping this arm strict
+/// preserves callers that use Enroll as a refusal-on-existing probe.
+pub(in crate::control) fn mfa_enroll(
     admission: &FrameAdmission,
     network: String,
 ) -> Result<(Answer, ProvisionalHandoff)> {
@@ -264,14 +299,6 @@ pub(in crate::control) fn mfa_prepare(
     )
     .context("MFA enrollment response line was not admitted")?;
     Ok((answer, provisional))
-}
-
-/// Legacy enrollment is retained as an alias for the explicit prepare step.
-pub(in crate::control) fn mfa_enroll(
-    admission: &FrameAdmission,
-    network: String,
-) -> Result<(Answer, ProvisionalHandoff)> {
-    mfa_prepare(admission, network)
 }
 
 /// Query one exact transaction. A prepared record is deliberately not

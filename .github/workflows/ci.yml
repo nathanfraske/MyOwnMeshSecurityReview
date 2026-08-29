@@ -47,11 +47,14 @@ jobs:
         run: cargo test --workspace --no-fail-fast
 
       # `--workspace` above runs default features only, so the transport-lab
-      # controls never compile there. One suite-wide run with the lab feature
-      # covers them. `transport-lab` is now the only optional feature in the
-      # workspace, so this is the whole non-default surface.
+      # controls never compile there. Keep the core feature run and separately
+      # exercise the shipped daemon/CLI package, whose feature forwards the
+      # same core seam to the external R2 control.
       - name: Suite-wide transport-lab tests
         run: cargo test -p myownmesh-core --features "transport-lab" --no-fail-fast
+
+      - name: Shipped CLI transport-lab tests
+        run: cargo test -p myownmesh --features "transport-lab" --no-fail-fast
 
   # Keep one focused Ubuntu invocation for each native path: a direct in-process
   # handshake, the same behaviour over a real TURN relay, and one ignored native

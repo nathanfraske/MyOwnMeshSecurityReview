@@ -116,11 +116,12 @@ impl Default for EnrollmentPhase {
     }
 }
 
-/// What [`enroll`] hands back to show the user exactly once: the secret (as
-/// base32 and as an `otpauth://` URI for QR rendering) and the cleartext
-/// recovery codes. Prepared records persist the exact cleartext one-time
-/// material in the mode-0600 custody file for crash redelivery; a successful
-/// commit clears that copy and retains only its hashes.
+/// Validated enrollment material for rendering before an exact Commit: the
+/// secret (as base32 and as an `otpauth://` URI for QR rendering) and the
+/// cleartext recovery codes. While the record is Prepared, the exact one-time
+/// material remains in the mode-0600 custody file for redelivery, including
+/// after a lost response or restart; a successful Commit clears that copy and
+/// retains only its hashes, so it is never redelivered after Commit.
 #[derive(Debug, Clone, Serialize)]
 pub struct Enrolled {
     pub secret_b32: String,
@@ -146,9 +147,10 @@ pub fn is_enrolled(network_id: &str) -> bool {
 
 /// One enrollment that is **installed** but is not yet its caller's.
 ///
-/// Custody material is the one thing a caller cannot ask for twice: the secret
-/// and the recovery codes are shown exactly once. A prepared record also keeps
-/// that exact material in the protected custody file for crash redelivery.
+/// The secret and recovery codes are validated for rendering before exact
+/// Commit. While the record is Prepared, that exact material remains in the
+/// protected custody file for redelivery after a lost response or restart;
+/// after Commit it is cleared and is never redelivered.
 /// Writing after the
 /// response is sent lets a device be told it is locked when the write then
 /// failed and it is not; never writing until then lets two callers both be told
@@ -194,6 +196,21 @@ pub enum EnrollmentTransaction {
     Committed,
     /// No record matches both supplied identities.
     Absent,
+}
+
+/// The result of an idempotent MFA prepare request.
+///
+/// A fresh request installs one Prepared record before returning. A request
+/// that arrives after a response was lost (or while the original handoff is
+/// still unresolved) returns the exact durable record instead of minting a
+/// second secret or transaction. The two cases are distinct so a caller can
+/// retain the right local handoff value without making durability depend on a
+/// process-local lease.
+pub enum EnrollmentPreparation {
+    /// A new Prepared record, with its process-local owner lease.
+    Fresh(ProvisionalEnrollment),
+    /// An existing Prepared record recovered from durable custody.
+    Existing(PreparedEnrollment),
 }
 
 /// The one explicit terminal operation allowed for a prepared transaction.
@@ -304,7 +321,7 @@ impl PreparedEnrollment {
 }
 
 impl ProvisionalEnrollment {
-    /// The material the caller must show exactly once.
+    /// The validated material the caller renders before exact Commit.
     pub fn enrolled(&self) -> &Enrolled {
         &self.enrolled
     }
@@ -406,6 +423,21 @@ pub fn install_provisional_enroll(
     let path = store_path()?;
     recover_provisional_at(&path)?;
     install_provisional_enroll_at(&path, network_id, account)
+}
+
+/// Prepare an MFA enrollment, or recover the exact current Prepared record.
+///
+/// The absent/check/insert or existing-record classification is one durable
+/// transaction under [`STORE_LOCK`] and the cross-process [`WriterLease`]. A
+/// Prepared record is never rotated or overwritten here, and a Committed
+/// record retains the strict install refusal. Only explicit commit or abort
+/// can settle the returned transaction.
+pub fn prepare_or_recover_provisional_enroll(
+    network_id: &str,
+    account: &str,
+) -> Result<EnrollmentPreparation> {
+    let path = store_path()?;
+    prepare_or_recover_provisional_enroll_at(&path, network_id, account)
 }
 
 /// Validate the durable prepared-enrollment store without expiring records.
@@ -795,6 +827,35 @@ fn install_provisional_enroll_at(
     recover_provisional_at(path)?;
     let (_serialized, _writer) = store_transaction_guard(path)?;
     let mut store = load_at(path)?;
+    create_provisional_enroll_at(path, network_id, account, &mut store)
+}
+
+fn prepare_or_recover_provisional_enroll_at(
+    path: &Path,
+    network_id: &str,
+    account: &str,
+) -> Result<EnrollmentPreparation> {
+    let (_serialized, _writer) = store_transaction_guard(path)?;
+    let mut store = load_at(path)?;
+    let Some(enrollment) = store.networks.get(network_id) else {
+        return create_provisional_enroll_at(path, network_id, account, &mut store)
+            .map(EnrollmentPreparation::Fresh);
+    };
+    if is_prepared(enrollment) {
+        return prepared_enrollment_from_record(path, network_id, enrollment)
+            .map(EnrollmentPreparation::Existing);
+    }
+    Err(Error::Custody(format!(
+        "network {network_id} already has MFA enrolled on this device; disable it first"
+    )))
+}
+
+fn create_provisional_enroll_at(
+    path: &Path,
+    network_id: &str,
+    account: &str,
+    store: &mut CustodyStore,
+) -> Result<ProvisionalEnrollment> {
     if store.networks.contains_key(network_id) {
         return Err(Error::Custody(format!(
             "network {network_id} already has MFA enrolled on this device; disable it first"
@@ -824,7 +885,7 @@ fn install_provisional_enroll_at(
     // Written before anything is answered, so what comes back names a lock that
     // exists. A failure here is the caller's failure: no material has been
     // shown, and nothing is installed.
-    save_at(path, &store)?;
+    save_at(path, store)?;
     Ok(ProvisionalEnrollment {
         path: path.to_path_buf(),
         network_id: network_id.to_string(),
@@ -922,32 +983,47 @@ fn prepared_enrollments_at(path: &Path) -> Result<Vec<PreparedEnrollment>> {
             Some((network_id, enrollment))
         })
         .map(|(network_id, enrollment)| {
-            if enrollment.transaction_id.is_empty() {
-                return Err(Error::Custody(format!(
-                    "prepared custody record for {network_id} has no transaction identity"
-                )));
-            }
-            if enrollment.prepared_recovery_codes.is_empty() {
-                return Err(Error::Custody(format!(
-                    "prepared custody record for {network_id} has no re-deliverable recovery material"
-                )));
-            }
-            let enrolled = Enrolled {
-                secret_b32: enrollment.secret_b32.clone(),
-                otpauth_uri: provisioning_uri(
-                    &enrollment.secret_b32,
-                    &enrollment.prepared_account,
-                ),
-                recovery_codes: enrollment.prepared_recovery_codes,
-            };
-            Ok(PreparedEnrollment {
-                network_id,
-                transaction_id: enrollment.transaction_id,
-                enrolled,
-                path: path.to_path_buf(),
-            })
+            prepared_enrollment_from_record(path, &network_id, &enrollment)
         })
         .collect()
+}
+
+fn prepared_enrollment_from_record(
+    path: &Path,
+    network_id: &str,
+    enrollment: &Enrollment,
+) -> Result<PreparedEnrollment> {
+    if enrollment.transaction_id.is_empty() {
+        return Err(Error::Custody(format!(
+            "prepared custody record for {network_id} has no transaction identity"
+        )));
+    }
+    if enrollment.secret_b32.is_empty() {
+        return Err(Error::Custody(format!(
+            "prepared custody record for {network_id} has no secret"
+        )));
+    }
+    if enrollment.prepared_recovery_codes.is_empty() {
+        return Err(Error::Custody(format!(
+            "prepared custody record for {network_id} has no re-deliverable recovery material"
+        )));
+    }
+    if enrollment.prepared_account.is_empty() {
+        return Err(Error::Custody(format!(
+            "prepared custody record for {network_id} has no account label"
+        )));
+    }
+    let enrolled = Enrolled {
+        secret_b32: enrollment.secret_b32.clone(),
+        otpauth_uri: provisioning_uri(&enrollment.secret_b32, &enrollment.prepared_account),
+        recovery_codes: enrollment.prepared_recovery_codes.clone(),
+    };
+    Ok(PreparedEnrollment {
+        network_id: network_id.to_owned(),
+        transaction_id: enrollment.transaction_id.clone(),
+        enrolled,
+        path: path.to_path_buf(),
+    })
 }
 
 fn enrollment_transaction_at(
@@ -967,22 +1043,8 @@ fn enrollment_transaction_at(
         return Ok(EnrollmentTransaction::Absent);
     }
     if is_prepared(&enrollment) {
-        if enrollment.prepared_recovery_codes.is_empty() {
-            return Err(Error::Custody(format!(
-                "prepared custody record for {network_id} has no re-deliverable recovery material"
-            )));
-        }
-        let enrolled = Enrolled {
-            secret_b32: enrollment.secret_b32.clone(),
-            otpauth_uri: provisioning_uri(&enrollment.secret_b32, &enrollment.prepared_account),
-            recovery_codes: enrollment.prepared_recovery_codes,
-        };
-        return Ok(EnrollmentTransaction::Prepared(PreparedEnrollment {
-            network_id: network_id.to_string(),
-            transaction_id: enrollment.transaction_id,
-            enrolled,
-            path: path.to_path_buf(),
-        }));
+        return prepared_enrollment_from_record(path, network_id, &enrollment)
+            .map(EnrollmentTransaction::Prepared);
     }
     Ok(EnrollmentTransaction::Committed)
 }
@@ -1438,6 +1500,131 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A repeated prepare returns the exact durable transaction and one-time
+    /// material rather than rotating the lock or allocating a new transaction.
+    #[test]
+    fn v4_r2_prepare_recovers_exact_existing_prepared_material() {
+        let path = tmp();
+        let net = "fleet-prepare-retry";
+        let first =
+            prepare_or_recover_provisional_enroll_at(&path, net, "laptop").expect("first prepare");
+        let (first_transaction, first_material) = match &first {
+            EnrollmentPreparation::Fresh(fresh) => {
+                (fresh.transaction_id().to_owned(), fresh.enrolled().clone())
+            }
+            EnrollmentPreparation::Existing(_) => panic!("first prepare was not fresh"),
+        };
+        drop(first);
+
+        let retry = prepare_or_recover_provisional_enroll_at(&path, net, "different-account")
+            .expect("prepared retry");
+        match retry {
+            EnrollmentPreparation::Existing(existing) => {
+                assert_eq!(existing.transaction_id(), first_transaction);
+                assert_eq!(existing.enrolled().secret_b32, first_material.secret_b32);
+                assert_eq!(existing.enrolled().otpauth_uri, first_material.otpauth_uri);
+                assert_eq!(
+                    existing.enrolled().recovery_codes,
+                    first_material.recovery_codes
+                );
+            }
+            EnrollmentPreparation::Fresh(_) => panic!("prepared retry rotated the record"),
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Concurrent prepare callers classify one writer's insertion as Fresh and
+    /// the other as Existing, with identical material from the durable record.
+    #[test]
+    fn v4_r2_concurrent_prepare_callers_share_one_prepared_material() {
+        let path = tmp();
+        let net = "fleet-prepare-race";
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let callers: Vec<_> = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().expect("prepare caller does not panic"))
+            .collect::<Result<Vec<_>>>()
+            .expect("both prepare callers complete");
+        let mut fresh = None;
+        let mut existing = None;
+        for result in results {
+            match result {
+                EnrollmentPreparation::Fresh(value) => fresh = Some(value),
+                EnrollmentPreparation::Existing(value) => existing = Some(value),
+            }
+        }
+        let fresh = fresh.expect("one caller installs the prepared record");
+        let existing = existing.expect("the other caller recovers the prepared record");
+        assert_eq!(fresh.transaction_id(), existing.transaction_id());
+        assert_eq!(fresh.enrolled().secret_b32, existing.enrolled().secret_b32);
+        assert_eq!(
+            fresh.enrolled().recovery_codes,
+            existing.enrolled().recovery_codes
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A committed record remains a strict refusal for Prepare; only the
+    /// explicit terminal operation can make a fresh prepare possible again.
+    #[test]
+    fn v4_r2_prepare_refuses_committed_until_explicit_abort() {
+        let path = tmp();
+        let net = "fleet-prepare-committed";
+        let first = match prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+            .expect("first prepare")
+        {
+            EnrollmentPreparation::Fresh(value) => value,
+            EnrollmentPreparation::Existing(_) => panic!("first prepare was not fresh"),
+        };
+        first.commit().expect("commit exact prepared record");
+        assert!(
+            prepare_or_recover_provisional_enroll_at(&path, net, "laptop").is_err(),
+            "Prepare must preserve committed refusal"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Explicit Abort, rather than handle drop or lease death, permits a fresh
+    /// successor transaction and does not reuse the old transaction identity.
+    #[test]
+    fn v4_r2_prepare_explicit_abort_permits_fresh_successor() {
+        let path = tmp();
+        let net = "fleet-prepare-abort";
+        let first = match prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+            .expect("first prepare")
+        {
+            EnrollmentPreparation::Fresh(value) => value,
+            EnrollmentPreparation::Existing(_) => panic!("first prepare was not fresh"),
+        };
+        let first_transaction = first.transaction_id().to_owned();
+        first.abort().expect("explicit abort");
+
+        let successor = match prepare_or_recover_provisional_enroll_at(&path, net, "laptop")
+            .expect("successor prepare")
+        {
+            EnrollmentPreparation::Fresh(value) => value,
+            EnrollmentPreparation::Existing(_) => panic!("aborted record was recovered"),
+        };
+        assert_ne!(successor.transaction_id(), first_transaction);
+        successor.abort().expect("clean successor");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A prepared enrollment remains durable when its handle is dropped, and an
     /// explicit abort cannot remove a successor that arrives later.
     ///
@@ -1458,7 +1645,7 @@ mod tests {
         assert_eq!(
             unhanded.enrolled().recovery_codes.len(),
             RECOVERY_CODES,
-            "the caller is given the whole of what it must show exactly once"
+            "the caller is given the whole validated material before exact Commit"
         );
         assert_eq!(unhanded.network_id(), net);
         let transaction_id = unhanded.transaction_id().to_owned();

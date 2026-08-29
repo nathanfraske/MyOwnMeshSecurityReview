@@ -14,10 +14,12 @@ use std::process::{Child, Command, Stdio};
 
 const CHILD_MODE: &str = "MYOWNMESH_R2_CHILD_MODE";
 const CHILD_NETWORK: &str = "MYOWNMESH_R2_CHILD_NETWORK";
+const PREPARE_RACE_MODE: &str = "prepare-race";
 
 fn spawn_child(
     home: &std::path::Path,
     mode: &str,
+    network: &str,
 ) -> (Child, BufReader<std::process::ChildStdout>) {
     let mut child = Command::new(std::env::current_exe().expect("the integration test executable"))
         .arg("--exact")
@@ -25,7 +27,7 @@ fn spawn_child(
         .arg("--nocapture")
         .env("MYOWNMESH_HOME", home)
         .env(CHILD_MODE, mode)
-        .env(CHILD_NETWORK, "r2-hard-death")
+        .env(CHILD_NETWORK, network)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -49,6 +51,8 @@ fn read_marker(reader: &mut BufReader<std::process::ChildStdout>) -> String {
             || marker == "KEPT"
             || marker == "COMMITTED"
             || marker == "ACKED"
+            || marker == "CALLER_READY"
+            || marker.starts_with("RESULT ")
             || (marker.starts_with("DELIVERED ") && marker.len() > "DELIVERED ".len())
         {
             return marker.to_owned();
@@ -66,7 +70,7 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     // response boundary. A hard stop is the real process-death edge: armed
     // Drop cannot run in the child, so restart must recover this provisional
     // record rather than treating it as a delivered enrollment.
-    let (mut prepared, mut prepared_out) = spawn_child(home.path(), "prepared");
+    let (mut prepared, mut prepared_out) = spawn_child(home.path(), "prepared", network);
     let prepared_marker = read_marker(&mut prepared_out);
     let prepared_transaction = prepared_marker
         .strip_prefix("PREPARED ")
@@ -101,7 +105,7 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     // Material delivery is not a commit. Kill the child after the exact
     // material marker and before an explicit commit, then query and settle
     // the same transaction from durable storage.
-    let (mut delivered, mut delivered_out) = spawn_child(home.path(), "delivered");
+    let (mut delivered, mut delivered_out) = spawn_child(home.path(), "delivered", network);
     let marker = read_marker(&mut delivered_out);
     let delivered_fields = marker
         .strip_prefix("DELIVERED ")
@@ -150,7 +154,7 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
     // A durable commit can itself be followed by process death before the
     // client receives its final acknowledgement. Querying the same identity
     // after restart must resolve that lost ACK as Committed.
-    let (mut committed, mut committed_out) = spawn_child(home.path(), "commit-before-ack");
+    let (mut committed, mut committed_out) = spawn_child(home.path(), "commit-before-ack", network);
     let marker = read_marker(&mut committed_out);
     let committed_fields = marker
         .strip_prefix("DELIVERED ")
@@ -266,6 +270,117 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
 }
 
 #[test]
+fn v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record() {
+    let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
+    let network = format!("r2-prepare-race-{}", std::process::id());
+    std::env::set_var("MYOWNMESH_HOME", home.path());
+
+    let (mut first, mut first_out) = spawn_child(home.path(), PREPARE_RACE_MODE, &network);
+    let (mut second, mut second_out) = spawn_child(home.path(), PREPARE_RACE_MODE, &network);
+    let first_caller_marker = read_marker(&mut first_out);
+    assert!(
+        first_caller_marker == "CALLER_READY",
+        "first child reaches the pre-prepare barrier"
+    );
+    let second_caller_marker = read_marker(&mut second_out);
+    assert!(
+        second_caller_marker == "CALLER_READY",
+        "second child reaches the pre-prepare barrier"
+    );
+
+    for child in [&mut first, &mut second] {
+        child
+            .stdin
+            .as_mut()
+            .expect("prepare-race child stdin")
+            .write_all(b"GO\n")
+            .expect("release prepare-race callers");
+    }
+
+    let first_marker = read_marker(&mut first_out);
+    let second_marker = read_marker(&mut second_out);
+    assert!(
+        first_marker.starts_with("RESULT ") && second_marker.starts_with("RESULT "),
+        "both children prepare only after the shared GO barrier"
+    );
+
+    fn parse_result(marker: &str) -> (&str, &str, &str, &str, Vec<&str>) {
+        let fields: Vec<_> = marker.splitn(6, ' ').collect();
+        assert_eq!(
+            fields.len(),
+            6,
+            "RESULT carries complete enrollment material"
+        );
+        let codes: Vec<_> = fields[5].split(',').collect();
+        assert!(!fields[2].is_empty(), "RESULT carries transaction identity");
+        assert!(!fields[3].is_empty(), "RESULT carries the secret");
+        assert!(!fields[4].is_empty(), "RESULT carries the otpauth URI");
+        assert!(!codes.is_empty() && codes.iter().all(|code| !code.is_empty()));
+        (fields[1], fields[2], fields[3], fields[4], codes)
+    }
+
+    let first_result = parse_result(&first_marker);
+    let second_result = parse_result(&second_marker);
+    assert_ne!(
+        first_result.0, second_result.0,
+        "the cross-process writer fence classifies Fresh and Existing distinctly"
+    );
+    assert!(
+        matches!(
+            (first_result.0, second_result.0),
+            ("fresh", "existing") | ("existing", "fresh")
+        ),
+        "exactly one child inserts and exactly one recovers"
+    );
+    assert_eq!(
+        first_result.1, second_result.1,
+        "children report the same transaction"
+    );
+    assert_eq!(
+        first_result.2, second_result.2,
+        "children report the same secret"
+    );
+    assert_eq!(
+        first_result.3, second_result.3,
+        "children report the same otpauth URI"
+    );
+    assert_eq!(
+        first_result.4, second_result.4,
+        "children report the same recovery codes"
+    );
+
+    first.wait().expect("reap first prepare-race child");
+    second.wait().expect("reap second prepare-race child");
+
+    let prepared = myownmesh_core::custody::prepared_enrollments()
+        .expect("enumerate durable prepared records");
+    assert_eq!(
+        prepared.len(),
+        1,
+        "the two children leave exactly one durable Prepared record"
+    );
+    let prepared = prepared.into_iter().next().expect("one prepared record");
+    assert_eq!(prepared.transaction_id(), first_result.1);
+    assert_eq!(prepared.enrolled().secret_b32, first_result.2);
+    assert_eq!(prepared.enrolled().otpauth_uri, first_result.3);
+    assert_eq!(
+        prepared.enrolled().recovery_codes,
+        first_result
+            .4
+            .iter()
+            .map(|code| (*code).to_owned())
+            .collect::<Vec<_>>()
+    );
+    prepared.abort().expect("explicitly abort race transaction");
+    assert!(
+        myownmesh_core::custody::prepared_enrollments()
+            .expect("enumerate after explicit abort")
+            .is_empty(),
+        "explicit abort cleans the exact prepared record"
+    );
+}
+
+#[test]
 fn child_provisional_enrollment() {
     let (Some(mode), Some(network)) = (
         std::env::var_os(CHILD_MODE),
@@ -275,6 +390,43 @@ fn child_provisional_enrollment() {
     };
     let mode = mode.to_string_lossy();
     let network = network.to_string_lossy();
+
+    if mode == PREPARE_RACE_MODE {
+        println!("CALLER_READY");
+        std::io::stdout()
+            .flush()
+            .expect("flush pre-prepare lifecycle marker");
+        let mut go = String::new();
+        std::io::stdin()
+            .read_line(&mut go)
+            .expect("parent prepare-race GO");
+        assert_eq!(go.trim(), "GO");
+
+        let preparation = myownmesh_core::custody::prepare_or_recover_provisional_enroll(
+            &network,
+            "r2-prepare-race",
+        )
+        .expect("child prepares or recovers the exact enrollment");
+        let (state, transaction_id, enrolled) = match &preparation {
+            myownmesh_core::custody::EnrollmentPreparation::Fresh(fresh) => {
+                ("fresh", fresh.transaction_id(), fresh.enrolled())
+            }
+            myownmesh_core::custody::EnrollmentPreparation::Existing(existing) => {
+                ("existing", existing.transaction_id(), existing.enrolled())
+            }
+        };
+        println!(
+            "RESULT {state} {transaction_id} {} {} {}",
+            enrolled.secret_b32,
+            enrolled.otpauth_uri,
+            enrolled.recovery_codes.join(",")
+        );
+        std::io::stdout()
+            .flush()
+            .expect("flush prepare-race result marker");
+        return;
+    }
+
     let provisional = myownmesh_core::custody::install_provisional_enroll(&network, "r2-child")
         .expect("child installs provisional enrollment");
 

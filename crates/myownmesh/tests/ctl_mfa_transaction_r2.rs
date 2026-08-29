@@ -1,17 +1,21 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "transport-lab"))]
 
 //! R2 control-socket coverage for the shipped MFA CLI.
 //!
-//! The daemon is the real embedded control surface and the client for every
-//! request is the built `myownmesh ctl` binary. This keeps the assertion at the
-//! boundary users cross: an enrollment response is not a terminal custody
-//! decision, and an exact transaction can be queried after a discarded reply.
+//! The daemon is the real control surface (embedded for ordinary requests and
+//! the shipped `myownmesh serve` process for the hard-death boundary), while
+//! the client for every request is the built `myownmesh ctl` binary. This keeps
+//! the assertion at the boundary users cross: an enrollment response is not a
+//! terminal custody decision, and an exact transaction can be queried after a
+//! discarded reply.
 
 use std::path::Path;
 use std::process::{Output, Stdio};
 
 use interprocess::local_socket::{tokio::prelude::*, GenericFilePath, ToFsName};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 fn test_resource_port() -> myownmesh_core::ResourceProviderPort {
     let claim = myownmesh_core::ResourceClaim::try_from_entries(
@@ -145,9 +149,10 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     config
         .save()
         .expect("persist the CLI's isolated socket config");
-    let daemon = myownmesh::embedded::start_infrastructure_only(config, test_resource_port())
-        .await
-        .expect("start the real embedded control server");
+    let daemon =
+        myownmesh::embedded::start_infrastructure_only(config.clone(), test_resource_port())
+            .await
+            .expect("start the real embedded control server");
     wait_for_socket(&socket).await;
 
     let network = "ctl-r2-exact-mfa";
@@ -310,6 +315,319 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "committed"
     );
 
+    // A daemon boundary must not lose a Prepared transaction. Shut down the
+    // in-process fixture first, then use the shipped daemon with a real
+    // transport-lab pause after durable preparation and before its first
+    // response write. The raw client never reads that response: the marker
+    // contains no transaction or material, and the parked daemon is killed
+    // before the client is restarted against the same custody root.
+    let restart_network = "ctl-r2-restart-recovery";
+    daemon.shutdown().await;
+
+    let barrier_listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind the loopback transport-lab barrier");
+    let barrier_address = barrier_listener
+        .local_addr()
+        .expect("read the loopback barrier address");
+    let resource_grant = "accounted_memory_bytes=1000000000,queued_bytes=1000000000,\
+        socket_or_handle=1000000000,native_transport_object=1000000000,\
+        worker_or_task=1000000000,callback_or_scheduled_work=1000000000,\
+        storage_bytes=1000000000,storage_object=1000000000,\
+        relay_or_provider_allocation=1000000000,parsing_or_cpu_work=1000000000,\
+        opaque_dependency_residual=1000000000";
+    let mut parked_daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_myownmesh"))
+        .arg("serve")
+        .env("MYOWNMESH_HOME", home.path())
+        .env("MYOWNMESH_RESOURCE_GRANT", resource_grant)
+        .env(
+            "MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER",
+            barrier_address.to_string(),
+        )
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the shipped daemon for the parked prepare");
+    wait_for_socket(&socket).await;
+    let socket_name = socket
+        .as_path()
+        .to_fs_name::<GenericFilePath>()
+        .expect("the control socket path is valid");
+    let mut raw_client = LocalSocketStream::connect(socket_name)
+        .await
+        .expect("connect the raw client before the parked prepare");
+    raw_client
+        .write_all(
+            br#"{"op":"governance_mfa_prepare","network":"ctl-r2-restart-recovery"}
+"#,
+        )
+        .await
+        .expect("send the prepare without reading its response");
+    let (mut barrier_stream, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        barrier_listener.accept(),
+    )
+    .await
+    .expect("the daemon reaches the pre-write barrier")
+    .expect("the barrier accepts the daemon");
+    let mut marker = [0_u8; 9];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        barrier_stream.read_exact(&mut marker),
+    )
+    .await
+    .expect("the daemon announces the durable prepare")
+    .expect("read the complete barrier marker");
+    assert_eq!(&marker, b"PREPARED\n");
+    drop(raw_client);
+    parked_daemon
+        .kill()
+        .await
+        .expect("hard-kill the daemon while its response is parked");
+    let killed = tokio::time::timeout(std::time::Duration::from_secs(10), parked_daemon.wait())
+        .await
+        .expect("the killed daemon exits")
+        .expect("wait for the killed daemon");
+    assert!(!killed.success(), "the parked daemon was hard-killed");
+
+    // The oracle is read only after the crash and never supplies arguments to
+    // the recovery client. It proves that exactly one durable Prepared record
+    // survived, including the full material the client must recover by N.
+    let prepared = myownmesh_core::custody::prepared_enrollments()
+        .expect("read the durable prepared records after hard-kill");
+    let mut matching = prepared
+        .into_iter()
+        .filter(|record| record.network_id() == restart_network)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "hard-kill leaves exactly one prepared transaction for the network"
+    );
+    let oracle = matching
+        .pop()
+        .expect("the exact prepared recovery oracle exists");
+    let restart_transaction = oracle.transaction_id().to_owned();
+    let restart_secret = oracle.enrolled().secret_b32.clone();
+    let restart_otpauth = oracle.enrolled().otpauth_uri.clone();
+    let restart_recovery_codes = oracle.enrolled().recovery_codes.clone();
+
+    // Restart without the lab hook. The shipped Enroll command receives only
+    // N and must recover the exact durable transaction and material.
+    let mut recovered_daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_myownmesh"))
+        .arg("serve")
+        .env("MYOWNMESH_HOME", home.path())
+        .env("MYOWNMESH_RESOURCE_GRANT", resource_grant)
+        .kill_on_drop(true)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the restarted shipped daemon");
+    wait_for_socket(&socket).await;
+
+    let (recovered_material, recovered_commit) = enroll_documents(
+        run_ctl(home.path(), &["enroll", restart_network]).await,
+        "ctl mfa enroll after daemon restart",
+    );
+    assert_eq!(
+        field(
+            &recovered_material,
+            "transaction_id",
+            "ctl mfa recovered enrollment material",
+        ),
+        restart_transaction
+    );
+    assert_eq!(
+        field(
+            &recovered_material,
+            "secret",
+            "ctl mfa recovered enrollment material",
+        ),
+        restart_secret
+    );
+    assert_eq!(
+        field(
+            &recovered_material,
+            "otpauth_uri",
+            "ctl mfa recovered enrollment material",
+        ),
+        restart_otpauth
+    );
+    assert_eq!(
+        recovered_material
+            .get("recovery_codes")
+            .and_then(Value::as_array)
+            .expect("ctl mfa recovered enrollment has recovery codes")
+            .iter()
+            .map(|value| value.as_str().expect("recovery code is a string"))
+            .collect::<Vec<_>>(),
+        restart_recovery_codes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        field(
+            &recovered_commit,
+            "transaction_id",
+            "ctl mfa recovered enrollment commit",
+        ),
+        restart_transaction
+    );
+    assert_eq!(
+        field(
+            &recovered_commit,
+            "state",
+            "ctl mfa recovered enrollment commit",
+        ),
+        "committed"
+    );
+    assert!(recovered_commit.get("secret").is_none());
+    assert!(recovered_commit.get("otpauth_uri").is_none());
+    assert!(recovered_commit.get("recovery_codes").is_none());
+    let recovered_query = response(
+        run_ctl(
+            home.path(),
+            &["query", restart_network, &restart_transaction],
+        )
+        .await,
+        "ctl mfa query after daemon restart recovery",
+    );
+    let recovered_query_data = transaction_data(
+        &recovered_query,
+        "ctl mfa query after daemon restart recovery",
+    );
+    assert_eq!(
+        field(
+            recovered_query_data,
+            "state",
+            "ctl mfa query after daemon restart recovery",
+        ),
+        "committed"
+    );
+    assert!(recovered_query_data.get("secret").is_none());
+    assert!(recovered_query_data.get("otpauth_uri").is_none());
+    assert!(recovered_query_data.get("recovery_codes").is_none());
+    assert!(
+        !myownmesh_core::custody::prepared_enrollments()
+            .expect("reopen prepared records after exact recovery")
+            .iter()
+            .any(|record| record.network_id() == restart_network),
+        "exact recovery commits the one prepared record without creating a successor"
+    );
+
+    // Two real shipped Prepare clients racing on one network may both win
+    // the recovery-aware classification, but they must observe the same
+    // exact transaction/material. No response may fabricate a second record.
+    let concurrent_network = "ctl-r2-concurrent-prepare";
+    let (left, right) = tokio::join!(
+        run_ctl(home.path(), &["prepare", concurrent_network]),
+        run_ctl(home.path(), &["prepare", concurrent_network]),
+    );
+    let left = response(left, "first concurrent ctl mfa prepare");
+    let right = response(right, "second concurrent ctl mfa prepare");
+    let left_data = transaction_data(&left, "first concurrent ctl mfa prepare");
+    let right_data = transaction_data(&right, "second concurrent ctl mfa prepare");
+    assert_eq!(
+        field(
+            left_data,
+            "transaction_id",
+            "first concurrent ctl mfa prepare"
+        ),
+        field(
+            right_data,
+            "transaction_id",
+            "second concurrent ctl mfa prepare"
+        )
+    );
+    assert_eq!(
+        field(left_data, "secret", "first concurrent ctl mfa prepare"),
+        field(right_data, "secret", "second concurrent ctl mfa prepare")
+    );
+    assert_eq!(
+        field(left_data, "otpauth_uri", "first concurrent ctl mfa prepare",),
+        field(
+            right_data,
+            "otpauth_uri",
+            "second concurrent ctl mfa prepare",
+        )
+    );
+    let left_recovery_codes = left_data
+        .get("recovery_codes")
+        .and_then(Value::as_array)
+        .expect("first concurrent ctl mfa prepare has recovery codes")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("first concurrent recovery code is a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    let right_recovery_codes = right_data
+        .get("recovery_codes")
+        .and_then(Value::as_array)
+        .expect("second concurrent ctl mfa prepare has recovery codes")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("second concurrent recovery code is a string")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(left_recovery_codes, right_recovery_codes);
+    let concurrent_transaction = field(
+        left_data,
+        "transaction_id",
+        "first concurrent ctl mfa prepare",
+    )
+    .to_owned();
+    let concurrent_secret =
+        field(left_data, "secret", "first concurrent ctl mfa prepare").to_owned();
+    let concurrent_otpauth =
+        field(left_data, "otpauth_uri", "first concurrent ctl mfa prepare").to_owned();
+    let prepared = myownmesh_core::custody::prepared_enrollments()
+        .expect("read the exact concurrent prepared record");
+    let mut matching = prepared
+        .into_iter()
+        .filter(|record| {
+            record.network_id() == concurrent_network
+                && record.transaction_id() == concurrent_transaction
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matching.len(),
+        1,
+        "concurrent Prepare creates exactly one durable prepared record"
+    );
+    let matching = matching
+        .pop()
+        .expect("the exact concurrent prepared record exists");
+    assert_eq!(matching.enrolled().secret_b32, concurrent_secret);
+    assert_eq!(matching.enrolled().otpauth_uri, concurrent_otpauth);
+    assert_eq!(matching.enrolled().recovery_codes, left_recovery_codes);
+    let concurrent_abort = response(
+        run_ctl(
+            home.path(),
+            &["abort", concurrent_network, concurrent_transaction],
+        )
+        .await,
+        "ctl mfa abort concurrent prepared transaction",
+    );
+    assert_eq!(
+        field(
+            transaction_data(
+                &concurrent_abort,
+                "ctl mfa abort concurrent prepared transaction",
+            ),
+            "state",
+            "ctl mfa abort concurrent prepared transaction",
+        ),
+        "absent"
+    );
+
     // Enroll is the shipped one-roundtrip user experience: it must explicitly
     // settle its exact prepared transaction before reporting success. The
     // follow-up query proves the returned material was not merely Prepared.
@@ -365,6 +683,13 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     assert!(enrolled_query_data.get("otpauth_uri").is_none());
     assert!(enrolled_query_data.get("recovery_codes").is_none());
 
-    daemon.shutdown().await;
+    recovered_daemon
+        .kill()
+        .await
+        .expect("hard-kill the recovered daemon after exact CLI checks");
+    tokio::time::timeout(std::time::Duration::from_secs(10), recovered_daemon.wait())
+        .await
+        .expect("the recovered daemon exits")
+        .expect("wait for the recovered daemon");
     std::env::remove_var("MYOWNMESH_HOME");
 }

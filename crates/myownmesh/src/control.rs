@@ -14,6 +14,8 @@
 //! this to forward live mesh events into the frontend.
 
 use std::path::PathBuf;
+#[cfg(feature = "transport-lab")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -160,6 +162,62 @@ pub(crate) struct ControlHooks {
     /// prove that the write cannot strand its sole custody owner.
     #[cfg(test)]
     before_provisional_settle: Option<Arc<DispatchBarrier>>,
+    /// Pauses after durable MFA preparation and response encoding, but before
+    /// the response bytes are handed to the socket. This is the exact edge
+    /// where a client may lose the first response while the transaction must
+    /// remain queryable and redeliverable.
+    #[cfg(test)]
+    before_mfa_response_write: Option<Arc<DispatchBarrier>>,
+}
+
+/// Cross-process transport-lab pause for the first MFA response.
+///
+/// This is compiled only with the explicit `transport-lab` feature and is enabled only by the
+/// explicit `MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER` environment variable. It is
+/// deliberately a loopback rendezvous rather than a process-global flag: the
+/// test observes a marker containing no transaction or material, then decides
+/// when the response write may proceed. Normal daemon builds have no field,
+/// parser, listener, or pause path for it.
+#[cfg(feature = "transport-lab")]
+struct TransportLabMfaBarrier {
+    address: std::net::SocketAddr,
+    used: AtomicBool,
+}
+
+#[cfg(feature = "transport-lab")]
+impl TransportLabMfaBarrier {
+    fn from_env() -> Result<Option<Arc<Self>>> {
+        let Some(raw) = std::env::var_os("MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER") else {
+            return Ok(None);
+        };
+        let raw = raw
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("MFA transport-lab barrier address is not UTF-8"))?;
+        let address = raw.parse().with_context(|| {
+            format!("MFA transport-lab barrier address is not a socket address: {raw}")
+        })?;
+        Ok(Some(Arc::new(Self {
+            address,
+            used: AtomicBool::new(false),
+        })))
+    }
+
+    async fn pause_once(&self) -> Result<()> {
+        if self.used.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut stream = tokio::net::TcpStream::connect(self.address)
+            .await
+            .context("connect MFA transport-lab barrier")?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"PREPARED\n")
+            .await
+            .context("announce MFA transport-lab preparation")?;
+        let mut release = [0_u8; 1];
+        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut release)
+            .await
+            .context("wait for MFA transport-lab release")?;
+        Ok(())
+    }
 }
 
 /// A one-shot pause, for controls that need a task stopped at an exact line.
@@ -597,6 +655,8 @@ async fn serve_with_hooks(
     } = surface;
     #[cfg(test)]
     let mut hooks = hooks;
+    #[cfg(feature = "transport-lab")]
+    let mfa_transport_lab_barrier = TransportLabMfaBarrier::from_env()?;
     // Read before the listener binds and kept for the whole accept loop. The
     // request it resolves on is a latched state, so a reset that lands between
     // this line and the first poll below is not a lost wake.
@@ -665,6 +725,10 @@ async fn serve_with_hooks(
         before_begin_closing: hooks.before_begin_closing,
         #[cfg(test)]
         before_provisional_settle: hooks.before_provisional_settle,
+        #[cfg(test)]
+        before_mfa_response_write: hooks.before_mfa_response_write,
+        #[cfg(feature = "transport-lab")]
+        mfa_transport_lab_barrier,
     });
     #[cfg(not(test))]
     let _ = hooks;
@@ -1004,6 +1068,11 @@ struct ControlState {
     /// See [`ControlHooks::before_provisional_settle`].
     #[cfg(test)]
     before_provisional_settle: Option<Arc<DispatchBarrier>>,
+    /// See [`ControlHooks::before_mfa_response_write`].
+    #[cfg(test)]
+    before_mfa_response_write: Option<Arc<DispatchBarrier>>,
+    #[cfg(feature = "transport-lab")]
+    mfa_transport_lab_barrier: Option<Arc<TransportLabMfaBarrier>>,
 }
 
 /// One control surface with nothing joined, for the controls that are about
@@ -1053,6 +1122,9 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
         before_rpc_call: None,
         before_begin_closing: None,
         before_provisional_settle: None,
+        before_mfa_response_write: None,
+        #[cfg(feature = "transport-lab")]
+        mfa_transport_lab_barrier: None,
     })
 }
 
@@ -2100,10 +2172,18 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceMfaEnroll { network }
-            | Request::GovernanceMfaPrepare { network } => {
-                let ((reply, output), provisional) =
-                    dispatch::governance::mfa_enroll(&json_lines, network)?;
+            request @ (Request::GovernanceMfaEnroll { .. }
+            | Request::GovernanceMfaPrepare { .. }) => {
+                let (network, recovery_aware) = match request {
+                    Request::GovernanceMfaEnroll { network } => (network, false),
+                    Request::GovernanceMfaPrepare { network } => (network, true),
+                    _ => unreachable!("MFA preparation arm is exhaustive"),
+                };
+                let ((reply, output), provisional) = if recovery_aware {
+                    dispatch::governance::mfa_prepare(&json_lines, network)?
+                } else {
+                    dispatch::governance::mfa_enroll(&json_lines, network)?
+                };
                 let mut provisional = handoff::HandoffGuard::new(provisional);
                 // The lock is already installed. It has to be: a success
                 // response has to name an enrollment that exists, and deferring
@@ -2113,12 +2193,12 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 // across every write outcome; only an explicit transaction
                 // commit or abort decides custody after the client has received
                 // (or declined) this material. The local handle is released
-                // after the response boundary, not used as a commit oracle.
-                // the response boundary; it remains Prepared until an explicit
-                // transaction command. The
-                // secret and the recovery codes are still shown exactly once
-                // and are recoverable only through the exact transaction query
-                // or redelivery operation.
+                // after the response boundary, not used as a commit oracle;
+                // the durable record remains Prepared until that explicit
+                // transaction command.
+                // secret and the recovery codes remain recoverable through the
+                // exact transaction query or redelivery operation until an
+                // explicit commit or abort settles the durable record.
                 let line =
                     match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
                         Ok(line) => line,
@@ -2128,6 +2208,17 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                                 .context("MFA enrollment response changed after measurement");
                         }
                     };
+                #[cfg(test)]
+                if let Some(barrier) = &state.before_mfa_response_write {
+                    barrier.pass().await;
+                }
+                #[cfg(feature = "transport-lab")]
+                if let Some(barrier) = &state.mfa_transport_lab_barrier {
+                    barrier
+                        .pause_once()
+                        .await
+                        .context("MFA transport-lab response barrier failed")?;
+                }
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
                 settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote? {
@@ -3685,6 +3776,7 @@ mod terminal_shutdown_tests {
                 before_rpc_call: Some(rpc_barrier),
                 before_begin_closing: Some(shutdown_barrier),
                 before_provisional_settle: None,
+                before_mfa_response_write: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -3852,6 +3944,7 @@ mod terminal_shutdown_tests {
                 before_rpc_call: None,
                 before_begin_closing: None,
                 before_provisional_settle: None,
+                before_mfa_response_write: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -4007,6 +4100,7 @@ mod terminal_shutdown_tests {
                 before_rpc_call: None,
                 before_begin_closing: None,
                 before_provisional_settle: None,
+                before_mfa_response_write: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
@@ -4170,6 +4264,7 @@ mod terminal_shutdown_tests {
                 before_rpc_call: None,
                 before_begin_closing: None,
                 before_provisional_settle: None,
+                before_mfa_response_write: None,
             },
         ));
         let clients = guarded("serve publishes its registry", registry_rx)
