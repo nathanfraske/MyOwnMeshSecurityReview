@@ -93,8 +93,8 @@ lease, startup reclaims only lease-free provisional records before exposing the
 control socket, and the client-owned transaction retains exact provisional
 custody until explicit `Commit` or exact `Abort`. Recovery probes the exact persisted-secret
 lease for every provisional record; process-nonce equality is diagnostic, not
-liveness. These controls are not a shipped CLI correction or external
-exact-head evidence.
+liveness. These controls are the shipped CLI transaction boundary and its exact
+recovery controls; their exact-head evidence is recorded below.
 
 Closing controls are the package-level child hard-death control above,
 `custody::tests::v4_r2_hard_death_recovery_preserves_prepared_transaction`,
@@ -104,12 +104,25 @@ Closing controls are the package-level child hard-death control above,
 Together they exercise prepared versus delivered material, explicit commit,
 query/redelivery/abort recovery, restart custody, kernel-lease orphan truth,
 and preservation of a sent-but-unsettled response as `Prepared` across task
-cancellation until explicit settlement. They do
-not establish a shipped CLI correction or close R2 without external exact-head
-commit/run/audit evidence.
+cancellation until explicit settlement. The exact shipped CLI controls are
+`crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`
+and
+`crates/myownmesh/src/control/handoff.rs::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared`;
+the integration discriminator and external evidence are recorded below.
 
-Status: pending external exact-head commit/run/audit evidence after the shipped
-CLI correction; no R2 success or discharge claim is made at this ledger head.
+The shipped CLI unit controls are
+`crates/myownmesh/src/cli/ctl.rs::tests::mfa_enroll_displays_and_flushes_material_before_commit`,
+`crates/myownmesh/src/cli/ctl.rs::tests::mfa_lost_commit_ack_queries_exact_committed_transaction`,
+`crates/myownmesh/src/cli/ctl.rs::tests::mfa_prepared_query_retries_one_exact_commit`,
+`crates/myownmesh/src/cli/ctl.rs::tests::mfa_ambiguous_retry_queries_once_after_second_ambiguous_commit`,
+`crates/myownmesh/src/cli/ctl.rs::tests::malformed_material_never_reaches_commit`,
+and
+`crates/myownmesh/src/cli/ctl.rs::tests::mfa_transaction_subcommands_preserve_exact_wire_mapping`.
+The exact integration discriminator is
+`crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`.
+
+Status: discharged at integration head `6d71567`; hosted CI `33229628657`
+completed all six jobs green and Turing's exact-head source audit is PASS.
 
 ### R3 — an offline evicted Device receives a durable proof delivery
 
@@ -136,18 +149,24 @@ The closed-network reconnect control remains
 The durable proof lane and its transport-lab controls are the implementation
 boundary, not a retry timer or a best-effort denial protocol.
 
+The exact R3 controls are
+`crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`,
+`crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`,
+and
+`crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down`.
+
 Owner: the typed durable-semantic Signaling Node lane together with the
 Macro-slice 2 semantic proof work.
 
-Status: pending external exact-head commit/run/audit evidence; no R3 success or
-discharge claim is made at this ledger head.
+Status: discharged at integration head `6d71567`; hosted CI `33229628657`
+completed all six jobs green and Turing's exact-head source audit is PASS.
 
 ### AuthorityLineage - bounded persistent closure record
 
-**Status: PROVISIONAL.** The typed AuthorityLineage controls below are
-implementation evidence only and remain pending the independent typed audit
-and a green result at the exact integration head. They do not amend the R1
-discharge or turn an unresolved HOLD into an acceptance.
+**Status: FROZEN at integration head `6d71567`.** Hosted CI
+`33229628657` completed all six jobs green and Turing's exact-head typed source
+audit is PASS. These controls do not amend the R1 discharge or turn an
+unresolved HOLD into an acceptance.
 
 This is a separate, bounded semantic record accompanying the R3 implementation
 boundary; it does not create another residual or widen the transport lane.
@@ -159,8 +178,9 @@ Resolution remains payload-local and cannot join Role lineage. Self-authored
 Closed Membership retains its author AuthorityUse edge and must fork with a
 concurrent Role revoke; an OpenParticipation Resolution remains payload-local
 and adds no persistent subject lineage. An unresolved fork stays fail-closed
-and its losing RoleGrant remains inactive. Exact integration-head commit,
-run, and typed-audit evidence remains external and pending.
+and its losing RoleGrant remains inactive. The exact integration-head commit,
+hosted run, and typed-audit evidence are `6d71567`, `33229628657`, and Turing's
+source PASS, respectively.
 
 Within the AuthorityLineage boundary, `FactGraph::selected_authority_branch`
 chooses the unique causally maximal matching typed selector in the sole
@@ -197,6 +217,13 @@ require complete typed resolution before regrant, preserve the self-authored
 Membership authority edge, keep the loser inactive, reject stale selectors,
 and prove the 12-schedule stale-selector, 120-permutation, and 720-permutation
 controls.
+
+The exact shipped typed-selector controls are
+`crates/myownmesh-core/tests/semantic_fact_controls.rs::authority_use_fork_requires_explicit_typed_selection_across_arrival_orders`,
+`crates/myownmesh-core/tests/semantic_projection_controls.rs::authority_lineage_selection_round_trips_and_regrant_is_future_only`,
+`crates/myownmesh-core/tests/semantic_projection_controls.rs::stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor`,
+and
+`crates/myownmesh-core/src/semantic/causal.rs::FactGraph::selected_authority_branch`.
 
 ### R4 — driver-side pre-normalization attributes a departure to the named device
 
@@ -526,6 +553,6 @@ evidence, not its sole copy.
 | Residual | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
-| R2 | `Pending — external exact-head commit/run/audit evidence` | `v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `custody::tests::v4_r2_hard_death_recovery_preserves_prepared_transaction`, `custody::tests::v4_r2_committed_handoff_survives_restart_recovery`, `custody::tests::v4_r2_current_nonce_without_owner_lease_is_recovered`, `control::handoff::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared` |
-| R3 | `Pending — external exact-head commit/run/audit evidence` | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs` (full suite, including `r3_pending_proof_is_persisted_before_send_and_replayed_after_restart` and its second-reopen terminal-tombstone control), `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
+| R2 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::v4_r2_hard_death_recovery_preserves_prepared_transaction`, `crates/myownmesh-core/src/custody.rs::v4_r2_committed_handoff_survives_restart_recovery`, `crates/myownmesh-core/src/custody.rs::v4_r2_current_nonce_without_owner_lease_is_recovered`, `crates/myownmesh/src/control/handoff.rs::tests::v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared` |
+| R3 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`, `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`, `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |
