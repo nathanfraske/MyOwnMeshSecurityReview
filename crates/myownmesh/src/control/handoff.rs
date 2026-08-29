@@ -409,7 +409,7 @@ mod tests {
     #[tokio::test]
     async fn v4_r2_mfa_sent_write_aborted_before_settle_stays_prepared() {
         let mut state = crate::control::joinless_control_state().await;
-        let (barrier, arrived, _release) = DispatchBarrier::paired();
+        let (barrier, arrived, release) = DispatchBarrier::paired();
         Arc::get_mut(&mut state)
             .expect("the test state has one owner before the task starts")
             .before_provisional_settle = Some(barrier);
@@ -444,10 +444,16 @@ mod tests {
             matches!(&wrote, Ok(Wrote::Sent)),
             "the control write reached Sent"
         );
-        assert!(
-            myownmesh_core::custody::is_enrolled(&network),
-            "the enrollment is live while the response handoff is paused"
-        );
+        match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
+            .expect("the exact prepared enrollment is queryable before the pause")
+        {
+            myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => assert_eq!(
+                prepared.transaction_id(),
+                transaction_id,
+                "the paused handoff retains the exact prepared transaction"
+            ),
+            other => panic!("the response handoff was not prepared: {other:?}"),
+        }
 
         let task_state = state.clone();
         let task = tokio::spawn(async move {
@@ -458,12 +464,25 @@ mod tests {
             .await
             .expect("the production handoff reached its post-write barrier");
         task.abort();
-        let _ = task.await;
-
+        let join_error = task
+            .await
+            .expect_err("the handoff task must be cancelled at the barrier");
         assert!(
-            myownmesh_core::custody::is_enrolled(&network),
-            "dropping the response handoff leaves the prepared enrollment durable"
+            join_error.is_cancelled(),
+            "the handoff task ended by cancellation, not by a completed settle"
         );
+        drop(release);
+
+        match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
+            .expect("the exact prepared enrollment remains queryable after task abort")
+        {
+            myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared) => assert_eq!(
+                prepared.transaction_id(),
+                transaction_id,
+                "dropping the response handoff leaves the exact prepared enrollment durable"
+            ),
+            other => panic!("response drop changed exact custody state: {other:?}"),
+        }
         let prepared =
             match myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
                 .expect("the exact prepared transaction remains queryable")
@@ -478,5 +497,10 @@ mod tests {
             !myownmesh_core::custody::is_enrolled(&network),
             "explicit abort, rather than Wrote::Sent, removes the enrollment"
         );
+        assert!(matches!(
+            myownmesh_core::custody::enrollment_transaction(&network, &transaction_id)
+                .expect("the exact aborted transaction remains queryable"),
+            myownmesh_core::custody::EnrollmentTransaction::Absent
+        ));
     }
 }

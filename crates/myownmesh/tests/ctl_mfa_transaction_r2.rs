@@ -282,6 +282,7 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "committed"
     );
     assert!(recovered_data.get("secret").is_none());
+    assert!(recovered_data.get("otpauth_uri").is_none());
     assert!(recovered_data.get("recovery_codes").is_none());
 
     let duplicate_commit = response(
@@ -349,6 +350,7 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "committed"
     );
     assert!(enrolled.get("secret").is_none());
+    assert!(enrolled.get("otpauth_uri").is_none());
     assert!(enrolled.get("recovery_codes").is_none());
     let enrolled_query = response(
         run_ctl(home.path(), &["query", enroll_network, enroll_transaction]).await,
@@ -360,6 +362,7 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "committed"
     );
     assert!(enrolled_query_data.get("secret").is_none());
+    assert!(enrolled_query_data.get("otpauth_uri").is_none());
     assert!(enrolled_query_data.get("recovery_codes").is_none());
 
     daemon.shutdown().await;

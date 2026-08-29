@@ -385,11 +385,11 @@ struct MfaTransactionData {
     network: String,
     transaction_id: String,
     state: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     secret: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     otpauth_uri: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_codes: Option<Vec<String>>,
 }
 
