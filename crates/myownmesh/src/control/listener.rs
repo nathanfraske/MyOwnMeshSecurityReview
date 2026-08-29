@@ -393,21 +393,27 @@ mod tests {
         drop(listener);
     }
 
-    /// A socket left by a clean listener drop is replaced, but the replacement
-    /// still receives the exact owner-only mode and ownership checks.
+    /// A portable raw Unix socket fixture is replaced, but the replacement
+    /// still receives the exact owner-only mode and ownership checks. This does
+    /// not depend on the production listener's platform-specific Drop, which
+    /// may unlink its path on macOS.
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_replaces_an_owned_stale_socket() {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
         let directory = tempfile::tempdir().expect("temporary control root");
         let parent = directory.path().join("private");
+        std::fs::create_dir(&parent).expect("create private parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make private parent owner-only");
         let path = parent.join("control.sock");
-        let first = bind_listener(&SocketTarget::Path(path.clone())).expect("first bind");
-        drop(first);
+        let stale_fixture = std::os::unix::net::UnixListener::bind(&path)
+            .expect("portable raw Unix stale socket fixture");
         let stale = std::fs::symlink_metadata(&path).expect("stale socket remains named");
         assert!(stale.file_type().is_socket());
         assert_eq!(stale.uid(), unsafe { libc::geteuid() });
+        drop(stale_fixture);
 
         let replacement = bind_listener(&SocketTarget::Path(path.clone()))
             .expect("owned stale socket is replaced");
@@ -423,7 +429,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_refuses_non_socket_without_mutation() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let directory = tempfile::tempdir().expect("temporary control root");
         let parent = directory.path().join("private");
@@ -433,12 +439,19 @@ mod tests {
         let path = parent.join("control.sock");
         std::fs::write(&path, b"operator data").expect("create non-socket endpoint");
         let before = std::fs::read(&path).expect("read non-socket endpoint");
+        let before_metadata = std::fs::symlink_metadata(&path).expect("stat non-socket endpoint");
 
-        let Err(error) = bind_listener(&SocketTarget::Path(path.clone())) else {
+        let Err(_) = bind_listener(&SocketTarget::Path(path.clone())) else {
             panic!("a regular file must be refused");
         };
-        assert!(error.to_string().contains("not a socket"));
         assert_eq!(std::fs::read(&path).expect("endpoint remains"), before);
+        let after_metadata = std::fs::symlink_metadata(&path).expect("stat endpoint remains");
+        assert!(after_metadata.file_type().is_file());
+        assert_eq!(after_metadata.ino(), before_metadata.ino());
+        assert_eq!(
+            after_metadata.mode() & 0o777,
+            before_metadata.mode() & 0o777
+        );
     }
 
     /// A symlink at the configured endpoint is refused via lstat-style
@@ -446,7 +459,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn unix_control_refuses_symlink_without_mutation() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
         let directory = tempfile::tempdir().expect("temporary control root");
         let parent = directory.path().join("private");
@@ -457,15 +470,18 @@ mod tests {
         let path = parent.join("control.sock");
         std::fs::write(&target, b"target data").expect("create symlink target");
         symlink(&target, &path).expect("create symlink endpoint");
+        let before_link = std::fs::symlink_metadata(&path).expect("stat symlink endpoint");
 
-        let Err(error) = bind_listener(&SocketTarget::Path(path.clone())) else {
+        let Err(_) = bind_listener(&SocketTarget::Path(path.clone())) else {
             panic!("a symlink endpoint must be refused");
         };
-        assert!(error.to_string().contains("not a socket"));
-        assert!(std::fs::symlink_metadata(&path)
-            .expect("symlink remains")
-            .file_type()
-            .is_symlink());
+        let after_link = std::fs::symlink_metadata(&path).expect("symlink remains");
+        assert!(after_link.file_type().is_symlink());
+        assert_eq!(after_link.ino(), before_link.ino());
+        assert_eq!(
+            std::fs::read_link(&path).expect("symlink target remains"),
+            target
+        );
         assert_eq!(
             std::fs::read(&target).expect("target remains"),
             b"target data"

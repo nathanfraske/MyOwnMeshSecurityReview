@@ -11,10 +11,24 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 
 const CHILD_MODE: &str = "MYOWNMESH_R2_CHILD_MODE";
 const CHILD_NETWORK: &str = "MYOWNMESH_R2_CHILD_NETWORK";
 const PREPARE_RACE_MODE: &str = "prepare-race";
+
+/// `MYOWNMESH_HOME` is process-global, and the integration harness launches
+/// child processes that inherit it. Serialize every parent test that changes
+/// it so parallel libtest scheduling cannot redirect another test's custody
+/// reads or writes into the wrong temporary root. Poison is recovered because
+/// a prior test panic must not permanently disable the remaining controls.
+static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn test_env_guard() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn spawn_child(
     home: &std::path::Path,
@@ -62,6 +76,7 @@ fn read_marker(reader: &mut BufReader<std::process::ChildStdout>) -> String {
 
 #[test]
 fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
+    let _test_env_guard = test_env_guard();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     let network = "r2-hard-death";
     std::env::set_var("MYOWNMESH_HOME", home.path());
@@ -271,6 +286,7 @@ fn v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment() {
 
 #[test]
 fn v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record() {
+    let _test_env_guard = test_env_guard();
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     let network = format!("r2-prepare-race-{}", std::process::id());
     std::env::set_var("MYOWNMESH_HOME", home.path());
@@ -360,6 +376,7 @@ fn v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record() {
         "the two children leave exactly one durable Prepared record"
     );
     let prepared = prepared.into_iter().next().expect("one prepared record");
+    assert_eq!(prepared.network_id(), network);
     assert_eq!(prepared.transaction_id(), first_result.1);
     assert_eq!(prepared.enrolled().secret_b32, first_result.2);
     assert_eq!(prepared.enrolled().otpauth_uri, first_result.3);
@@ -429,6 +446,10 @@ fn child_provisional_enrollment() {
 
     let provisional = myownmesh_core::custody::install_provisional_enroll(&network, "r2-child")
         .expect("child installs provisional enrollment");
+    assert!(
+        myownmesh_core::custody::is_enrolled(&network),
+        "prepared child must first prove durable lock exists"
+    );
 
     if mode == "prepared" {
         println!("PREPARED {}", provisional.transaction_id());
