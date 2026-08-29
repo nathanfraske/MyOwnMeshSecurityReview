@@ -205,8 +205,7 @@ The closure is evidenced by
 `open_participation_payload_fork_stays_in_its_ordinary_cell`, and the
 `720`-permutation projection control
 `finite_authority_fork_projection_converges_for_every_arrival_permutation`,
-`self_authored_membership_keeps_a_role_authority_fork_explicit`,
-`self_authored_membership_resolution_cannot_select_the_role_loser`, and
+`self_authored_membership_keeps_a_role_authority_fork_explicit`, and
 `self_authored_membership_resolution_is_order_independent_after_role_regrant`,
 `stale_selector_follows_newer_typed_role_resolution`, and
 `stale_selector_arrival_converges_with_distinct_owner_and_redundant_ancestor`
