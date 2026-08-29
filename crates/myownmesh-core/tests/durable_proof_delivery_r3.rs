@@ -753,10 +753,10 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
         target,
         _member,
         facts,
-        _context,
+        context,
         config,
         broker,
-        _target_root,
+        target_root,
     ) = create_fixture(&root, "r3-replay").await;
     let target_id = device(&target);
     let owner = wait_for_proof_owner(&state, target.public_id()).await;
@@ -783,10 +783,35 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
         .expect("same delivery id is an idempotent enqueue");
     assert_eq!(duplicate, record);
 
+    let target_signing_key = target.signing_key().clone();
+    let target_bootstrap = state.verified_bootstrap().record().clone();
     state.request_shutdown();
+    target_state.request_shutdown();
+    target_driver
+        .await
+        .expect("first target lifecycle shutdown");
     driver.await.expect("first lifecycle shutdown");
     drop(owner);
     drop(state);
+    drop(target_state);
+
+    let (restarted_target, restarted_target_driver) = import_network_in_instance_root(
+        config.clone(),
+        Arc::new(Identity::from_signing_key(target_signing_key, "r3-target")),
+        support::test_transport(),
+        target_root.path().to_path_buf(),
+        context,
+        target_bootstrap,
+    )
+    .await
+    .expect("reopen target before sender");
+    for fact in facts.iter().take(2).cloned() {
+        ingest_semantic_fact(&restarted_target, fact).await;
+    }
+    restarted_target
+        .compact_semantic_state()
+        .expect("reopened target commits the authenticated roster grants");
+    attach_local(&restarted_target, &broker);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
         config.clone(),
@@ -867,8 +892,10 @@ async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() 
     reopened_again_driver
         .await
         .expect("second reopened lifecycle shutdown");
-    target_state.request_shutdown();
-    target_driver.await.expect("target lifecycle shutdown");
+    restarted_target.request_shutdown();
+    restarted_target_driver
+        .await
+        .expect("reopened target lifecycle shutdown");
 }
 
 #[tokio::test]

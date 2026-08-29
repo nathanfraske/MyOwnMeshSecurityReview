@@ -21,12 +21,11 @@ fn test_resource_port() -> myownmesh_core::ResourceProviderPort {
     )
     .expect("the CLI control fixture claim is representable");
     myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(claim))
-        .expect("the CLI control fixture provider opens");
+        .expect("the CLI control fixture provider opens")
 }
 
 async fn wait_for_socket(socket: &Path) {
     let name = socket
-        .as_path()
         .to_fs_name::<GenericFilePath>()
         .expect("the CLI control socket path is valid");
     tokio::time::timeout(std::time::Duration::from_secs(10), async move {
@@ -115,7 +114,7 @@ fn enroll_documents(output: Output, what: &str) -> (Value, Value) {
     )
 }
 
-fn transaction_data(value: &Value, what: &str) -> &Value {
+fn transaction_data<'a>(value: &'a Value, what: &str) -> &'a Value {
     value
         .get("data")
         .unwrap_or_else(|| panic!("{what} response has no data: {value}"))
