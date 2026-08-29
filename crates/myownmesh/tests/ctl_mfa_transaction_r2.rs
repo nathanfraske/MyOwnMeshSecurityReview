@@ -114,10 +114,8 @@ fn enroll_documents(output: Output, what: &str) -> (Value, Value) {
     )
 }
 
-fn transaction_data<'a>(value: &'a Value, what: &str) -> &'a Value {
+fn transaction_data<'a>(value: &'a Value, _what: &str) -> &'a Value {
     value
-        .get("data")
-        .unwrap_or_else(|| panic!("{what} response has no data: {value}"))
 }
 
 fn field<'a>(data: &'a Value, key: &str, what: &str) -> &'a str {
