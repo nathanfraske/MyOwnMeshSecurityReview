@@ -88,12 +88,13 @@ The package-level regression control
 now drives both sides of the boundary with a real child process and pipe
 barriers: a prepared enrollment is hard-stopped before its acknowledgement,
 while a delivered enrollment is acknowledged before the child keeps it. The
-production custody record carries its exact process incarnation and OS owner
-lease, startup reclaims only lease-free provisional records before exposing the
-control socket, and the client-owned transaction retains exact provisional
-custody until explicit `Commit` or exact `Abort`. Recovery probes the exact persisted-secret
-lease for every provisional record; process-nonce equality is diagnostic, not
-liveness. These controls are the shipped CLI transaction boundary and its exact
+Startup validates durable custody before listener exposure. Owner lease and
+process nonce are diagnostic/live-handle fences only: neither expires, reclaims,
+nor settles a durable `Prepared` record. `Prepared` survives process
+death/restart and changes only by exact explicit `Commit` or `Abort`. Legacy
+`Disable` refuses `Prepared`; exact `Abort` is the transaction route that
+permits a fresh successor, and exact `Commit` transitions to `Committed`.
+These controls are the shipped CLI transaction boundary and its exact
 recovery controls; their exact-head evidence is recorded below.
 
 Closing controls are
@@ -102,13 +103,15 @@ Closing controls are
 `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`,
 `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`,
 `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`,
-`crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, and
-`crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`.
+`crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`,
+`crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, and
+`crates/myownmesh-core/src/custody.rs::tests::v4_r2_disable_refuses_prepared_material_until_explicit_abort`.
 Together they exercise exact client-owned Prepare/Commit/Query/Redeliver/Abort
 transactions, concurrent identity, hard-death and restart custody, and stale
-successor fencing. The shipped CLI unit controls are the `ctl.rs` MFA controls
-listed below; the exact integration discriminator and external evidence are
-recorded below.
+successor fencing. The shipped CLI Prepared-disable refusal is covered by
+`crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`;
+the shipped CLI unit controls are the `ctl.rs` MFA controls listed below, and
+the exact integration discriminator and external evidence are recorded below.
 
 The shipped CLI unit controls are
 `crates/myownmesh/src/cli/ctl.rs::tests::mfa_enroll_displays_and_flushes_material_before_commit`,
@@ -134,8 +137,8 @@ The Windows DACL/SID controls are
 `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`.
 
 Status: discharged at exact source head
-`cfbb487616bb4e4fd83cfd2940c76bb6ff7ba6f1`; hosted CI
-`33242272048` completed all six jobs green, including shipped CLI
+`3556a9a5a509b6773898213870f289e6dbb1ff5b`; hosted CI
+`33245879472` completed all six jobs green, including shipped CLI
 transport-lab success on Linux, macOS, and Windows, and Turing's exact-head
 FINAL PASS is recorded. The full unread-response shipped-daemon choreography
 is Unix-gated; Windows is covered by exact cross-process custody, DACL/SID
@@ -569,6 +572,6 @@ evidence, not its sole copy.
 | Residual | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
-| R2 | `cfbb487616bb4e4fd83cfd2940c76bb6ff7ba6f1` (hosted CI `33242272048`; Turing exact-head FINAL PASS) | `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_endpoint_is_verified_as_exact_owner_only_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_replaces_an_owned_stale_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_non_socket_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_symlink_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_an_accessible_unrelated_parent_without_chmod`, `crates/myownmesh/src/control/listener.rs::tests::windows_pipe_dacl_names_current_token_user_not_owner_rights`, `crates/myownmesh/src/control/listener.rs::tests::windows_current_user_pipe_connects_and_is_accepted`, `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`; full unread-response shipped-daemon choreography is Unix-gated, not identical Windows crash choreography |
+| R2 | `3556a9a5a509b6773898213870f289e6dbb1ff5b` (hosted CI `33245879472`; Turing exact-head FINAL PASS) | `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_disable_refuses_prepared_material_until_explicit_abort`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_endpoint_is_verified_as_exact_owner_only_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_replaces_an_owned_stale_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_non_socket_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_symlink_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_an_accessible_unrelated_parent_without_chmod`, `crates/myownmesh/src/control/listener.rs::tests::windows_pipe_dacl_names_current_token_user_not_owner_rights`, `crates/myownmesh/src/control/listener.rs::tests::windows_current_user_pipe_connects_and_is_accepted`, `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`; full unread-response shipped-daemon choreography is Unix-gated, not identical Windows crash choreography |
 | R3 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`, `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`, `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |
