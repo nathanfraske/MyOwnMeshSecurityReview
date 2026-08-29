@@ -1,8 +1,16 @@
 # V4 release-closure resource matrix
 
-Status: working evidence handoff for review `5058637044`, bound to the current
-dirty and unfrozen source. It names no final commit or run. Cargo, hosted,
-field, firewall, packaging, and detached-performance evidence remain pending.
+Status: evidence handoff for review `5058637044`, bound to source integration
+commit `b719e48c0669a97cd5cf2413d7c73c486abed2a0`, tree
+`067c4ce8b34f5869fe9412b17c79b3b086c91dd2`, parent
+`7983f12587962806b153dae66d4cf18608bfa56b`. Serialized local evidence below
+was captured against source-equivalent precommit bytes with the manifest, not
+as exact-head reruns: fmt `d7e26845`; default check `7698b679`; transport
+check `26926d73`; Clippy `f707a503`; default tests `5438d6bc`; transport tests
+`37cf80a2`; scanner 8/8 `27b42f24`; workflow/manifest `325914b4`;
+no-default release build `ce790598`; binary scan `91d3df7b`. Hosted CI
+`33279629298` is in progress; field, firewall, packaging, and detached-
+performance evidence remain pending.
 PR #7 remains OPEN, draft, unmerged, and on HOLD.
 
 "Finite" below identifies a source bound, not a capacity promise or SLO. A
@@ -54,5 +62,5 @@ response-write rollback in current source.
   governance authority, add application payload to signaling, or relabel OS,
   resolver, carrier-library, Tauri, or CI storage as core-provider funded.
 - Durable MFA recovery is local custody recovery, not remote account recovery.
-- All Cargo, hosted, field, firewall, packaging, and performance results remain
-  pending for review `5058637044`.
+- Hosted CI `33279629298` remains in progress; field, firewall, packaging, and
+  detached-performance qualification remain pending for review `5058637044`.
