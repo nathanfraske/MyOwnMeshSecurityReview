@@ -9,15 +9,15 @@ use myownmesh_core::config::{
     NetworkConfig, SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer,
     TurnServiceConfig,
 };
-use myownmesh_core::engine::{
-    attach_local, depart_for_lab, join_open_participation, spawn_network,
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, depart_for_lab, join_open_participation, spawn_network,
 };
 use myownmesh_core::events::{DropReason, MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackPolicy,
+    transport_lab_remote_description_fixture_grant, ConnectorCallbackPolicy,
     FiniteResourceProvider, ResourceProviderPort, TransportLabCallbackWorkload,
     WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
@@ -241,8 +241,8 @@ async fn authenticated_depart_observed_over_actual_turn() {
     // authenticated session. Prove its receipt settles before departure
     // retires the session, rather than treating relay selection as a shape
     // assertion around the teardown path.
-    let alice_channel = Channel::<String>::new("turn-receipt-before-close".into(), alice.clone());
-    let mut bob_channel = Channel::<String>::new("turn-receipt-before-close".into(), bob.clone())
+    let alice_channel = channel::<String>("turn-receipt-before-close".into(), alice.clone());
+    let mut bob_channel = channel::<String>("turn-receipt-before-close".into(), bob.clone())
         .subscribe()
         .expect("bob subscribes to the TURN carrying channel");
     alice_channel

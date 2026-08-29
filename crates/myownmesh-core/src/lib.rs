@@ -34,7 +34,7 @@
 //! }).await?;
 //!
 //! // Attach a signaling driver.
-//! let _nostr = myownmesh_core::engine::attach_nostr(&net.state());
+//! let _drivers = net.attach_signaling()?;
 //!
 //! // Subscribe to events.
 //! let mut events = mesh.events();

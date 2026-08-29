@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! End-to-end engine integration test: roster persistence + gossip.
 //!
 //! Covers the contract that mutual active participation persists, while an
@@ -30,8 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network, NetworkCmd};
+use myownmesh_core::engine::transport_lab::{
+    approve_roster, attach_local, join_open_participation, spawn_network, NetworkState,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -167,23 +170,14 @@ async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() 
     // participation, the canonical evaluator must refuse the approval and
     // neither side may gain a roster entry through unsigned gossip.
     let carol_id = Arc::new(Identity::ephemeral());
-    let (tx, rx) = tokio::sync::oneshot::channel();
     let alice_before = rostered(&a2, carol_id.public_id());
     let bob_before = rostered(&b2, carol_id.public_id());
     assert!(!alice_before, "Carol starts absent from Alice's roster");
     assert!(!bob_before, "Carol starts absent from Bob's roster");
     assert!(
-        a2.cmd_tx
-            .send(NetworkCmd::ApproveRoster {
-                device_id: carol_id.public_id().to_string(),
-                label: "carol".into(),
-                reply: tx,
-            })
-            .is_ok(),
-        "queue approve"
-    );
-    assert!(
-        rx.await.expect("approve reply").is_err(),
+        approve_roster(&a2, carol_id.public_id().to_string(), "carol".into())
+            .await
+            .is_err(),
         "approval for an absent, non-participating Carol must be refused"
     );
     assert_eq!(

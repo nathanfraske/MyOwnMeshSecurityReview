@@ -892,7 +892,7 @@ mod tests {
     // against a link its sibling does not build is exactly the failure that
     // would hide.
     use crate::test_link::{fresh_network, test_transport, two_peer_rpc};
-    use myownmesh_core::engine::spawn_network;
+    use myownmesh_core::engine::transport_lab::spawn_network;
     use myownmesh_core::identity::Identity;
     use serde_json::Value;
     use std::sync::Arc;
@@ -916,7 +916,7 @@ mod tests {
     async fn one_engine_rpc(
         wire_id: &str,
     ) -> (
-        Arc<myownmesh_core::engine::NetworkState>,
+        Arc<myownmesh_core::engine::transport_lab::NetworkState>,
         myownmesh_core::rpc::Rpc,
         tokio::task::JoinHandle<()>,
     ) {
@@ -932,7 +932,7 @@ mod tests {
         )
         .await
         .expect("the solo engine starts");
-        let rpc = myownmesh_core::rpc::Rpc::attach(&state)
+        let rpc = myownmesh_core::engine::transport_lab::rpc(&state)
             .expect("the live gateway admits its RPC owner");
         (state, rpc, driver)
     }
@@ -1350,7 +1350,7 @@ mod tests {
         // refusal would have turned that into a mysteriously silent peer.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve("echo", move |call| {
                 let registry = registry_for_handler.clone();
@@ -1490,7 +1490,7 @@ mod tests {
         // admissions rather than discarding them.
         let registry_for_handler = registry.clone();
         let key_for_handler = key.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve_stream("stream_echo", move |call| {
                 let registry = registry_for_handler.clone();
@@ -1667,7 +1667,7 @@ mod tests {
         // Spawn a pump that mirrors `bridge::spawn_channel_pump`
         // but uses the engine state directly.
         let chan: myownmesh_core::Channel<serde_json::Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let mut sub = chan.subscribe().expect("subscription admitted");
         let registry_for_pump = registry.clone();
         let key_for_pump = key.clone();
@@ -1705,7 +1705,7 @@ mod tests {
 
         // Bob sends to Alice on the channel.
         let bob_chan: myownmesh_core::Channel<serde_json::Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
         bob_chan
             .send_to(
                 _alice_id_arg(&alice_state),
@@ -1845,7 +1845,7 @@ mod tests {
         };
 
         let channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let sub = channel
             .subscribe()
             .expect("the fixture's channel admits a subscription");
@@ -1874,7 +1874,7 @@ mod tests {
         );
 
         let bob_channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
 
         // Positive. The isolated subscriber is the only member, its grant funds
         // exactly this frame, and one publish costs exactly one build.
@@ -2027,7 +2027,7 @@ mod tests {
         // funding the task and minting the cancellation; all three are done here
         // the same way it does them.
         let channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), alice_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), alice_state.clone());
         let sub = channel
             .subscribe()
             .expect("the fixture's channel admits a subscription");
@@ -2072,7 +2072,7 @@ mod tests {
              clone and a real measurement rather than a formality"
         );
         let bob_channel: myownmesh_core::Channel<Value> =
-            myownmesh_core::Channel::new(chan_key.clone(), bob_state.clone());
+            myownmesh_core::engine::transport_lab::channel(chan_key.clone(), bob_state.clone());
         bob_channel
             .send_to(_alice_id_arg(&alice_state), &payload)
             .await
@@ -2123,7 +2123,7 @@ mod tests {
         drivers.shutdown().await;
     }
 
-    fn _alice_id_arg(state: &Arc<myownmesh_core::engine::NetworkState>) -> &str {
+    fn _alice_id_arg(state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>) -> &str {
         state.identity.public_id()
     }
 }

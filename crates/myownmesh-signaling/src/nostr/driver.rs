@@ -24,14 +24,15 @@ use std::time::Duration;
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::time::sleep;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, trace, warn};
 
 use super::delivery::{
-    AdmissionSource, DeliveryProvider, DeliveryStore, DeliveryTerminal, RelaySessionId,
-    UnmeteredDeliveryProvider,
+    AdmissionSource, DeliveryLease, DeliveryProvider, DeliveryStore, DeliveryTerminal,
+    RelaySessionId,
 };
 use super::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
@@ -57,6 +58,30 @@ impl AttemptOutcomeSink for UnmeteredAttemptOutcomeSink {
 }
 
 const INBOUND_SINK_CLOSED: &str = "inbound sink closed";
+const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024;
+
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
+        max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
+        max_write_buffer_size: MAX_INBOUND_FRAME_BYTES + 16 * 1024,
+        ..WebSocketConfig::default()
+    }
+}
+
+fn binary_frame_within_limit(frame: &[u8]) -> bool {
+    frame.len() <= MAX_INBOUND_FRAME_BYTES
+}
+
+struct InboundFrameLease(Option<Box<dyn DeliveryLease>>);
+
+impl Drop for InboundFrameLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            lease.finish(DeliveryTerminal::Cancelled);
+        }
+    }
+}
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -130,25 +155,6 @@ pub enum NostrOutbound {
         to: String,
         msg: SignalingMessage,
     },
-}
-
-/// Start the driver. Spawns a coordinator task per relay; returns
-/// the handle (drop to stop).
-pub fn start<S>(
-    config: NostrDriverConfig,
-    outbound: S,
-    inbound_tx: InboundSink<NostrInbound>,
-) -> NostrDriverHandle
-where
-    S: OutboundSource<NostrOutbound> + Send + 'static,
-    S::Owner: Sync + 'static,
-{
-    start_with_delivery_provider(
-        config,
-        outbound,
-        inbound_tx,
-        Arc::new(UnmeteredDeliveryProvider),
-    )
 }
 
 /// Start with the provider that funds each exact attempt and relay-session
@@ -300,6 +306,8 @@ where
     }
 
     let mut cancellers = Vec::new();
+    let mut cancel_wakes = Vec::new();
+    let mut tasks = Vec::new();
 
     // Count of primary relays with a live session; the fallback
     // supervisor watches this to decide when to step in.
@@ -311,11 +319,22 @@ where
         let inbound_tx = inbound_tx.clone();
         let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_token_for_task = cancel_token.clone();
+        let cancel_wake = Arc::new(Notify::new());
+        let cancel_wake_for_task = cancel_wake.clone();
         cancellers.push(cancel_token);
+        cancel_wakes.push(cancel_wake);
         let live = primary_live.clone();
-        tokio::spawn(async move {
-            run_relay(url, shared, inbound_tx, cancel_token_for_task, Some(live)).await;
-        });
+        tasks.push(tokio::spawn(async move {
+            run_relay(
+                url,
+                shared,
+                inbound_tx,
+                cancel_token_for_task,
+                cancel_wake_for_task,
+                Some(live),
+            )
+            .await;
+        }));
     }
 
     // Spawn the public-relay fallback supervisor (no-op unless the pool is
@@ -326,17 +345,21 @@ where
         let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_token_for_task = cancel_token.clone();
         cancellers.push(cancel_token);
+        let cancel_wake = Arc::new(Notify::new());
+        let cancel_wake_for_task = cancel_wake.clone();
+        cancel_wakes.push(cancel_wake);
         let primary_live = primary_live.clone();
-        tokio::spawn(async move {
+        tasks.push(tokio::spawn(async move {
             run_fallback_supervisor(
                 fallback_urls,
                 shared,
                 inbound_tx,
                 cancel_token_for_task,
+                cancel_wake_for_task,
                 primary_live,
             )
             .await;
-        });
+        }));
     }
 
     // Spawn the outbound pump.
@@ -344,9 +367,9 @@ where
     let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_token_for_task = cancel_token.clone();
     cancellers.push(cancel_token);
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         run_outbound_pump_v2(shared_for_outbound, cancel_token_for_task).await;
-    });
+    }));
 
     // Spawn the global announce task. Single ticker per driver
     // instance (NOT per relay) — updates the driver-owned presence watch.
@@ -356,12 +379,14 @@ where
     let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_token_for_task = cancel_token.clone();
     cancellers.push(cancel_token);
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         run_announcer(shared_for_announce, cancel_token_for_task).await;
-    });
+    }));
 
     NostrDriverHandle {
         cancellers,
+        cancel_wakes,
+        tasks: Arc::new(tokio::sync::Mutex::new(Some(tasks))),
         force_reconnect,
         relay_connected,
         delivery,
@@ -369,10 +394,13 @@ where
     }
 }
 
-/// Handle returned by [`start`]. Drop or call [`Self::stop`] to
+/// Handle returned by [`start_with_delivery_provider`]. Drop or call
+/// [`Self::stop`] to
 /// signal every spawned task to exit.
 pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
+    cancel_wakes: Vec<Arc<Notify>>,
+    tasks: Arc<tokio::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
     force_reconnect: Arc<watch::Sender<u64>>,
     relay_connected: Arc<watch::Sender<u64>>,
     delivery: Arc<DeliveryStore>,
@@ -398,12 +426,32 @@ impl NostrDriverHandle {
             .settle_source(source, session, event_id, terminal)
     }
 
-    pub fn stop(self) {
+    fn request_stop(&self) {
         let _ = self.shutdown.send(true);
         self.delivery.shutdown();
         for c in &self.cancellers {
             c.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        for wake in &self.cancel_wakes {
+            wake.notify_waiters();
+        }
+    }
+
+    /// Signal shutdown and join every driver-owned task. This is the
+    /// lifecycle boundary for callers that hold the shared driver handle;
+    /// dropping the handle remains a non-blocking signal-only compatibility
+    /// operation. The task list is consumed exactly once, so concurrent
+    /// shutdown callers cannot double-join or lose ownership of a task.
+    pub async fn stop_and_join(&self) {
+        self.request_stop();
+        let tasks = self.tasks.lock().await.take().unwrap_or_default();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+
+    pub fn stop(&self) {
+        self.request_stop();
     }
 
     /// Clone of the force-reconnect signal. The engine stashes this
@@ -426,11 +474,7 @@ impl NostrDriverHandle {
 
 impl Drop for NostrDriverHandle {
     fn drop(&mut self) {
-        let _ = self.shutdown.send(true);
-        self.delivery.shutdown();
-        for c in &self.cancellers {
-            c.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.request_stop();
     }
 }
 
@@ -552,11 +596,50 @@ struct RelayHandle {
     connected: bool,
 }
 
+struct RelaySessionCancellation<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    wake: &'a Notify,
+}
+
+#[derive(Debug)]
+enum RelayWriteOutcome {
+    Cancelled,
+    Failed(String),
+}
+
+async fn send_relay_frame<S>(
+    write: &mut S,
+    frame: WsMessage,
+    cancellation: &RelaySessionCancellation<'_>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<(), RelayWriteOutcome>
+where
+    S: Sink<WsMessage> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let cancel_notified = cancellation.wake.notified();
+    tokio::pin!(cancel_notified);
+    cancel_notified.as_mut().enable();
+    if cancellation.flag.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
+        return Err(RelayWriteOutcome::Cancelled);
+    }
+    tokio::select! {
+        result = write.send(frame) => result
+            .map_err(|error| RelayWriteOutcome::Failed(error.to_string())),
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            Err(RelayWriteOutcome::Cancelled)
+        }
+        _ = &mut cancel_notified => Err(RelayWriteOutcome::Cancelled),
+    }
+}
+
 async fn run_relay(
     url: String,
     shared: Arc<DriverShared>,
     inbound_tx: InboundSink<NostrInbound>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel_wake: Arc<Notify>,
     live: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) {
     let mut backoff_attempt = 0u32;
@@ -566,6 +649,10 @@ async fn run_relay(
     let mut force_rx = shared.force_reconnect.subscribe();
     force_rx.borrow_and_update();
     let mut shutdown_rx = shared.shutdown.subscribe();
+    let cancellation = RelaySessionCancellation {
+        flag: cancel.as_ref(),
+        wake: cancel_wake.as_ref(),
+    };
     // Tracks consecutive connect failures so we can dampen the log
     // spam from chronically-broken public relays (DNS no-such-host,
     // 403s, TLS handshake timeouts). Without this, a single bad
@@ -580,7 +667,17 @@ async fn run_relay(
         if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
-        match tokio_tungstenite::connect_async(&url).await {
+        let cancel_notified = cancel_wake.notified();
+        let connect = tokio::select! {
+            result = tokio_tungstenite::connect_async_with_config(
+                &url,
+                Some(websocket_config()),
+                false,
+            ) => result,
+            _ = shutdown_rx.changed() => return,
+            _ = cancel_notified => return,
+        };
+        match connect {
             Ok((stream, _)) => {
                 if consecutive_failures > 0 {
                     info!(
@@ -610,58 +707,58 @@ async fn run_relay(
                     if let Some(c) = &live {
                         c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                     }
-                    continue;
-                }
-                // Tell the engine a relay is freshly up only after this exact
-                // session has provider custody. An incomplete profile must
-                // not advertise readiness or enter the receive loop.
-                shared
-                    .relay_connected
-                    .send_modify(|g| *g = g.checked_add(1).unwrap_or(u64::MAX));
-                for refusal in refused {
-                    warn!(
-                        relay = %short(&url),
-                        attempt = %refusal.attempt,
-                        event_id = %refusal.event_id,
-                        ?refusal.refusal,
-                        "relay-session delivery refused by provider"
-                    );
-                    shared.refusal_sink.refused(refusal);
-                }
-                let outcome = run_relay_session(
-                    &url,
-                    stream,
-                    &shared,
-                    &inbound_tx,
-                    &cancel,
-                    &mut force_rx,
-                    &session,
-                )
-                .await;
-                // The store removes only this relay's custody. Its
-                // per-event carrier aggregate decides whether the resulting
-                // carrier observation is new, order-independent, and
-                // reconnect-scoped before notifying the consumer.
-                shared
-                    .delivery
-                    .close_session(session, DeliveryTerminal::Cancelled);
-                if let Some(c) = &live {
-                    c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
-                if matches!(outcome, RelaySessionOutcome::ConsumerClosed) {
-                    let _ = shared.shutdown.send(true);
-                    cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-                if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
-                    // Engine asked us to redial now (e.g. resume from
-                    // sleep). Skip the backoff entirely and reconnect on
-                    // the next loop turn so a fresh socket — and the
-                    // open-announce it sends — lands immediately.
-                    debug!(relay = %short(&url), "forced reconnect — redialing now");
-                    backoff_attempt = 0;
-                    continue;
+                } else {
+                    // Tell the engine a relay is freshly up only after this exact
+                    // session has provider custody. An incomplete profile must
+                    // not advertise readiness or enter the receive loop.
+                    shared
+                        .relay_connected
+                        .send_modify(|g| *g = g.checked_add(1).unwrap_or(u64::MAX));
+                    for refusal in refused {
+                        warn!(
+                            relay = %short(&url),
+                            attempt = %refusal.attempt,
+                            event_id = %refusal.event_id,
+                            ?refusal.refusal,
+                            "relay-session delivery refused by provider"
+                        );
+                        shared.refusal_sink.refused(refusal);
+                    }
+                    let outcome = run_relay_session(
+                        &url,
+                        stream,
+                        &shared,
+                        &inbound_tx,
+                        &cancellation,
+                        &mut force_rx,
+                        &session,
+                    )
+                    .await;
+                    // The store removes only this relay's custody. Its
+                    // per-event carrier aggregate decides whether the resulting
+                    // carrier observation is new, order-independent, and
+                    // reconnect-scoped before notifying the consumer.
+                    shared
+                        .delivery
+                        .close_session(session, DeliveryTerminal::Cancelled);
+                    if let Some(c) = &live {
+                        c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    trace!(relay = %short(&url), outcome = ?outcome, "relay session ended");
+                    if matches!(outcome, RelaySessionOutcome::ConsumerClosed) {
+                        let _ = shared.shutdown.send(true);
+                        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                    if matches!(outcome, RelaySessionOutcome::ForcedReconnect) {
+                        // Engine asked us to redial now (e.g. resume from
+                        // sleep). Skip the backoff entirely and reconnect on
+                        // the next loop turn so a fresh socket — and the
+                        // open-announce it sends — lands immediately.
+                        debug!(relay = %short(&url), "forced reconnect — redialing now");
+                        backoff_attempt = 0;
+                        continue;
+                    }
                 }
             }
             Err(e) => {
@@ -698,6 +795,7 @@ async fn run_relay(
                 backoff_attempt = 0;
             }
             _ = shutdown_rx.changed() => return,
+            _ = cancel_wake.notified() => return,
         }
     }
 }
@@ -749,20 +847,31 @@ async fn run_fallback_supervisor(
     shared: Arc<DriverShared>,
     inbound_tx: InboundSink<NostrInbound>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel_wake: Arc<Notify>,
     primary_live: Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use std::sync::atomic::Ordering::SeqCst;
     use std::time::Instant;
 
-    // Cancel tokens for the fallback relay tasks currently running.
-    let mut active: Vec<Arc<std::sync::atomic::AtomicBool>> = Vec::new();
+    // Cancel tokens and join handles for the fallback relay tasks currently
+    // running. The supervisor owns both halves so standing down cannot leave
+    // a detached relay task retaining provider custody.
+    let mut active: Vec<(
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<Notify>,
+        tokio::task::JoinHandle<()>,
+    )> = Vec::new();
     let mut down_since: Option<Instant> = None;
     let mut shutdown_rx = shared.shutdown.subscribe();
 
     loop {
         if cancel.load(SeqCst) || *shutdown_rx.borrow() {
-            for c in &active {
+            for (c, wake, _) in &active {
                 c.store(true, SeqCst);
+                wake.notify_waiters();
+            }
+            while let Some((_, _, task)) = active.pop() {
+                let _ = task.await;
             }
             return;
         }
@@ -785,21 +894,35 @@ async fn run_fallback_supervisor(
                 );
                 for url in &urls {
                     let task_cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    active.push(task_cancel.clone());
+                    let task_cancel_for_task = task_cancel.clone();
+                    let task_wake = Arc::new(Notify::new());
+                    let task_wake_for_task = task_wake.clone();
                     let shared = shared.clone();
                     let inbound_tx = inbound_tx.clone();
                     let url = url.clone();
-                    tokio::spawn(async move {
-                        run_relay(url, shared, inbound_tx, task_cancel, None).await;
+                    let task = tokio::spawn(async move {
+                        run_relay(
+                            url,
+                            shared,
+                            inbound_tx,
+                            task_cancel_for_task,
+                            task_wake_for_task,
+                            None,
+                        )
+                        .await;
                     });
+                    active.push((task_cancel, task_wake, task));
                 }
             }
             FallbackAction::StandDown => {
                 info!("primary signaling recovered — standing down public fallback relays");
-                for c in &active {
+                for (c, wake, _) in &active {
                     c.store(true, SeqCst);
+                    wake.notify_waiters();
                 }
-                active.clear();
+                while let Some((_, _, task)) = active.pop() {
+                    let _ = task.await;
+                }
             }
             FallbackAction::Hold => {}
         }
@@ -807,8 +930,13 @@ async fn run_fallback_supervisor(
         tokio::select! {
             _ = sleep(Duration::from_millis(FALLBACK_POLL_MS)) => {}
             _ = shutdown_rx.changed() => {
-                for c in &active {
+                for (c, wake, _) in &active {
                     c.store(true, SeqCst);
+                    wake.notify_waiters();
+                }
+                cancel_wake.notify_waiters();
+                while let Some((_, _, task)) = active.pop() {
+                    let _ = task.await;
                 }
                 return;
             }
@@ -830,20 +958,17 @@ enum RelaySessionOutcome {
     ConsumerClosed,
 }
 
-/// How often the relay read loop wakes on an otherwise-idle socket to
-/// re-check the cancel flag. The loop wakes immediately on any inbound
-/// frame or outbound publish; this bounds how long a *stopped* driver
-/// (handle dropped / `stop()`) holds an idle socket open before it tears
-/// it down — which is what lets an intelligent relay emit our `leave`
-/// promptly rather than waiting on its own connection timeout.
-const RELAY_CANCEL_POLL_MS: u64 = 250;
-
+/// The relay read loop listens to the driver-owned cancellation signal, so a
+/// stopped driver tears down an otherwise-idle socket without a cancellation
+/// poll and wakes immediately for inbound frames and outbound work.
 async fn send_pending_deliveries<S>(
     url: &str,
     write: &mut S,
     delivery: &Arc<DeliveryStore>,
     session: &RelaySessionId,
-) -> Result<(), String>
+    cancellation: &RelaySessionCancellation<'_>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<(), RelayWriteOutcome>
 where
     S: Sink<WsMessage> + Unpin,
     S::Error: std::fmt::Display,
@@ -851,19 +976,23 @@ where
     // Admission has already funded the attempt record and this exact relay
     // entry. Each loop iteration emits one frame for one funded relay; it
     // never re-admits or acquires a second provider lease for the emission.
-    for event_id in delivery.pending(session) {
+    while let Some(event_id) = delivery.next_pending(session) {
         let Some(frame) = delivery.with_event(&event_id, |event| {
             serde_json::json!(["EVENT", event]).to_string()
         }) else {
             continue;
         };
-        if let Err(error) = write.send(WsMessage::Text(frame)).await {
-            delivery.settle(
-                session,
-                &event_id,
-                DeliveryTerminal::TypedRefused(format!("local write: {error}")),
-            );
-            return Err(format!("send publish: {error}"));
+        match send_relay_frame(write, WsMessage::Text(frame), cancellation, shutdown_rx).await {
+            Ok(()) => {}
+            Err(RelayWriteOutcome::Cancelled) => return Err(RelayWriteOutcome::Cancelled),
+            Err(RelayWriteOutcome::Failed(error)) => {
+                delivery.settle(
+                    session,
+                    &event_id,
+                    DeliveryTerminal::TypedRefused(format!("local write: {error}")),
+                );
+                return Err(RelayWriteOutcome::Failed(format!("send publish: {error}")));
+            }
         }
     }
     let _ = url;
@@ -880,7 +1009,9 @@ async fn prepare_relay_delivery<'a, S>(
     shared: &DriverShared,
     delivery: &'a Arc<DeliveryStore>,
     session: &RelaySessionId,
-) -> Result<Pin<Box<tokio::sync::futures::Notified<'a>>>, String>
+    cancellation: &RelaySessionCancellation<'_>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Result<Pin<Box<tokio::sync::futures::Notified<'a>>>, RelayWriteOutcome>
 where
     S: Sink<WsMessage> + Unpin,
     S::Error: std::fmt::Display,
@@ -888,14 +1019,34 @@ where
     let mut delivery_notified = Box::pin(delivery.notification().notified());
     delivery_notified.as_mut().enable();
 
-    send_pending_deliveries(url, write, delivery, session).await?;
+    send_pending_deliveries(url, write, delivery, session, cancellation, shutdown_rx).await?;
 
-    let event = build_announce_event(shared);
-    let frame = serde_json::json!(["EVENT", event]).to_string();
-    write
-        .send(WsMessage::Text(frame))
-        .await
-        .map_err(|error| format!("send open-announce: {error}"))?;
+    // Clone the watch value before branching so its read guard is dropped
+    // before the empty branch calls `Sender::send` below.
+    let current_presence = shared.presence_tx.borrow().clone();
+    let event = if let Some(event) = current_presence {
+        event
+    } else {
+        let event = shared
+            .delivery
+            .admit_presence(build_announce_event(shared))
+            .map_err(|error| {
+                RelayWriteOutcome::Failed(format!("presence admission refused: {error:?}"))
+            })?;
+        let event = Arc::new(event);
+        let _ = shared.presence_tx.send(Some(event.clone()));
+        event
+    };
+    let frame = serde_json::json!(["EVENT", event.value()]).to_string();
+    match send_relay_frame(write, WsMessage::Text(frame), cancellation, shutdown_rx).await {
+        Ok(()) => {}
+        Err(RelayWriteOutcome::Cancelled) => return Err(RelayWriteOutcome::Cancelled),
+        Err(RelayWriteOutcome::Failed(error)) => {
+            return Err(RelayWriteOutcome::Failed(format!(
+                "send open-announce: {error}"
+            )));
+        }
+    }
 
     Ok(delivery_notified)
 }
@@ -907,11 +1058,12 @@ async fn run_relay_session(
     >,
     shared: &Arc<DriverShared>,
     inbound_tx: &InboundSink<NostrInbound>,
-    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    cancellation: &RelaySessionCancellation<'_>,
     force_rx: &mut watch::Receiver<u64>,
     session: &RelaySessionId,
 ) -> RelaySessionOutcome {
     let (mut write, mut read) = stream.split();
+    let mut shutdown_rx = shared.shutdown.subscribe();
 
     // Open the room subscription — one REQ, several filters (see
     // `desired_filters`):
@@ -926,8 +1078,19 @@ async fn run_relay_session(
     let sub_id = "mom-sig-1";
     let req_text = build_req(shared, sub_id);
 
-    if let Err(e) = write.send(WsMessage::Text(req_text)).await {
-        return RelaySessionOutcome::Error(format!("send REQ: {e}"));
+    match send_relay_frame(
+        &mut write,
+        WsMessage::Text(req_text),
+        cancellation,
+        &mut shutdown_rx,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(RelayWriteOutcome::Cancelled) => return RelaySessionOutcome::Cancelled,
+        Err(RelayWriteOutcome::Failed(error)) => {
+            return RelaySessionOutcome::Error(format!("send REQ: {error}"));
+        }
     }
 
     // Subscribe to the driver-owned presence watch for this socket.
@@ -935,15 +1098,24 @@ async fn run_relay_session(
     // per driver instance, not one per relay — so the per-cycle
     // publish rate doesn't scale with relay count.
     let mut presence_rx = shared.presence_tx.subscribe();
-    let mut delivery_notified =
-        match prepare_relay_delivery(url, &mut write, shared, &shared.delivery, session).await {
-            Ok(notification) => notification,
-            Err(error) => return RelaySessionOutcome::Error(error),
-        };
-    let mut shutdown_rx = shared.shutdown.subscribe();
+    let mut delivery_notified = match prepare_relay_delivery(
+        url,
+        &mut write,
+        shared,
+        &shared.delivery,
+        session,
+        cancellation,
+        &mut shutdown_rx,
+    )
+    .await
+    {
+        Ok(notification) => notification,
+        Err(RelayWriteOutcome::Cancelled) => return RelaySessionOutcome::Cancelled,
+        Err(RelayWriteOutcome::Failed(error)) => return RelaySessionOutcome::Error(error),
+    };
 
     loop {
-        if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
+        if cancellation.flag.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             // Best-effort clean close so the relay sees our departure
             // immediately (a Close frame, falling back to the TCP FIN
             // from dropping the stream). Bounded so a wedged socket
@@ -951,15 +1123,22 @@ async fn run_relay_session(
             let _ = tokio::time::timeout(std::time::Duration::from_secs(1), write.close()).await;
             return RelaySessionOutcome::Cancelled;
         }
+        let cancel_notified = cancellation.wake.notified();
         tokio::select! {
             msg = read.next() => {
                 let Some(msg) = msg else { return RelaySessionOutcome::SocketClosed };
                 let frame = match msg {
                     Ok(WsMessage::Text(t)) => t,
-                    Ok(WsMessage::Binary(b)) => match std::str::from_utf8(&b) {
+                    Ok(WsMessage::Binary(b)) => {
+                        if !binary_frame_within_limit(&b) {
+                            trace!(relay = %short(url), "dropping oversized binary frame");
+                            continue;
+                        }
+                        match std::str::from_utf8(&b) {
                         Ok(s) => s.to_string(),
                         Err(_) => continue,
-                    },
+                        }
+                    }
                     Ok(WsMessage::Close(_)) => return RelaySessionOutcome::SocketClosed,
                     Ok(_) => continue,
                     Err(e) => return RelaySessionOutcome::Error(format!("ws read: {e}")),
@@ -976,10 +1155,20 @@ async fn run_relay_session(
                 // observed by the next select turn as well.
                 delivery_notified = Box::pin(shared.delivery.notification().notified());
                 delivery_notified.as_mut().enable();
-                if let Err(error) =
-                    send_pending_deliveries(url, &mut write, &shared.delivery, session).await
+                if let Err(error) = send_pending_deliveries(
+                    url,
+                    &mut write,
+                    &shared.delivery,
+                    session,
+                    cancellation,
+                    &mut shutdown_rx,
+                )
+                .await
                 {
-                    return RelaySessionOutcome::Error(error);
+                    return match error {
+                        RelayWriteOutcome::Cancelled => RelaySessionOutcome::Cancelled,
+                        RelayWriteOutcome::Failed(error) => RelaySessionOutcome::Error(error),
+                    };
                 }
             }
             changed = presence_rx.changed() => {
@@ -989,8 +1178,21 @@ async fn run_relay_session(
                 let event = presence_rx.borrow().clone();
                 if let Some(event) = event {
                     let frame = serde_json::json!(["EVENT", event.value()]).to_string();
-                    if let Err(e) = write.send(WsMessage::Text(frame)).await {
-                        return RelaySessionOutcome::Error(format!("send presence: {e}"));
+                    match send_relay_frame(
+                        &mut write,
+                        WsMessage::Text(frame),
+                        cancellation,
+                        &mut shutdown_rx,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(RelayWriteOutcome::Cancelled) => {
+                            return RelaySessionOutcome::Cancelled;
+                        }
+                        Err(RelayWriteOutcome::Failed(error)) => {
+                            return RelaySessionOutcome::Error(format!("send presence: {error}"));
+                        }
                     }
                     // The relay socket has synchronously accepted the frame;
                     // commit the exact retained watch record now.
@@ -1010,13 +1212,9 @@ async fn run_relay_session(
             _ = shutdown_rx.changed() => {
                 return RelaySessionOutcome::Cancelled;
             }
-            // Idle-wake so a stopped/dropped handle is noticed within one
-            // poll interval even on a quiet socket. Without this, a
-            // `read.next()` parked on an idle connection could hold the
-            // socket open long after `stop()`, delaying the relay's
-            // departure signal. Normal traffic wakes the loop sooner via
-            // the branches above; this only bites when nothing is moving.
-            _ = tokio::time::sleep(std::time::Duration::from_millis(RELAY_CANCEL_POLL_MS)) => {}
+            _ = cancel_notified => {
+                return RelaySessionOutcome::Cancelled;
+            }
         }
     }
 }
@@ -1036,10 +1234,20 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
-        let event = OwnedSignal::new(build_announce_event(&shared), Box::new(()) as ErasedOwner);
-        // Each connected relay observes this latest best-effort presence
-        // value independently; negotiation never enters this path.
-        let _ = shared.presence_tx.send(Some(Arc::new(event)));
+        match shared
+            .delivery
+            .admit_presence(build_announce_event(&shared))
+        {
+            Ok(event) => {
+                // Each connected relay observes this latest best-effort
+                // presence value independently; negotiation never enters this
+                // path. The provider lease travels with the watch record.
+                let _ = shared.presence_tx.send(Some(Arc::new(event)));
+            }
+            Err(error) => {
+                warn!(?error, "presence publication refused before encoding");
+            }
+        }
 
         let base_ms = ANNOUNCE_BACKOFF_MS
             .get(count)
@@ -1084,9 +1292,15 @@ fn handle_inbound_frame(
     inbound_tx: &InboundSink<NostrInbound>,
     session: RelaySessionId,
 ) -> Result<(), String> {
-    if frame.len() > 256 * 1024 {
+    if frame.len() > MAX_INBOUND_FRAME_BYTES {
         return Err("inbound frame exceeds size cap".to_string());
     }
+    let _parse_lease = InboundFrameLease(Some(
+        shared
+            .delivery
+            .reserve_inbound_frame(frame.len())
+            .map_err(|error| format!("inbound frame refused before parse: {error:?}"))?,
+    ));
     let value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
     let arr = value.as_array().ok_or_else(|| "not an array".to_string())?;
     let tag = arr.first().and_then(|v| v.as_str()).unwrap_or("");
@@ -1399,6 +1613,7 @@ fn short(url: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nostr::delivery::UnmeteredDeliveryProvider;
     use crate::nostr::event::NostrIdentity;
     use crate::OwnedSignal;
     use futures::task::{Context, Poll};
@@ -1503,6 +1718,35 @@ mod tests {
         assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
     }
 
+    #[test]
+    fn websocket_limits_bound_text_binary_and_fragmented_messages() {
+        let config = websocket_config();
+        assert_eq!(config.max_message_size, Some(MAX_INBOUND_FRAME_BYTES));
+        assert_eq!(config.max_frame_size, Some(MAX_INBOUND_FRAME_BYTES));
+        assert!(config.max_write_buffer_size <= MAX_INBOUND_FRAME_BYTES * 2);
+        assert!(!binary_frame_within_limit(&vec![
+            0;
+            MAX_INBOUND_FRAME_BYTES + 1
+        ]));
+
+        // The frame limit is applied by tungstenite before it assembles a
+        // fragmented message, while the direct parser guard covers text
+        // values that reach this layer through another transport seam.
+        let shared = fixture_shared();
+        let (tx, _rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
+        let oversized = "x".repeat(MAX_INBOUND_FRAME_BYTES + 1);
+        let error = handle_inbound_frame(
+            "wss://oversized",
+            &oversized,
+            &shared,
+            &tx,
+            RelaySessionId::fresh(),
+        )
+        .expect_err("oversized text is rejected before parsing");
+        assert_eq!(error, "inbound frame exceeds size cap");
+    }
+
     #[tokio::test]
     async fn prearmed_delivery_survives_open_announcement_scan_wait_gap() {
         let shared = fixture_shared();
@@ -1517,6 +1761,13 @@ mod tests {
             frames: Vec::new(),
             gate: Arc::clone(&gate),
         };
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
         // Drive the exact production pre-arm -> initial scan -> open-write
         // helper, parking its open write before it enters the select loop.
@@ -1526,6 +1777,8 @@ mod tests {
             &shared,
             &shared.delivery,
             &session,
+            &cancellation,
+            &mut shutdown_rx,
         ));
         let parked_wait = gate.parked.notified();
         tokio::select! {
@@ -1554,9 +1807,16 @@ mod tests {
         gate.release();
         let delivery_notified = preparation.await.expect("open write gate settles");
         delivery_notified.await;
-        send_pending_deliveries("wss://relay-gap", &mut sink, &shared.delivery, &session)
-            .await
-            .expect("same relay sends the admitted event");
+        send_pending_deliveries(
+            "wss://relay-gap",
+            &mut sink,
+            &shared.delivery,
+            &session,
+            &cancellation,
+            &mut shutdown_rx,
+        )
+        .await
+        .expect("same relay sends the admitted event");
 
         assert_eq!(sink.frames.len(), 2, "open announcement plus one EVENT");
         let frames = sink
@@ -1588,6 +1848,87 @@ mod tests {
                 .count(),
             1,
             "exactly one open announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relay_write_cancels_when_shutdown_is_signaled() {
+        let gate = Arc::new(ParkedWriteGate {
+            parked: tokio::sync::Notify::new(),
+            waker: Mutex::new(None),
+            announced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let mut sink = ParkedSink {
+            frames: Vec::new(),
+            gate: Arc::clone(&gate),
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let parked_wait = gate.parked.notified();
+        let mut write = Box::pin(send_relay_frame(
+            &mut sink,
+            WsMessage::Text("pending".into()),
+            &cancellation,
+            &mut shutdown_rx,
+        ));
+        tokio::select! {
+            result = &mut write => panic!("write completed before shutdown: {result:?}"),
+            _ = parked_wait => {}
+        }
+
+        shutdown_tx
+            .send(true)
+            .expect("shutdown receiver remains live");
+        assert!(matches!(write.await, Err(RelayWriteOutcome::Cancelled)));
+        assert!(
+            sink.frames.is_empty(),
+            "cancelled write must not emit a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relay_write_cancels_on_task_notify_without_shutdown_watch() {
+        let gate = Arc::new(ParkedWriteGate {
+            parked: tokio::sync::Notify::new(),
+            waker: Mutex::new(None),
+            announced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        });
+        let mut sink = ParkedSink {
+            frames: Vec::new(),
+            gate: Arc::clone(&gate),
+        };
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let parked_wait = gate.parked.notified();
+        let mut write = Box::pin(send_relay_frame(
+            &mut sink,
+            WsMessage::Text("pending".into()),
+            &cancellation,
+            &mut shutdown_rx,
+        ));
+        tokio::select! {
+            result = &mut write => panic!("write completed before task cancellation: {result:?}"),
+            _ = parked_wait => {}
+        }
+
+        cancel.store(true, Ordering::SeqCst);
+        cancel_wake.notify_waiters();
+        assert!(matches!(write.await, Err(RelayWriteOutcome::Cancelled)));
+        assert!(
+            sink.frames.is_empty(),
+            "cancelled write must not emit a frame"
         );
     }
 

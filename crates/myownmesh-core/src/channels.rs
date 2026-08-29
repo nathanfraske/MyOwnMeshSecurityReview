@@ -182,7 +182,11 @@ where
     /// [`crate::JoinedNetwork::channel`] instead — this is the
     /// raw constructor for advanced callers that hold the
     /// engine state directly (e.g. integration tests).
-    pub fn new(name: String, network: Arc<NetworkState>) -> Self {
+    pub(crate) fn new(name: String, network: Arc<NetworkState>) -> Self {
+        Self::new_inner(name, network)
+    }
+
+    fn new_inner(name: String, network: Arc<NetworkState>) -> Self {
         Self {
             name: Arc::new(name),
             network,

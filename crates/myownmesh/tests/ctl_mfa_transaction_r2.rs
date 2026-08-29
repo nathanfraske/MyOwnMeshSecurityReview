@@ -86,38 +86,6 @@ fn response(output: Output, what: &str) -> Value {
     })
 }
 
-fn enroll_documents(output: Output, what: &str) -> (Value, Value) {
-    assert!(
-        output.status.success(),
-        "{what} failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let documents = serde_json::Deserializer::from_slice(&output.stdout)
-        .into_iter::<Value>()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|error| {
-            panic!(
-                "{what} did not print valid JSON documents: {error}; stdout={}",
-                String::from_utf8_lossy(&output.stdout)
-            )
-        });
-    assert_eq!(
-        documents.len(),
-        2,
-        "{what} must print exactly enrollment material and its committed transaction"
-    );
-    let mut documents = documents.into_iter();
-    (
-        documents
-            .next()
-            .expect("enrollment material document exists"),
-        documents
-            .next()
-            .expect("committed transaction document exists"),
-    )
-}
-
 fn transaction_data<'a>(value: &'a Value, _what: &str) -> &'a Value {
     value
 }
@@ -413,8 +381,9 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
     let restart_otpauth = oracle.enrolled().otpauth_uri.clone();
     let restart_recovery_codes = oracle.enrolled().recovery_codes.clone();
 
-    // Restart without the lab hook. The shipped Enroll command receives only
-    // N and must recover the exact durable transaction and material.
+    // Restart without the lab hook. The recovery-aware Prepare command
+    // receives only N and must recover the exact durable transaction and
+    // material; Commit remains a separate explicit client decision.
     let mut recovered_daemon = tokio::process::Command::new(env!("CARGO_BIN_EXE_myownmesh"))
         .arg("serve")
         .env("MYOWNMESH_HOME", home.path())
@@ -426,9 +395,9 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         .expect("spawn the restarted shipped daemon");
     wait_for_socket(&socket).await;
 
-    let (recovered_material, recovered_commit) = enroll_documents(
-        run_ctl(home.path(), &["enroll", restart_network]).await,
-        "ctl mfa enroll after daemon restart",
+    let recovered_material = response(
+        run_ctl(home.path(), &["prepare", restart_network]).await,
+        "ctl mfa prepare after daemon restart",
     );
     assert_eq!(
         field(
@@ -466,6 +435,14 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>()
+    );
+    let recovered_commit = response(
+        run_ctl(
+            home.path(),
+            &["commit", restart_network, &restart_transaction],
+        )
+        .await,
+        "ctl mfa commit after daemon restart",
     );
     assert_eq!(
         field(
@@ -819,13 +796,13 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         "absent"
     );
 
-    // Enroll is the shipped one-roundtrip user experience: it must explicitly
-    // settle its exact prepared transaction before reporting success. The
-    // follow-up query proves the returned material was not merely Prepared.
+    // Prepare returns material, and only the explicit Commit command settles
+    // its exact transaction. The follow-up query proves the result is not
+    // merely Prepared.
     let enroll_network = "ctl-r2-explicit-enroll";
-    let (enrollment_material, enrolled) = enroll_documents(
-        run_ctl(home.path(), &["enroll", enroll_network]).await,
-        "ctl mfa enroll",
+    let enrollment_material = response(
+        run_ctl(home.path(), &["prepare", enroll_network]).await,
+        "ctl mfa prepare for explicit commit",
     );
     let enroll_transaction = field(
         &enrollment_material,
@@ -846,16 +823,20 @@ async fn shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_
         .and_then(Value::as_array)
         .expect("ctl mfa enroll material has recovery codes")
         .is_empty());
+    let enrolled = response(
+        run_ctl(home.path(), &["commit", enroll_network, enroll_transaction]).await,
+        "ctl mfa explicit commit",
+    );
     assert_eq!(
-        field(&enrolled, "network", "ctl mfa enroll committed"),
+        field(&enrolled, "network", "ctl mfa explicit commit"),
         enroll_network
     );
     assert_eq!(
-        field(&enrolled, "transaction_id", "ctl mfa enroll committed"),
+        field(&enrolled, "transaction_id", "ctl mfa explicit commit"),
         enroll_transaction
     );
     assert_eq!(
-        field(&enrolled, "state", "ctl mfa enroll committed"),
+        field(&enrolled, "state", "ctl mfa explicit commit"),
         "committed"
     );
     assert!(enrolled.get("secret").is_none());

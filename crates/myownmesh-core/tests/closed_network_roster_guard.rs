@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! Regression controls for canonical roster membership authority.
 //!
 //! `RosterEntries` is carrier material, not an authority-bearing fact. The
@@ -16,8 +18,9 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{
-    create_network_in_instance_root, governance, spawn_network_in_instance_root, NetworkState,
+use myownmesh_core::engine::governance;
+use myownmesh_core::engine::transport_lab::{
+    create_network_in_instance_root, spawn_network_in_instance_root, NetworkState,
 };
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};

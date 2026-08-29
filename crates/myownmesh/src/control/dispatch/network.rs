@@ -91,8 +91,7 @@ pub(in crate::control) async fn network_add(
     // installed with no signaling and no explanation would look identical to
     // the benign case from every later request's point of view.
     let drivers = {
-        let net_state = joined.state();
-        match myownmesh_core::engine::attach_signaling(&net_state) {
+        match joined.attach_signaling() {
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
@@ -108,7 +107,9 @@ pub(in crate::control) async fn network_add(
     }
     if let Some(refused) = state.registry.insert(joined, drivers).into_refusal() {
         let refusal_state = refused.state;
-        drop(refused.drivers);
+        if let Some(drivers) = refused.drivers {
+            drivers.shutdown().await;
+        }
         let _ = refused.joined.shutdown().await;
         return owner.finish(Err(format!(
             "network id is held by a runtime in {refusal_state:?} state"
@@ -399,10 +400,7 @@ async fn rollback_old_network(state: &Arc<ControlState>, old_config: &NetworkCon
             return " — AND rollback failed; re-add it from the Networks tab".to_string();
         }
     };
-    let attached = {
-        let net_state = restored.state();
-        myownmesh_core::engine::attach_signaling(&net_state)
-    };
+    let attached = restored.attach_signaling();
     let drivers = match attached {
         Ok(drivers) => drivers,
         Err(error) => {
@@ -412,7 +410,9 @@ async fn rollback_old_network(state: &Arc<ControlState>, old_config: &NetworkCon
     };
     if let Some(refused) = state.registry.insert(restored, drivers).into_refusal() {
         let refusal_state = refused.state;
-        drop(refused.drivers);
+        if let Some(drivers) = refused.drivers {
+            drivers.shutdown().await;
+        }
         let _ = refused.joined.shutdown().await;
         return format!(
             " — rollback join was refused by a {refusal_state:?} runtime; config was not overwritten"
@@ -507,15 +507,7 @@ pub(in crate::control) async fn network_update(
 
     // Compare the incoming config against the engine's live config to
     // decide hot-apply vs. transport restart.
-    let net_state = joined.state();
-    let (needs_restart, signaling_changed, network_id_changed) = {
-        let current = net_state.config.read().clone();
-        (
-            myownmesh_core::engine::reconcile::requires_restart(&current, &config),
-            current.signaling != config.signaling,
-            current.network_id != config.network_id,
-        )
-    };
+    let (needs_restart, signaling_changed, network_id_changed) = joined.reconcile_status(&config);
     // Name the path taken so a config-driven flap is greppable: a hot-apply
     // keeps every live peer; a restart drops them. Only network_id/signaling
     // force the restart now (STUN/TURN are hot — see `reconcile`).
@@ -538,8 +530,7 @@ pub(in crate::control) async fn network_update(
                 .registry
                 .with_current(&config.id, &joined, |current| -> Result<()> {
                     persist_network_update(&config)?;
-                    let current_state = current.state();
-                    myownmesh_core::engine::reconcile::apply_hot(&current_state, config.clone())?;
+                    current.apply_hot(config.clone())?;
                     Ok(())
                 });
         let hot_result = match hot_result {
@@ -549,11 +540,7 @@ pub(in crate::control) async fn network_update(
                     .registry
                     .with_current(&config.network_id, &joined, |current| -> Result<()> {
                         persist_network_update(&config)?;
-                        let current_state = current.state();
-                        myownmesh_core::engine::reconcile::apply_hot(
-                            &current_state,
-                            config.clone(),
-                        )?;
+                        current.apply_hot(config.clone())?;
                         Ok(())
                     })
             }
@@ -569,7 +556,6 @@ pub(in crate::control) async fn network_update(
             }
             Some(Ok(())) => {}
         }
-        drop(net_state);
         drop(joined);
         return owner.finish(Ok(OperationReplyData::UpdatedId {
             id: config.id,
@@ -584,14 +570,13 @@ pub(in crate::control) async fn network_update(
     // survives on disk regardless, but a vanished network with no
     // recovery surface is a footgun. Then release our Arc clones so the
     // registry can begin its single owned teardown.
-    let old_config = net_state.config.read().clone();
+    let old_config = joined.config_snapshot();
     // Start the authenticated departure and teardown together so teardown can
     // cancel a silent peer's DepartObserved waiter. The carrier hint remains
     // part of the departure future.
     let departure = joined.announce_leave();
     let removal = state.registry.remove(&old_config.id);
     let (_, removal) = tokio::join!(departure, removal);
-    drop(net_state);
     drop(joined);
 
     match removal {
@@ -639,8 +624,7 @@ pub(in crate::control) async fn network_update(
         restarted: true,
     };
     let drivers = {
-        let net_state = joined.state();
-        match myownmesh_core::engine::attach_signaling(&net_state) {
+        match joined.attach_signaling() {
             Ok(drivers) => drivers,
             Err(error) => {
                 let _ = joined.shutdown().await;
@@ -660,7 +644,9 @@ pub(in crate::control) async fn network_update(
     }
     if let Some(refused) = state.registry.insert(joined, drivers).into_refusal() {
         let refusal_state = refused.state;
-        drop(refused.drivers);
+        if let Some(drivers) = refused.drivers {
+            drivers.shutdown().await;
+        }
         let _ = refused.joined.shutdown().await;
         let rollback = rollback_old_network(state, &old_config).await;
         return owner.finish(Err(format!(

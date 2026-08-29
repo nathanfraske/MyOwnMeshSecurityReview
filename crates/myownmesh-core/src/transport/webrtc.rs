@@ -29,7 +29,7 @@ use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sha2::{Digest, Sha256};
-#[cfg(any(test, feature = "transport-lab"))]
+#[cfg(test)]
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::Semaphore;
@@ -2394,17 +2394,14 @@ impl TransportEventReceiver {
         }
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
-    async fn recv_queued(&mut self) -> Option<QueuedTransportEvent> {
-        self.recv_queued_filtered(true).await
-    }
-
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     pub async fn recv(&mut self) -> Option<TransportEvent> {
-        self.recv_queued().await.map(|queued| queued.event)
+        self.recv_queued_filtered(true)
+            .await
+            .map(|queued| queued.event)
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     pub fn try_recv(&mut self) -> std::result::Result<TransportEvent, mpsc::error::TryRecvError> {
         if let Some(queued) = self.try_scheduled_filtered(true) {
             return Ok(queued.event);
@@ -6325,7 +6322,7 @@ impl Transport {
     /// installs all webrtc callbacks; events flow out the returned
     /// receiver until the session is dropped.
     #[cfg(any(test, feature = "transport-lab"))]
-    pub async fn open_peer(
+    pub(crate) async fn open_peer(
         &self,
         role: Role,
         stun: &[crate::config::StunServer],
@@ -6490,7 +6487,7 @@ impl Transport {
     /// `RTCConfiguration`. Tests can use this to short-circuit
     /// the user-config path.
     #[cfg(any(test, feature = "transport-lab"))]
-    pub async fn open_peer_with_config(
+    pub(crate) async fn open_peer_with_config(
         &self,
         role: Role,
         config: RTCConfiguration,

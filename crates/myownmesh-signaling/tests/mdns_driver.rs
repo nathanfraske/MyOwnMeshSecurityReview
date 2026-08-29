@@ -50,6 +50,132 @@ fn advertised_profile_excludes_other_room_and_recipient() {
     assert!(!frame_is_for_us(&frame, "room-a", "device-c"));
 }
 
+#[test]
+fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
+    use myownmesh_signaling::mdns::discovery::{
+        ResolveCompletion, ResolveHint, ResolveOwnership, MAX_RESOLVE_OWNERS,
+    };
+
+    let ownership = ResolveOwnership::new();
+    let first = match ownership.admit("service-a") {
+        ResolveHint::Started(lease) => lease,
+        other => panic!("first service hint was not admitted: {other:?}"),
+    };
+    assert_eq!(first.instance(), "service-a");
+    assert_eq!(ownership.active_count(), 1);
+    assert_eq!(ownership.pending_count(), 0);
+    assert!(matches!(
+        ownership.admit("service-a"),
+        ResolveHint::Coalesced
+    ));
+    assert!(matches!(
+        ownership.admit("service-a"),
+        ResolveHint::Coalesced
+    ));
+    assert_eq!(ownership.active_count(), 1);
+    assert_eq!(ownership.pending_count(), 1);
+
+    let followup = match first.complete() {
+        ResolveCompletion::Followup(lease) => lease,
+        ResolveCompletion::Finished => panic!("coalesced hint lost its follow-up"),
+    };
+    assert_eq!(ownership.active_count(), 1);
+    assert_eq!(ownership.pending_count(), 0);
+    assert!(matches!(followup.complete(), ResolveCompletion::Finished));
+    assert_eq!(ownership.active_count(), 0);
+
+    let mut leases = Vec::new();
+    for index in 0..MAX_RESOLVE_OWNERS {
+        match ownership.admit(format!("service-{index}")) {
+            ResolveHint::Started(lease) => leases.push(lease),
+            other => panic!("bounded service hint {index} was not admitted: {other:?}"),
+        }
+    }
+    assert_eq!(ownership.active_count(), MAX_RESOLVE_OWNERS);
+    assert!(matches!(
+        ownership.admit("service-over-capacity"),
+        ResolveHint::Refused
+    ));
+    ownership.shutdown();
+    assert_eq!(ownership.active_count(), 0);
+    assert_eq!(ownership.pending_count(), 0);
+    drop(leases);
+}
+
+#[test]
+fn discovery_hint_cancellation_fences_stale_service_instance_owners() {
+    use myownmesh_signaling::mdns::discovery::{ResolveHint, ResolveOwnership};
+
+    let ownership = ResolveOwnership::new();
+    let stale = match ownership.admit("service-replaced") {
+        ResolveHint::Started(lease) => lease,
+        other => panic!("stale service hint was not admitted: {other:?}"),
+    };
+    assert!(matches!(
+        ownership.admit("service-replaced"),
+        ResolveHint::Coalesced
+    ));
+    assert!(ownership.cancel("service-replaced"));
+    assert_eq!(ownership.active_count(), 0);
+    assert_eq!(ownership.pending_count(), 0);
+
+    let dropped = match ownership.admit("service-dropped") {
+        ResolveHint::Started(lease) => lease,
+        other => panic!("dropped service hint was not admitted: {other:?}"),
+    };
+    assert!(matches!(
+        ownership.admit("service-dropped"),
+        ResolveHint::Coalesced
+    ));
+    drop(dropped);
+    assert_eq!(ownership.active_count(), 0);
+    assert_eq!(ownership.pending_count(), 0);
+
+    let current = match ownership.admit("service-replaced") {
+        ResolveHint::Started(lease) => lease,
+        other => panic!("replacement service hint was not admitted: {other:?}"),
+    };
+    assert!(
+        !stale.cancel(),
+        "stale generation cancelled the replacement"
+    );
+    assert_eq!(ownership.active_count(), 1);
+
+    ownership.shutdown();
+    assert_eq!(ownership.active_count(), 0);
+    assert_eq!(ownership.pending_count(), 0);
+    assert!(!current.cancel(), "shutdown left a live resolve owner");
+}
+
+#[test]
+fn aliases_keep_a_peer_live_until_its_final_service_key_withdraws() {
+    use myownmesh_signaling::mdns::AliasOwnership;
+
+    let mut aliases = AliasOwnership::default();
+    assert_eq!(aliases.bind("if-a".into(), "peer-a".into()), None);
+    assert_eq!(aliases.bind("if-b".into(), "peer-a".into()), None);
+    assert_eq!(aliases.alias_count("peer-a"), 2);
+    assert_eq!(aliases.remove("if-a"), Some(("peer-a".into(), false)));
+    assert_eq!(aliases.alias_count("peer-a"), 1);
+    assert_eq!(aliases.remove("if-b"), Some(("peer-a".into(), true)));
+    assert_eq!(aliases.alias_count("peer-a"), 0);
+    assert_eq!(aliases.remove("if-b"), None);
+}
+
+#[test]
+fn alias_replacement_withdraws_only_the_displaced_final_owner() {
+    use myownmesh_signaling::mdns::AliasOwnership;
+
+    let mut aliases = AliasOwnership::default();
+    aliases.bind("shared".into(), "peer-old".into());
+    aliases.bind("other".into(), "peer-old".into());
+    assert_eq!(aliases.bind("shared".into(), "peer-new".into()), None);
+    assert_eq!(aliases.alias_count("peer-old"), 1);
+    assert_eq!(aliases.alias_count("peer-new"), 1);
+    assert_eq!(aliases.remove("other"), Some(("peer-old".into(), true)));
+    assert_eq!(aliases.remove("shared"), Some(("peer-new".into(), true)));
+}
+
 async fn wait_for_announce(
     rx: &mut mpsc::UnboundedReceiver<MdnsInbound>,
     expect_peer: &str,
@@ -147,6 +273,6 @@ async fn two_drivers_discover_and_exchange() {
     };
     assert_eq!(left, "device-b");
 
-    a.stop();
-    b.stop();
+    a.stop_and_join().await;
+    b.stop_and_join().await;
 }

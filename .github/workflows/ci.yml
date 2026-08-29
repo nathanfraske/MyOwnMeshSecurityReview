@@ -34,6 +34,11 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
@@ -57,6 +62,20 @@ jobs:
 
       - name: Shipped CLI transport-lab tests
         run: cargo test -p myownmesh --features "transport-lab" --no-fail-fast -- --test-threads=1
+
+      - name: Verify release feature boundary
+        run: python scripts/verify-release-artifact.py --workflow .github/workflows/release.yml --manifest crates/myownmesh/Cargo.toml
+
+      - name: Build native release daemon boundary
+        run: cargo build --release --no-default-features --bin myownmesh
+
+      - name: Scan native release daemon boundary
+        shell: bash
+        run: |
+          set -e
+          BIN=target/release/myownmesh
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          python scripts/verify-release-artifact.py --binary "$BIN"
 
   # Keep one focused Ubuntu invocation for each native path: a direct in-process
   # handshake, the same behaviour over a real TURN relay, and one ignored native
@@ -142,6 +161,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -157,4 +181,4 @@ jobs:
           cargo install cargo-zigbuild --locked
 
       - name: Cross-build daemon
-        run: cargo zigbuild --release --bin myownmesh --target ${{ matrix.target }}
+        run: cargo zigbuild --release --no-default-features --bin myownmesh --target ${{ matrix.target }}

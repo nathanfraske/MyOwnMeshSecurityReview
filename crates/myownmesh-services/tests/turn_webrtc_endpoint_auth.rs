@@ -8,12 +8,14 @@ use myownmesh_core::config::{
     TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, join_open_participation, spawn_network,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackPolicy,
+    transport_lab_remote_description_fixture_grant, ConnectorCallbackPolicy,
     FiniteResourceProvider, MeshEvent, PeerEvent, ResourceProviderPort,
     TransportLabCallbackWorkload, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
@@ -240,7 +242,9 @@ async fn wait_for_authenticated(
     .expect("endpoint authentication timed out");
 }
 
-async fn wait_for_reported_relay_pair(peers: [(&myownmesh_core::engine::NetworkState, &str); 2]) {
+async fn wait_for_reported_relay_pair(
+    peers: [(&myownmesh_core::engine::transport_lab::NetworkState, &str); 2],
+) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if peers.iter().any(|(state, peer_id)| {
@@ -345,8 +349,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     }
     assert!(reported_relay_pair, "ICE reports the selected relay pair");
 
-    let alice_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&alice));
-    let bob_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&bob));
+    let alice_channel = channel::<String>("arc03-proof".to_string(), Arc::clone(&alice));
+    let bob_channel = channel::<String>("arc03-proof".to_string(), Arc::clone(&bob));
     let mut alice_receive = alice_channel
         .subscribe()
         .expect("alice subscription admitted");
@@ -441,7 +445,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         assert!(!peer.remote_approve_seen);
     }
 
-    let carol_channel = Channel::<String>::new("arc03-negative".to_string(), Arc::clone(&carol));
+    let carol_channel = channel::<String>("arc03-negative".to_string(), Arc::clone(&carol));
     carol_channel
         .send_to(dave_id.public_id(), &"must-not-send".to_string())
         .await

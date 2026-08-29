@@ -81,6 +81,11 @@ jobs:
         with:
           targets: ${{ matrix.platform.target }}
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       # Two separate Cargo workspaces in this repo — the headless
       # daemon at the root, and the Tauri GUI under `gui/src-tauri`.
       # Each gets its own cache scope so they don't stomp each other.
@@ -120,15 +125,22 @@ jobs:
       # Build the headless daemon first. The bundle step below will
       # ship it alongside the GUI installer so users get one
       # download per platform that contains both halves.
-      - name: Build daemon
-        run: cargo build --release --bin myownmesh --target ${{ matrix.platform.target }}
+      - name: Build daemon (without transport-lab)
+        run: cargo build --release --no-default-features --bin myownmesh --target ${{ matrix.platform.target }}
 
-      # Build the Tauri GUI bundle. tauri-action runs `pnpm tauri
-      # build` under the hood and uploads the resulting installers
-      # (.deb / .AppImage / .dmg / .msi / .exe) to the named
-      # release. `projectPath: gui` points it at the GUI's own
-      # workspace so it doesn't try to build the daemon as a Tauri
-      # crate.
+      - name: Verify daemon excludes transport-lab
+        shell: bash
+        run: |
+          set -e
+          BIN=target/${{ matrix.platform.target }}/release/myownmesh
+          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          python scripts/verify-release-artifact.py --binary "$BIN"
+
+      # Build the GUI-only Tauri bundle. These installers contain the GUI,
+      # not the separately shipped daemon binary; the portable GUI archive
+      # below is the scanner-covered GUI artifact. `projectPath: gui` points
+      # the action at the GUI workspace so it does not build the daemon as a
+      # Tauri crate.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -153,16 +165,19 @@ jobs:
           if [[ ! -f "$BIN" ]]; then
             echo "daemon binary not found at $BIN"; exit 1
           fi
+
           mkdir -p dist-bin
           NAME="myownmesh-${{ matrix.platform.name }}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$BIN" "dist-bin/myownmesh.exe"
             (cd dist-bin && 7z a "${NAME}.zip" myownmesh.exe)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.zip" --member myownmesh.exe
           else
             cp "$BIN" "dist-bin/myownmesh"
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
           fi
 
       # Package the portable GUI binary the same way, so the curl|sh
@@ -187,11 +202,13 @@ jobs:
             cp "$BIN" "dist-bin/myownmesh-gui.exe"
             (cd dist-bin && 7z a "${NAME}.zip" myownmesh-gui.exe)
             (cd dist-bin && (sha256sum "${NAME}.zip" || shasum -a 256 "${NAME}.zip") > "${NAME}.zip.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.zip" --member myownmesh-gui.exe
             rm -f dist-bin/myownmesh-gui.exe
           else
             cp "$BIN" "dist-bin/myownmesh-gui"
             tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh-gui
             (cd dist-bin && (sha256sum "${NAME}.tar.gz" || shasum -a 256 "${NAME}.tar.gz") > "${NAME}.tar.gz.sha256")
+            python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh-gui
             rm -f dist-bin/myownmesh-gui
           fi
 
@@ -221,6 +238,11 @@ jobs:
         with:
           targets: riscv64gc-unknown-linux-musl
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Cache (daemon workspace)
         uses: Swatinem/rust-cache@v2
         with:
@@ -249,7 +271,7 @@ jobs:
       - name: Build daemon (riscv64 musl)
         run: |
           zig version
-          cargo zigbuild --release --bin myownmesh --target riscv64gc-unknown-linux-musl
+          cargo zigbuild --release --no-default-features --bin myownmesh --target riscv64gc-unknown-linux-musl
 
       - name: Package portable daemon binary
         shell: bash
@@ -263,6 +285,7 @@ jobs:
           tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
           (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           rm -f dist-bin/myownmesh
+          python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -292,6 +315,11 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Cache (daemon workspace)
         uses: Swatinem/rust-cache@v2
         with:
@@ -315,7 +343,7 @@ jobs:
       - name: Build daemon (aarch64 musl)
         run: |
           zig version
-          cargo zigbuild --release --bin myownmesh --target aarch64-unknown-linux-musl
+          cargo zigbuild --release --no-default-features --bin myownmesh --target aarch64-unknown-linux-musl
 
       - name: Package portable daemon binary
         shell: bash
@@ -329,6 +357,7 @@ jobs:
           tar -czf "dist-bin/${NAME}.tar.gz" -C dist-bin myownmesh
           (cd dist-bin && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
           rm -f dist-bin/myownmesh
+          python scripts/verify-release-artifact.py --archive "dist-bin/${NAME}.tar.gz" --member myownmesh
 
       - uses: softprops/action-gh-release@v2
         with:

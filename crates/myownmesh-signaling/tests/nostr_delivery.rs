@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
@@ -52,6 +52,11 @@ struct AccountingProvider {
     refuse_relays: Arc<AtomicBool>,
 }
 
+struct AlwaysRefuseSessionProvider {
+    refusals: Arc<AtomicUsize>,
+    refused: Arc<Notify>,
+}
+
 struct AccountingLease {
     live: Arc<AtomicUsize>,
 }
@@ -62,6 +67,21 @@ impl AccountingProvider {
         Box::new(AccountingLease {
             live: Arc::clone(&self.live),
         })
+    }
+}
+
+impl AlwaysRefuseSessionProvider {
+    fn new() -> Self {
+        Self {
+            refusals: Arc::new(AtomicUsize::new(0)),
+            refused: Arc::new(Notify::new()),
+        }
+    }
+
+    fn refuse_session(&self) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.refusals.fetch_add(1, Ordering::SeqCst);
+        self.refused.notify_one();
+        Err(DeliveryRefusal::Provider("session custody refused".into()))
     }
 }
 
@@ -192,6 +212,86 @@ impl DeliveryProvider for AccountingProvider {
     }
 }
 
+impl DeliveryProvider for AlwaysRefuseSessionProvider {
+    fn reserve_session_identity(
+        &self,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.refuse_session()
+    }
+
+    fn reserve_session_record(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_session_set_node(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_session_set_growth(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_record(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_key(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_attempt_map_growth(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
+    fn reserve_relay_map_growth(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+}
+
 impl DeliveryProvider for CountingProvider {
     fn reserve_admission_source(
         &self,
@@ -313,6 +413,62 @@ fn parse(frame: &str) -> Vec<Value> {
     serde_json::from_str(frame).expect("relay frame is a JSON array")
 }
 
+#[test]
+fn inbound_frame_admission_is_funded_and_released_exactly() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let provider = AccountingProvider {
+        live: live.clone(),
+        refuse_relays: Arc::new(AtomicBool::new(false)),
+    };
+    let store = DeliveryStore::new(Arc::new(provider));
+
+    let lease = store
+        .reserve_inbound_frame(4 * 1024)
+        .expect("provider admits the bounded parse frame");
+    assert_eq!(live.load(Ordering::SeqCst), 1);
+    lease.finish(DeliveryTerminal::AttemptCompleted);
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn closed_store_refuses_new_reservations_before_provider_admission() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let provider = AccountingProvider {
+        live: live.clone(),
+        refuse_relays: Arc::new(AtomicBool::new(false)),
+    };
+    let store = DeliveryStore::new(Arc::new(provider));
+
+    assert_eq!(store.shutdown(), 0);
+    assert!(matches!(
+        store.reserve_inbound_frame(4 * 1024),
+        Err(DeliveryRefusal::Provider(reason)) if reason == "delivery store is closed"
+    ));
+    let (_, session_refusal, refusals) = store.open_session_with_refusals();
+    assert!(matches!(
+        session_refusal,
+        Some(DeliveryRefusal::Provider(reason)) if reason == "delivery store is closed"
+    ));
+    assert!(refusals.is_empty());
+    let event = myownmesh_signaling::nostr::event::make_event(
+        &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
+        1077,
+        Vec::new(),
+        String::new(),
+        1,
+    );
+    let report = store.admit(
+        "closed-attempt".into(),
+        OwnedSignal::new(event, Box::new(()) as ErasedOwner),
+    );
+    assert!(matches!(
+        report.attempt_refusal,
+        Some(AdmissionRefusal::Provider(DeliveryRefusal::Provider(reason)))
+            if reason == "delivery store is closed"
+    ));
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
 async fn subscribe(
     url: &str,
     subscription: &str,
@@ -390,7 +546,6 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
         .await
         .expect("reconnect generation remains live");
     assert_ne!(*reconnect_seen.borrow(), previous_generation);
-
     let mut sub_a = subscribe(&url_a, "sub-a", &room, &[1077, 21077]).await;
     let mut sub_b = subscribe(&url_b, "sub-b", &room, &[1077, 21077]).await;
     for sub in [&mut sub_a, &mut sub_b] {
@@ -438,11 +593,61 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
     let mut late = subscribe(&url_a, "late", &room, &[21077]).await;
     assert_eq!(parse(&next_text(&mut late).await)[0], "EOSE");
 
-    driver.stop();
+    driver.stop_and_join().await;
     drop(out_tx);
     assert!(stats.finished.load(Ordering::SeqCst) > 0);
-    relay_a.stop();
-    relay_b.stop();
+    relay_a.stop_and_wait().await;
+    relay_b.stop_and_wait().await;
+}
+
+#[tokio::test]
+async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
+    let relay = SignalingServer::start("127.0.0.1", 0, Limits::default())
+        .await
+        .expect("relay starts");
+    let url = format!("ws://127.0.0.1:{}", relay.local_addr().port());
+    let provider = Arc::new(AlwaysRefuseSessionProvider::new());
+    let first_refusal = provider.refused.notified();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
+    let (in_tx, _in_rx) = mpsc::unbounded_channel::<NostrInbound>();
+    let driver = start_with_delivery_provider(
+        NostrDriverConfig {
+            app_id: "nostr-session-refusal-control".into(),
+            network_id: "session-refusal-control".into(),
+            device_id: "device-refusal".into(),
+            servers: vec![url],
+            denylist: Vec::new(),
+            redundancy: 1,
+            public_fallback: false,
+        },
+        Box::new(UnboundedSource::new(out_rx)),
+        InboundSink::from_unbounded(in_tx),
+        provider.clone(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(10), first_refusal)
+        .await
+        .expect("first session provider refusal is observed");
+    let second_refusal = provider.refused.notified();
+    let immediate_retry = tokio::time::timeout(Duration::from_secs(1), second_refusal).await;
+
+    tokio::time::timeout(Duration::from_secs(2), driver.stop_and_join())
+        .await
+        .expect("driver shutdown remains prompt after refusal");
+    drop(out_tx);
+    tokio::time::timeout(Duration::from_secs(2), relay.stop_and_wait())
+        .await
+        .expect("relay shutdown remains prompt after refusal");
+
+    assert!(
+        immediate_retry.is_err(),
+        "session refusal must enter reconnect backoff rather than spin"
+    );
+    assert_eq!(
+        provider.refusals.load(Ordering::SeqCst),
+        1,
+        "no second session admission occurs during the bounded backoff window"
+    );
 }
 
 #[tokio::test]
@@ -472,7 +677,7 @@ async fn relay_returns_exact_nip01_ok_for_accepted_event() {
     assert_eq!(ok[1], id);
     assert_eq!(ok[2], true);
     assert!(ok[3].is_string());
-    relay.stop();
+    relay.stop_and_wait().await;
 }
 
 #[test]

@@ -144,7 +144,7 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
         let topo = state.topology_impl.read();
         for peer in state.peers.values_snapshot() {
             let id = &peer.device_id;
-            let has_session = peer.session.lock().is_some();
+            let has_session = peer.has_current_worker();
             let edge = topo.edge(&me, id, &known);
             if has_session {
                 let data = peer.state.read();
@@ -241,10 +241,10 @@ mod tests {
         *state.topology.write() = TopologyMode::Star { hub: "~hub".into() };
         *state.topology_impl.write() = from_mode(&TopologyMode::Star { hub: "~hub".into() });
         insert_session_less_peer(&state, "~hub", None);
-        assert!(state.peers.get("~hub").unwrap().session.lock().is_none());
+        assert!(!state.peers.get("~hub").unwrap().has_current_worker());
         shape_connections(&state).await;
         assert!(
-            state.peers.get("~hub").unwrap().session.lock().is_some(),
+            state.peers.get("~hub").unwrap().has_current_worker(),
             "the shape pass upgrades a wanted placeholder to a real dial"
         );
     }
@@ -268,7 +268,7 @@ mod tests {
         }
         shape_connections(&state).await;
         assert!(
-            state.peers.get("spoke-b").unwrap().session.lock().is_some(),
+            state.peers.get("spoke-b").unwrap().has_current_worker(),
             "one-sided shelve must NOT prune"
         );
         {
@@ -278,7 +278,7 @@ mod tests {
         shape_connections(&state).await;
         let entry = state.peers.get("spoke-b").unwrap();
         assert!(
-            entry.session.lock().is_none(),
+            !entry.has_current_worker(),
             "both-sides-shelved non-edge closes, member stays Sighted"
         );
     }
@@ -351,7 +351,7 @@ mod tests {
         }
         shape_connections(&state).await;
         assert!(
-            state.peers.get("spoke-b").unwrap().session.lock().is_some(),
+            state.peers.get("spoke-b").unwrap().has_current_worker(),
             "a standing dial outranks the shape"
         );
     }

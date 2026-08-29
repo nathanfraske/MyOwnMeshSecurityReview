@@ -10,15 +10,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::{
     admit_durable_proof, durable_proof_records, install_capability_replay_park_for_lab,
     materialize_durable_proof_delivery, pending_durable_proofs, promote_exact_owner_for_lab,
-    proof_owner_for_device, rebind_durable_proof, release_capability_replay_park_for_lab,
+    proof_owner_for_device, rebind_durable_proof, release_capability_replay_park_for_lab, rpc,
     settle_durable_proof_ack, supersede_durable_proof, wait_capability_replay_park_for_lab,
 };
-use myownmesh_core::engine::{
-    attach_local, create_network_in_instance_root, governance, import_network_in_instance_root,
-    spawn_network_in_instance_root, transport_lab::ingest_semantic_fact,
+use myownmesh_core::engine::transport_lab::{
+    attach_local, create_network_in_instance_root, import_network_in_instance_root,
+    ingest_semantic_fact, spawn_network_in_instance_root,
 };
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
@@ -27,7 +28,7 @@ use myownmesh_core::semantic::{
     AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, ProofRecord,
     ProofRecordState, SignedFact, VerifiedBootstrap,
 };
-use myownmesh_core::{CapabilityAdvert, Rpc};
+use myownmesh_core::CapabilityAdvert;
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration, Instant};
@@ -493,9 +494,9 @@ async fn create_fixture(
     root: &TempDir,
     id: &str,
 ) -> (
-    Arc<myownmesh_core::engine::NetworkState>,
+    Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     tokio::task::JoinHandle<()>,
-    Arc<myownmesh_core::engine::NetworkState>,
+    Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     tokio::task::JoinHandle<()>,
     Arc<Identity>,
     Identity,
@@ -607,7 +608,7 @@ async fn wait_for_approval(
 }
 
 async fn wait_for_proof_owner(
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     device_id: &str,
 ) -> myownmesh_core::engine::transport_lab::ProofOwner {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -623,7 +624,7 @@ async fn wait_for_proof_owner(
 }
 
 async fn wait_for_no_proof_owner(
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     device_id: &str,
 ) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -639,7 +640,7 @@ async fn wait_for_no_proof_owner(
 }
 
 async fn wait_for_replayed_proof(
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     previous: &ProofRecord,
 ) -> (ProofRecord, bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -695,7 +696,7 @@ async fn wait_for_replayed_proof(
 }
 
 async fn wait_for_durable_record_state(
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     delivery_id: myownmesh_core::semantic::ProofDeliveryId,
     expected: ProofRecordState,
 ) -> ProofRecord {
@@ -729,7 +730,7 @@ fn assert_exact_delivery_metadata(actual: &ProofRecord, expected: &ProofRecord) 
 }
 
 fn assert_settled_tombstone(
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     expected: &ProofRecord,
 ) {
     let tombstone = durable_proof_records(state)
@@ -1943,7 +1944,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         "G1 restores session policy while E0 is still pending"
     );
 
-    let rpc = Rpc::attach(&reopened).expect("reopened sender funds one RPC dispatcher");
+    let rpc = rpc(&reopened).expect("reopened sender funds one RPC dispatcher");
     let advert = CapabilityAdvert {
         tags: vec!["r3-capability-debt".to_string()],
         app_version: Some("r3-park-v1".to_string()),

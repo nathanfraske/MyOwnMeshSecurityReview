@@ -151,7 +151,7 @@ pub enum DeliveryTerminal {
 
 /// Provider-owned lease for one exact attempt or (event, relay-session)
 /// delivery.
-pub trait DeliveryLease: Send {
+pub trait DeliveryLease: Send + Sync {
     fn finish(self: Box<Self>, terminal: DeliveryTerminal);
 }
 
@@ -161,6 +161,31 @@ pub trait DeliveryLease: Send {
 /// before the encoded frame is allocated.  The returned lease remains with
 /// that relay-session entry until one terminal outcome consumes it.
 pub trait DeliveryProvider: Send + Sync {
+    /// Fund the bounded raw-frame parse before JSON or envelope decoding.
+    ///
+    /// The frame has not been interpreted yet, so the default uses the
+    /// provider's existing attempt-map residual seam with a zero-content
+    /// placeholder. Providers charge `encoded_event_bytes` from the supplied
+    /// retention; no peer-controlled collection is built before this lease is
+    /// acquired. The lease is released when the caller finishes the parse.
+    fn reserve_inbound_frame(
+        &self,
+        frame_bytes: usize,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let event = NostrEvent {
+            id: String::new(),
+            pubkey: String::new(),
+            created_at: 0,
+            kind: 0,
+            tags: Vec::new(),
+            content: String::new(),
+            sig: String::new(),
+        };
+        let mut retention = DeliveryRetention::for_event(&event);
+        retention.encoded_event_bytes = frame_bytes;
+        self.reserve_attempt_map_growth("<inbound-frame>", &event, retention)
+    }
+
     /// Observe the process-local source before duplicate detection.  This is
     /// intentionally only the binding hook: the provider-owned lifetime is
     /// acquired through [`Self::reserve_admission_source`] below, while an
@@ -311,8 +336,10 @@ pub trait DeliveryProvider: Send + Sync {
     }
 }
 
-/// Standalone compatibility provider. Production core attachment should pass
-/// its provider through [`super::driver::start_with_delivery_provider`].
+/// Test-only provider for local delivery-driver controls. Production core
+/// attachment must pass an explicit provider through
+/// [`super::driver::start_with_delivery_provider`].
+#[cfg(test)]
 pub struct UnmeteredDeliveryProvider;
 
 struct UnmeteredLease;
@@ -327,6 +354,7 @@ impl DeliveryLease for UnmeteredLease {
     fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {}
 }
 
+#[cfg(test)]
 impl DeliveryProvider for UnmeteredDeliveryProvider {
     fn reserve_session_identity(
         &self,
@@ -569,6 +597,18 @@ fn exhausted_admission_report(owned: OwnedSignal<NostrEvent, ErasedOwner>) -> Ad
         accepted_sessions: 0,
         refused: Vec::new(),
         attempt_refusal: Some(AdmissionRefusal::AdmissionIdentityExhausted),
+    }
+}
+
+fn closed_admission_report(owned: OwnedSignal<NostrEvent, ErasedOwner>) -> AdmissionReport {
+    AdmissionReport {
+        source: AdmissionSource::Unavailable,
+        event_id: owned.value().id.clone(),
+        accepted_sessions: 0,
+        refused: Vec::new(),
+        attempt_refusal: Some(AdmissionRefusal::Provider(DeliveryRefusal::Provider(
+            "delivery store is closed".to_string(),
+        ))),
     }
 }
 
@@ -876,8 +916,19 @@ impl<K, V> Iterator for DeliveryMapIntoIter<K, V> {
 }
 
 struct DeliveryState {
+    closed: bool,
     sessions: DeliveryMap<RelaySessionId, SessionEntry>,
     attempts: DeliveryMap<String, AttemptEntry>,
+}
+
+struct RetainedDeliveryLease(Option<Box<dyn DeliveryLease>>);
+
+impl Drop for RetainedDeliveryLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            lease.finish(DeliveryTerminal::Cancelled);
+        }
+    }
 }
 
 /// The live attempt owner and its per-relay delivery entries.
@@ -901,6 +952,7 @@ impl DeliveryStore {
             provider,
             outcome_sink,
             state: Mutex::new(DeliveryState {
+                closed: false,
                 sessions: DeliveryMap::new(),
                 attempts: DeliveryMap::new(),
             }),
@@ -910,6 +962,49 @@ impl DeliveryStore {
 
     pub fn notification(&self) -> &Notify {
         &self.notify
+    }
+
+    /// Fund one raw inbound frame before the driver parses it. The returned
+    /// lease is intentionally independent of any outbound attempt and must be
+    /// finished by the caller after parsing or local refusal.
+    pub fn reserve_inbound_frame(
+        &self,
+        frame_bytes: usize,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let state = self.state.lock();
+        if state.closed {
+            return Err(DeliveryRefusal::Provider(
+                "delivery store is closed".to_string(),
+            ));
+        }
+        let lease = self.provider.reserve_inbound_frame(frame_bytes);
+        drop(state);
+        lease
+    }
+
+    /// Admit one retained presence event before it is placed in the shared
+    /// watch or encoded for a relay. The lease travels with the event through
+    /// the watch and every relay's borrowed copy, and is released when the
+    /// final copy leaves those owners.
+    pub fn admit_presence(
+        &self,
+        event: NostrEvent,
+    ) -> Result<OwnedSignal<NostrEvent, ErasedOwner>, DeliveryRefusal> {
+        let state = self.state.lock();
+        if state.closed {
+            return Err(DeliveryRefusal::Provider(
+                "delivery store is closed".to_string(),
+            ));
+        }
+        let retention = DeliveryRetention::for_event(&event);
+        let lease = self
+            .provider
+            .reserve_admission_source("<presence>", &event, retention)?;
+        drop(state);
+        Ok(OwnedSignal::new(
+            event,
+            Box::new(RetainedDeliveryLease(Some(lease))) as ErasedOwner,
+        ))
     }
 
     /// Register a fresh relay connection and fund one entry for each live
@@ -939,6 +1034,15 @@ impl DeliveryStore {
         &self,
     ) -> (RelaySessionId, Option<DeliveryRefusal>, Vec<AttemptRefusal>) {
         let mut state = self.state.lock();
+        if state.closed {
+            return (
+                RelaySessionId::rejected(),
+                Some(DeliveryRefusal::Provider(
+                    "delivery store is closed".to_string(),
+                )),
+                Vec::new(),
+            );
+        }
         let retention = SessionRetention::exact();
         let identity_lease = match self.provider.reserve_session_identity(retention) {
             Ok(lease) => lease,
@@ -1052,6 +1156,10 @@ impl DeliveryStore {
         attempt: String,
         owned: OwnedSignal<NostrEvent, ErasedOwner>,
     ) -> AdmissionReport {
+        let mut state = self.state.lock();
+        if state.closed {
+            return closed_admission_report(owned);
+        }
         let Some(source) = AdmissionSource::try_fresh() else {
             return exhausted_admission_report(owned);
         };
@@ -1075,7 +1183,6 @@ impl DeliveryStore {
                     };
                 }
             };
-        let mut state = self.state.lock();
         if state.attempts.contains_key(event_id_ref) {
             source_lease.finish(DeliveryTerminal::Cancelled);
             return AdmissionReport {
@@ -1249,6 +1356,24 @@ impl DeliveryStore {
             }
         }
         ids
+    }
+
+    /// Mark and return one pending entry for a session.
+    ///
+    /// The compatibility [`Self::pending`] method remains available to callers
+    /// that need a snapshot, but the live driver uses this one-at-a-time seam so
+    /// a relay cannot create an additional unbounded pending-ID collection.
+    pub fn next_pending(&self, session: &RelaySessionId) -> Option<String> {
+        let mut state = self.state.lock();
+        for (event_id, entry) in state.attempts.iter_mut() {
+            if let Some(relay) = entry.relays.get_mut(session) {
+                if !relay.in_flight {
+                    relay.in_flight = true;
+                    return Some(event_id.clone());
+                }
+            }
+        }
+        None
     }
 
     /// Borrow an event only after its relay entry has been provider-funded.
@@ -1498,6 +1623,10 @@ impl DeliveryStore {
         let mut count = 0;
         {
             let mut state = self.state.lock();
+            if state.closed {
+                return 0;
+            }
+            state.closed = true;
             for (_, session_entry) in mem::take(&mut state.sessions).into_iter() {
                 leases.push(session_entry.record_lease);
                 leases.push(session_entry.node_lease);

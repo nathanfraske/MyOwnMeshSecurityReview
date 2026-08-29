@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! End-to-end engine integration test: closed-network governance.
 //!
 //! Two peers handshake through an in-process LocalBroker, import one verified
@@ -13,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{
+use myownmesh_core::engine::transport_lab::{
     attach_local, create_network_in_instance_root, import_network_in_instance_root, NetworkState,
 };
 use myownmesh_core::identity::Identity;
@@ -1404,12 +1406,7 @@ async fn local_topology_control_does_not_enter_canonical_governance() {
         spoke_redundancy: Some(1),
     };
     assert!(
-        alice_state
-            .cmd_tx
-            .send(myownmesh_core::engine::NetworkCmd::SetTopology(
-                governed.clone(),
-            ))
-            .is_ok(),
+        myownmesh_core::engine::transport_lab::set_topology(&alice_state, governed.clone()),
         "send local topology set"
     );
 

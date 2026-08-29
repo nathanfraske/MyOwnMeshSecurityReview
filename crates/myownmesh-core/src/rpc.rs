@@ -2689,8 +2689,9 @@ impl Drop for OwnedMethodRegistration {
 
 impl Rpc {
     /// Attach (or look up) the RPC dispatcher for a network. Use
-    /// this when you've spun up the engine directly via
-    /// [`crate::engine::spawn_network`] and want to register
+    /// this when you've spun up the engine directly via the explicit
+    /// transport-lab facade `engine::transport_lab::spawn_network`
+    /// and want to register
     /// handlers or make calls. The [`crate::JoinedNetwork`] facade
     /// attaches automatically — this is the lower-level
     /// equivalent.
@@ -2698,7 +2699,13 @@ impl Rpc {
     /// Idempotent: subsequent calls return a fresh `Rpc` handle
     /// over the same underlying state, so previously-registered
     /// handlers remain in effect.
-    pub fn attach(
+    pub(crate) fn attach(
+        network: &Arc<NetworkState>,
+    ) -> Result<Self, crate::application_gateway::GatewayRefusal> {
+        Self::attach_inner(network)
+    }
+
+    fn attach_inner(
         network: &Arc<NetworkState>,
     ) -> Result<Self, crate::application_gateway::GatewayRefusal> {
         if let Some(inner) = network.application_gateway.rpc() {

@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! Integration test: the per-device custody MFA gate on governance authoring.
 //!
 //! Proves that once a device enrolls a custody lock for a network,
@@ -9,7 +11,8 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{create_network_in_instance_root, governance};
+use myownmesh_core::engine::governance;
+use myownmesh_core::engine::transport_lab::create_network_in_instance_root;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
 

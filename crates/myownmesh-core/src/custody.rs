@@ -252,6 +252,11 @@ pub fn enrollment_transaction(
 /// process's owner lease, and it never changes a prepared record. The caller
 /// must explicitly call [`PreparedEnrollment::commit`] after handing the
 /// material to its recipient, or [`PreparedEnrollment::abort`] to discard it.
+///
+/// Enumeration is a transport-lab recovery control, not part of the shipped
+/// custody surface. Querying one known transaction remains available through
+/// [`enrollment_transaction`] in ordinary builds.
+#[cfg(feature = "transport-lab")]
 pub fn prepared_enrollments() -> Result<Vec<PreparedEnrollment>> {
     prepared_enrollments_at(&store_path()?)
 }

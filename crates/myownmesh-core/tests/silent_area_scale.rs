@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! A silent area at scale, measured: one operator node and N member
 //! boxes on a **Silent** mesh, over the real engine + WebRTC transport
 //! (in-process `LocalBroker` signaling, loopback ICE). This is the
@@ -32,12 +34,13 @@ use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::NetworkState;
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::NetworkState;
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, join_open_participation, spawn_network,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::transport::Transport;
-use myownmesh_core::Channel;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 
@@ -316,7 +319,7 @@ async fn run_area(n_spokes: usize) {
         // run. `recv` separates the two endings the old receiver merged: `None`
         // is the channel going away with the network, `Err` is one frame that
         // did not decode.
-        let mut rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), spoke.state.clone())
+        let mut rx = channel::<serde_json::Value>(CHANNEL.to_owned(), spoke.state.clone())
             .subscribe()
             .expect("member subscription admitted");
         let echo_state = spoke.state.clone();
@@ -341,7 +344,7 @@ async fn run_area(n_spokes: usize) {
             }
         });
     }
-    let mut echo_rx = Channel::<serde_json::Value>::new(CHANNEL.to_owned(), operator.state.clone())
+    let mut echo_rx = channel::<serde_json::Value>(CHANNEL.to_owned(), operator.state.clone())
         .subscribe()
         .expect("operator subscription admitted");
     let pings_per_spoke: usize = 10;

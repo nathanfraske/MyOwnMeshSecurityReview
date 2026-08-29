@@ -24,7 +24,7 @@
 //! driver's lifetime; per-instance resolve + address lookups are short-lived
 //! threads that exit once the answer (or a 5 s deadline) arrives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,7 +35,11 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use super::{DiscoveryConfig, DiscoveryEvent};
+use super::{
+    DiscoveryConfig, DiscoveryEvent, ResolveCompletion, ResolveHint, ResolveLease,
+    ResolveOwnership, DISCOVERY_EVENT_CAPACITY, MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES,
+    MAX_TXT_BYTES, MAX_TXT_ENTRIES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
+};
 use crate::Error;
 
 // ---- the dnssd C API (dns_sd.h) ----------------------------------------
@@ -181,17 +185,30 @@ fn encode_txt(entries: &[(String, String)]) -> Vec<u8> {
 
 /// Parse DNS TXT rdata into a key→value map (a flag entry maps to "").
 fn parse_txt(rdata: &[u8]) -> HashMap<String, String> {
+    if rdata.len() > MAX_TXT_BYTES {
+        return HashMap::new();
+    }
     let mut out = HashMap::new();
     let mut p = 0usize;
+    let mut entries = 0usize;
     while p < rdata.len() {
+        entries += 1;
+        if entries > MAX_TXT_ENTRIES {
+            return HashMap::new();
+        }
         let len = rdata[p] as usize;
         p += 1;
         let end = (p + len).min(rdata.len());
         if let Ok(s) = std::str::from_utf8(&rdata[p..end]) {
             match s.split_once('=') {
-                Some((k, v)) => out.insert(k.to_string(), v.to_string()),
-                None if !s.is_empty() => out.insert(s.to_string(), String::new()),
+                Some((k, v)) if k.len() <= MAX_TXT_KEY_BYTES && v.len() <= MAX_TXT_VALUE_BYTES => {
+                    out.insert(k.to_string(), v.to_string())
+                }
+                None if !s.is_empty() && s.len() <= MAX_TXT_KEY_BYTES => {
+                    out.insert(s.to_string(), String::new())
+                }
                 None => None,
+                Some(_) => None,
             };
         }
         p = end;
@@ -261,9 +278,14 @@ struct Inner {
     stopped: AtomicBool,
     /// The live registration's stop flag, if registered.
     registration: Mutex<Option<Arc<AtomicBool>>>,
-    /// Instances with a resolve in flight (dedup across per-interface Adds).
-    resolving: Mutex<HashSet<String>>,
-    tx: mpsc::UnboundedSender<DiscoveryEvent>,
+    /// Exact service-instance resolve ownership. Duplicate per-interface Adds
+    /// coalesce into one pending follow-up, and Removed/shutdown invalidates
+    /// the active generation before any late result can be published.
+    resolving: ResolveOwnership,
+    tx: mpsc::Sender<DiscoveryEvent>,
+    /// Every native worker is retained until shutdown joins it. This keeps
+    /// callback contexts and resolve ownership alive only for their owner.
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 pub struct Discovery {
@@ -274,15 +296,13 @@ impl Discovery {
     /// Connect to the system daemon, start browsing, and hand back the event
     /// stream. Fails fast when the daemon is unreachable (no mDNSResponder /
     /// Avahi) — callers fall back to their other signaling transports.
-    pub fn start(
-        cfg: &DiscoveryConfig,
-    ) -> crate::Result<(Self, mpsc::UnboundedReceiver<DiscoveryEvent>)> {
+    pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
         let regtype = CString::new(regtype_of(&cfg.service_type))
             .map_err(|e| Error::Other(format!("service type: {e}")))?;
         let instance = CString::new(cfg.instance.as_str())
             .map_err(|e| Error::Other(format!("instance name: {e}")))?;
 
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
         let inner = Arc::new(Inner {
             regtype,
             instance,
@@ -290,8 +310,9 @@ impl Discovery {
             txt: encode_txt(&cfg.txt),
             stopped: AtomicBool::new(false),
             registration: Mutex::new(None),
-            resolving: Mutex::new(HashSet::new()),
+            resolving: ResolveOwnership::new(),
             tx,
+            workers: Mutex::new(Vec::new()),
         });
 
         // Browse first (mirrors the embedded backend: never miss resolves
@@ -323,7 +344,7 @@ impl Discovery {
         // The callback context crosses into the thread as a plain address;
         // it's the leaked Arc reclaimed at thread exit.
         let ctx_addr = ctx as usize;
-        std::thread::Builder::new()
+        let browse_worker = match std::thread::Builder::new()
             .name("dnssd-browse".into())
             .spawn(move || {
                 let browse_ref = browse_ref;
@@ -338,8 +359,17 @@ impl Discovery {
                     drop(Arc::from_raw(ctx_addr as *const Inner));
                 }
                 trace!("dnssd browse thread exiting");
-            })
-            .map_err(|e| Error::Other(format!("spawn dnssd browse thread: {e}")))?;
+            }) {
+            Ok(worker) => worker,
+            Err(e) => {
+                unsafe {
+                    DNSServiceRefDeallocate(sd_ref);
+                    drop(Arc::from_raw(ctx as *const Inner));
+                }
+                return Err(Error::Other(format!("spawn dnssd browse thread: {e}")));
+            }
+        };
+        inner.workers.lock().push(browse_worker);
 
         Ok((Discovery { inner }, rx))
     }
@@ -351,6 +381,9 @@ impl Discovery {
         let mut slot = self.inner.registration.lock();
         if slot.is_some() {
             return true;
+        }
+        if self.inner.stopped.load(Ordering::Acquire) {
+            return false;
         }
         let mut sd_ref: DNSServiceRef = std::ptr::null_mut();
         let err = unsafe {
@@ -371,6 +404,10 @@ impl Discovery {
         };
         if err != NO_ERROR {
             debug!("dnssd register failed (will retry): {err}");
+            return false;
+        }
+        if self.inner.stopped.load(Ordering::Acquire) {
+            unsafe { DNSServiceRefDeallocate(sd_ref) };
             return false;
         }
 
@@ -397,8 +434,17 @@ impl Discovery {
                 trace!("dnssd register thread exiting");
             });
         match spawned {
-            Ok(_) => {
+            Ok(worker) => {
+                let mut workers = self.inner.workers.lock();
+                if self.inner.stopped.load(Ordering::Acquire) {
+                    stop.store(true, Ordering::Release);
+                    drop(workers);
+                    let _ = worker.join();
+                    return false;
+                }
                 *slot = Some(stop);
+                workers.retain(|worker| !worker.is_finished());
+                workers.push(worker);
                 true
             }
             Err(e) => {
@@ -421,6 +467,25 @@ impl Discovery {
     pub fn shutdown(&self) {
         self.unregister();
         self.inner.stopped.store(true, Ordering::SeqCst);
+        self.inner.resolving.shutdown();
+        // Joining the browse worker first closes the only callback path that
+        // can enqueue a new resolve worker. Drain in rounds so a callback
+        // racing the first take cannot leave an unjoined worker behind.
+        loop {
+            let workers = std::mem::take(&mut *self.inner.workers.lock());
+            if workers.is_empty() {
+                break;
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    /// The system backend owns native worker threads rather than a Tokio pump;
+    /// keep the common driver ownership seam explicit.
+    pub fn take_task(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        None
     }
 }
 
@@ -467,7 +532,21 @@ unsafe extern "C" fn browse_cb(
     // Borrow the context Arc without consuming it (the browse thread owns the
     // strong count and reclaims it at exit).
     let inner = &*(ctx as *const Inner);
-    let name = CStr::from_ptr(service_name).to_string_lossy().into_owned();
+    let Some(name_bytes) = bounded_cstr(service_name, MAX_DNS_NAME_BYTES) else {
+        return;
+    };
+    let Some(regtype_bytes) = bounded_cstr(regtype, MAX_DNS_NAME_BYTES) else {
+        return;
+    };
+    let Some(domain_bytes) = bounded_cstr(domain, MAX_DNS_NAME_BYTES) else {
+        return;
+    };
+    let Ok(_queue_slot) = inner.tx.try_reserve() else {
+        return;
+    };
+    let Ok(name) = String::from_utf8(name_bytes.to_vec()) else {
+        return;
+    };
 
     if flags & FLAG_ADD != 0 {
         // Our own advertisement echoes back; wire::parse_advert drops it by
@@ -478,26 +557,59 @@ unsafe extern "C" fn browse_cb(
                 return;
             }
         }
-        if !inner.resolving.lock().insert(name.clone()) {
-            return; // resolve already in flight (per-interface duplicate Add)
-        }
-        let regtype = CStr::from_ptr(regtype).to_string_lossy().into_owned();
-        let domain = CStr::from_ptr(domain).to_string_lossy().into_owned();
+        let lease = match inner.resolving.admit(name) {
+            ResolveHint::Started(lease) => lease,
+            ResolveHint::Coalesced => return,
+            ResolveHint::Refused => {
+                debug!("mdns resolve hint refused or shutdown");
+                return;
+            }
+        };
+        let name = lease.instance().to_owned();
+        let (Ok(regtype), Ok(domain)) = (
+            String::from_utf8(regtype_bytes.to_vec()),
+            String::from_utf8(domain_bytes.to_vec()),
+        ) else {
+            let _ = lease.cancel();
+            return;
+        };
         let inner = {
             // A real clone for the resolve thread to hold.
             Arc::increment_strong_count(ctx as *const Inner);
             Arc::from_raw(ctx as *const Inner)
         };
-        if std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("dnssd-resolve".into())
-            .spawn(move || run_resolve(inner, name, regtype, domain, interface_index))
-            .is_err()
+            .spawn(move || run_resolve(inner, name, regtype, domain, interface_index, lease))
         {
-            warn!("dnssd resolve thread failed to spawn");
+            Ok(worker) => {
+                let mut workers = (&*(ctx as *const Inner)).workers.lock();
+                workers.retain(|worker| !worker.is_finished());
+                workers.push(worker);
+            }
+            Err(_) => {
+                warn!("dnssd resolve thread failed to spawn");
+            }
         }
     } else {
-        let _ = inner.tx.send(DiscoveryEvent::Removed { key: name });
+        inner.resolving.cancel(&name);
+        let _ = inner.tx.try_send(DiscoveryEvent::Removed { key: name });
     }
+}
+
+/// Borrow a NUL-terminated C string only after proving its bound. This keeps
+/// callbacks from cloning attacker-controlled names before resolve ownership
+/// and its bounded queue slot have been admitted.
+unsafe fn bounded_cstr<'a>(ptr: *const c_char, max: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        return None;
+    }
+    for len in 0..=max {
+        if *ptr.add(len) == 0 {
+            return Some(std::slice::from_raw_parts(ptr.cast::<u8>(), len));
+        }
+    }
+    None
 }
 
 /// One resolved SRV+TXT answer, filled by `resolve_cb`.
@@ -527,10 +639,16 @@ unsafe extern "C" fn resolve_cb(
     if error != NO_ERROR || host_target.is_null() {
         return;
     }
-    out.host = Some(CStr::from_ptr(host_target).to_string_lossy().into_owned());
+    let Some(host_bytes) = bounded_cstr(host_target, MAX_DNS_NAME_BYTES) else {
+        return;
+    };
+    let Ok(host) = String::from_utf8(host_bytes.to_vec()) else {
+        return;
+    };
+    out.host = Some(host);
     out.port = u16::from_be(port_network_order);
     out.interface_index = interface_index;
-    if !txt_record.is_null() && txt_len > 0 {
+    if !txt_record.is_null() && txt_len > 0 && txt_len as usize <= MAX_TXT_BYTES {
         out.txt = parse_txt(std::slice::from_raw_parts(txt_record, txt_len as usize));
     }
 }
@@ -564,7 +682,7 @@ unsafe extern "C" fn addr_cb(
     {
         let octets = std::slice::from_raw_parts(rdata as *const u8, 4);
         let ip = IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
-        if !out.addrs.contains(&ip) {
+        if !out.addrs.contains(&ip) && out.addrs.len() < MAX_RESOLVED_ADDRESSES {
             out.addrs.push(ip);
         }
     }
@@ -583,16 +701,27 @@ fn run_resolve(
     regtype: String,
     domain: String,
     interface_index: u32,
+    mut lease: ResolveLease,
 ) {
-    let result = resolve_instance(&inner, &name, &regtype, &domain, interface_index);
-    inner.resolving.lock().remove(&name);
-    if let Some((addrs, port, txt)) = result {
-        let _ = inner.tx.send(DiscoveryEvent::Resolved {
-            key: name,
-            addrs,
-            port,
-            txt,
+    loop {
+        if inner.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let result = resolve_instance(&inner, &name, &regtype, &domain, interface_index);
+        let completion = lease.complete_with(|| {
+            if let Some((addrs, port, txt)) = result {
+                let _ = inner.tx.try_send(DiscoveryEvent::Resolved {
+                    key: name.clone(),
+                    addrs,
+                    port,
+                    txt,
+                });
+            }
         });
+        match completion {
+            ResolveCompletion::Finished => return,
+            ResolveCompletion::Followup(next) => lease = next,
+        }
     }
 }
 

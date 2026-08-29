@@ -101,7 +101,7 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
     // trail. Self-limiting: a peer only sits in Checking briefly before it
     // connects, fails, or hits the connect-timeout.
     let checking: Vec<String> = state.peers.collect_map(|peer| {
-        let session = peer.session.lock().clone()?;
+        let session = peer.current_worker()?;
         if session.ice_connection_state() == RTCIceConnectionState::Checking {
             Some(peer.device_id.clone())
         } else {
@@ -147,17 +147,12 @@ pub async fn poll_all(state: &Arc<NetworkState>) {
             ConnectionTier::IceRestart { started } => started,
             _ => return None,
         };
-        let ice_up = peer
-            .session
-            .lock()
-            .as_ref()
-            .map(|s| {
-                matches!(
-                    s.ice_connection_state(),
-                    RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
-                )
-            })
-            .unwrap_or(false);
+        let ice_up = peer.current_worker().is_some_and(|session| {
+            matches!(
+                session.ice_connection_state(),
+                RTCIceConnectionState::Connected | RTCIceConnectionState::Completed
+            )
+        });
         let deadline = if ice_up {
             RESTART_TRAFFIC_GRACE_MS
         } else {

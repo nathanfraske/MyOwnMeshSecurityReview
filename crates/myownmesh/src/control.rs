@@ -237,9 +237,9 @@ pub(crate) struct DispatchBarrier {
 impl DispatchBarrier {
     /// The barrier and the two ends a control drives it by.
     ///
-    /// Available to every test target. Existing Unix-only controls continue to
-    /// use the same one-shot barrier, while pure sink controls can exercise an
-    /// exact lifecycle edge on Windows as well.
+    /// The paired constructor is for Unix socket tests; the barrier and its
+    /// wait hook remain available to test-only control paths on every target.
+    #[cfg(unix)]
     fn paired() -> (
         Arc<Self>,
         tokio::sync::oneshot::Receiver<()>,
@@ -1404,7 +1404,7 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                             .context("trace-subscribe response text was not admitted")?
                     },
                 };
-                let rx = net.state().subscribe_conn_trace();
+                let rx = net.subscribe_conn_trace();
                 // A trace client has no registry entry to be unregistered, so
                 // the runtime's close is its only cancellation -- and without
                 // one, a connected trace client on a quiet network held the
@@ -2172,19 +2172,8 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            request @ (Request::GovernanceMfaEnroll { .. }
-            | Request::GovernanceMfaPrepare { .. }) => {
-                let (network, recovery_aware) = match request {
-                    Request::GovernanceMfaEnroll { network } => (network, false),
-                    Request::GovernanceMfaPrepare { network } => (network, true),
-                    _ => unreachable!("MFA preparation arm is exhaustive"),
-                };
-                let ((reply, output), provisional) = if recovery_aware {
-                    dispatch::governance::mfa_prepare(&json_lines, network)?
-                } else {
-                    dispatch::governance::mfa_enroll(&json_lines, network)?
-                };
-                let mut provisional = handoff::HandoffGuard::new(provisional);
+            Request::GovernanceMfaPrepare { network } => {
+                let (reply, output) = dispatch::governance::mfa_prepare(&json_lines, network)?;
                 // The lock is already installed. It has to be: a success
                 // response has to name an enrollment that exists, and deferring
                 // the write until this line would let two clients both be told
@@ -2192,22 +2181,10 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 // refuse the other. The durable transaction remains Prepared
                 // across every write outcome; only an explicit transaction
                 // commit or abort decides custody after the client has received
-                // (or declined) this material. The local handle is released
-                // after the response boundary, not used as a commit oracle;
-                // the durable record remains Prepared until that explicit
-                // transaction command.
-                // secret and the recovery codes remain recoverable through the
-                // exact transaction query or redelivery operation until an
-                // explicit commit or abort settles the durable record.
-                let line =
-                    match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
-                        Ok(line) => line,
-                        Err(error) => {
-                            provisional.settle(&state, false).await;
-                            return Err(error)
-                                .context("MFA enrollment response changed after measurement");
-                        }
-                    };
+                // (or declined) this material. The exact transaction remains
+                // queryable and redeliverable until that explicit command.
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA enrollment response changed after measurement")?;
                 #[cfg(test)]
                 if let Some(barrier) = &state.before_mfa_response_write {
                     barrier.pass().await;
@@ -2220,7 +2197,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                         .context("MFA transport-lab response barrier failed")?;
                 }
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
-                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -2243,20 +2219,11 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                 network,
                 transaction_id,
             } => {
-                let ((reply, output), provisional) =
+                let (reply, output) =
                     dispatch::governance::mfa_redeliver(&json_lines, network, transaction_id)?;
-                let mut provisional = handoff::HandoffGuard::new(provisional);
-                let line =
-                    match AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output) {
-                        Ok(line) => line,
-                        Err(error) => {
-                            provisional.settle(&state, false).await;
-                            return Err(error)
-                                .context("MFA redelivery response changed after measurement");
-                        }
-                    };
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("MFA redelivery response changed after measurement")?;
                 let wrote = write_admitted_line(&mut writer, &cancel, line).await;
-                settle_provisional_handoff(&state, &mut provisional, &wrote).await;
                 match wrote? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -3711,8 +3678,8 @@ mod terminal_shutdown_tests {
         let mut near_events = near_mesh.events();
         let mut far_events = far_mesh.events();
         let _local_broker = myownmesh_signaling::local::LocalBroker::new();
-        myownmesh_core::engine::attach_local(&near.state(), &_local_broker);
-        myownmesh_core::engine::attach_local(&far.state(), &_local_broker);
+        near.attach_local(&_local_broker);
+        far.attach_local(&_local_broker);
         let near_device = near_mesh.device_id();
         let far_device = far_mesh.device_id();
         crate::test_link::wait_for_approval(&mut near_events, &far_device).await;

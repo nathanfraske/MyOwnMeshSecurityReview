@@ -10,9 +10,9 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::transport_lab::ingest_semantic_fact;
-use myownmesh_core::engine::{
-    create_network_in_instance_root, governance, spawn_network_in_instance_root,
+use myownmesh_core::engine::governance;
+use myownmesh_core::engine::transport_lab::{
+    create_network_in_instance_root, ingest_semantic_fact, spawn_network_in_instance_root,
 };
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};

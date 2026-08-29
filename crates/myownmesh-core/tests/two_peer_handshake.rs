@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! End-to-end engine integration test: two peers handshake
 //! through an in-process LocalBroker, exchange a channel
 //! message, and shut down cleanly.
@@ -6,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, join_open_participation, spawn_network,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{Channel, MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
@@ -79,8 +83,8 @@ async fn two_peers_handshake_and_exchange_channel_message() {
     wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
     // Type-safe channel send.
-    let alice_chan: Channel<String> = Channel::new("greetings".into(), alice_state.clone());
-    let bob_chan: Channel<String> = Channel::new("greetings".into(), bob_state.clone());
+    let alice_chan: Channel<String> = channel("greetings".into(), alice_state.clone());
+    let bob_chan: Channel<String> = channel("greetings".into(), bob_state.clone());
     let mut bob_sub = bob_chan.subscribe().expect("bob subscription admitted");
 
     alice_chan

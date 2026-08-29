@@ -290,7 +290,7 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             mfa_code,
         },
         CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Enroll { network })) => {
-            return run_mfa_enroll(network).await;
+            return run_mfa_prepare_and_commit(network).await;
         }
         CtlCmd::Governance(GovernanceCmd::Mfa(MfaCmd::Prepare { network })) => {
             return run_mfa_material(Request::GovernanceMfaPrepare { network }, None).await;
@@ -670,7 +670,7 @@ where
     settle_mfa_with(network, enrollment.transaction_id, send).await
 }
 
-async fn run_mfa_enroll(network: String) -> Result<()> {
+async fn run_mfa_prepare_and_commit(network: String) -> Result<()> {
     let final_state = enroll_with(
         network,
         |request| async move { roundtrip(&request).await },
@@ -1065,7 +1065,27 @@ fn verify_local_server(stream: &LocalSocketStream) -> Result<()> {
     verify_server_process_user(server_pid, &expected_sid)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn verify_server_euid(server: u32, expected: u32) -> Result<()> {
+    anyhow::ensure!(
+        server == expected,
+        "control server euid {server} does not match ctl euid {expected}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn verify_local_server(stream: &LocalSocketStream) -> Result<()> {
+    let credentials = stream
+        .peer_creds()
+        .context("read control server credentials")?;
+    let server = credentials
+        .euid()
+        .context("control transport did not provide server euid")?;
+    verify_server_euid(server, unsafe { libc::geteuid() })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn verify_local_server(_stream: &LocalSocketStream) -> Result<()> {
     Ok(())
 }
@@ -1361,6 +1381,50 @@ mod tests {
         drop(server);
         drop(client);
         drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_ctl_verifies_same_euid_server_before_request() {
+        use interprocess::local_socket::{GenericFilePath, ListenerOptions};
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let parent = directory.path().join("private");
+        std::fs::create_dir(&parent).expect("create private parent");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+            .expect("make private parent owner-only");
+        let path = parent.join("ctl.sock");
+        let name = path
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("control socket path is a valid fs name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .create_tokio()
+            .expect("same-euid test socket binds");
+        let client_name = path
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("control socket path is a valid fs name");
+        let client = LocalSocketStream::connect(client_name)
+            .await
+            .expect("same-euid ctl connects");
+        verify_local_server(&client).expect("same-euid server is verified before request");
+        let server = listener.accept().await.expect("server accepts ctl");
+        drop(server);
+        drop(client);
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_ctl_refuses_distinct_server_euid() {
+        let expected = unsafe { libc::geteuid() };
+        let foreign = expected ^ 1;
+        verify_server_euid(expected, expected).expect("same euid is accepted");
+        let error = verify_server_euid(foreign, expected).expect_err("foreign euid is refused");
+        assert!(error.to_string().contains("does not match ctl euid"));
     }
 
     #[cfg(windows)]

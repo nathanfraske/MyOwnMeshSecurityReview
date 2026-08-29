@@ -8,15 +8,140 @@
 //!     discover each other. This is the "use it in place of Nostr" claim
 //!     under test.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, Stream, StreamExt};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
+use myownmesh_signaling::nostr::delivery::{
+    DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryTerminal,
+    RelaySessionId, SessionRetention,
+};
 use myownmesh_signaling::server::{Limits, SignalingServer};
 use myownmesh_signaling::{InboundSink, UnboundedSource};
+
+const SIGNALLING_TEST_DELIVERY_CAPACITY: usize = 256;
+
+struct FiniteTestProvider {
+    live: Arc<AtomicUsize>,
+}
+
+struct FiniteTestLease {
+    live: Arc<AtomicUsize>,
+}
+
+impl FiniteTestProvider {
+    fn new() -> Self {
+        Self {
+            live: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn reserve_one(&self) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        loop {
+            let current = self.live.load(Ordering::Acquire);
+            if current >= SIGNALLING_TEST_DELIVERY_CAPACITY {
+                return Err(DeliveryRefusal::Provider(
+                    "finite signaling test provider exhausted".into(),
+                ));
+            }
+            if self
+                .live
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(Box::new(FiniteTestLease {
+                    live: Arc::clone(&self.live),
+                }));
+            }
+        }
+    }
+}
+
+impl DeliveryLease for FiniteTestLease {
+    fn finish(self: Box<Self>, _terminal: DeliveryTerminal) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl DeliveryProvider for FiniteTestProvider {
+    fn reserve_session_record(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_session_set_node(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_session_set_growth(
+        &self,
+        _session: RelaySessionId,
+        _retention: SessionRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_attempt_record(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_attempt_key(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_attempt_map_growth(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_relay_map_growth(
+        &self,
+        _attempt: &str,
+        _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+}
 
 /// Read frames until a text frame arrives (skipping pings/pongs),
 /// failing the test on timeout or close.
@@ -90,7 +215,7 @@ async fn relay_forwards_event_to_matching_subscriber() {
     assert_eq!(delivered[1], "sub1");
     assert_eq!(delivered[2]["content"], "hello");
 
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 #[tokio::test]
@@ -127,7 +252,7 @@ async fn relay_replays_stored_presence_to_late_subscriber() {
     let eose = parse(&next_text(&mut sub).await);
     assert_eq!(eose[0], "EOSE");
 
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 #[tokio::test]
@@ -157,7 +282,7 @@ async fn ephemeral_events_are_not_stored() {
     let first = parse(&next_text(&mut sub).await);
     assert_eq!(first[0], "EOSE", "ephemeral event must not be replayed");
 
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 #[tokio::test]
@@ -198,7 +323,7 @@ async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
         !received,
         "only the advertised presence/negotiation profiles match"
     );
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 // The headline test: two real Nostr drivers, pointed ONLY at a
@@ -207,7 +332,7 @@ async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
 #[tokio::test]
 async fn two_drivers_discover_via_self_hosted_relay() {
     use myownmesh_signaling::nostr::driver::{
-        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
     };
     use tokio::sync::mpsc;
 
@@ -215,6 +340,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let provider: Arc<dyn DeliveryProvider> = Arc::new(FiniteTestProvider::new());
 
     let mk = |device: &str| NostrDriverConfig {
         app_id: "myownmesh-test".into(),
@@ -232,18 +358,20 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // test — dropping either tears the driver down.
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start(
+    let _driver_a = start_with_delivery_provider(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
+        Arc::clone(&provider),
     );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(
+    let _driver_b = start_with_delivery_provider(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
+        Arc::clone(&provider),
     );
 
     // Drivers auto-announce on start; B should learn about A through the
@@ -265,7 +393,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // Hold the senders/handles until here.
     drop(out_tx_a);
     drop(out_tx_b);
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 // End-to-end: a driver that makes a *deliberate* exit announces its own
@@ -276,7 +404,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
 #[tokio::test]
 async fn driver_self_announced_leave_reaches_peer() {
     use myownmesh_signaling::nostr::driver::{
-        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
     };
     use tokio::sync::mpsc;
 
@@ -284,6 +412,7 @@ async fn driver_self_announced_leave_reaches_peer() {
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let provider: Arc<dyn DeliveryProvider> = Arc::new(FiniteTestProvider::new());
 
     let mk = |device: &str| NostrDriverConfig {
         app_id: "myownmesh-test".into(),
@@ -297,18 +426,20 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start(
+    let _driver_a = start_with_delivery_provider(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
+        Arc::clone(&provider),
     );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(
+    let _driver_b = start_with_delivery_provider(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
+        Arc::clone(&provider),
     );
 
     // B discovers A first.
@@ -345,7 +476,7 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     drop(out_tx_a);
     drop(out_tx_b);
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 // Intelligent-relay behaviour: when a member's socket drops, the relay emits a
@@ -394,7 +525,7 @@ async fn relay_emits_leave_when_member_disconnects() {
     assert_eq!(content["kind"], "leave");
     assert_eq!(content["peer_id"], "devA");
 
-    server.stop();
+    server.stop_and_wait().await;
 }
 
 // End-to-end: a driver learns a peer left soon after the relay sees the
@@ -411,7 +542,7 @@ async fn relay_emits_leave_when_member_disconnects() {
 #[tokio::test]
 async fn driver_gets_peer_left_when_peer_disconnects() {
     use myownmesh_signaling::nostr::driver::{
-        start, NostrDriverConfig, NostrInbound, NostrOutbound,
+        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
     };
     use tokio::sync::mpsc;
 
@@ -419,6 +550,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let provider: Arc<dyn DeliveryProvider> = Arc::new(FiniteTestProvider::new());
 
     let mk = |device: &str| NostrDriverConfig {
         app_id: "myownmesh-test".into(),
@@ -432,18 +564,20 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let driver_a = start(
+    let driver_a = start_with_delivery_provider(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
+        Arc::clone(&provider),
     );
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start(
+    let _driver_b = start_with_delivery_provider(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
+        Arc::clone(&provider),
     );
 
     // First B discovers A.
@@ -477,5 +611,85 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
     assert!(saw_leave, "B never saw A's departure");
 
     drop(out_tx_b);
-    server.stop();
+    server.stop_and_wait().await;
+}
+
+#[tokio::test]
+async fn zero_limit_configuration_is_rejected_before_binding() {
+    let limits = Limits {
+        max_connections: 0,
+        ..Limits::default()
+    };
+    let error = SignalingServer::start("127.0.0.1", 0, limits)
+        .await
+        .err()
+        .expect("an unlimited global admission must be rejected");
+    assert!(error.to_string().contains("max_connections"));
+}
+
+#[tokio::test]
+async fn global_admission_cap_applies_before_websocket_handshake() {
+    let limits = Limits {
+        max_connections: 1,
+        ..Limits::default()
+    };
+    let server = SignalingServer::start("127.0.0.1", 0, limits)
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let (first, _) = connect_async(&url).await.unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), connect_async(&url))
+        .await
+        .expect("second handshake should be refused promptly");
+    assert!(
+        second.is_err(),
+        "global admission must refuse the second peer"
+    );
+    assert_eq!(server.stats().connections, 1);
+    drop(first);
+    server.stop_and_wait().await;
+}
+
+#[tokio::test]
+async fn handshake_bytes_are_bounded_before_websocket_parser() {
+    let limits = Limits {
+        max_handshake_bytes: 64,
+        ..Limits::default()
+    };
+    let server = SignalingServer::start("127.0.0.1", 0, limits)
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: ").await.unwrap();
+    stream.write_all(&[b'x'; 128]).await.unwrap();
+    let mut response = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("oversized handshake should be closed promptly");
+    assert_eq!(server.stats().connections, 0);
+    server.stop_and_wait().await;
+}
+
+#[tokio::test]
+async fn websocket_frame_and_message_limits_refuse_before_json_parse() {
+    let limits = Limits {
+        max_message_bytes: 32,
+        max_frame_bytes: 32,
+        ..Limits::default()
+    };
+    let server = SignalingServer::start("127.0.0.1", 0, limits)
+        .await
+        .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let (mut ws, _) = connect_async(&url).await.unwrap();
+    ws.send(Message::Text("x".repeat(128))).await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), ws.next())
+        .await
+        .expect("oversized message should produce a bounded protocol close");
+    assert!(matches!(
+        outcome,
+        Some(Err(_)) | Some(Ok(Message::Close(_)))
+    ));
+    assert_eq!(server.stats().connections, 0);
+    server.stop_and_wait().await;
 }

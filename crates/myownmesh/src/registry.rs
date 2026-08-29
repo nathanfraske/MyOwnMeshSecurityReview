@@ -1444,7 +1444,10 @@ impl NetworkRegistry {
         // Signaling first: their `Drop` signals every spawned task to exit, and
         // doing it before the engine wait means those tasks are not still
         // publishing on behalf of a network that is going away.
-        drop(entry.drivers.lock().take());
+        let drivers = entry.drivers.lock().take();
+        if let Some(drivers) = drivers {
+            drivers.shutdown().await;
+        }
         let outcome = entry
             .joined
             .shutdown()
@@ -1751,7 +1754,7 @@ impl MeasuredNetworksList<'_> {
 
 /// Outcome of a [`NetworkRegistry::remove`] call.
 pub enum RemoveResult {
-    /// The runtime was torn down: drivers dropped, engine driver retired,
+    /// The runtime was torn down: signaling drivers joined, engine driver retired,
     /// state `Stopped`. Carries the shutdown outcome so a failed teardown is
     /// reported rather than assumed clean.
     Removed(Result<(), String>),

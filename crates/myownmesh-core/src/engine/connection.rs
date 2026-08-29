@@ -351,10 +351,17 @@ pub(super) struct DedupDrain {
 struct ClosingWorker {
     worker: Arc<WebRtcConnectorWorker>,
     dedup: Option<DedupToken>,
-    supplemental_dedup: Option<DedupToken>,
     additional_dedup: PromotedDedupDrain,
-    supplemental_additional_dedup: Option<PromotedDedupDrain>,
     additional_attached: bool,
+}
+
+/// The one pre-promotion owner for a connector installation.
+///
+/// Promotion transfers the connector into `PromotedSessionSlot`; keeping the
+/// unpromoted phase in an explicit owner prevents callers from borrowing an
+/// ownership-bearing field as a compatibility mirror.
+struct UnpromotedConnector {
+    worker: Arc<WebRtcConnectorWorker>,
 }
 
 impl Iterator for DedupDrain {
@@ -407,11 +414,10 @@ impl PeerConnection {
 pub struct PeerConnection {
     pub device_id: String,
     pub state: RwLock<PeerStateData>,
-    /// Compatibility mirror for the unpromoted connector and legacy
-    /// diagnostics. Once a channel is promoted, `promoted_session` owns
-    /// worker membership and selection; all authority helpers consult it
-    /// first and never trust this mirror to select a channel.
-    pub(super) session: Mutex<Option<Arc<WebRtcConnectorWorker>>>,
+    /// Sole owner slot for the pre-promotion connector. Promotion transfers
+    /// authority into `promoted_session`; this slot is never consulted after
+    /// that transfer.
+    unpromoted_connector: Mutex<Option<UnpromotedConnector>>,
     speculative: Mutex<Vec<SpeculativeAttempt>>,
     closing_workers: Mutex<Vec<ClosingWorker>>,
     retired_dedup: Mutex<Vec<DedupToken>>,
@@ -503,9 +509,7 @@ impl PeerConnection {
         closing.push(ClosingWorker {
             worker,
             dedup: None,
-            supplemental_dedup: None,
             additional_dedup: PromotedDedupSet::new().drain_tokens(),
-            supplemental_additional_dedup: None,
             additional_attached: false,
         });
     }
@@ -518,41 +522,37 @@ impl PeerConnection {
     ) {
         worker.retire();
         let mut closing = self.closing_workers.lock();
+        let mut unretained_dedup = dedup;
+        let mut unretained_additional_dedup = Some(additional_dedup);
         if let Some(index) = closing
             .iter()
             .position(|current| Arc::ptr_eq(&current.worker, &worker))
         {
             let current = &mut closing[index];
-            // A second retirement of the same Arc is expected when a
-            // promoted worker is still present in the legacy mirror. Never
-            // overwrite the first custody. A primary token can fill an empty
-            // primary slot; a second source uses the bounded supplemental
-            // slot and remains attached to this exact close entry.
             if current.dedup.is_none() {
-                current.dedup = dedup;
-            } else if current.supplemental_dedup.is_none() {
-                current.supplemental_dedup = dedup;
-            } else {
-                unreachable!("one exact worker has only one bounded duplicate primary source");
+                current.dedup = unretained_dedup.take();
             }
             if !current.additional_attached {
-                current.additional_dedup = additional_dedup;
+                current.additional_dedup = unretained_additional_dedup
+                    .take()
+                    .expect("additional dedup input is present");
                 current.additional_attached = true;
-            } else if current.supplemental_additional_dedup.is_none() {
-                current.supplemental_additional_dedup = Some(additional_dedup);
-            } else {
-                unreachable!("one exact worker has only one bounded duplicate additional source");
             }
         } else {
             closing.push(ClosingWorker {
                 worker,
-                dedup,
-                supplemental_dedup: None,
-                additional_dedup,
-                supplemental_additional_dedup: None,
+                dedup: unretained_dedup.take(),
+                additional_dedup: unretained_additional_dedup
+                    .take()
+                    .expect("additional dedup input is present"),
                 additional_attached: true,
             });
         }
+        drop(closing);
+        self.release_dedup_custody(
+            unretained_dedup,
+            unretained_additional_dedup.unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
+        );
     }
 
     fn release_dedup_custody(
@@ -588,20 +588,11 @@ impl PeerConnection {
                 continue;
             }
             let dedup = current.dedup.take();
-            let supplemental_dedup = current.supplemental_dedup.take();
             let additional_dedup = std::mem::replace(
                 &mut current.additional_dedup,
                 PromotedDedupSet::new().drain_tokens(),
             );
-            let supplemental_additional_dedup = current.supplemental_additional_dedup.take();
             self.release_dedup_custody(dedup, additional_dedup);
-            if supplemental_dedup.is_some() || supplemental_additional_dedup.is_some() {
-                self.release_dedup_custody(
-                    supplemental_dedup,
-                    supplemental_additional_dedup
-                        .unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
-                );
-            }
         }
         closing.retain(|current| !Arc::ptr_eq(&current.worker, worker));
     }
@@ -613,20 +604,11 @@ impl PeerConnection {
                 continue;
             }
             let dedup = current.dedup.take();
-            let supplemental_dedup = current.supplemental_dedup.take();
             let additional_dedup = std::mem::replace(
                 &mut current.additional_dedup,
                 PromotedDedupSet::new().drain_tokens(),
             );
-            let supplemental_additional_dedup = current.supplemental_additional_dedup.take();
             self.release_dedup_custody(dedup, additional_dedup);
-            if supplemental_dedup.is_some() || supplemental_additional_dedup.is_some() {
-                self.release_dedup_custody(
-                    supplemental_dedup,
-                    supplemental_additional_dedup
-                        .unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
-                );
-            }
         }
         closing.retain(|current| worker.as_ptr() != Arc::as_ptr(&current.worker));
     }
@@ -687,21 +669,23 @@ impl PeerConnection {
                 self.release_dedup_custody(dedup, additional_dedup);
                 return false;
             };
+            let mut unretained_dedup = dedup;
+            let mut unretained_additional_dedup = Some(additional_dedup);
             if entry.dedup.is_none() {
-                entry.dedup = dedup;
-            } else if entry.supplemental_dedup.is_none() {
-                entry.supplemental_dedup = dedup;
-            } else {
-                unreachable!("one exact worker has only one bounded duplicate primary source");
+                entry.dedup = unretained_dedup.take();
             }
             if !entry.additional_attached {
-                entry.additional_dedup = additional_dedup;
+                entry.additional_dedup = unretained_additional_dedup
+                    .take()
+                    .expect("additional dedup input is present");
                 entry.additional_attached = true;
-            } else if entry.supplemental_additional_dedup.is_none() {
-                entry.supplemental_additional_dedup = Some(additional_dedup);
-            } else {
-                unreachable!("one exact worker has only one bounded duplicate additional source");
             }
+            drop(closing);
+            self.release_dedup_custody(
+                unretained_dedup,
+                unretained_additional_dedup
+                    .unwrap_or_else(|| PromotedDedupSet::new().drain_tokens()),
+            );
         }
         self.spawn_one_closing_worker(worker)
     }
@@ -722,7 +706,7 @@ impl PeerConnection {
 
     pub(super) fn revoke_promoted_session(self: &Arc<Self>) {
         let workers = self.promoted_session.take_workers_with_dedup();
-        drop(self.session.lock().take());
+        drop(self.take_unpromoted_connector());
         drop(self.endpoint_auth.lock().take());
         drop(self.authenticated_channel.lock().take());
         self.media_renegotiation_workers.lock().clear();
@@ -759,7 +743,7 @@ impl PeerConnection {
             self.authenticated_channel.lock().is_none(),
             "a successfully promoted channel is consumed before replacement"
         );
-        let replaced = self.session.lock().replace(worker);
+        let replaced = self.install_unpromoted_connector(worker);
         drop(replaced);
     }
 
@@ -773,15 +757,49 @@ impl PeerConnection {
         self.attempt.read().clone()
     }
 
-    /// The selected slot channel is the post-promotion authority. The legacy
-    /// worker mirror remains only for an unpromoted installation and for
-    /// compatibility callers; it is never allowed to choose over the slot.
+    /// The selected slot channel is the post-promotion authority. The explicit
+    /// unpromoted owner is consulted only before promotion.
     pub(super) fn current_worker(&self) -> Option<Arc<WebRtcConnectorWorker>> {
         if self.promoted_session.is_installed() {
             self.promoted_session.selected_worker()
         } else {
-            self.session.lock().clone()
+            self.current_unpromoted_worker()
         }
+    }
+
+    /// Whether this installation has a current worker in either lifecycle
+    /// phase. The promoted slot remains authoritative when it is installed.
+    pub(super) fn has_current_worker(&self) -> bool {
+        self.current_worker().is_some()
+    }
+
+    /// Install the sole pre-promotion connector owner, returning the prior
+    /// owner for an explicit retirement path.
+    #[cfg(test)]
+    pub(super) fn install_unpromoted_connector(
+        &self,
+        worker: Arc<WebRtcConnectorWorker>,
+    ) -> Option<Arc<WebRtcConnectorWorker>> {
+        self.unpromoted_connector
+            .lock()
+            .replace(UnpromotedConnector { worker })
+            .map(|owner| owner.worker)
+    }
+
+    /// Take the pre-promotion connector owner without consulting promoted
+    /// session state.
+    pub(super) fn take_unpromoted_connector(&self) -> Option<Arc<WebRtcConnectorWorker>> {
+        self.unpromoted_connector
+            .lock()
+            .take()
+            .map(|owner| owner.worker)
+    }
+
+    fn current_unpromoted_worker(&self) -> Option<Arc<WebRtcConnectorWorker>> {
+        self.unpromoted_connector
+            .lock()
+            .as_ref()
+            .map(|owner| Arc::clone(&owner.worker))
     }
 
     /// Adopt the offerer's correlation for this attempt.
@@ -820,7 +838,7 @@ impl PeerConnection {
         let mut current = self.attempt.write();
         if *current == attempt {
             if let Some(dedup) = dedup {
-                let worker = self.session.lock().clone();
+                let worker = self.current_unpromoted_worker();
                 let mut retained = self.additional_attempt_dedup.lock();
                 if let Some(worker) = worker {
                     if let Err(dedup) = retained.try_push_speculative(&worker, dedup) {
@@ -862,7 +880,7 @@ impl PeerConnection {
     }
 
     pub(super) fn retain_current_dedup(&self, token: DedupToken) {
-        let worker = self.session.lock().clone();
+        let worker = self.current_unpromoted_worker();
         let mut retained = self.additional_attempt_dedup.lock();
         if let Some(worker) = worker {
             if let Err(token) = retained.try_push_speculative(&worker, token) {
@@ -1384,11 +1402,11 @@ impl PeerConnection {
         })
     }
 
-    pub(super) fn new(device_id: String, session: Option<Arc<WebRtcConnectorWorker>>) -> Self {
+    pub(super) fn new(device_id: String, worker: Option<Arc<WebRtcConnectorWorker>>) -> Self {
         Self {
             device_id,
             state: RwLock::new(PeerStateData::default()),
-            session: Mutex::new(session),
+            unpromoted_connector: Mutex::new(worker.map(|worker| UnpromotedConnector { worker })),
             speculative: Mutex::new(Vec::new()),
             closing_workers: Mutex::new(Vec::new()),
             retired_dedup: Mutex::new(Vec::new()),
@@ -1532,7 +1550,7 @@ impl PeerConnection {
                 attempt.additional_dedup.drain_tokens(),
             ));
         }
-        let worker = self.session.lock().take();
+        let worker = self.take_unpromoted_connector();
         if let Some(worker) = worker {
             workers.push((
                 worker,
@@ -1617,9 +1635,7 @@ impl PeerConnection {
             return false;
         }
         let exact_connector = self
-            .session
-            .lock()
-            .as_ref()
+            .current_unpromoted_worker()
             .is_some_and(|worker| worker.owns_endpoint_auth(&task));
         if !exact_connector {
             return false;
@@ -1669,10 +1685,10 @@ impl PeerConnection {
             return self.promoted_session.endpoint_auth_for(worker);
         }
         self.promoted_session.endpoint_auth_for(worker).or_else(|| {
-            self.session
+            self.unpromoted_connector
                 .lock()
                 .as_ref()
-                .filter(|current| Arc::ptr_eq(current, worker))
+                .filter(|current| Arc::ptr_eq(&current.worker, worker))
                 .and_then(|_| self.endpoint_auth.lock().clone())
         })
     }
@@ -1925,10 +1941,10 @@ impl PeerConnection {
         if self.promoted_session.is_installed() {
             return self.promoted_session.has_usable_channel();
         }
-        self.session
+        self.unpromoted_connector
             .lock()
             .as_ref()
-            .is_some_and(|worker| worker.live_connector_incarnation().is_some())
+            .is_some_and(|owner| owner.worker.live_connector_incarnation().is_some())
     }
 
     #[cfg(test)]
@@ -2312,15 +2328,11 @@ impl PeerConnection {
     /// The two slots are read **one at a time, never nested**, and that is a
     /// correctness requirement rather than a style choice.
     ///
-    /// This entry's lock order is `session` → `promoted_session` →
-    /// `authenticated_channel`, and [`Self::promote_session_if_needed`] is the
-    /// only method that nests any of them. It holds `promoted_session` while it
-    /// takes `authenticated_channel`, so reading those two here in the opposite
-    /// order — which is what a single `||` tail expression would do, the first
-    /// operand's guard still alive when the second lock is reached — closes a
-    /// cycle against promotion running concurrently on another peer's task. The
-    /// `let` binding is what ends the first guard's temporary scope before the
-    /// second lock is taken.
+    /// The promoted slot is inspected before `authenticated_channel`, and
+    /// those locks are never nested here. [`Self::promote_session_if_needed`]
+    /// may hold the promoted slot while it takes the capability slot, so the
+    /// separate observations below must keep their guards short-lived rather
+    /// than composing them into one lock-holding expression.
     ///
     /// Every other acquisition on this entry, here and elsewhere, takes exactly
     /// one of these locks per statement and releases it before the next, so no

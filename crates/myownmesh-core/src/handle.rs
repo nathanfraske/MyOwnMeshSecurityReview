@@ -409,6 +409,61 @@ impl JoinedNetwork {
         self.state.topology.read().clone()
     }
 
+    /// Subscribe to the connection diagnostics for this exact joined
+    /// runtime. The engine state remains behind the handle boundary.
+    pub fn subscribe_conn_trace(
+        &self,
+    ) -> broadcast::Receiver<crate::engine::conn_trace::ConnTrace> {
+        self.state.subscribe_conn_trace()
+    }
+
+    /// Attach an in-process signaling broker to this joined runtime. This is
+    /// retained for transport-lab controls; normal applications use the
+    /// configured signaling attachment performed by the mesh lifecycle.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn attach_local(&self, broker: &myownmesh_signaling::local::LocalBroker) {
+        crate::engine::attach_local(&self.state, broker);
+    }
+
+    /// Attach the signaling drivers selected by this network's configuration.
+    ///
+    /// Driver ownership stays inside the joined-network handle: callers do
+    /// not need to borrow or retain the engine state in order to start the
+    /// configured signaling path. `Ok(None)` means another in-process owner
+    /// already took the outbound receiver; it is not an attach failure.
+    pub fn attach_signaling(&self) -> Result<Option<crate::engine::SignalingDrivers>> {
+        crate::engine::attach_signaling(&self.state)
+    }
+
+    /// Return the restart decision and the two config dimensions used by the
+    /// daemon's lifecycle log without exposing the engine state.
+    #[doc(hidden)]
+    pub fn reconcile_status(&self, next: &NetworkConfig) -> (bool, bool, bool) {
+        let current = self.state.config.read();
+        (
+            crate::engine::reconcile::requires_restart(&current, next),
+            current.signaling != next.signaling,
+            current.network_id != next.network_id,
+        )
+    }
+
+    /// Snapshot the exact live configuration owned by this handle.
+    ///
+    /// The daemon uses this only to restore the predecessor when a
+    /// transport-config replacement is refused after teardown has begun.
+    #[doc(hidden)]
+    pub fn config_snapshot(&self) -> NetworkConfig {
+        self.state.config.read().clone()
+    }
+
+    /// Apply the config fields that are safe to change while this exact
+    /// joined runtime remains current.
+    #[doc(hidden)]
+    pub fn apply_hot(&self, next: NetworkConfig) -> Result<()> {
+        crate::engine::reconcile::apply_hot(&self.state, next)
+    }
+
     /// Lend the allocation-free fields of one daemon network summary as one
     /// ordered observation.
     ///
@@ -886,14 +941,7 @@ impl JoinedNetwork {
         Ok(())
     }
 
-    /// Direct access to the shared network state. Hidden from
     /// the API surface for embedders — the engine reaches across
-    /// crate boundaries to manipulate it.
-    #[doc(hidden)]
-    pub fn state(&self) -> Arc<NetworkState> {
-        self.state.clone()
-    }
-
     /// Open one WebRTC realtime flow to `peer` on this network.
     ///
     /// **Named for its provider on purpose.** It carries WebRTC's own

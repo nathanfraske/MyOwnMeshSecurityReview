@@ -264,15 +264,6 @@ pub enum Request {
         #[serde(default)]
         mfa_code: Option<String>,
     },
-    /// Enroll a per-device TOTP custody lock for `network` on this daemon.
-    /// Returns validated secret material (base32 + `otpauth://` URI for a QR)
-    /// and one-time recovery codes for rendering before exact Commit. Material
-    /// remains redeliverable while Prepared, including after a lost response or
-    /// restart, and is never redelivered after Commit. Legacy Enroll remains
-    /// strict and fails if an enrollment already exists (disable it first).
-    GovernanceMfaEnroll {
-        network: String,
-    },
     /// Prepare a new enrollment and return its exact transaction identity.
     /// The enrollment remains prepared until an explicit commit or abort.
     GovernanceMfaPrepare {

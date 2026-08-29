@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! Regression test for the "refresh button strands the peer" bug: the GUI's
 //! reconnect / refresh control used to leave-and-rejoin the network, which
 //! announces a departure (`Leave`) and tears the peer's session down on the
@@ -12,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};

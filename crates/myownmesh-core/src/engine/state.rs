@@ -1655,7 +1655,7 @@ pub struct NetworkState {
     pub(crate) rpc_handler_precommit_action: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 
     /// Force-reconnect handle for the signaling driver, stashed by
-    /// [`crate::engine::signaling_bridge::attach_nostr`] once the
+    /// [`crate::handle::JoinedNetwork::attach_signaling`] call is made, once the
     /// Nostr driver is up. Bumping the generation makes every relay
     /// drop its socket and redial immediately (see the driver's
     /// `force_reconnect`); the engine triggers it on resume-from-sleep

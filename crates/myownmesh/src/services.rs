@@ -263,7 +263,7 @@ impl ServiceManager {
             || g.config.signaling != desired.signaling
         {
             if let Some(h) = g.signaling.take() {
-                h.stop();
+                h.stop_and_wait().await;
             }
             if desired.signaling.enabled {
                 match SignalingServer::start(
@@ -336,7 +336,7 @@ impl ServiceManager {
             h.stop();
         }
         if let Some(h) = g.signaling.take() {
-            h.stop();
+            h.stop_and_wait().await;
         }
         if let Some(h) = g.turn.take() {
             let _ = h.stop().await;
@@ -598,10 +598,7 @@ pub(crate) async fn join_network(
             // through. This stays best-effort per this function's contract:
             // neither caller (daemon startup, the node-enable transition) has
             // anywhere to return a per-network failure to.
-            let attached = {
-                let net_state = joined.state();
-                myownmesh_core::engine::attach_signaling(&net_state)
-            };
+            let attached = joined.attach_signaling();
             let drivers = match attached {
                 Ok(drivers) => drivers,
                 Err(error) => {
@@ -634,7 +631,9 @@ pub(crate) async fn join_network(
                     state = ?refused.state,
                     "join refused: that id is held by a runtime that has not stopped"
                 );
-                drop(refused.drivers);
+                if let Some(drivers) = refused.drivers {
+                    drivers.shutdown().await;
+                }
                 if let Err(e) = refused.joined.shutdown().await {
                     warn!(network = %cfg.network_id, "refused join failed to shut down: {e:#}");
                 }

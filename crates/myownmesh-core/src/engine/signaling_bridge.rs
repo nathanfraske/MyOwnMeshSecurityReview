@@ -27,8 +27,6 @@
 //!   single-consumer) and the two attaches share one
 //!   [`SignalingRuntime`], which is what lets it see that the two
 //!   copies coming back are one emission.
-//! - [`attach_nostr`] / [`attach_mdns`] - single-driver attaches for
-//!   embedders that pick a transport directly.
 //! - [`attach_local`] - an in-process
 //!   [`myownmesh_signaling::local::LocalBroker`] (tests and
 //!   single-process apps).
@@ -493,6 +491,32 @@ impl DeliveryLease for CoreNostrDeliveryLease {
 }
 
 impl CoreNostrDeliveryProvider {
+    fn lease_for_raw_frame(
+        &self,
+        bytes: usize,
+        label: &str,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        let bytes = u64::try_from(bytes)
+            .map_err(|_| DeliveryRefusal::Provider(format!("{label} retention overflow")))?;
+        let claim = ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, bytes),
+            (crate::resource::ResourceClass::ParsingOrCpuWork, bytes),
+            (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
+        ])
+        .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
+        let lease = self
+            .scope
+            .acquire(claim)
+            .map_err(|error| DeliveryRefusal::Provider(error.to_string()))?;
+        self.ledger
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::new(CoreNostrDeliveryLease {
+            _lease: lease,
+            ledger: Arc::clone(&self.ledger),
+            bytes,
+        }))
+    }
+
     fn lease_for_bytes(
         &self,
         bytes: usize,
@@ -520,6 +544,20 @@ impl CoreNostrDeliveryProvider {
 }
 
 impl DeliveryProvider for CoreNostrDeliveryProvider {
+    fn reserve_inbound_frame(
+        &self,
+        frame_bytes: usize,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        // When the signaling driver invokes this seam, it is before decoding a
+        // relay frame. Do not inherit the compatibility zero-content attempt-
+        // map reservation: the raw frame is the peer-controlled allocation,
+        // and its exact byte length must consume finite provider custody before
+        // parsing begins.
+        // This begins at the core adapter; pre-core WebSocket, mDNS, and Nostr
+        // carrier-library allocations remain outside this boundary.
+        self.lease_for_raw_frame(frame_bytes, "raw inbound frame")
+    }
+
     fn on_admission_source(&self, source: AdmissionSource, attempt: &str, _event_id: &str) {
         // DeliveryStore invokes this before duplicate detection. Bind the
         // fresh process-local source to the already claimed physical emission;
@@ -1004,7 +1042,7 @@ fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<Sign
 /// Spawns two pump tasks (outbound engine → broker, inbound
 /// broker → engine) that live until either side closes its
 /// queue. Returns once both pumps are spawned.
-pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
+pub(crate) fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     let room = myownmesh_signaling::nostr::handle::derive_room_handle(
         &resolve_app_id(),
         &state.network_id,
@@ -1296,34 +1334,7 @@ fn resolve_app_id() -> String {
         .unwrap_or_else(|_| crate::TRYSTERO_APP_ID.to_string())
 }
 
-/// Attach the engine to the production Nostr signaling driver.
-/// Returns the driver handle — drop or call `.stop()` to detach.
-/// Prefer [`attach_signaling`] unless you specifically want Nostr
-/// regardless of the network's configured strategy.
-pub fn attach_nostr(state: &Arc<NetworkState>) -> Option<NostrDriverHandle> {
-    let outbound_rx = state.take_signaling_outbound_rx()?;
-    let runtime = signaling_runtime(state, "nostr")?;
-    let (nostr_tx, nostr_rx) =
-        crate::resource::resource_mailbox(state.local_application_resource_scope().ok()?).ok()?;
-    let recovery_instance = state.next_recovery_carrier_instance();
-    let attach = SignalingRuntime::attach_for_state(
-        &runtime,
-        SignalingCarrier::Nostr,
-        state,
-        recovery_instance,
-    )?;
-    let guard = attach.guard();
-    let handle = attach_nostr_with(state, nostr_rx, attach, recovery_instance, false)?;
-    let fanout = spawn_fanout(
-        state.clone(),
-        outbound_rx,
-        vec![(recovery_instance, nostr_tx, guard)],
-    );
-    let handle = state.with_local_signaling_forwarder(|| (handle, fanout))?;
-    Some(handle)
-}
-
-/// [`attach_nostr`] with an explicit outbound receiver + carrier
+/// Attach Nostr using an explicit outbound receiver + carrier
 /// attach, so [`attach_signaling`]'s fan-out can feed several drivers
 /// from the one engine receiver and one runtime.
 fn attach_nostr_with(
@@ -1489,37 +1500,7 @@ fn attach_nostr_shared(
     Some(handle)
 }
 
-/// Attach the engine to the LAN mDNS signaling driver. Returns the
-/// driver handle — drop or call `.stop()` to withdraw the DNS-SD
-/// advertisement and detach. `None` if another consumer already took
-/// the engine's outbound receiver, or if the mDNS daemon / exchange
-/// listener couldn't come up (no usable socket, no multicast).
-/// Prefer [`attach_signaling`] unless you specifically want mDNS
-/// regardless of the network's configured strategy.
-pub fn attach_mdns(state: &Arc<NetworkState>) -> Option<MdnsDriverHandle> {
-    let outbound_rx = state.take_signaling_outbound_rx()?;
-    let runtime = signaling_runtime(state, "mdns")?;
-    let (mdns_tx, mdns_rx) =
-        crate::resource::resource_mailbox(state.local_application_resource_scope().ok()?).ok()?;
-    let recovery_instance = state.next_recovery_carrier_instance();
-    let attach = SignalingRuntime::attach_for_state(
-        &runtime,
-        SignalingCarrier::Mdns,
-        state,
-        recovery_instance,
-    )?;
-    let guard = attach.guard();
-    let handle = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false)?;
-    let fanout = spawn_fanout(
-        state.clone(),
-        outbound_rx,
-        vec![(recovery_instance, mdns_tx, guard)],
-    );
-    let handle = state.with_local_signaling_forwarder(|| (handle, fanout))?;
-    Some(handle)
-}
-
-/// [`attach_mdns`] with an explicit outbound receiver + carrier
+/// Attach mDNS with an explicit outbound receiver + carrier
 /// attach — the fan-out building block. On driver-start failure the
 /// receiver is dropped (a fan-out sender to it becomes a no-op) and
 /// a warning names the network.
@@ -1626,10 +1607,9 @@ fn attach_mdns_with(
 }
 
 /// Every signaling driver attached to one network, plus the fan-out
-/// task feeding them. Stop-on-drop: the fan-out is aborted and each
-/// driver handle's own `Drop` detaches it — so the registry tears
-/// signaling down for a network by dropping this value, exactly as
-/// it did with the bare Nostr handle before mDNS existed.
+/// task feeding them. The owning lifecycle calls [`Self::shutdown`] and
+/// awaits it so fan-out and driver tasks are joined before the network entry
+/// is released. `Drop` remains a signal-only compatibility boundary.
 pub struct SignalingDrivers {
     nostr: Option<Arc<NostrDriverHandle>>,
     mdns: Option<MdnsDriverHandle>,
@@ -1675,6 +1655,26 @@ impl SignalingDrivers {
     pub fn cancel_attempt(&self, attempt: &str) -> usize {
         self.finish_attempt(attempt, DeliveryTerminal::Cancelled)
     }
+
+    /// Signal and join every signaling task owned by this value.
+    ///
+    /// The fan-out is stopped and joined before the driver handles are
+    /// consumed. Nostr's handle is shared because relay reconnect state is
+    /// also held by the engine; its own idempotent join boundary is therefore
+    /// borrowed. mDNS is uniquely owned here and is consumed by its join
+    /// boundary. All awaits happen after the registry has released its mutex.
+    pub async fn shutdown(mut self) {
+        if let Some(fanout) = self.fanout.take() {
+            fanout.abort();
+            let _ = fanout.await;
+        }
+        if let Some(nostr) = self.nostr.take() {
+            nostr.stop_and_join().await;
+        }
+        if let Some(mdns) = self.mdns.take() {
+            mdns.stop_and_join().await;
+        }
+    }
 }
 
 impl Drop for SignalingDrivers {
@@ -1705,7 +1705,9 @@ impl Drop for SignalingDrivers {
 /// config in a multicast-less environment) still drains the engine's
 /// outbound queue so it can't grow unboundedly — the network is
 /// simply unreachable, and warnings say so.
-pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<SignalingDrivers>> {
+pub(crate) fn attach_signaling(
+    state: &Arc<NetworkState>,
+) -> crate::Result<Option<SignalingDrivers>> {
     let (strategy, mdns_on) = {
         let cfg = state.config.read();
         (cfg.signaling.strategy.clone(), cfg.signaling.mdns)
@@ -2438,6 +2440,27 @@ mod tests {
         let before = accountant
             .in_use()
             .amount(crate::resource::ResourceClass::AccountedMemoryBytes);
+        let raw = provider
+            .reserve_inbound_frame(37)
+            .expect("raw frame admission is funded before parse");
+        let after_raw = accountant
+            .in_use()
+            .amount(crate::resource::ResourceClass::AccountedMemoryBytes);
+        assert_eq!(after_raw - before, 37);
+        assert_eq!(
+            accountant
+                .in_use()
+                .amount(crate::resource::ResourceClass::ParsingOrCpuWork),
+            37,
+            "raw frame admission also funds its bounded parse work"
+        );
+        drop(raw);
+        assert_eq!(
+            accountant
+                .in_use()
+                .amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            before
+        );
         let lease = provider
             .lease_for_bytes(37, "ledger-control")
             .expect("the isolated provider admits the exact retention");

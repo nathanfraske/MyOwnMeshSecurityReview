@@ -18,8 +18,8 @@
 //!   waiting out a heartbeat timeout. Public relays never send this;
 //!   peers that don't get it fall back to timeout detection.
 //! - **Flood limits.** Per-connection token buckets, per-IP connection
-//!   caps, subscription / filter / message-size caps, and strike-based
-//!   disconnection — so the relay is safe to stand up publicly.
+//!   caps, subscription / filter / message-size / presence caps, and
+//!   strike-based disconnection — so the relay is safe to stand up publicly.
 //!
 //! ## What it deliberately skips
 //!
@@ -35,18 +35,23 @@
 //! late-joiner replay.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::accept_async_with_config;
+use tokio_tungstenite::tungstenite::{protocol::WebSocketConfig, Message as WsMessage};
 use tracing::{debug, info, trace, warn};
 
 use crate::nostr::event::{
@@ -71,17 +76,30 @@ const MAX_REPLAY_PER_REQ: usize = 500;
 /// must not turn relay fanout into an unbounded allocation path.
 const OUTBOUND_QUEUE_CAP: usize = 128;
 
+/// Bound the bytes read while parsing the HTTP upgrade request. This is
+/// separate from the WebSocket frame/message limits because the upgrade is
+/// parsed before a WebSocket stream exists.
+const DEFAULT_MAX_HANDSHAKE_BYTES: u32 = 16 * 1024;
+
+/// A slow client must not hold a pre-admission slot forever while trickling an
+/// incomplete HTTP upgrade.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound writer shutdown while preserving an awaited, joined stop path.
+const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How many rate-limit violations a connection may rack up before the
 /// relay closes it. Generous enough to ride out a legitimate burst,
 /// tight enough to evict a persistent abuser.
 const STRIKE_LIMIT: u32 = 50;
 
-/// Flood-protection limits for the signaling relay. Tunable so a busy
-/// public deployment can loosen them and a locked-down private one can
-/// tighten them. `0` means "no limit" for every field.
+/// Flood-protection limits for the signaling relay. Every field is finite and
+/// non-zero: an unbounded deployment is not a valid server configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
+    /// Max connections admitted globally, including handshakes in progress.
+    pub max_connections: u32,
     /// Max `EVENT` publishes per second per connection (token bucket,
     /// 1-second burst).
     pub max_event_rate: u32,
@@ -95,18 +113,55 @@ pub struct Limits {
     pub max_message_bytes: u32,
     /// Max concurrent connections from one IP address.
     pub max_connections_per_ip: u32,
+    /// Max distinct live `(room, device)` memberships one connection may
+    /// own. Since global connections are bounded, total live presence is
+    /// bounded by `max_connections * max_presence_memberships`.
+    pub max_presence_memberships: u32,
+    /// Max bytes in the HTTP upgrade request before the WebSocket parser.
+    pub max_handshake_bytes: u32,
+    /// Max payload bytes in one incoming WebSocket frame.
+    pub max_frame_bytes: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_connections: 256,
             max_event_rate: 50,
             max_req_rate: 20,
             max_subscriptions: 64,
             max_filters_per_req: 16,
             max_message_bytes: 65_536,
             max_connections_per_ip: 64,
+            max_presence_memberships: 256,
+            max_handshake_bytes: DEFAULT_MAX_HANDSHAKE_BYTES,
+            max_frame_bytes: 65_536,
         }
+    }
+}
+
+impl Limits {
+    /// Reject zero/unlimited values before any listener or connection task is
+    /// created. Keeping the check at the public construction boundary makes
+    /// every live relay finite, including deployments that deserialize this
+    /// type from configuration.
+    pub fn validate(&self) -> Result<()> {
+        let fields = [
+            ("max_connections", self.max_connections),
+            ("max_event_rate", self.max_event_rate),
+            ("max_req_rate", self.max_req_rate),
+            ("max_subscriptions", self.max_subscriptions),
+            ("max_filters_per_req", self.max_filters_per_req),
+            ("max_message_bytes", self.max_message_bytes),
+            ("max_connections_per_ip", self.max_connections_per_ip),
+            ("max_presence_memberships", self.max_presence_memberships),
+            ("max_handshake_bytes", self.max_handshake_bytes),
+            ("max_frame_bytes", self.max_frame_bytes),
+        ];
+        if let Some((name, _)) = fields.into_iter().find(|(_, value)| *value == 0) {
+            return Err(Error::Other(format!("{name} must be finite and non-zero")));
+        }
+        Ok(())
     }
 }
 
@@ -132,10 +187,11 @@ pub struct RelayStatsSnapshot {
 pub struct SignalingServer;
 
 /// Handle to a running signaling relay. Drop it (or call
-/// [`SignalingServerHandle::stop`]) to shut the listener down.
+/// [`SignalingServerHandle::stop_and_wait`]) to shut the listener down.
 pub struct SignalingServerHandle {
-    task: JoinHandle<()>,
-    heartbeat: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
     local_addr: SocketAddr,
     hub: Hub,
 }
@@ -152,19 +208,40 @@ impl SignalingServerHandle {
         self.hub.snapshot()
     }
 
-    /// Stop the relay, aborting its accept loop and connection tasks.
-    pub fn stop(self) {
+    /// Gracefully stop the listener and heartbeat, signal every live
+    /// connection, and await all owned connection/writer tasks. A writer that
+    /// cannot close within the bounded stop interval is aborted and joined so
+    /// no detached task survives this fence.
+    pub async fn stop_and_wait(mut self) {
         self.hub.shutdown();
-        self.task.abort();
-        self.heartbeat.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
+
+        let tasks = {
+            let mut owned = self.connections.lock();
+            std::mem::take(&mut *owned)
+        };
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 }
 
 impl Drop for SignalingServerHandle {
     fn drop(&mut self) {
         self.hub.shutdown();
-        self.task.abort();
-        self.heartbeat.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
     }
 }
 
@@ -173,6 +250,7 @@ impl SignalingServer {
     /// connections. Returns once the socket is bound; the accept loop
     /// runs in a spawned task.
     pub async fn start(bind: &str, port: u16, limits: Limits) -> Result<SignalingServerHandle> {
+        limits.validate()?;
         let addr = format!("{bind}:{port}");
         let listener = TcpListener::bind(&addr)
             .await
@@ -182,11 +260,13 @@ impl SignalingServer {
             .map_err(|e| Error::Bind(addr.clone(), e))?;
         info!(%local_addr, "signaling relay listening (NIP-01 over WebSocket)");
         let hub = Hub::new(limits);
-        let task = tokio::spawn(accept_loop(listener, hub.clone()));
+        let connections = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(accept_loop(listener, hub.clone(), Arc::clone(&connections)));
         let heartbeat = tokio::spawn(stats_heartbeat(hub.clone()));
         Ok(SignalingServerHandle {
-            task,
-            heartbeat,
+            task: Some(task),
+            heartbeat: Some(heartbeat),
+            connections,
             local_addr,
             hub,
         })
@@ -212,26 +292,65 @@ async fn stats_heartbeat(hub: Hub) {
     }
 }
 
-async fn accept_loop(listener: TcpListener, hub: Hub) {
+async fn accept_loop(
+    listener: TcpListener,
+    hub: Hub,
+    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let hub = hub.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, peer, hub).await {
+                let connections = Arc::clone(&connections);
+                let Some(admission) = hub.admit(peer.ip()) else {
+                    let mut stream = stream;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                    continue;
+                };
+                let task = tokio::spawn(async move {
+                    if let Err(e) = handle_conn(stream, peer, hub, admission).await {
                         trace!(%peer, "signaling conn ended: {e}");
                     }
                 });
+                let mut owned = connections.lock();
+                owned.retain(|task| !task.is_finished());
+                owned.push(task);
             }
             Err(e) => warn!("signaling accept error: {e}"),
         }
     }
 }
 
-async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()> {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
+async fn handle_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    hub: Hub,
+    admission: Admission,
+) -> Result<()> {
+    let limits = hub.limits();
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(limits.max_message_bytes as usize),
+        max_frame_size: Some(limits.max_frame_bytes as usize),
+        write_buffer_size: 0,
+        max_write_buffer_size: (limits.max_message_bytes as usize).saturating_mul(2).max(1),
+        ..WebSocketConfig::default()
+    };
+    let handshake = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_async_with_config(
+            HandshakeLimitedStream::new(stream, limits.max_handshake_bytes as usize),
+            Some(ws_config),
+        ),
+    )
+    .await;
+    let ws = match handshake {
+        Ok(Ok(ws)) => ws,
+        Ok(Err(e)) => {
             // A failed handshake means something reached us on the TCP
             // port but didn't complete a WebSocket upgrade. The most
             // common cause in a public deployment is a `wss://` (TLS)
@@ -244,35 +363,51 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
             warn!(%peer, "signaling: websocket handshake failed — a wss:// client on a plain-ws relay (no TLS proxy)?: {e}");
             return Ok(());
         }
+        Err(_) => {
+            warn!(%peer, "signaling: websocket handshake timed out");
+            return Ok(());
+        }
     };
     let (mut write, mut read) = ws.split();
     let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(OUTBOUND_QUEUE_CAP);
 
-    // Per-IP admission control happens at register time.
-    let Some(conn_id) = hub.register(out_tx.clone(), peer.ip()) else {
-        let _ = write
-            .send(WsMessage::Text(
-                json!(["NOTICE", "too many connections from your address"]).to_string(),
-            ))
-            .await;
+    let Some(conn_id) = admission.activate(out_tx.clone()) else {
         let _ = write.close().await;
         return Ok(());
     };
 
     // Writer task: drains the per-connection outbound queue to the
-    // socket. The hub pushes frames onto `out_tx` from any thread.
+    // socket. The closed watch is the fence: queued frames are not drained
+    // after the hub has revoked this connection's admission.
+    let (closed_tx, mut closed_rx) = watch::channel(false);
     let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            if write.send(msg).await.is_err() {
-                break;
+        loop {
+            tokio::select! {
+                changed = closed_rx.changed() => {
+                    if changed.is_err() || *closed_rx.borrow() {
+                        break;
+                    }
+                }
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if *closed_rx.borrow() {
+                        break;
+                    }
+                    if write.send(msg).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
+        let _ = write.close().await;
     });
 
     let mut shutdown = hub.shutdown_signal();
     if *shutdown.borrow() {
+        let _ = closed_tx.send(true);
         hub.unregister(conn_id);
-        writer.abort();
+        drop(out_tx);
+        await_writer(writer).await;
         return Ok(());
     }
     loop {
@@ -305,18 +440,152 @@ async fn handle_conn(stream: TcpStream, peer: SocketAddr, hub: Hub) -> Result<()
         }
     }
 
+    let _ = closed_tx.send(true);
     hub.unregister(conn_id);
-    writer.abort();
+    drop(out_tx);
+    await_writer(writer).await;
     Ok(())
+}
+
+async fn await_writer(mut writer: JoinHandle<()>) {
+    match tokio::time::timeout(WRITER_STOP_TIMEOUT, &mut writer).await {
+        Ok(_) => {}
+        Err(_) => {
+            writer.abort();
+            let _ = writer.await;
+        }
+    }
 }
 
 /// Shared relay state. Cheap to clone — wraps an `Arc<Mutex<…>>`. All the
 /// real logic lives on [`HubInner`] so it runs under a single lock with
 /// no re-entrancy.
+/// Adapter that bounds the HTTP upgrade bytes before tungstenite parses the
+/// request. It switches to transparent forwarding immediately after the
+/// terminating CRLF pair, preserving any coalesced WebSocket bytes.
+struct HandshakeLimitedStream {
+    inner: TcpStream,
+    max_bytes: usize,
+    seen: usize,
+    header_state: u8,
+    complete: bool,
+}
+
+impl HandshakeLimitedStream {
+    fn new(inner: TcpStream, max_bytes: usize) -> Self {
+        Self {
+            inner,
+            max_bytes,
+            seen: 0,
+            header_state: 0,
+            complete: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.header_state = match (self.header_state, *byte) {
+                (0, b'\r') => 1,
+                (1, b'\n') => 2,
+                (2, b'\r') => 3,
+                (3, b'\n') => {
+                    self.complete = true;
+                    return;
+                }
+                (1, b'\r') => 1,
+                _ => 0,
+            };
+        }
+    }
+}
+
+impl AsyncRead for HandshakeLimitedStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if self.complete {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        }
+        if self.seen >= self.max_bytes {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "websocket handshake exceeds configured limit",
+            )));
+        }
+        let amount = buf.remaining().min((self.max_bytes - self.seen).min(8192));
+        if amount == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut scratch = [0u8; 8192];
+        let mut limited = ReadBuf::new(&mut scratch[..amount]);
+        match Pin::new(&mut self.inner).poll_read(cx, &mut limited) {
+            Poll::Ready(Ok(())) => {
+                let bytes = limited.filled();
+                let n = bytes.len();
+                buf.put_slice(bytes);
+                self.seen += n;
+                self.observe(bytes);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for HandshakeLimitedStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 #[derive(Clone)]
 struct Hub {
     inner: Arc<Mutex<HubInner>>,
     shutdown: watch::Sender<bool>,
+}
+
+/// A global/per-IP admission reservation held from TCP accept through the
+/// WebSocket upgrade. Dropping it before activation releases both counters.
+struct Admission {
+    hub: Hub,
+    id: u64,
+    ip: IpAddr,
+    active: bool,
+}
+
+impl Admission {
+    fn activate(mut self, out: mpsc::Sender<WsMessage>) -> Option<u64> {
+        let id = self.id;
+        if self.hub.register(id, out, self.ip) {
+            self.active = false;
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        if self.active {
+            self.hub.release(self.id, self.ip);
+        }
+    }
 }
 
 struct HubInner {
@@ -328,6 +597,8 @@ struct HubInner {
     presence: HashMap<String, HashMap<String, Presence>>,
     /// Concurrent connection count per source IP, for admission control.
     ip_counts: HashMap<IpAddr, u32>,
+    /// Reservations held by handshakes plus registered connections.
+    active_connections: u32,
     limits: Limits,
     /// Keypair used only to sign the relay's own synthesized `leave`
     /// events so they're well-formed for verifying peers.
@@ -344,7 +615,8 @@ struct ConnEntry {
     subs: HashMap<String, Vec<Value>>,
     ip: IpAddr,
     /// `(room, device)` pairs this connection is the live presence owner
-    /// of — used to emit departures when it closes.
+    /// of — used to emit departures when it closes. Its length is bounded by
+    /// `HubInner::limits.max_presence_memberships`.
     present: Vec<(String, String)>,
     event_bucket: TokenBucket,
     req_bucket: TokenBucket,
@@ -352,33 +624,11 @@ struct ConnEntry {
 }
 
 #[derive(Clone)]
-enum OutboundSender {
-    Bounded(mpsc::Sender<WsMessage>),
-    Unbounded(mpsc::UnboundedSender<WsMessage>),
-}
+struct OutboundSender(mpsc::Sender<WsMessage>);
 
 impl OutboundSender {
     fn try_send(&self, message: WsMessage) -> std::result::Result<(), ()> {
-        match self {
-            Self::Bounded(sender) => sender.try_send(message).map_err(|_| ()),
-            Self::Unbounded(sender) => sender.send(message).map_err(|_| ()),
-        }
-    }
-}
-
-trait IntoOutboundSender {
-    fn into_outbound_sender(self) -> OutboundSender;
-}
-
-impl IntoOutboundSender for mpsc::Sender<WsMessage> {
-    fn into_outbound_sender(self) -> OutboundSender {
-        OutboundSender::Bounded(self)
-    }
-}
-
-impl IntoOutboundSender for mpsc::UnboundedSender<WsMessage> {
-    fn into_outbound_sender(self) -> OutboundSender {
-        OutboundSender::Unbounded(self)
+        self.0.try_send(message).map_err(|_| ())
     }
 }
 
@@ -404,6 +654,7 @@ impl Hub {
                 stored: VecDeque::new(),
                 presence: HashMap::new(),
                 ip_counts: HashMap::new(),
+                active_connections: 0,
                 limits,
                 identity: NostrIdentity::generate(),
                 connections_total: 0,
@@ -413,8 +664,26 @@ impl Hub {
         }
     }
 
-    fn register<S: IntoOutboundSender>(&self, out: S, ip: IpAddr) -> Option<u64> {
-        self.inner.lock().register(out, ip)
+    fn admit(&self, ip: IpAddr) -> Option<Admission> {
+        let id = self.inner.lock().admit(ip)?;
+        Some(Admission {
+            hub: self.clone(),
+            id,
+            ip,
+            active: true,
+        })
+    }
+
+    fn limits(&self) -> Limits {
+        self.inner.lock().limits.clone()
+    }
+
+    fn register(&self, id: u64, out: mpsc::Sender<WsMessage>, ip: IpAddr) -> bool {
+        self.inner.lock().register(id, out, ip)
+    }
+
+    fn release(&self, id: u64, ip: IpAddr) {
+        self.inner.lock().release(id, ip);
     }
 
     fn shutdown(&self) {
@@ -445,7 +714,12 @@ impl Hub {
 }
 
 impl HubInner {
-    fn register<S: IntoOutboundSender>(&mut self, out: S, ip: IpAddr) -> Option<u64> {
+    fn admit(&mut self, ip: IpAddr) -> Option<u64> {
+        if self.active_connections >= self.limits.max_connections {
+            return None;
+        }
+        let id = self.next_id;
+        let next_id = id.checked_add(1)?;
         if self.limits.max_connections_per_ip > 0 {
             let n = self.ip_counts.get(&ip).copied().unwrap_or(0);
             if n >= self.limits.max_connections_per_ip {
@@ -453,12 +727,20 @@ impl HubInner {
             }
         }
         *self.ip_counts.entry(ip).or_insert(0) += 1;
-        let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = next_id;
+        self.active_connections += 1;
+        self.connections_total += 1;
+        Some(id)
+    }
+
+    fn register(&mut self, id: u64, out: mpsc::Sender<WsMessage>, ip: IpAddr) -> bool {
+        if self.conns.contains_key(&id) {
+            return false;
+        }
         self.conns.insert(
             id,
             ConnEntry {
-                out: out.into_outbound_sender(),
+                out: OutboundSender(out),
                 subs: HashMap::new(),
                 ip,
                 present: Vec::new(),
@@ -467,19 +749,29 @@ impl HubInner {
                 strikes: 0,
             },
         );
-        self.connections_total += 1;
         // Per-connection churn, not a daemon event: on a relay holding 20+
         // clients this fires constantly, and every reconnect writes a pair of
         // lines forever. The running total is what a healthy log wants, and
         // that's on the periodic summary — this stays available at debug.
         debug!(%ip, active = self.conns.len(), "signaling: client connected");
-        Some(id)
+        true
+    }
+
+    fn release(&mut self, _id: u64, ip: IpAddr) {
+        self.active_connections = self.active_connections.saturating_sub(1);
+        if let Some(c) = self.ip_counts.get_mut(&ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.ip_counts.remove(&ip);
+            }
+        }
     }
 
     fn unregister(&mut self, id: u64) {
         let Some(entry) = self.conns.remove(&id) else {
             return;
         };
+        self.active_connections = self.active_connections.saturating_sub(1);
         if let Some(c) = self.ip_counts.get_mut(&entry.ip) {
             *c = c.saturating_sub(1);
             if *c == 0 {
@@ -686,12 +978,41 @@ impl HubInner {
             }
             return;
         }
-        self.events_relayed = self.events_relayed.saturating_add(1);
-
         // Live presence: an announce makes this connection the owner of
         // (room, device). Best-effort — only well-formed mesh announces
         // parse; generic NIP-01 traffic is ignored here.
-        if let Some((room, device)) = presence_of(&event) {
+        let presence = presence_of(&event);
+        if let Some((room, device)) = &presence {
+            let already_owned = self
+                .conns
+                .get(&conn_id)
+                .map(|conn| conn.present.iter().any(|(r, d)| r == room && d == device))
+                .unwrap_or(false);
+            let over_cap = !already_owned
+                && self
+                    .conns
+                    .get(&conn_id)
+                    .map(|conn| conn.present.len() >= self.limits.max_presence_memberships as usize)
+                    .unwrap_or(false);
+            if over_cap {
+                if let Some(conn) = self.conns.get(&conn_id) {
+                    let _ = conn.out.try_send(WsMessage::Text(
+                        json!([
+                            "OK",
+                            event.id,
+                            false,
+                            "rate-limited: too many live presence memberships"
+                        ])
+                        .to_string(),
+                    ));
+                }
+                trace!(%room, %device, "signaling presence membership refused at per-connection limit");
+                return;
+            }
+        }
+        self.events_relayed = self.events_relayed.saturating_add(1);
+
+        if let Some((room, device)) = presence {
             self.presence.entry(room.clone()).or_default().insert(
                 device.clone(),
                 Presence {
@@ -944,6 +1265,28 @@ mod tests {
         }
     }
 
+    fn announce(identity: &NostrIdentity, room: &str, device: &str, created_at: u64) -> NostrEvent {
+        make_event(
+            identity,
+            SIGNALING_EVENT_KIND,
+            vec![vec!["r".into(), room.into()]],
+            json!({ "from": device, "kind": "announce", "peer_id": device }).to_string(),
+            created_at,
+        )
+    }
+
+    fn test_connection(hub: &Hub, ip: &str) -> (u64, mpsc::Receiver<WsMessage>) {
+        let admission = hub.admit(ip.parse().unwrap()).unwrap();
+        let (out, input) = mpsc::channel(32);
+        let id = admission.activate(out).unwrap();
+        (id, input)
+    }
+
+    fn send_event(hub: &Hub, conn_id: u64, event: &NostrEvent) -> bool {
+        let frame = serde_json::to_string(&json!(["EVENT", event])).unwrap();
+        hub.inner.lock().on_client_message(conn_id, &frame)
+    }
+
     #[test]
     fn kind_storage_split_matches_nip01() {
         assert!(is_stored_kind(1077));
@@ -1004,10 +1347,139 @@ mod tests {
 
     #[test]
     fn token_bucket_zero_is_unlimited() {
+        // TokenBucket's internal zero behavior is retained for its local
+        // arithmetic contract; public Limits rejects zero before startup.
         let mut b = TokenBucket::new(0);
         for _ in 0..1000 {
             assert!(b.allow());
         }
+    }
+
+    #[test]
+    fn limits_reject_every_unlimited_field() {
+        let mut cases = Vec::new();
+        let limits = Limits {
+            max_connections: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_event_rate: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_req_rate: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_subscriptions: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_filters_per_req: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_message_bytes: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_connections_per_ip: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_presence_memberships: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_handshake_bytes: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_frame_bytes: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        assert!(cases.into_iter().all(|limits| limits.validate().is_err()));
+        assert!(Limits::default().validate().is_ok());
+    }
+
+    #[test]
+    fn presence_cap_refuses_only_new_membership_and_duplicate_is_idempotent() {
+        let hub = Hub::new(Limits {
+            max_presence_memberships: 1,
+            ..Limits::default()
+        });
+        let (first_id, mut first_input) = test_connection(&hub, "127.0.0.1");
+        let (second_id, _second_input) = test_connection(&hub, "127.0.0.2");
+        let identity = NostrIdentity::generate();
+        let first = announce(&identity, "room-a", "device-a", 1);
+        let duplicate = announce(&identity, "room-a", "device-a", 2);
+        let second = announce(&identity, "room-b", "device-b", 3);
+
+        assert!(send_event(&hub, first_id, &first));
+        assert!(send_event(&hub, first_id, &duplicate));
+        assert!(send_event(&hub, first_id, &second));
+
+        let mut refused = false;
+        while let Ok(message) = first_input.try_recv() {
+            if let WsMessage::Text(text) = message {
+                let text = text.to_string();
+                if text.contains(&second.id) && text.contains("false") {
+                    refused = true;
+                }
+            }
+        }
+        assert!(refused, "the exact over-cap presence event must be refused");
+
+        let inner = hub.inner.lock();
+        assert_eq!(inner.conns[&first_id].present.len(), 1);
+        assert_eq!(inner.presence["room-a"]["device-a"].conn_id, first_id);
+        assert!(!inner.presence.contains_key("room-b"));
+        assert!(inner.conns.contains_key(&second_id));
+    }
+
+    #[test]
+    fn presence_cap_is_released_after_disconnect() {
+        let hub = Hub::new(Limits {
+            max_presence_memberships: 1,
+            ..Limits::default()
+        });
+        let (first_id, _first_input) = test_connection(&hub, "127.0.0.1");
+        let identity = NostrIdentity::generate();
+        let first = announce(&identity, "room-a", "device-a", 1);
+        assert!(send_event(&hub, first_id, &first));
+
+        hub.unregister(first_id);
+        assert!(hub.inner.lock().presence.is_empty());
+
+        let (second_id, _second_input) = test_connection(&hub, "127.0.0.2");
+        let second = announce(&identity, "room-b", "device-b", 2);
+        assert!(send_event(&hub, second_id, &second));
+        let inner = hub.inner.lock();
+        assert_eq!(inner.conns[&second_id].present.len(), 1);
+        assert_eq!(inner.presence["room-b"]["device-b"].conn_id, second_id);
+    }
+
+    #[test]
+    fn connection_id_exhaustion_refuses_without_admission() {
+        let hub = Hub::new(Limits::default());
+        hub.inner.lock().next_id = u64::MAX;
+
+        assert!(hub.admit("127.0.0.1".parse().unwrap()).is_none());
+        let inner = hub.inner.lock();
+        assert_eq!(inner.next_id, u64::MAX);
+        assert_eq!(inner.active_connections, 0);
+        assert_eq!(inner.connections_total, 0);
+        assert!(inner.ip_counts.is_empty());
     }
 
     #[test]

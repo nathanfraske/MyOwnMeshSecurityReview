@@ -23,7 +23,7 @@
 //!   the `dnssd` C API on iOS (raw multicast sockets are entitlement-gated
 //!   there; mDNSResponder isn't). The exchange below is backend-independent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -32,7 +32,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
@@ -43,6 +44,9 @@ use crate::{
     CarrierAttribution, ErasedOwner, ErasedSource, Error, InboundSink, OutboundSource, OwnedSignal,
     SignalingMessage,
 };
+
+/// Maximum number of accepted or dialed exchanges owned by one driver.
+pub const MAX_ACTIVE_CONNECTIONS: usize = 256;
 
 /// Configuration for one driver instance.
 #[derive(Debug, Clone)]
@@ -148,12 +152,13 @@ where
     let instance = wire::instance_name(&room_handle, &config.device_id);
     // Browse starts inside the backend before the first register, so we never
     // miss a burst of resolves racing our own announce.
-    let (discovery, browse_rx) = Discovery::start(&DiscoveryConfig {
+    let (mut discovery, browse_rx) = Discovery::start(&DiscoveryConfig {
         service_type: wire::SERVICE_TYPE.to_string(),
         instance,
         port,
         txt: wire::txt_properties(&room_handle, &config.device_id),
     })?;
+    let discovery_task = discovery.take_task();
     let discovery = Arc::new(discovery);
 
     // Soft failure (e.g. no usable interface yet) — the re-announce tick
@@ -176,8 +181,11 @@ where
         discovery: discovery.clone(),
         registered: AtomicBool::new(registered),
         peers: Mutex::new(HashMap::new()),
-        key_to_peer: Mutex::new(HashMap::new()),
+        aliases: Mutex::new(AliasOwnership::default()),
         conns: Mutex::new(HashMap::new()),
+        connection_slots: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
+        connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
+        stopped: Arc::new(AtomicBool::new(false)),
         // Zero is the permanent exhausted sentinel; live connections start
         // at the first nonzero generation so the first adoption is usable.
         conn_gen: AtomicU64::new(1),
@@ -186,6 +194,9 @@ where
     });
 
     let mut tasks = Vec::new();
+    if let Some(task) = discovery_task {
+        tasks.push(task);
+    }
 
     // Browse pump: mDNS resolutions → peer table + PeerAnnounced/PeerLeft.
     {
@@ -225,7 +236,8 @@ where
     Ok(MdnsDriverHandle {
         discovery,
         tasks,
-        stopped: AtomicBool::new(false),
+        connection_tasks: shared.connection_tasks.clone(),
+        stopped: shared.stopped.clone(),
         cancel: shared.cancel.clone(),
     })
 }
@@ -235,23 +247,43 @@ where
 pub struct MdnsDriverHandle {
     discovery: Arc<Discovery>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
-    stopped: AtomicBool,
+    connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
+    stopped: Arc<AtomicBool>,
     cancel: watch::Sender<bool>,
 }
 
 impl MdnsDriverHandle {
-    pub fn stop(&self) {
+    fn request_stop(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
         let _ = self.cancel.send(true);
         // Goodbye first (peers get PeerLeft promptly), then shut the
-        // backend down (closes the browse stream), then abort the
-        // tokio tasks parked on accept/recv.
+        // backend down (closes the browse stream). The async owner joins
+        // tasks after this signal; the compatibility stop aborts them.
         self.discovery.unregister();
         self.discovery.shutdown();
+    }
+
+    /// Signal shutdown and join every driver-owned Tokio task.
+    pub async fn stop_and_join(mut self) {
+        self.request_stop();
+        while let Some(task) = self.tasks.pop() {
+            let _ = task.await;
+        }
+        let mut connection_tasks = self.connection_tasks.lock().take().unwrap_or_default();
+        while connection_tasks.join_next().await.is_some() {}
+    }
+
+    /// Compatibility signal-only stop for callers that cannot await. The
+    /// owning async boundary should prefer [`Self::stop_and_join`].
+    pub fn stop(&self) {
+        self.request_stop();
         for t in &self.tasks {
             t.abort();
+        }
+        if let Some(mut connection_tasks) = self.connection_tasks.lock().take() {
+            connection_tasks.abort_all();
         }
     }
 }
@@ -269,14 +301,17 @@ struct Shared {
     registered: AtomicBool,
     /// Peers resolved in our room: device id → exchange endpoint.
     peers: Mutex<HashMap<String, PeerEntry>>,
-    /// Backend discovery key → device id, so a `Removed` (which only
-    /// carries the key) maps back to the peer it withdraws.
-    key_to_peer: Mutex<HashMap<String, String>>,
+    /// Exact backend service aliases grouped by decoded peer. A peer is
+    /// withdrawn only after its final alias disappears.
+    aliases: Mutex<AliasOwnership>,
     /// Live exchange connections, either direction: device id →
     /// writer. Outbound dials register at connect; inbound accepts
     /// register under the first `from` their frames carry, so a reply
     /// can ride the same socket the request arrived on.
     conns: Mutex<HashMap<String, ConnHandle>>,
+    connection_slots: Arc<Semaphore>,
+    connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
+    stopped: Arc<AtomicBool>,
     conn_gen: AtomicU64,
     inbound_tx: InboundSink<MdnsInbound>,
     cancel: watch::Sender<bool>,
@@ -288,10 +323,78 @@ struct PeerEntry {
     port: u16,
 }
 
+/// Exact DNS-SD alias ownership. A decoded peer may be represented by more
+/// than one backend service key (for example, one per interface), so one key's
+/// removal cannot withdraw the peer while another key remains live.
+#[derive(Debug, Default)]
+pub struct AliasOwnership {
+    by_key: HashMap<String, String>,
+    by_peer: HashMap<String, HashSet<String>>,
+}
+
+impl AliasOwnership {
+    /// Bind one exact service key to a decoded peer. Returns an old peer only
+    /// when rebinding made that peer lose its final alias.
+    pub fn bind(&mut self, key: String, peer: String) -> Option<String> {
+        let old = self.by_key.insert(key.clone(), peer.clone());
+        if old.as_deref() == Some(peer.as_str()) {
+            return None;
+        }
+        let displaced = old.and_then(|old_peer| {
+            let last = self
+                .by_peer
+                .get_mut(&old_peer)
+                .map(|keys| {
+                    keys.remove(&key);
+                    keys.is_empty()
+                })
+                .unwrap_or(true);
+            if last {
+                self.by_peer.remove(&old_peer);
+                Some(old_peer)
+            } else {
+                None
+            }
+        });
+        self.by_peer.entry(peer).or_default().insert(key);
+        displaced
+    }
+
+    /// Remove one exact service key. The boolean is true only when its peer
+    /// has no remaining aliases.
+    pub fn remove(&mut self, key: &str) -> Option<(String, bool)> {
+        let peer = self.by_key.remove(key)?;
+        let last = self
+            .by_peer
+            .get_mut(&peer)
+            .map(|keys| {
+                keys.remove(key);
+                keys.is_empty()
+            })
+            .unwrap_or(true);
+        if last {
+            self.by_peer.remove(&peer);
+        }
+        Some((peer, last))
+    }
+
+    /// Number of aliases currently attached to one decoded peer.
+    pub fn alias_count(&self, peer: &str) -> usize {
+        self.by_peer.get(peer).map_or(0, HashSet::len)
+    }
+}
+
 #[derive(Clone)]
 struct ConnHandle {
     generation: u64,
     tx: mpsc::Sender<OwnedSignal<String, ErasedOwner>>,
+    stop: watch::Sender<bool>,
+}
+
+/// A connection slot remains occupied until both halves have observed the
+/// connection's local stop signal and released their shared owner.
+struct ConnectionLease {
+    _permit: OwnedSemaphorePermit,
 }
 
 fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
@@ -311,7 +414,7 @@ fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
         .ok()
 }
 
-async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<DiscoveryEvent>) {
+async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<DiscoveryEvent>) {
     // Stream closes when the backend shuts down.
     let mut cancel = shared.cancel.subscribe();
     loop {
@@ -349,7 +452,23 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 if !known && at_capacity {
                     continue;
                 }
-                shared.key_to_peer.lock().insert(key, advert.peer.clone());
+                let displaced = shared.aliases.lock().bind(key, advert.peer.clone());
+                if let Some(old_peer) = displaced {
+                    shared.peers.lock().remove(&old_peer);
+                    stop_connection(&shared, &old_peer);
+                    debug!(peer = %&old_peer[..old_peer.len().min(16)], "mdns peer lost final alias");
+                    if shared
+                        .inbound_tx
+                        .send(MdnsInbound::PeerLeft {
+                            device_id: old_peer,
+                            attribution: CarrierAttribution::SenderClaimed,
+                        })
+                        .is_err()
+                    {
+                        let _ = shared.cancel.send(true);
+                        return;
+                    }
+                }
                 shared.peers.lock().insert(advert.peer.clone(), entry);
                 debug!(peer = %&advert.peer[..advert.peer.len().min(16)], "mdns peer resolved");
                 // Every resolve (first sight or cache refresh) surfaces as
@@ -380,10 +499,12 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::UnboundedReceiver<
                 }
             }
             DiscoveryEvent::Removed { key } => {
-                let peer = shared.key_to_peer.lock().remove(&key);
-                if let Some(peer) = peer {
+                if let Some((peer, last)) = shared.aliases.lock().remove(&key) {
+                    if !last {
+                        continue;
+                    }
                     shared.peers.lock().remove(&peer);
-                    shared.conns.lock().remove(&peer);
+                    stop_connection(&shared, &peer);
                     debug!(peer = %&peer[..peer.len().min(16)], "mdns peer withdrew");
                     if shared
                         .inbound_tx
@@ -584,20 +705,48 @@ fn adopt_stream(
     stream: TcpStream,
     known_peer: Option<String>,
 ) -> Option<mpsc::Sender<OwnedSignal<String, ErasedOwner>>> {
+    if shared.stopped.load(Ordering::Acquire) {
+        return None;
+    }
+    let slot = shared
+        .connection_slots
+        .clone()
+        .try_acquire_owned()
+        .ok()
+        .map(|_permit| ConnectionLease { _permit })
+        .map(Arc::new)?;
+    if shared.stopped.load(Ordering::Acquire) {
+        return None;
+    }
     let generation = next_connection_generation(&shared.conn_gen)?;
     let (read_half, write_half) = stream.into_split();
     let (tx, rx) = mpsc::channel::<OwnedSignal<String, ErasedOwner>>(OUTBOUND_QUEUE_CAP);
+    let (local_stop, _) = watch::channel(false);
+    // Serialize task registration with stop's drain. Once this guard is
+    // acquired, shutdown cannot take the registry between the stopped check
+    // and publishing either half's JoinHandle.
+    let mut connection_tasks = shared.connection_tasks.lock();
+    if shared.stopped.load(Ordering::Acquire) {
+        return None;
+    }
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
     let registered_as = Arc::new(Mutex::new(None::<String>));
     if let Some(peer) = known_peer {
-        shared.conns.lock().insert(
+        if shared.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        let displaced = shared.conns.lock().insert(
             peer.clone(),
             ConnHandle {
                 generation,
                 tx: tx.clone(),
+                stop: local_stop.clone(),
             },
         );
+        if let Some(displaced) = displaced {
+            let _ = displaced.stop.send(true);
+        }
         *registered_as.lock() = Some(peer);
     }
 
@@ -607,8 +756,12 @@ fn adopt_stream(
         let shared = shared.clone();
         let registered_as = registered_as.clone();
         let cancel = shared.cancel.subscribe();
-        tokio::spawn(async move {
-            run_writer(write_half, rx, cancel).await;
+        let local_cancel = local_stop.subscribe();
+        let local_stop = local_stop.clone();
+        let _slot = slot.clone();
+        let writer_task = async move {
+            run_writer(write_half, rx, cancel, local_cancel).await;
+            let _ = local_stop.send(true);
             // Deregister — only our own generation; a newer connection
             // may have replaced this entry already.
             if let Some(peer) = registered_as.lock().clone() {
@@ -617,7 +770,9 @@ fn adopt_stream(
                     conns.remove(&peer);
                 }
             }
-        });
+        };
+        let tasks = connection_tasks.as_mut()?;
+        tasks.spawn(writer_task);
     }
 
     // Reader: parses frames addressed to us and (for inbound
@@ -626,21 +781,32 @@ fn adopt_stream(
         let shared = shared.clone();
         let tx = tx.clone();
         let registered_as = registered_as.clone();
-        tokio::spawn(async move {
-            run_reader(&shared, read_half, |from| {
+        let local_cancel = local_stop.subscribe();
+        let local_stop = local_stop.clone();
+        let _slot = slot;
+        let reader_task = async move {
+            run_reader(&shared, read_half, local_cancel, |from| {
+                if shared.stopped.load(Ordering::Acquire) {
+                    return;
+                }
                 let mut reg = registered_as.lock();
                 if reg.is_none() {
-                    shared.conns.lock().insert(
+                    let displaced = shared.conns.lock().insert(
                         from.to_string(),
                         ConnHandle {
                             generation,
                             tx: tx.clone(),
+                            stop: local_stop.clone(),
                         },
                     );
+                    if let Some(displaced) = displaced {
+                        let _ = displaced.stop.send(true);
+                    }
                     *reg = Some(from.to_string());
                 }
             })
             .await;
+            let _ = local_stop.send(true);
             // A dead read side means the conversation is over even if
             // writes would still go through — deregister so the next
             // exchange re-dials.
@@ -651,7 +817,9 @@ fn adopt_stream(
                 }
             }
             trace!("mdns exchange connection closed");
-        });
+        };
+        let tasks = connection_tasks.as_mut()?;
+        tasks.spawn(reader_task);
     }
 
     Some(tx)
@@ -669,11 +837,13 @@ async fn run_writer(
     mut write_half: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<OwnedSignal<String, ErasedOwner>>,
     mut cancel: watch::Receiver<bool>,
+    mut local_cancel: watch::Receiver<bool>,
 ) {
     loop {
         let next = tokio::select! {
             next = timeout(CONN_IDLE_TIMEOUT, rx.recv()) => next,
             _ = cancel.changed() => return,
+            _ = local_cancel.changed() => return,
         };
         match next {
             Ok(Some(line)) => {
@@ -722,13 +892,14 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
 async fn run_reader(
     shared: &Arc<Shared>,
     read_half: tokio::net::tcp::OwnedReadHalf,
+    mut local_cancel: watch::Receiver<bool>,
     mut on_peer_frame: impl FnMut(&str),
 ) {
     let mut reader = BufReader::new(read_half);
-    let mut buf: Vec<u8> = Vec::new();
+    let mut buf: Vec<u8> = Vec::with_capacity(wire::MAX_FRAME_BYTES.min(8192));
     let mut cancel = shared.cancel.subscribe();
     loop {
-        if *cancel.borrow() {
+        if *cancel.borrow() || shared.stopped.load(Ordering::Acquire) {
             return;
         }
         buf.clear();
@@ -738,6 +909,7 @@ async fn run_reader(
                 read_bounded_line(&mut reader, &mut buf),
             ) => read,
             _ = cancel.changed() => return,
+            _ = local_cancel.changed() => return,
         };
         match read {
             Ok(Ok(true)) => {}
@@ -803,19 +975,34 @@ async fn read_bounded_line(
             return Ok(false);
         }
         if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if buf.len().saturating_add(pos) > wire::MAX_FRAME_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "mdns frame exceeds size cap",
+                ));
+            }
             buf.extend_from_slice(&chunk[..pos]);
             reader.consume(pos + 1);
             return Ok(true);
         }
-        buf.extend_from_slice(chunk);
-        let n = chunk.len();
-        reader.consume(n);
-        if buf.len() > wire::MAX_FRAME_BYTES {
+        if buf.len().saturating_add(chunk.len()) > wire::MAX_FRAME_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "mdns frame exceeds size cap",
             ));
         }
+        buf.extend_from_slice(chunk);
+        let n = chunk.len();
+        reader.consume(n);
+    }
+}
+
+/// Remove and stop exactly the connection currently registered for `peer`.
+/// Signaling the owner before the stale task can publish another frame keeps
+/// alias withdrawal and connection replacement on the same lifecycle fence.
+fn stop_connection(shared: &Shared, peer: &str) {
+    if let Some(handle) = shared.conns.lock().remove(peer) {
+        let _ = handle.stop.send(true);
     }
 }
 
@@ -860,6 +1047,26 @@ async fn run_reannounce(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_slots_have_a_finite_cap_and_release() {
+        let slots = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
+        let mut leases = Vec::with_capacity(MAX_ACTIVE_CONNECTIONS);
+        for _ in 0..MAX_ACTIVE_CONNECTIONS {
+            leases.push(slots.clone().try_acquire_owned().expect("slot available"));
+        }
+        assert!(slots.clone().try_acquire_owned().is_err());
+        drop(leases.pop());
+        assert!(slots.try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn connection_supervisor_joins_each_worker_once() {
+        let mut supervisor = JoinSet::new();
+        supervisor.spawn(async {});
+        assert!(supervisor.join_next().await.is_some());
+        assert!(supervisor.join_next().await.is_none());
+    }
 
     /// An owner that records its own release.
     ///

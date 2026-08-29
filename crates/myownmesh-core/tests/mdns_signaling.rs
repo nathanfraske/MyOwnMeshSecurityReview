@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! Engine-level integration tests for mDNS signaling and the
 //! multi-driver fan-out.
 //!
@@ -19,7 +21,9 @@ use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::conn_trace::ConnTrace;
-use myownmesh_core::engine::{attach_signaling, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{
+    attach_signaling, join_open_participation, spawn_network,
+};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use tokio::time::Instant;
@@ -95,7 +99,7 @@ async fn multicast_available() -> bool {
 
 async fn wait_for_approval(
     side: &str,
-    state: &Arc<myownmesh_core::engine::NetworkState>,
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
     trace_rx: &mut tokio::sync::broadcast::Receiver<ConnTrace>,
     peer_id: &str,
@@ -261,14 +265,14 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     let alice_id = Arc::new(Identity::ephemeral());
     let bob_id = Arc::new(Identity::ephemeral());
 
-    let (alice_state, _alice_driver) = spawn_network(
+    let (alice_state, alice_driver) = spawn_network(
         network_config("alice", &network_id, both.clone()),
         alice_id.clone(),
         transport.clone(),
     )
     .await
     .expect("alice engine");
-    let (bob_state, _bob_driver) = spawn_network(
+    let (bob_state, bob_driver) = spawn_network(
         network_config("bob", &network_id, both),
         bob_id.clone(),
         transport.clone(),
@@ -323,5 +327,13 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
         Duration::from_secs(60),
     )
     .await;
+
+    bob_drivers.shutdown().await;
+    alice_drivers.shutdown().await;
+    alice_state.request_shutdown();
+    bob_state.request_shutdown();
+    alice_driver.await.expect("alice engine driver");
+    bob_driver.await.expect("bob engine driver");
+    relay.stop_and_wait().await;
 }
 mod support;

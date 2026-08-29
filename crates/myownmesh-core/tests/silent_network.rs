@@ -1,3 +1,5 @@
+#![cfg(feature = "transport-lab")]
+
 //! End-to-end engine integration test for a **Silent** network: two
 //! co-present peers on a Silent mesh discover each other (`Sighted`) but do
 //! NOT auto-connect — no handshake runs until one side issues an explicit
@@ -9,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::{MeshEvent, PeerEvent};

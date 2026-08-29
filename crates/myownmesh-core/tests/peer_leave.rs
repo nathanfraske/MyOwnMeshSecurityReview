@@ -21,14 +21,14 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{
-    attach_local, depart_for_lab, departure_receipt_gate_arrival_for_lab,
+use myownmesh_core::engine::transport_lab::{
+    attach_local, channel, depart_for_lab, departure_receipt_gate_arrival_for_lab,
     install_departure_receipt_gate_for_lab, join_open_participation,
     pending_departure_count_for_lab, release_departure_receipt_gate_for_lab, spawn_network,
 };
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
-use myownmesh_core::{Channel, MeshEvent, PeerEvent};
+use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
 
@@ -122,8 +122,8 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
     // A carrying-channel receipt is observed before the authenticated
     // departure is sent. This keeps the control honest about ordering: the
     // data path settled first, then the exact session was retired.
-    let alice_channel = Channel::<String>::new("receipt-before-close".into(), alice_state.clone());
-    let mut bob_channel = Channel::<String>::new("receipt-before-close".into(), bob_state.clone())
+    let alice_channel = channel::<String>("receipt-before-close".into(), alice_state.clone());
+    let mut bob_channel = channel::<String>("receipt-before-close".into(), bob_state.clone())
         .subscribe()
         .expect("bob subscribes to the carrying channel");
     alice_channel
@@ -139,18 +139,36 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
 
     // Alice makes a deliberate exit. This is what the daemon runs before
     // tearing a network down on remove / restart / shutdown, reached in
-    // production through `MeshHandle::announce_leave`.
+    // production through `MeshHandle::announce_leave`. Arm the production
+    // receipt gate before publishing the carrier hint: the gate is reached
+    // only by the authenticated Depart path, so it gives this test a causal
+    // boundary instead of guessing that a short quiet interval means the
+    // carrier hint did not retire the session.
+    let arrival = departure_receipt_gate_arrival_for_lab(&bob_state);
+    tokio::pin!(arrival);
+    arrival.as_mut().enable();
+    install_departure_receipt_gate_for_lab(&bob_state);
     alice_state.announce_departure();
-    assert!(
-        !wait_for_drop_if_present(
-            &mut bob_events,
-            alice_id.public_id(),
-            Duration::from_millis(300)
-        )
-        .await,
-        "queueing a carrier leave is not authenticated observation"
+    let departure_state = Arc::clone(&alice_state);
+    let departure_task = tokio::spawn(async move { depart_for_lab(&departure_state).await });
+    tokio::time::timeout(Duration::from_secs(5), &mut arrival)
+        .await
+        .expect("authenticated departure receipt entered the production hold");
+    assert_eq!(
+        alice_state.peer_count(),
+        1,
+        "carrier leave does not retire the exact authenticated session"
     );
-    let departure = depart_for_lab(&alice_state).await;
+    assert_eq!(
+        pending_departure_count_for_lab(&alice_state),
+        1,
+        "the exact session owns one pending authenticated departure"
+    );
+    release_departure_receipt_gate_for_lab(&bob_state);
+    let departure = tokio::time::timeout(Duration::from_secs(5), departure_task)
+        .await
+        .expect("authenticated departure completes after its receipt is released")
+        .expect("authenticated departure task joins");
     assert_eq!(departure.observed, 1);
     assert_eq!(departure.cancelled, 0);
 
@@ -179,15 +197,13 @@ async fn graceful_departure_drops_peer_without_waiting_for_heartbeat() {
     // A duplicate departure is a no-op after the exact authenticated session
     // is retired. It must not manufacture a second drop event or touch a
     // successor that could be installed later under the same device id.
-    depart_for_lab(&alice_state).await;
-    assert!(
-        !wait_for_drop_if_present(
-            &mut bob_events,
-            alice_id.public_id(),
-            Duration::from_millis(300)
-        )
-        .await,
-        "a duplicate Depart cannot retire or re-emit the old session"
+    let duplicate_departure = depart_for_lab(&alice_state).await;
+    assert_eq!(duplicate_departure.observed, 0);
+    assert_eq!(duplicate_departure.cancelled, 0);
+    assert_eq!(
+        alice_state.peer_count(),
+        0,
+        "a duplicate Depart has no exact authenticated session to retire"
     );
 
     // Shutdown is an explicit lifecycle boundary, not an implicit cleanup
@@ -258,12 +274,12 @@ async fn bilateral_departures_are_observed_once_on_both_exact_sessions() {
     wait_for_approval(&mut alice_events, bob_id.public_id()).await;
     wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
-    let alice_sender = Channel::<String>::new("bilateral-proof".into(), alice_state.clone());
-    let mut bob_receiver = Channel::<String>::new("bilateral-proof".into(), bob_state.clone())
+    let alice_sender = channel::<String>("bilateral-proof".into(), alice_state.clone());
+    let mut bob_receiver = channel::<String>("bilateral-proof".into(), bob_state.clone())
         .subscribe()
         .expect("bob subscribes to bilateral proof channel");
-    let bob_sender = Channel::<String>::new("bilateral-proof".into(), bob_state.clone());
-    let mut alice_receiver = Channel::<String>::new("bilateral-proof".into(), alice_state.clone())
+    let bob_sender = channel::<String>("bilateral-proof".into(), bob_state.clone());
+    let mut alice_receiver = channel::<String>("bilateral-proof".into(), alice_state.clone())
         .subscribe()
         .expect("alice subscribes to bilateral proof channel");
     alice_sender
@@ -385,12 +401,12 @@ async fn authenticated_departure_withheld_receipt_cancels_on_shutdown() {
     wait_for_approval(&mut alice_events, bob_id.public_id()).await;
     wait_for_approval(&mut bob_events, alice_id.public_id()).await;
 
-    let alice_sender = Channel::<String>::new("withheld-proof".into(), alice_state.clone());
-    let mut bob_receiver = Channel::<String>::new("withheld-proof".into(), bob_state.clone())
+    let alice_sender = channel::<String>("withheld-proof".into(), alice_state.clone());
+    let mut bob_receiver = channel::<String>("withheld-proof".into(), bob_state.clone())
         .subscribe()
         .expect("bob subscribes to withheld proof channel");
-    let bob_sender = Channel::<String>::new("withheld-proof".into(), bob_state.clone());
-    let mut alice_receiver = Channel::<String>::new("withheld-proof".into(), alice_state.clone())
+    let bob_sender = channel::<String>("withheld-proof".into(), bob_state.clone());
+    let mut alice_receiver = channel::<String>("withheld-proof".into(), alice_state.clone())
         .subscribe()
         .expect("alice subscribes to withheld proof channel");
     alice_sender
@@ -518,25 +534,4 @@ async fn wait_for_drop(
     }
 }
 
-async fn wait_for_drop_if_present(
-    rx: &mut tokio::sync::broadcast::Receiver<MeshEvent>,
-    peer_id: &str,
-    within: Duration,
-) -> bool {
-    tokio::time::timeout(within, async {
-        loop {
-            match rx.recv().await {
-                Ok(MeshEvent::Peer(PeerEvent::Dropped { device_id, .. }))
-                    if device_id == peer_id =>
-                {
-                    return true
-                }
-                Ok(_) => continue,
-                Err(_) => return false,
-            }
-        }
-    })
-    .await
-    .unwrap_or(false)
-}
 mod support;

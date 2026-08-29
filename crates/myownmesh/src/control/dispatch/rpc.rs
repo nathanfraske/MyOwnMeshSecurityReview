@@ -1141,7 +1141,7 @@ mod tests {
         // wider than anything a short-string bug could hide behind.
         let reason = "q".repeat(32 * 1024);
         let handler_reason = reason.clone();
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("the fixture network's application gateway admits an Rpc")
             .serve_stream("terminal_only", move |_call| {
                 let reason = handler_reason.clone();

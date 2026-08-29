@@ -33,5 +33,5 @@ pub mod shuffle;
 pub use delivery::{
     AdmissionRefusal, AdmissionReport, AdmissionSource, CarrierAggregate, DeliveryLease,
     DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryStore, DeliveryTerminal,
-    RelaySessionId, SessionRetention, UnmeteredDeliveryProvider,
+    RelaySessionId, SessionRetention,
 };

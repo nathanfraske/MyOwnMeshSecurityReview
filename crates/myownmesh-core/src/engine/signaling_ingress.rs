@@ -49,8 +49,9 @@ use myownmesh_signaling::nostr::AdmissionSource;
 use myownmesh_signaling::SignalingMessage;
 
 use crate::resource::{
-    mailbox_retained_claim, LocalApplicationResourceScope, ResourceClaim, ResourceLease,
-    ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxSendError, ResourceMailboxSender,
+    mailbox_retained_claim, strings_measure, LocalApplicationResourceScope, ResourceClaim,
+    ResourceLease, ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxSendError,
+    ResourceMailboxSender,
 };
 use crate::transport::LocalIceCandidate;
 
@@ -754,6 +755,105 @@ enum ObservationBody {
 }
 
 impl CarrierObservation {
+    /// Measure the carrier-owned value while it is still in its raw shape.
+    ///
+    /// This is separate from [`EphemeralIngress::retained_claim`]: the raw
+    /// observation is admitted before parsing, while the parsed value is
+    /// admitted again only if the inbound mailbox retains it.
+    /// This core boundary does not retroactively account allocations already
+    /// made by the WebSocket, mDNS, or Nostr carrier libraries.
+    fn raw_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+        let (bytes, _queued, allocations) = match &self.body {
+            ObservationBody::Presence { device_id, .. }
+            | ObservationBody::Withdrawal { device_id, .. } => {
+                strings_measure([device_id.as_str()])?
+            }
+            ObservationBody::Directed { from, message } => match message {
+                SignalingMessage::Announce { peer_id } | SignalingMessage::Leave { peer_id } => {
+                    strings_measure([from.as_str(), peer_id.as_str()])?
+                }
+                SignalingMessage::Offer {
+                    peer_id,
+                    offer_id,
+                    sdp,
+                }
+                | SignalingMessage::Answer {
+                    peer_id,
+                    offer_id,
+                    sdp,
+                } => strings_measure([
+                    from.as_str(),
+                    peer_id.as_str(),
+                    offer_id.as_str(),
+                    sdp.as_str(),
+                ])?,
+                SignalingMessage::Candidate {
+                    peer_id,
+                    candidate,
+                    offer_id,
+                    sdp_mid,
+                    username_fragment,
+                    ..
+                } => strings_measure(
+                    [
+                        Some(from.as_str()),
+                        Some(peer_id.as_str()),
+                        Some(candidate.as_str()),
+                        Some(offer_id.as_str()),
+                        sdp_mid.as_deref(),
+                        username_fragment.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten(),
+                )?,
+            },
+        };
+        let fixed = std::mem::size_of::<Self>().checked_add(bytes).ok_or(
+            ResourceMailboxItemError::Claim(
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+                },
+            ),
+        )?;
+        let allocations = allocations
+            .checked_add(1)
+            .ok_or(ResourceMailboxItemError::Claim(
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+                },
+            ))?;
+        let fixed = u64::try_from(fixed).map_err(|_| {
+            ResourceMailboxItemError::Claim(
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::AccountedMemoryBytes,
+                },
+            )
+        })?;
+        let parsing = u64::try_from(bytes).map_err(|_| {
+            ResourceMailboxItemError::Claim(
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::ParsingOrCpuWork,
+                },
+            )
+        })?;
+        let allocations = u64::try_from(allocations).map_err(|_| {
+            ResourceMailboxItemError::Claim(
+                crate::resource::ResourceClaimArithmeticError::Overflow {
+                    dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+                },
+            )
+        })?;
+        ResourceClaim::try_from_entries([
+            (crate::resource::ResourceClass::AccountedMemoryBytes, fixed),
+            (crate::resource::ResourceClass::ParsingOrCpuWork, parsing),
+            (
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                allocations,
+            ),
+        ])
+        .map_err(Into::into)
+    }
+
     /// Parse into the engine's domain value, keeping the provenance.
     ///
     /// The only route from a carrier value to a [`SignalingInbound`] the engine
@@ -1424,7 +1524,24 @@ impl SignalingRuntime {
     /// once cannot both pass the check, which is the exact case a reservation
     /// would otherwise be needed for.
     fn deliver(&self, observation: CarrierObservation) -> Delivered {
+        // The carrier value is still raw here. Admit its bounded temporary
+        // representation before parsing it into an engine value; pressure
+        // therefore refuses before any parse/reducer hand-off.
+        let raw_lease = match observation.raw_claim() {
+            Ok(claim) => match self.scope.acquire(claim) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    trace!(?error, "raw signaling observation refused before parse");
+                    return Delivered::Unavailable;
+                }
+            },
+            Err(error) => {
+                trace!(?error, "raw signaling observation is not representable");
+                return Delivered::Unavailable;
+            }
+        };
         let ingress = observation.into_ingress();
+        drop(raw_lease);
         if attempt_is_empty(&ingress) {
             trace!(
                 kind = ingress.kind_name(),
@@ -1879,6 +1996,7 @@ pub(super) mod tests {
         /// control can take funding away in the open rather than by guessing how
         /// many bytes a message happens to weigh.
         scope: crate::resource::LocalApplicationResourceScope,
+        provider: crate::resource::FiniteResourceProvider,
     }
 
     /// A runtime on an isolated provider whose per-dimension grant is `budget`.
@@ -1887,10 +2005,9 @@ pub(super) mod tests {
             crate::resource::ResourceClass::ALL.map(|dimension| (dimension, budget(dimension))),
         )
         .expect("test grant is representable");
-        let provider = crate::resource::ResourceProviderPort::new(
-            crate::resource::FiniteResourceProvider::new(grant),
-        )
-        .expect("test grant funds process bookkeeping");
+        let accountant = crate::resource::FiniteResourceProvider::new(grant);
+        let provider = crate::resource::ResourceProviderPort::new(accountant.clone())
+            .expect("test grant funds process bookkeeping");
         let root = crate::resource::ProcessResourceRoot::isolated();
         root.install_local_application_provider(provider)
             .expect("isolated root accepts its provider");
@@ -1902,6 +2019,7 @@ pub(super) mod tests {
             runtime: SignalingRuntime::new(tx, scope.clone()),
             rx,
             scope,
+            provider: accountant,
         }
     }
 
@@ -1916,6 +2034,43 @@ pub(super) mod tests {
     ) {
         let funded = funded(|_| 1_000_000);
         (funded.runtime, funded.rx)
+    }
+
+    /// Raw provider pressure refuses one observation before parsing, without
+    /// consuming a carrier or changing the runtime's baseline. The next
+    /// observation proves this is a value-local refusal rather than a carrier
+    /// shutdown or a retained raw-payload queue.
+    #[test]
+    fn raw_observation_pressure_refuses_before_parse_and_recovers_next_value() {
+        let funded = funded(|_| 1_000_000);
+        let before = funded.provider.in_use();
+        let attach = SignalingRuntime::attach(&funded.runtime, SignalingCarrier::Nostr);
+        let mut rx = funded.rx;
+        funded
+            .provider
+            .script_pressure(crate::resource::ResourceClass::ParsingOrCpuWork);
+
+        assert_eq!(
+            attach.admit(attach.directed("peer-a".into(), offer("first"))),
+            Delivered::Unavailable,
+            "raw pressure refuses before the observation is parsed"
+        );
+        assert!(
+            rx.try_recv().is_none(),
+            "a raw refusal never reaches the inbound mailbox"
+        );
+        assert_eq!(
+            funded.provider.in_use(),
+            before,
+            "raw refusal releases no retained claim because it acquired none"
+        );
+
+        assert_eq!(
+            attach.admit(attach.directed("peer-a".into(), offer_with_id("second", "sdp"))),
+            Delivered::Accepted,
+            "a later observation on the same carrier remains admissible"
+        );
+        assert!(rx.try_recv().is_some());
     }
 
     /// One attach, for the admission-only controls that never deliver.
@@ -2463,6 +2618,7 @@ pub(super) mod tests {
             runtime,
             mut rx,
             scope,
+            ..
         } = funded(|dimension| match dimension {
             crate::resource::ResourceClass::QueuedBytes => QUEUE_BYTES,
             _ => 1_000_000,
@@ -2514,6 +2670,7 @@ pub(super) mod tests {
             runtime,
             mut rx,
             scope,
+            ..
         } = funded(|_| 1_000_000);
         let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
 
@@ -2580,6 +2737,7 @@ pub(super) mod tests {
             runtime,
             mut rx,
             scope,
+            ..
         } = funded(|_| 1_000_000);
         let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
         let mut holds = Vec::new();

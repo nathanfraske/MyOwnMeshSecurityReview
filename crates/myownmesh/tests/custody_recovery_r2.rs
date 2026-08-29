@@ -9,6 +9,8 @@
 //! explicit marker and then kills it; there are no timing guesses, polling
 //! loops, or sleeps. Explicit abort/commit calls below model client commands.
 
+#![cfg(feature = "transport-lab")]
+
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
