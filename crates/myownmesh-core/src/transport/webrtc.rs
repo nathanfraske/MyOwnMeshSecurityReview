@@ -13687,6 +13687,7 @@ mod tests {
             "candidate burst includes retained string capacity beyond content"
         );
         let mut retained_capacity_claim = crate::resource::ResourceClaim::ZERO;
+        let mut planned_queue_claim = crate::resource::ResourceClaim::ZERO;
         for candidate in &candidates {
             let content = u64::try_from(
                 candidate_content_bytes(candidate)
@@ -13706,14 +13707,26 @@ mod tests {
                     ))
                 })
                 .expect("candidate queue baseline content claim is representable");
-            let retained = pending_remote_candidate_queue_claim(candidate)
-                .expect("candidate queue retained-capacity claim is representable")
+            let planned = pending_remote_candidate_queue_claim(candidate)
+                .expect("candidate queue retained-capacity claim is representable");
+            planned_queue_claim = planned_queue_claim
+                .checked_add(planned)
+                .expect("candidate queue planned aggregate is representable");
+            let retained = planned
                 .checked_sub(baseline)
                 .expect("production retained capacity covers the fixture baseline");
             retained_capacity_claim = retained_capacity_claim
                 .checked_add(retained)
                 .expect("candidate queue retained-capacity total is representable");
         }
+        let duplicate = candidates
+            .first()
+            .cloned()
+            .expect("candidate burst has one equality-only duplicate");
+        assert_eq!(
+            duplicate, candidates[0],
+            "duplicate probe has exactly equal candidate content"
+        );
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -13725,7 +13738,7 @@ mod tests {
         let baseline = provider.in_use();
         let mut state = RemoteCandidateState::with_resources(work_scope);
         let started = Instant::now();
-        for (index, candidate) in candidates.iter().cloned().enumerate() {
+        for (index, candidate) in candidates.into_iter().enumerate() {
             let pushed_at = Instant::now();
             assert_eq!(
                 state.admit(candidate, &scope),
@@ -13737,10 +13750,44 @@ mod tests {
                 pushed_at.elapsed().as_nanos()
             );
         }
+        let retained_queue_claim = state
+            .current
+            .pending
+            .entries
+            .iter()
+            .try_fold(crate::resource::ResourceClaim::ZERO, |claim, pending| {
+                claim.checked_add(
+                    pending_remote_candidate_queue_claim(&pending.candidate)
+                        .expect("retained candidate queue claim is representable"),
+                )
+            })
+            .expect("retained candidate queue aggregate is representable");
+        assert_eq!(
+            retained_queue_claim, planned_queue_claim,
+            "moved candidates retain exactly their planned production capacities"
+        );
+        let before_duplicate = (
+            provider.in_use(),
+            state.current.pending.entries.len(),
+            state.current.seen.len(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
         let duplicate_at = Instant::now();
         assert_eq!(
-            state.admit(candidates[0].clone(), &scope),
+            state.admit(duplicate, &scope),
             PendingRemoteCandidateQueuePush::Duplicate
+        );
+        assert_eq!(
+            (
+                provider.in_use(),
+                state.current.pending.entries.len(),
+                state.current.seen.len(),
+                provider.active_reservations(),
+                provider.active_scopes(),
+            ),
+            before_duplicate,
+            "duplicate changes no provider, queue, digest, reservation, or scope state"
         );
         println!(
             "arc03_candidate_burst_raw duplicate_ns={} total_push_ns={}",
@@ -13748,6 +13795,37 @@ mod tests {
             started.elapsed().as_nanos()
         );
         assert_eq!(state.current.pending.entries.len(), candidate_count.get());
+        let per_candidate_digest_charge =
+            crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+                crate::runtime::attempt::remote_candidate_digest_retention_aggregate_claim(1)
+                    .expect("one-candidate retention aggregate is representable"),
+            )
+            .expect("one-candidate retention reservation charge is representable");
+        let expected_live_charge = state
+            .current
+            .pending
+            .entries
+            .iter()
+            .try_fold(crate::resource::ResourceClaim::ZERO, |charge, pending| {
+                let queue_charge =
+                    crate::resource::FiniteResourceProvider::reservation_charge_for_test(
+                        pending_remote_candidate_queue_claim(&pending.candidate)
+                            .expect("retained candidate queue claim is representable"),
+                    )
+                    .expect("retained candidate queue reservation charge is representable");
+                charge
+                    .checked_add(per_candidate_digest_charge)
+                    .and_then(|charge| charge.checked_add(queue_charge))
+            })
+            .expect("per-candidate live reservation charges are representable");
+        assert_eq!(
+            provider
+                .in_use()
+                .checked_sub(baseline)
+                .expect("candidate live usage includes the provider baseline"),
+            expected_live_charge,
+            "provider usage is exactly the planned retained per-reservation charges with no unused grant"
+        );
         state.current.retire();
         assert_eq!(
             provider.in_use(),
