@@ -105,6 +105,48 @@ impl Drop for GatewayChannel {
 }
 
 impl ApplicationGateway {
+    /// Submit one locally-originated channel frame through the engine's
+    /// owner-bound transport command port.
+    ///
+    /// The gateway owns the application operation; the engine still owns the
+    /// signaling/transport implementation. Keeping that distinction explicit
+    /// prevents a public channel handle from manufacturing a worker, peer
+    /// session, or signaling authority of its own.
+    pub(crate) async fn send_channel_frame(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<()> {
+        state.send_channel_frame(peer, channel, payload).await
+    }
+
+    /// Submit one locally-originated reliable channel frame through the same
+    /// typed gateway boundary. Retention and acknowledgement remain owned by
+    /// the exact live session selected by the engine.
+    pub(crate) async fn send_channel_reliable(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        peer: &str,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<()> {
+        state.send_channel_reliable(peer, channel, payload).await
+    }
+
+    /// Submit a best-effort fan-out through the engine's per-owner transport
+    /// selection. The returned count is a send-success count, not a delivery
+    /// guarantee.
+    pub(crate) async fn broadcast_channel_frame(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        channel: &str,
+        payload: serde_json::Value,
+    ) -> crate::error::Result<usize> {
+        state.broadcast_channel_frame(channel, payload).await
+    }
+
     pub(crate) fn subscribe_channel(
         &self,
         name: &str,

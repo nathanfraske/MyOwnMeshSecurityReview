@@ -45,6 +45,7 @@ pub mod features;
 pub mod governance;
 pub mod handshake;
 pub mod keepalive;
+pub mod relay;
 pub mod rpc;
 pub mod topology;
 
@@ -65,6 +66,9 @@ pub use handshake::{
     ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage, DENY_REASON_EVICTED,
 };
 pub use keepalive::{PingMessage, PongMessage};
+pub use relay::{
+    ClosedRelayControl, ClosedRelayData, ClosedRelayDataDirection, OpaqueRelayPacket, RelayKeyShare,
+};
 pub use rpc::{
     CapabilitiesUpdateMessage, CapabilityAdvert, RpcRequestMessage, RpcResponseMessage,
     RpcStreamChunkMessage, RpcStreamEndMessage,
@@ -368,6 +372,11 @@ pub enum MeshMessage {
     /// Authenticated exact-session control. See [`SessionControl`] for why it
     /// has no target field and what a receiver may do with it.
     SessionControl(SessionControl),
+    /// Exact Closed relay route control. Every variant carries its complete
+    /// context, three-party identity, and session binding.
+    ClosedRelayControl(ClosedRelayControl),
+    /// Opaque ciphertext for one exact Closed relay route.
+    ClosedRelayData(ClosedRelayData),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),

@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
-use crate::resource::{ResourceClaim, ResourceClass};
+use crate::resource::{
+    LeasedMap, ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease,
+};
 
 use super::RuntimeIncarnation;
 
@@ -29,6 +31,94 @@ mod resource_owner;
 pub use policy::*;
 pub(crate) use remote_candidate::*;
 pub use resource_owner::*;
+
+/// Provider-funded custody for live attempt-owned records.
+///
+/// Speculative candidates are retained by the attempt boundary rather than a
+/// growable engine collection. Each record owns one map node and its lease;
+/// there is no spare capacity that can outlive the exact candidate.
+pub(crate) struct AttemptOwnerSet<T> {
+    entries: LeasedMap<usize, T>,
+    next: usize,
+}
+
+impl<T> AttemptOwnerSet<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: LeasedMap::new(),
+            next: 0,
+        }
+    }
+
+    pub(crate) fn entry_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
+        LeasedMap::<usize, T>::entry_claim()
+    }
+
+    /// Insert one already-funded owner node. Key exhaustion is unreachable
+    /// while the provider can fund a node; both value and lease then drop.
+    pub(crate) fn insert(&mut self, value: T, lease: ResourceLease) -> bool {
+        let Some(next) = self.next.checked_add(1) else {
+            drop(lease);
+            drop(value);
+            return false;
+        };
+        let key = self.next;
+        self.next = next;
+        self.entries.insert(key, value, lease).is_ok()
+    }
+
+    /// Observe the first matching entry while keeping the leased map's borrow
+    /// inside this call. Returning a reference would outlive the map walk's
+    /// closure and incorrectly suggest that the map can expose node borrows.
+    pub(crate) fn with<R>(
+        &self,
+        mut predicate: impl FnMut(&T) -> bool,
+        mut observe: impl FnMut(&T) -> R,
+    ) -> Option<R> {
+        let mut observed = None;
+        self.entries.for_each(|_, value| {
+            if observed.is_none() && predicate(value) {
+                observed = Some(observe(value));
+            }
+        });
+        observed
+    }
+
+    pub(crate) fn find_mut(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<&mut T> {
+        self.entries.find_value_mut(|value| predicate(value))
+    }
+
+    pub(crate) fn any(&self, predicate: impl FnMut(&T) -> bool) -> bool {
+        self.entries.any_value(predicate)
+    }
+
+    pub(crate) fn for_each(&self, mut visit: impl FnMut(&T)) {
+        self.entries.for_each(|_, value| visit(value));
+    }
+
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn remove_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
+        let mut key = None;
+        self.entries.for_each(|entry_key, value| {
+            if key.is_none() && predicate(value) {
+                key = Some(*entry_key);
+            }
+        });
+        self.entries.remove(&key?)
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        self.entries.pop_first_entry().map(|(_, value)| value)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.entries.any_value(|_| true)
+    }
+}
 
 /// Resource claim for exactly one connector candidate.
 ///

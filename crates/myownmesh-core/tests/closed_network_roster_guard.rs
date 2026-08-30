@@ -17,7 +17,9 @@
 
 use std::sync::Arc;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::{
     create_network_in_instance_root, spawn_network_in_instance_root, NetworkState,
@@ -36,6 +38,7 @@ fn fresh_network(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig
         kind,
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
@@ -46,6 +49,17 @@ fn fresh_network(id: &str, network_id: &str, kind: NetworkKind) -> NetworkConfig
 
 fn rostered(state: &Arc<NetworkState>, id: &str) -> bool {
     myownmesh_core::roster::is_authorized(&state.roster.read(), id)
+}
+
+fn roster_role(state: &Arc<NetworkState>, id: &str) -> Option<Role> {
+    let pk = myownmesh_core::signing::pubkey_part(id);
+    state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .find(|peer| peer.device_id == pk)
+        .map(|peer| peer.role)
 }
 
 /// One unsigned carrier entry introducing `id` as a plain member.
@@ -96,10 +110,9 @@ async fn roster_membership_authority_gate() {
         alice.verified_bootstrap().context().scope,
         "closed-roster-guard"
     );
-    let initial_snapshot = governance::snapshot(&alice);
     assert_eq!(
-        initial_snapshot.roles.get(alice_id.public_id()),
-        Some(&Role::Owner),
+        alice.verified_authority_root(),
+        Some(alice_id.public_id()),
         "the explicit Closed creator is the canonical root owner"
     );
 
@@ -127,14 +140,10 @@ async fn roster_membership_authority_gate() {
         bob_fact, carol_fact,
         "each RoleGrant is a distinct canonical fact"
     );
-    let canonical_snapshot = governance::snapshot(&alice);
+    assert_eq!(roster_role(&alice, bob.public_id()), Some(Role::Member));
     assert_eq!(
-        canonical_snapshot.roles.get(bob.public_id()),
-        Some(&Role::Member)
-    );
-    assert_eq!(
-        canonical_snapshot.roles.get(carol.public_id()),
-        Some(&Role::Controller)
+        roster_role(&alice, carol.public_id()),
+        Some(Role::Controller)
     );
     assert!(
         rostered(&alice, bob.public_id()) && rostered(&alice, carol.public_id()),

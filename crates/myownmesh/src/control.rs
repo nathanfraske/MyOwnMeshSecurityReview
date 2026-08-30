@@ -1866,16 +1866,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
-            Request::GovernanceState { network } => {
-                let (reply, output) =
-                    dispatch::governance::governance_state(&state, &json_lines, network).await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("GovernanceState response exceeded its measured ceiling")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
             // Twelve arms, not one arm that bound a whole `Request` and re-matched
             // it. The grouped form needed a `_ => unreachable!()` underneath, so a
             // thirteenth transition would have compiled into that panic instead of
@@ -3634,6 +3624,7 @@ mod terminal_shutdown_tests {
             kind: Default::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),
+            closed_relay: Default::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             roster_path: None,

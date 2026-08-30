@@ -18,6 +18,9 @@
 //! and are documented in `CONNECTION-ENGINE-FIELD-NOTES.md`. Do not relax them
 //! without understanding the corresponding field-discovered bug.
 
+pub(crate) mod carrier_state;
+pub(crate) mod closed_relay;
+pub(crate) mod command;
 pub mod conn_trace;
 pub mod connection;
 pub mod governance;
@@ -25,6 +28,7 @@ pub mod handshake;
 pub mod heartbeat;
 pub mod ice_watchdog;
 pub mod ladder;
+pub(crate) mod lifecycle;
 pub mod network_watch;
 pub(crate) mod peer_registry;
 pub mod phase;
@@ -35,6 +39,7 @@ pub(crate) mod semantic_ingress;
 pub(crate) mod signaling_bridge;
 pub(crate) mod signaling_ingress;
 pub(crate) mod state;
+pub(crate) mod supervisor;
 pub mod tick;
 pub mod traffic;
 pub mod wake;
@@ -75,7 +80,6 @@ const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 /// peers converge inside a handful of seconds.
 const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,7 +89,6 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 
-use crate::config::NetworkConfig;
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, PeerEvent};
 use crate::identity::Identity;
@@ -97,13 +100,7 @@ use crate::protocol::{
     topology::ShelveMessage,
     CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
-#[cfg(feature = "transport-lab")]
-use crate::resource::ProcessResourceRoot;
-use crate::resource::{LocalApplicationResourceScope, MeshRuntimeResourceScope};
-use crate::semantic::{
-    BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId, SignedFact,
-    VerifiedBootstrap, VerifiedProjectPolicy,
-};
+use crate::semantic::{DeviceId, VerifiedBootstrap};
 use crate::transport::{
     DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
     WebRtcConnectorEvent,
@@ -111,7 +108,23 @@ use crate::transport::{
 
 use connection::{PeerConnection, PeerStatus};
 use ladder::ConnectionTier;
+#[cfg(feature = "transport-lab")]
+pub(crate) use lifecycle::{
+    create_network, create_network_in_instance_root, import_network,
+    import_network_in_instance_root, spawn_network, spawn_network_in_instance_root,
+};
+pub(crate) use lifecycle::{
+    create_network_in_mesh_scope, import_network_in_mesh_scope, ingest_semantic_fact,
+    join_open_participation, spawn_network_in_mesh_scope,
+};
 pub(crate) use state::{NetworkCmd, NetworkState};
+pub(crate) use supervisor::{handle_command, run_driver};
+#[cfg(all(test, feature = "transport-lab"))]
+mod supervisor_tests;
+#[cfg(all(test, feature = "transport-lab"))]
+use supervisor_tests::{
+    clear_b2_stage_probe, install_b2_stage_probe, record_b2_stage, B2Stage, B2StageProbe,
+};
 // The raw signaling surface is crate-private: `SignalingOutbound`, the two
 // mailbox endpoints on `NetworkState`, its constructors, `run_driver` and
 // `EphemeralIngress` are all reachable only from inside this crate. A repo-wide
@@ -130,422 +143,11 @@ use state::SignalingOutbound;
 // public re-export" rules out. The type itself stays exactly where it was.
 use state::SignalingInbound;
 
-#[cfg(all(test, feature = "transport-lab"))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum B2Stage {
-    DataChannelOpen,
-    AuthStarted,
-    PeerProofAccepted,
-    PromotionQueued,
-    MediaOfferApplied,
-    MediaAnswerApplied,
-    MediaOfferSent,
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-#[derive(Clone, Debug)]
-struct B2StageEvent {
-    local_device_id: String,
-    correlation: String,
-    stage: B2Stage,
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-struct B2StageProbe {
-    events: parking_lot::Mutex<Vec<B2StageEvent>>,
-    wake: tokio::sync::Notify,
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-impl B2StageProbe {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            events: parking_lot::Mutex::new(Vec::new()),
-            wake: tokio::sync::Notify::new(),
-        })
-    }
-
-    fn record(&self, event: B2StageEvent) {
-        eprintln!(
-            "B2_STAGE local={} correlation={} stage={:?}",
-            event.local_device_id, event.correlation, event.stage
-        );
-        tracing::info!(
-            target: "b2_stage",
-            local_device = %event.local_device_id,
-            correlation = %event.correlation,
-            stage = ?event.stage,
-            "B2 speculative handoff stage"
-        );
-        self.events.lock().push(event);
-        self.wake.notify_waiters();
-    }
-
-    async fn wait_for(&self, local_device_id: &str, correlation: &str, stage: B2Stage) {
-        loop {
-            let notified = self.wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.events.lock().iter().any(|event| {
-                event.local_device_id == local_device_id
-                    && event.correlation == correlation
-                    && event.stage == stage
-            }) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-static B2_STAGE_PROBE: std::sync::OnceLock<parking_lot::Mutex<Option<Arc<B2StageProbe>>>> =
-    std::sync::OnceLock::new();
-
-#[cfg(all(test, feature = "transport-lab"))]
-fn install_b2_stage_probe(probe: Arc<B2StageProbe>) {
-    *B2_STAGE_PROBE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock() = Some(probe);
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-fn clear_b2_stage_probe() {
-    *B2_STAGE_PROBE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock() = None;
-}
-
-#[cfg(all(test, feature = "transport-lab"))]
-fn record_b2_stage(state: &Arc<NetworkState>, correlation: &str, stage: B2Stage) {
-    if let Some(probe) = B2_STAGE_PROBE
-        .get_or_init(|| parking_lot::Mutex::new(None))
-        .lock()
-        .clone()
-    {
-        probe.record(B2StageEvent {
-            local_device_id: state.identity.public_id().to_string(),
-            correlation: correlation.to_string(),
-            stage,
-        });
-    }
-}
-
 #[cfg(test)]
 fn test_departure_control() -> crate::protocol::SessionControl {
     crate::protocol::SessionControl::Depart {
         correlation: DepartureCorrelation::from_bytes([0x2a; 32]),
     }
-}
-
-/// Spawn the engine for a single joined network. Returns the
-/// shared [`NetworkState`] handle plus the join handle of the
-/// driver task (waitable for clean shutdown).
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn spawn_network(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    spawn_network_impl(config, identity, transport).await
-}
-
-#[cfg(feature = "transport-lab")]
-async fn spawn_network_impl(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = bootstrap_for_spawn(&config, None)?;
-    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        &mesh_scope,
-        &local_resources,
-        bootstrap,
-        None,
-    )
-    .await
-}
-
-/// Create and durably install the local Closed bootstrap before exposing an
-/// engine for it. The creation id is caller-owned semantic input; the local
-/// signing key is the only authority root accepted by this profile.
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn create_network(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    creation_id: [u8; 32],
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    create_network_impl(config, identity, transport, creation_id).await
-}
-
-#[cfg(feature = "transport-lab")]
-async fn create_network_impl(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    creation_id: [u8; 32],
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = create_local_bootstrap(&config, &identity, None, creation_id)?;
-    spawn_network_with_verified_bootstrap(config, identity, transport, None, bootstrap).await
-}
-
-/// Transport-lab variant of [`create_network`] with instance-owned bootstrap
-/// persistence. The record is verified and durably installed before the
-/// engine becomes observable, so a second node can import the exact same
-/// semantic context into a distinct root.
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn create_network_in_instance_root(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    root: PathBuf,
-    creation_id: [u8; 32],
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = create_local_bootstrap(&config, &identity, Some(root.as_path()), creation_id)?;
-    spawn_network_with_verified_bootstrap(config, identity, transport, Some(root), bootstrap).await
-}
-
-/// Import and durably install a caller-provided bootstrap only after it has
-/// matched the locally expected semantic context. The expected context id is
-/// an import constraint, never a replacement for record verification.
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn import_network(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    expected_context_id: MeshContextId,
-    record: BootstrapRecord,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    import_network_impl(config, identity, transport, expected_context_id, record).await
-}
-
-#[cfg(feature = "transport-lab")]
-async fn import_network_impl(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    expected_context_id: MeshContextId,
-    record: BootstrapRecord,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = import_local_bootstrap(&config, None, expected_context_id, record)?;
-    spawn_network_with_verified_bootstrap(config, identity, transport, None, bootstrap).await
-}
-
-/// Transport-lab variant of [`import_network`] that verifies and persists the
-/// supplied record below one explicit instance root before exposing the
-/// imported engine.
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn import_network_in_instance_root(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    root: PathBuf,
-    expected_context_id: MeshContextId,
-    record: BootstrapRecord,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap =
-        import_local_bootstrap(&config, Some(root.as_path()), expected_context_id, record)?;
-    spawn_network_with_verified_bootstrap(config, identity, transport, Some(root), bootstrap).await
-}
-
-/// Spawn a transport-lab node with instance-owned on-disk projections.
-///
-/// The supplied root is local custody only: the config's wire-level
-/// `network_id` is preserved exactly. The root is passed through a private
-/// constructor seam, which derives the normal `states/` and `rosters/`
-/// layouts. Ordinary production callers continue through [`spawn_network`]
-/// and retain the default root.
-#[cfg(feature = "transport-lab")]
-pub(crate) async fn spawn_network_in_instance_root(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    root: std::path::PathBuf,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = bootstrap_for_spawn(&config, Some(root.as_path()))?;
-    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        &mesh_scope,
-        &local_resources,
-        bootstrap,
-        Some(root),
-    )
-    .await
-}
-
-pub(crate) async fn spawn_network_in_mesh_scope(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    mesh_scope: &MeshRuntimeResourceScope,
-    local_resources: &LocalApplicationResourceScope,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = bootstrap_for_spawn(&config, None)?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        mesh_scope,
-        local_resources,
-        bootstrap,
-        None,
-    )
-    .await
-}
-
-/// Create a Closed network below the already-issued Mesh scopes.
-///
-/// This is the handle facade's only creation seam. Keeping bootstrap
-/// verification and driver construction below the caller's exact scopes means
-/// creation cannot silently install a second process authority owner.
-pub(crate) async fn create_network_in_mesh_scope(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    mesh_scope: &MeshRuntimeResourceScope,
-    local_resources: &LocalApplicationResourceScope,
-    creation_id: [u8; 32],
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = create_local_bootstrap(&config, &identity, None, creation_id)?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        mesh_scope,
-        local_resources,
-        bootstrap,
-        None,
-    )
-    .await
-}
-
-/// Import a Closed network below the already-issued Mesh scopes.
-///
-/// The expected context is an import constraint; the persisted record remains
-/// the authority-bearing input and is verified before the driver is exposed.
-pub(crate) async fn import_network_in_mesh_scope(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    mesh_scope: &MeshRuntimeResourceScope,
-    local_resources: &LocalApplicationResourceScope,
-    expected_context_id: MeshContextId,
-    record: BootstrapRecord,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let bootstrap = import_local_bootstrap(&config, None, expected_context_id, record)?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        mesh_scope,
-        local_resources,
-        bootstrap,
-        None,
-    )
-    .await
-}
-
-#[cfg(feature = "transport-lab")]
-async fn spawn_network_with_verified_bootstrap(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    instance_root: Option<PathBuf>,
-    bootstrap: VerifiedBootstrap,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let mesh_scope = ProcessResourceRoot::global().mesh_runtime_scope();
-    let local_resources = ProcessResourceRoot::global().issue_local_application_scope()?;
-    spawn_network_in_mesh_scope_with_verified_bootstrap(
-        config,
-        identity,
-        transport,
-        &mesh_scope,
-        &local_resources,
-        bootstrap,
-        instance_root,
-    )
-    .await
-}
-
-async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
-    config: NetworkConfig,
-    identity: Arc<Identity>,
-    transport: Transport,
-    mesh_scope: &MeshRuntimeResourceScope,
-    local_resources: &LocalApplicationResourceScope,
-    bootstrap: VerifiedBootstrap,
-    instance_root: Option<std::path::PathBuf>,
-) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let (state, signaling_inbound_rx, cmd_rx) = NetworkState::new_in_mesh_scope_with_instance_root(
-        config,
-        identity,
-        transport,
-        bootstrap,
-        mesh_scope,
-        local_resources,
-        instance_root,
-    )?;
-    let driver_state = state.clone();
-    let handle = tokio::spawn(async move {
-        run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;
-    });
-    Ok((state, handle))
-}
-
-/// Explicitly join the local Open lifecycle at the low-level engine seam.
-///
-/// Authentication and carrier presence never author participation. A fresh
-/// Open network joins once; a persisted negative participation head re-enters
-/// through the causal rejoin API; an already-positive head is left untouched.
-/// Closed networks have no local Open lifecycle fact to manufacture.
-pub(crate) async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
-    join_open_participation_impl(state).await
-}
-
-async fn join_open_participation_impl(state: &Arc<NetworkState>) -> Result<()> {
-    if !matches!(
-        state.verified_bootstrap().policy(),
-        VerifiedProjectPolicy::Open
-    ) {
-        return Ok(());
-    }
-    let local = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|error| Error::Other(format!("local Open identity is not canonical: {error}")))?;
-    let participation = {
-        let graph = state.authoritative_fact_graph();
-        let graph = graph.read();
-        graph.evaluator().effective_open_participation(&local)
-    };
-    match participation {
-        Some(true) => Ok(()),
-        Some(false) => governance::rejoin_open_participation(state)
-            .await
-            .map(|_| ()),
-        None => governance::join_open_participation(state).await.map(|_| ()),
-    }
-}
-
-/// Ingest one authenticated canonical fact through the production semantic
-/// reducer. Carrier/session identity is deliberately absent: the signed fact
-/// supplies its own authority and the reducer supplies durable admission,
-/// quarantine custody, projection, and broadcast ordering.
-pub(crate) async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: SignedFact) {
-    let semantic_ingress::SemanticAdmission::Durable(exchange) =
-        semantic_ingress::admit(MeshMessage::Fact(fact))
-    else {
-        return;
-    };
-    semantic_ingress::reduce(state, exchange, None).await;
 }
 
 /// Integration-only facade for production-shaped transport-lab controls.
@@ -1068,513 +670,6 @@ async fn v4_open_local_join_leave_rejoin_is_causal_and_shutdown_is_not_leave() {
         Some(true),
         "shutdown preserves the explicit rejoin projection"
     );
-}
-
-fn bootstrap_root(instance_root: Option<&Path>) -> Result<PathBuf> {
-    match instance_root {
-        Some(root) => Ok(root.to_path_buf()),
-        None => Ok(crate::dirs::data_dir()?.join("mesh")),
-    }
-}
-
-fn bootstrap_store(
-    config: &NetworkConfig,
-    instance_root: Option<&Path>,
-) -> Result<crate::semantic::store::BootstrapStore> {
-    Ok(crate::semantic::store::BootstrapStore::new(
-        bootstrap_root(instance_root)?,
-        &config.id,
-    ))
-}
-
-fn local_bootstrap_principal() -> crate::application_gateway::LocalPrincipalCapability {
-    crate::application_gateway::LocalPrincipalCapability::for_local_process(
-        crate::runtime::RuntimeIncarnation::new(),
-    )
-}
-
-fn bootstrap_error(action: &str, error: impl std::fmt::Display) -> Error {
-    Error::Other(format!("{action} bootstrap: {error}"))
-}
-
-fn ensure_bootstrap_for_config(
-    config: &NetworkConfig,
-    bootstrap: VerifiedBootstrap,
-) -> Result<VerifiedBootstrap> {
-    if bootstrap.context().scope != config.network_id {
-        return Err(bootstrap_error(
-            "rejecting",
-            format!(
-                "semantic scope {} does not match network_id {}",
-                bootstrap.context().scope,
-                config.network_id
-            ),
-        ));
-    }
-
-    let valid_shape = match config.kind {
-        crate::network_state::NetworkKind::Closed => matches!(
-            bootstrap.policy(),
-            VerifiedProjectPolicy::Closed(policy)
-                if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
-        ),
-        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
-            matches!(bootstrap.policy(), VerifiedProjectPolicy::Open)
-        }
-    };
-    if !valid_shape {
-        return Err(bootstrap_error(
-            "rejecting",
-            format!(
-                "bootstrap policy does not match configured kind {:?}",
-                config.kind
-            ),
-        ));
-    }
-    Ok(bootstrap)
-}
-
-fn bootstrap_for_spawn(
-    config: &NetworkConfig,
-    instance_root: Option<&Path>,
-) -> Result<VerifiedBootstrap> {
-    let bootstrap = match config.kind {
-        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
-            VerifiedBootstrap::open(config.network_id.clone())
-                .map_err(|error| bootstrap_error("creating founderless", error))?
-        }
-        crate::network_state::NetworkKind::Closed => bootstrap_store(config, instance_root)?
-            .restore()
-            .map_err(|error| bootstrap_error("restoring Closed", error))?,
-    };
-    ensure_bootstrap_for_config(config, bootstrap)
-}
-
-fn create_local_bootstrap(
-    config: &NetworkConfig,
-    identity: &Identity,
-    instance_root: Option<&Path>,
-    creation_id: [u8; 32],
-) -> Result<VerifiedBootstrap> {
-    if config.kind != crate::network_state::NetworkKind::Closed {
-        return Err(bootstrap_error(
-            "creating",
-            "explicit local creation requires Closed network kind",
-        ));
-    }
-    let bootstrap = VerifiedBootstrap::create_closed(
-        config.network_id.clone(),
-        [identity.signing_key()],
-        creation_id,
-    )
-    .map_err(|error| bootstrap_error("creating", error))?;
-    let principal = local_bootstrap_principal();
-    let stored = bootstrap_store(config, instance_root)?
-        .persist_new(&principal, bootstrap.record())
-        .map_err(|error| bootstrap_error("persisting created", error))?;
-    ensure_bootstrap_for_config(config, stored)
-}
-
-fn import_local_bootstrap(
-    config: &NetworkConfig,
-    instance_root: Option<&Path>,
-    expected_context_id: MeshContextId,
-    record: BootstrapRecord,
-) -> Result<VerifiedBootstrap> {
-    if config.kind != crate::network_state::NetworkKind::Closed {
-        return Err(bootstrap_error(
-            "importing",
-            "explicit bootstrap import requires Closed network kind",
-        ));
-    }
-    let principal = local_bootstrap_principal();
-    let expected = ExpectedMeshContext::for_local_import(&principal, expected_context_id);
-    let imported = bootstrap_store(config, instance_root)?
-        .import_expected(&expected, record)
-        .map_err(|error| bootstrap_error("importing", error))?;
-    ensure_bootstrap_for_config(config, imported)
-}
-
-/// The engine's main loop. Owns the per-network state and the
-/// fan-in mpsc that consolidates signaling, transport, and
-/// command events.
-pub(crate) async fn run_driver(
-    state: Arc<NetworkState>,
-    mut signaling_inbound: crate::resource::ResourceMailboxReceiver<EphemeralIngress>,
-    mut cmd_rx: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
-) {
-    let mut speculative_promotion_rx = state
-        .take_speculative_promotion_rx()
-        .expect("the network driver takes its speculative-promotion receiver once");
-    state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
-    // Settle the signed-eviction verdict from the persisted governance
-    // state before anything announces or dials: a device evicted in a
-    // previous run must come up stood-down (and re-emit the event so an
-    // embedding app that missed it can clean up), not spend another
-    // session redialing into denials.
-    governance::refresh_self_evicted(&state);
-    if state.self_evicted.load(std::sync::atomic::Ordering::SeqCst) {
-        // A terminal recovery cohort is a carrier-owned retry, not a
-        // re-admission mechanism.  A persisted self-eviction therefore
-        // releases it at startup; only a later signed lifecycle event may
-        // make the device live again.
-        state.cancel_all_recovery_demands();
-    }
-    // Surface the ICE-server configuration so users can confirm at
-    // a glance whether they have any relay coverage. Mirrors
-    // MyOwnLLM's pattern: when peers get stuck at ICE-checking with
-    // 0 relay candidates, this line is the first thing to point at.
-    {
-        let cfg = state.config.read();
-        let stun_count: usize = cfg.stun_servers.iter().map(|s| s.urls.len()).sum();
-        let turn_count: usize = cfg.turn_servers.iter().map(|s| s.urls.len()).sum();
-        let turn_summary = if turn_count == 0 {
-            "no TURN configured (CGNAT / phone-hotspot will fail to connect)".to_string()
-        } else {
-            format!("{turn_count} TURN URL(s)")
-        };
-        state.log_diag_with(
-            crate::events::DiagLevel::Info,
-            "engine",
-            format!("ICE servers: {stun_count} STUN URL(s), {turn_summary}"),
-            serde_json::json!({
-                "stun_count": stun_count,
-                "turn_count": turn_count,
-                "auto_approve": cfg.auto_approve,
-            }),
-        );
-        drop(cfg);
-    }
-
-    // Top-level interval ticks. We hold them across the loop so
-    // sleeping happens inside `tokio::select!` — no separate
-    // task means a wake-event after a long-sleep tick gap is
-    // observable here without coordination.
-    let mut heartbeat =
-        tokio::time::interval(Duration::from_millis(scheduler::HEARTBEAT_INTERVAL_MS));
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // One periodic pass covers ICE watchdog and network watch together.
-    // Recovery is event-driven first; this is the secondary safety-net tick
-    // (see `scheduler::STATE_WATCH_INTERVAL_MS`) that confirms state and
-    // handles the inherently time-based conditions.
-    let mut state_watch =
-        tokio::time::interval(Duration::from_millis(scheduler::STATE_WATCH_INTERVAL_MS));
-    state_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The secondary control path: a registry of time-based subsystems run on
-    // each state-watch tick. Events drive state; these confirm and repair the
-    // conditions no event can signal. New network-intelligence systems plug in
-    // here — see `engine::tick`.
-    let mut tick_registry = tick::TickRegistry::new()
-        .register(tick::IceWatchdogTicker)
-        .register(tick::NetworkWatchTicker::new().await)
-        .register(tick::FactInventoryTicker)
-        .register(tick::ReliableSendTicker)
-        .register(tick::TopologyShapeTicker)
-        .register(tick::MediaRenegotiationTicker);
-    state.log_diag_with(
-        crate::events::DiagLevel::Debug,
-        "engine",
-        format!("state-watch tick registry: {:?}", tick_registry.names()),
-        serde_json::json!({ "tickers": tick_registry.names() }),
-    );
-    let mut wake_detector = wake::WakeDetector::new();
-    // Phase-0 connection tracer. Observes per-peer connection-state
-    // transitions after each driver-loop iteration. Zero cost unless a
-    // `ctl trace` subscriber is attached or `MYOWNMESH_CONN_TRACE` is
-    // set — see `engine::conn_trace`.
-    let mut conn_tracer = conn_trace::ConnTracer::new();
-
-    // Why the loop below exits — surfaced in the "driver stopping" line so a
-    // restart's *cause* is greppable. A network re-join (leave + re-join) is
-    // the only way a fresh `run_driver`/Nostr driver appears mid-run, and
-    // chasing one in the field is otherwise guesswork: "shutdown command" is a
-    // deliberate leave/`network_update`/`network_remove`, "command channel
-    // closed" is the registry dropping us, "signaling channel closed" is the
-    // relay/signaling feed dying.
-    let stop_reason: &str = loop {
-        tokio::select! {
-            _ = state.wait_for_shutdown() => {
-                break "shutdown requested";
-            }
-
-            cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break "command channel closed" };
-                // A command is handled, not read: fifteen `NetworkCmd` variants
-                // carry a `oneshot::Sender` that answering consumes, so this is
-                // the one path that cannot work from a borrow. The terminal
-                // effect releases the delivery's funding only after
-                // `handle_command` has finished, and can return nothing, so
-                // neither the command nor anything derived from it outlives the
-                // claim.
-                cmd.run_terminal_effect(|cmd| handle_command(&state, cmd)).await;
-            }
-
-            promotion = speculative_promotion_rx.recv() => {
-                let Some(promotion) = promotion else {
-                    break "speculative promotion channel closed";
-                };
-                promotion
-                    .run_terminal_effect(|promotion| {
-                        handle_speculative_promotion(&state, promotion)
-                    })
-                    .await;
-            }
-
-            sig = signaling_inbound.recv() => {
-                let Some(sig) = sig else {
-                    warn!(network = %state.network_id, "signaling channel closed");
-                    break "signaling channel closed";
-                };
-                // Same shape as the command arm above, for the same reason:
-                // the delivery's payloads are consumed by
-                // value downstream — `apply_remote_sdp` takes an owned `String`
-                // and `add_remote_candidate_observed` takes an owned
-                // `LocalIceCandidate`. Handling from a borrow would mean
-                // cloning two multi-kilobyte SDP bodies and an ICE candidate
-                // outside the claim that funded them, so the whole delivery
-                // rides into the handler and its funding is released only after
-                // the handler has finished.
-                sig.run_terminal_effect(|sig| handle_signaling_inbound(&state, sig))
-                    .await;
-            }
-
-            _ = heartbeat.tick() => {
-                wake_detector.observe(Instant::now(), scheduler::HEARTBEAT_INTERVAL_MS);
-                heartbeat::tick(&state).await;
-                if wake_detector.take_wake_event() {
-                    debug!(network = %state.network_id, "wake event observed");
-                    wake::on_wake(&state).await;
-                }
-            }
-
-            _ = state_watch.tick() => {
-                // Secondary safety net only — events drive recovery. Each
-                // registered ticker confirms its slice of state and repairs the
-                // time-based conditions no event can signal. The trace doubles
-                // as the driver's liveness heartbeat in debug captures: when
-                // the driver wedges, this is the line that stops.
-                trace!(network = %state.network_id, "driver: state-watch tick");
-                tick_registry.run(&state).await;
-            }
-        }
-
-        // Observe the post-event connection state. Cheap no-op unless
-        // someone is watching; never holds a per-peer lock across an
-        // await (the handler above has already returned).
-        conn_tracer.sweep(&state);
-    };
-
-    state.log_diag_with(
-        crate::events::DiagLevel::Info,
-        "engine",
-        format!("driver stopping ({stop_reason})"),
-        serde_json::json!({ "reason": stop_reason }),
-    );
-    // Resolve exact departure waiters before peer teardown.  A connected but
-    // silent remote cannot be allowed to keep shutdown behind an observation
-    // that will never arrive; the peer-session cancellation edge is the
-    // authority that settles the waiter, not a timer or a synthetic receipt.
-    state.peers.cancel_pending_departures_for_shutdown();
-    state.shutdown().await;
-}
-
-async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
-    match cmd {
-        NetworkCmd::SetTopology(mode) => {
-            // Topology is explicit connector/deployment policy, not a
-            // governance authority-bearing fact.  Apply the local command
-            // directly; canonical governance projection never derives a
-            // topology selector from the compatibility DTO.
-            *state.topology.write() = mode.clone();
-            *state.topology_impl.write() = crate::topology::from_mode(&mode);
-            ladder::reevaluate_topology(state).await;
-        }
-        NetworkCmd::ApproveRoster {
-            device_id,
-            label,
-            reply,
-        } => {
-            let result = state.approve_roster(&device_id, &label).await;
-            // A successful approval changed our roster — advertise the new
-            // membership so other members converge (the same path the
-            // mutual-confirmation handshake takes, here for the explicit
-            // user-approve case).
-            if result.is_ok() {
-                governance::broadcast_roster_summary(state).await;
-            }
-            let _ = reply.send(result);
-        }
-        NetworkCmd::RemoveRoster { device_id, reply } => {
-            let result = state.remove_roster(&device_id).await;
-            let _ = reply.send(result);
-        }
-        NetworkCmd::DropPeer { device_id, reason } => {
-            drop_peer(state, &device_id, reason).await;
-        }
-        NetworkCmd::DropPeerIfCurrent {
-            owner,
-            attempt,
-            reason,
-        } => {
-            drop_carrier_if_current_with_correlation(state, &owner, reason, &attempt).await;
-        }
-        NetworkCmd::AttemptRefused { owner, refusal } => {
-            if retire_speculative_carrier_attempt_if_current(state, &owner, &refusal.attempt).await
-            {
-                return;
-            }
-            let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
-                owner.worker().map_or_else(
-                    || peer.attempt() == refusal.attempt,
-                    |worker| {
-                        peer.attempt_for_worker(worker).as_deref() == Some(refusal.attempt.as_str())
-                    },
-                )
-            });
-            if current {
-                let reason = match refusal.refusal {
-                    myownmesh_signaling::NegotiationRefusal::DuplicateLiveEvent => {
-                        "Nostr attempt was refused as a duplicate live event".to_string()
-                    }
-                    myownmesh_signaling::NegotiationRefusal::Provider(reason) => reason,
-                };
-                drop_peer_if_current(
-                    state,
-                    &owner,
-                    DropReason::TransportError { message: reason },
-                )
-                .await;
-            }
-        }
-        NetworkCmd::AttemptOutcome { owner, outcome } => {
-            if matches!(
-                &outcome.kind,
-                myownmesh_signaling::AttemptOutcomeKind::TypedRefused(_)
-                    | myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable
-            ) && retire_speculative_carrier_attempt_if_current(state, &owner, &outcome.attempt)
-                .await
-            {
-                return;
-            }
-            let current = state.peers.get_if_current(&owner).is_some_and(|peer| {
-                owner.worker().map_or_else(
-                    || peer.attempt() == outcome.attempt,
-                    |worker| {
-                        peer.attempt_for_worker(worker).as_deref() == Some(outcome.attempt.as_str())
-                    },
-                )
-            });
-            if !current {
-                return;
-            }
-            match outcome.kind {
-                myownmesh_signaling::AttemptOutcomeKind::Accepted { .. }
-                | myownmesh_signaling::AttemptOutcomeKind::Cancelled
-                | myownmesh_signaling::AttemptOutcomeKind::Replaced => {
-                    // Accepted is provider observation only: the engine's
-                    // transport success path owns completion settlement, and
-                    // Cancelled/Replaced were already settled by that owner.
-                }
-                myownmesh_signaling::AttemptOutcomeKind::TypedRefused(reason) => {
-                    drop_peer_if_current(
-                        state,
-                        &owner,
-                        DropReason::TransportError {
-                            message: format!("Nostr attempt refused: {reason}"),
-                        },
-                    )
-                    .await;
-                }
-                myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable => {
-                    drop_peer_if_current(
-                        state,
-                        &owner,
-                        DropReason::TransportError {
-                            message: "Nostr signaling carrier unavailable".to_string(),
-                        },
-                    )
-                    .await;
-                }
-            }
-        }
-        NetworkCmd::Reconnect { peer } => match peer {
-            Some(device_id) => network_watch::reconnect_peer_in_place(state, &device_id).await,
-            None => network_watch::reconnect_all_in_place(state).await,
-        },
-        NetworkCmd::ConnectPeer {
-            device_id,
-            sticky,
-            reply,
-        } => connect_peer(state, &device_id, sticky, reply).await,
-        NetworkCmd::SendChannelReliable {
-            peer,
-            channel,
-            payload,
-            reply,
-        } => {
-            reliable::submit(state, &peer, &channel, payload, reply).await;
-        }
-        NetworkCmd::SendChannelFrame {
-            peer,
-            channel,
-            payload,
-            reply,
-        } => {
-            let result = send_channel_frame(state, &peer, &channel, payload).await;
-            let _ = reply.send(result);
-        }
-        NetworkCmd::BroadcastChannelFrame {
-            channel,
-            payload,
-            reply,
-        } => {
-            let count = broadcast_channel_frame(state, &channel, payload).await;
-            let _ = reply.send(count);
-        }
-        NetworkCmd::SendRpcRequest {
-            peer,
-            request,
-            reply,
-        } => {
-            let result = send_rpc_request(state, &peer, request).await;
-            let _ = reply.send(result);
-        }
-        // Nobody to answer. `Rpc::advertise` committed the value locally and
-        // returned; this is the fan-out it did not wait for.
-        // Reaching zero peers is not a failure — a node with no live session has
-        // nothing to push, and the value is replayed to each session as it is
-        // established — so the count is discarded rather than reported.
-        NetworkCmd::FanoutCapabilities { caps } => {
-            let _ = broadcast_capabilities(state, caps).await;
-        }
-        // The registry fence enqueued this at the moment it minted a session, and
-        // it is handled here because the send awaits and no fence lock may be held
-        // across it. Nothing is answered to a caller: the command carries no reply
-        // channel because no local caller is waiting on it — the session it names
-        // is what asked, by coming into existence owing an advertisement.
-        NetworkCmd::ReplayCapabilities { owner } => {
-            // Reconcile and persist every exact proof obligation before the
-            // unrelated capability replay can yield on transport. Preparation
-            // owns the current-owner/binding fence and releases its guard
-            // before the proof send; a reconnect therefore cannot observe an
-            // unprepared Pending record or race a stale replay behind this
-            // capability await.
-            replay_pending_durable_proofs(state, &owner).await;
-            replay_local_capabilities_to_owner(state, &owner).await;
-        }
-        // ---- governance ops ----
-        NetworkCmd::ProposeTransition {
-            variant,
-            mfa_code,
-            reply,
-        } => {
-            let result = governance::propose(state, variant, mfa_code.as_deref()).await;
-            let _ = reply.send(result);
-        }
-        NetworkCmd::GovernanceSnapshot { reply } => {
-            let _ = reply.send(governance::snapshot(state));
-        }
-    }
 }
 
 async fn handle_speculative_promotion(
@@ -5455,9 +4550,8 @@ async fn handle_pending_semantic_frame(
         MeshMessage::ProofDelivery(delivery) => Some(delivery.clone()),
         _ => None,
     };
-    let admission = semantic_ingress::admit(msg);
-    match admission {
-        semantic_ingress::SemanticAdmission::Durable(durable) => {
+    match semantic_ingress::DurableSemanticPort::admit(msg) {
+        Ok(durable) => {
             semantic_ingress::reduce(state, durable, None).await;
             if let Some(delivery) = pending_proof {
                 send_pending_proof_ack(state, operation, delivery).await;
@@ -5465,7 +4559,7 @@ async fn handle_pending_semantic_frame(
                 drop(operation);
             }
         }
-        semantic_ingress::SemanticAdmission::NotDurable(message) => {
+        Err(message) => {
             let (owner, _worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
             if let MeshMessage::ProofAck(ack) = *message {
                 on_proof_ack(state, &owner, ack);
@@ -5884,8 +4978,8 @@ async fn handle_inbound_frame_from(
     // here, from a cache, from a file or over a future durable carrier. The
     // token goes in as `Some` because there *is* somewhere to answer, and the
     // reducer's fact arms cannot read it. See `semantic_ingress`.
-    let msg = match semantic_ingress::admit(msg) {
-        semantic_ingress::SemanticAdmission::Durable(durable) => {
+    let msg = match semantic_ingress::DurableSemanticPort::admit(msg) {
+        Ok(durable) => {
             let logical_route = dispatch.logical_reply_operation();
             // The test-only RPC boundary is also the lifecycle boundary for a
             // durable request: it parks after exact admission and logical
@@ -5897,7 +4991,7 @@ async fn handle_inbound_frame_from(
             state.rpc_send_boundary.mark_semantic_finished();
             return reduced;
         }
-        semantic_ingress::SemanticAdmission::NotDurable(other) => *other,
+        Err(other) => *other,
     };
     match msg {
         MeshMessage::Ping(p) => heartbeat::on_ping(state, &dispatch, p).await,
@@ -5906,6 +5000,24 @@ async fn handle_inbound_frame_from(
         MeshMessage::Unshelve(_) => on_unshelve(state, &dispatch).await,
         MeshMessage::SessionControl(control) => on_session_control(state, &dispatch, control).await,
         MeshMessage::CapabilitiesUpdate(u) => on_capabilities_update(state, &dispatch, u).await,
+        MeshMessage::ClosedRelayControl(control) => {
+            if let Err(error) = control.validate() {
+                trace!(peer = %device_id, "discarding invalid Closed relay control: {error}");
+            } else {
+                match closed_relay::handle_control(state, dispatch.owner(), control).await {
+                    Ok(Some(endpoint_session)) => {
+                        // The handler installs the session in the bounded state
+                        // registry; retain this clone through the dispatch arm
+                        // so endpoint crypto is not dropped before that handoff.
+                        let _endpoint_session = endpoint_session;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        trace!(peer = %device_id, "Closed relay control refused: {error}");
+                    }
+                }
+            }
+        }
         MeshMessage::RpcRequest(req) => on_rpc_request(state, &dispatch, req).await,
         // The three response arms settle *our own* pending outbound calls,
         // resolved by `request_id` against a table the local requester owns.
@@ -5960,6 +5072,45 @@ async fn handle_inbound_frame_from(
         // resolved there, while each frame and its lease were still together.
         // Nothing is owed out here, which is why this arm does nothing.
         MeshMessage::ChannelAck { .. } => {}
+        MeshMessage::ClosedRelayData(data) => {
+            let max_ciphertext_bytes = match crate::runtime::relay::checked_ciphertext_ceiling(
+                state.config.read().closed_relay.max_frame_ciphertext_bytes,
+            ) {
+                Ok(max_ciphertext_bytes) => max_ciphertext_bytes,
+                Err(_) => {
+                    trace!(peer = %device_id, "Closed relay data refused by invalid profile bound");
+                    return;
+                }
+            };
+            let relay_direction = match data.direction(max_ciphertext_bytes) {
+                Ok(crate::protocol::ClosedRelayDataDirection::RequesterToTarget) => {
+                    crate::runtime::relay::RelayDirection::RequesterToTarget
+                }
+                Ok(crate::protocol::ClosedRelayDataDirection::TargetToRequester) => {
+                    crate::runtime::relay::RelayDirection::TargetToRequester
+                }
+                Err(error) => {
+                    trace!(peer = %device_id, "discarding invalid Closed relay data: {error}");
+                    return;
+                }
+            };
+            let session_id = data.session_id;
+            let relay_local = DeviceId::from_canonical_str(state.identity.public_id())
+                .map_or(false, |local| data.relay == local);
+            if let Err(error) = closed_relay::handle_data(state, dispatch.owner(), data).await {
+                trace!(peer = %device_id, "Closed relay data refused: {error}");
+            } else if relay_local {
+                if let Err(error) =
+                    closed_relay::forward_closed_relay_data(state, session_id, relay_direction)
+                        .await
+                {
+                    trace!(
+                        peer = %device_id,
+                        "Closed relay data forwarding refused: {error}"
+                    );
+                }
+            }
+        }
         // Unreachable at runtime, in two different ways, and both are listed
         // explicitly rather than swept up by a `_` arm — so that a *new*
         // `MeshMessage` variant still breaks this match at compile time and has
@@ -5969,7 +5120,7 @@ async fn handle_inbound_frame_from(
         // The four protocol frames: `message_admission` classifies exactly these
         // as `Protocol`, and the protocol branch above returns before this match.
         //
-        // The semantic exchange frames: `semantic_ingress::admit` took the
+        // The semantic exchange frames: `DurableSemanticPort::admit` took the
         // durable subset above and this function already returned; inventory
         // and request frames remain coordination traffic at this boundary.
         // They cannot be handled here *and* there without two owners for one
@@ -9470,6 +8621,7 @@ fn build_test_state_parts_metered_with_creation(
         },
         topology: crate::config::TopologyMode::FullMesh,
         signaling: crate::config::SignalingConfig::default(),
+        closed_relay: crate::config::ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
@@ -10431,7 +9583,10 @@ pub(crate) struct LinkedPromotedSession {
     _far_peer: Arc<PeerConnection>,
     /// Ends when the far connector's event stream does, which is what closing
     /// the link does to it.
-    pump: tokio::task::JoinHandle<()>,
+    near_pump: tokio::task::JoinHandle<()>,
+    /// Ends when the near connector's event stream does, which is what closing
+    /// the link does to it.
+    far_pump: tokio::task::JoinHandle<()>,
 }
 
 /// Promote both directions of one real link: `far`'s device becomes a peer of
@@ -10470,21 +9625,51 @@ pub(crate) async fn install_promoted_session_over_real_link(
         far_state.peers.owner(&near_device_id).is_some(),
         "the far side has just installed the near node"
     );
+    let far_owner = far_state
+        .peers
+        .owner(&near_device_id)
+        .expect("the far-side owner remains current after installation");
+    let far_mesh_context = far_state.mesh_context_id().to_string();
+    assert!(
+        far_state
+            .peers
+            .with_live_session(
+                &far_owner,
+                far_state.session_broker.as_ref(),
+                &far_mesh_context,
+                |_| (),
+            )
+            .is_some(),
+        "the far-side exact owner is live before the real-link fixture returns"
+    );
 
-    let pumping = Arc::clone(far_state);
-    let mut events = near.receive_ready.link.take_right_events();
-    let pump = tokio::spawn(async move {
-        // No deadline: this loop's termination is an observation, not a
-        // timeout. It ends when the native close ends the event stream.
-        while let Some(event) = events.recv().await {
-            let _ = handle_transport_event(&pumping, near_device_id.clone(), event).await;
+    let near_pumping = Arc::clone(near_state);
+    let near_device = far_device_id.clone();
+    let mut near_events = near.receive_ready.link.take_left_events();
+    let near_pump = tokio::spawn(async move {
+        // The left stream feeds the near engine under the far peer's exact
+        // device id. No deadline: termination is an observation, not a timeout.
+        while let Some(event) = near_events.recv().await {
+            let _ = handle_transport_event(&near_pumping, near_device.clone(), event).await;
+        }
+    });
+
+    let far_pumping = Arc::clone(far_state);
+    let far_device = near_device_id.clone();
+    let mut far_events = near.receive_ready.link.take_right_events();
+    let far_pump = tokio::spawn(async move {
+        // The right stream feeds the far engine under the near peer's exact
+        // device id.
+        while let Some(event) = far_events.recv().await {
+            let _ = handle_transport_event(&far_pumping, far_device.clone(), event).await;
         }
     });
 
     LinkedPromotedSession {
         near,
         _far_peer: far_peer,
-        pump,
+        near_pump,
+        far_pump,
     }
 }
 
@@ -10507,10 +9692,17 @@ impl LinkedPromotedSession {
         let LinkedPromotedSession {
             near,
             _far_peer,
-            pump,
+            near_pump,
+            far_pump,
         } = self;
-        let outcomes = near.close_outcomes().await;
-        let _ended = pump.await;
+        let LinkedPromotedPeer {
+            peer: near_peer,
+            receive_ready,
+        } = near;
+        let outcomes = receive_ready.close_outcomes().await;
+        let _near_ended = near_pump.await;
+        let _far_ended = far_pump.await;
+        drop(near_peer);
         drop(_far_peer);
         outcomes
     }
@@ -10570,7 +9762,10 @@ pub(crate) async fn insert_promoted_peer_over_real_link(
             .expect("a connected handoff carries its capability"),
         _ => panic!("the left connector promotes its exact candidate once"),
     };
-    receive_ready.link._left_events.commit_data_channel_open();
+    receive_ready
+        .link
+        .left_events_mut()
+        .commit_data_channel_open();
 
     let peer = Arc::new(PeerConnection::new(
         device_id.to_string(),
@@ -10588,6 +9783,18 @@ pub(crate) async fn insert_promoted_peer_over_real_link(
         state.identity.public_id(),
     );
     install_peer(&state.peers, Arc::clone(&peer));
+    let owner = state
+        .peers
+        .owner(device_id)
+        .expect("the exact real-link owner is current after installation");
+    let mesh_context = state.mesh_context_id().to_string();
+    assert!(
+        state
+            .peers
+            .with_live_session(&owner, state.session_broker.as_ref(), &mesh_context, |_| ())
+            .is_some(),
+        "the exact real-link owner is live before the fixture returns"
+    );
     LinkedPromotedPeer {
         peer,
         receive_ready,
@@ -14404,7 +13611,7 @@ mod tests {
                 .expect("a connected handoff carries its capability"),
             _ => panic!("the left connector promotes its exact candidate once"),
         };
-        link._left_events.commit_data_channel_open();
+        link.left_events_mut().commit_data_channel_open();
 
         let peer = Arc::new(PeerConnection::new(
             device_id.clone(),
@@ -17627,7 +16834,7 @@ mod tests {
             matches!(second_open, TransportEvent::DataChannelOpen),
             "the second connector reaches the genuine open callback"
         );
-        second_link._left_events.commit_data_channel_open();
+        second_link.left_events_mut().commit_data_channel_open();
         let second = Arc::clone(&second_link.left);
         let correlation = "b2-ambiguous-recovery-second";
         let _second_task = prepare_b2_provider_speculative_channel(
@@ -17674,7 +16881,7 @@ mod tests {
             matches!(third_open, TransportEvent::DataChannelOpen),
             "the third connector reaches the genuine open callback"
         );
-        third_link._left_events.commit_data_channel_open();
+        third_link.left_events_mut().commit_data_channel_open();
         let third = Arc::clone(&third_link.left);
         let third_correlation = "b2-ambiguous-recovery-third";
         let _third_task = prepare_b2_provider_speculative_channel(
@@ -20086,7 +19293,10 @@ mod tests {
         // Non-vacuity: before the tombstone this really is an admitted,
         // rostered member of a closed network.
         assert!(
-            !state.governance_state.read().kind.is_open_governance(),
+            !matches!(
+                state.verified_policy(),
+                crate::semantic::VerifiedProjectPolicy::Open
+            ),
             "the adopted log really closed the network — an open one admits \
              everyone and would make every assertion below vacuous"
         );
@@ -20220,7 +19430,10 @@ mod tests {
         // assertions after the withdrawal are about something that could have
         // been taken away.
         assert!(
-            !state.governance_state.read().kind.is_open_governance(),
+            !matches!(
+                state.verified_policy(),
+                crate::semantic::VerifiedProjectPolicy::Open
+            ),
             "the adopted log really closed the network"
         );
         assert!(state.is_rostered(&target), "and really seated the member");
@@ -20338,14 +19551,17 @@ mod tests {
     #[tokio::test]
     async fn v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable() {
         /// Everything a signaling report is forbidden to touch, in one value.
-        fn durable(state: &Arc<NetworkState>) -> (u32, usize, usize, usize) {
+        fn durable(state: &Arc<NetworkState>) -> (usize, u32, String) {
+            let fact_count = {
+                let graph = state.authoritative_fact_graph();
+                let graph = graph.read();
+                graph.len()
+            };
             let roster = state.roster.read();
-            let governance = state.governance_state.read();
             (
+                fact_count,
                 roster.version,
-                roster.authorized_devices.len(),
-                governance.transitions.len(),
-                governance.member_log.len(),
+                crate::roster::membership_root(&roster),
             )
         }
 
@@ -22280,7 +21496,7 @@ mod tests {
             .expect("W1 accepts its genuine open callback");
         let (open_w1, open_w1_resources) = open_w1.into_parts();
         assert!(matches!(open_w1, TransportEvent::DataChannelOpen));
-        link_w1._left_events.commit_data_channel_open();
+        link_w1.left_events_mut().commit_data_channel_open();
         let candidate_w1 = Arc::clone(&link_w1.left);
         let correlation_w1 = "b2-exact-proof-w1";
         let _task_w1 = prepare_b2_provider_speculative_channel(
@@ -22305,7 +21521,7 @@ mod tests {
             .expect("W2 accepts its genuine open callback");
         let (open_w2, open_w2_resources) = open_w2.into_parts();
         assert!(matches!(open_w2, TransportEvent::DataChannelOpen));
-        link_w2._left_events.commit_data_channel_open();
+        link_w2.left_events_mut().commit_data_channel_open();
         let candidate_w2 = Arc::clone(&link_w2.left);
         let correlation_w2 = "b2-exact-proof-w2";
         let _task_w2 = prepare_b2_provider_speculative_channel(
@@ -22684,7 +21900,7 @@ mod tests {
             matches!(open_one, TransportEvent::DataChannelOpen),
             "the first provider candidate uses the genuine left open callback"
         );
-        link_one._left_events.commit_data_channel_open();
+        link_one.left_events_mut().commit_data_channel_open();
         let candidate_one = Arc::clone(&link_one.left);
         let correlation_one = "b2-provider-additional-one";
         let _task_one = prepare_b2_provider_speculative_channel(
@@ -22891,7 +22107,7 @@ mod tests {
             matches!(open_two, TransportEvent::DataChannelOpen),
             "the second provider candidate uses the genuine left open callback"
         );
-        link_two._left_events.commit_data_channel_open();
+        link_two.left_events_mut().commit_data_channel_open();
         let candidate_two = Arc::clone(&link_two.left);
         let correlation_two = "b2-provider-additional-two";
         let task_two = prepare_b2_provider_speculative_channel(
@@ -24691,36 +23907,16 @@ mod tests {
         );
         let snapshot_before_terminal = owner_b.connection().snapshot();
         assert!(matches!(old_b_terminal, TransportEvent::DataChannelClosed));
-        let ((), near_events_consumed) = tokio::join!(
-            handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed),
-            async {
-                tokio::time::timeout(
-                    Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
-                    async {
-                        let mut near_events_consumed = 0usize;
-                        loop {
-                            let old_a_is_authenticated =
-                                state_a.peers.owner(&device_b).is_some_and(|owner| {
-                                    owner.connection().owns_authenticated_worker(&old_a)
-                                });
-                            if !old_a_is_authenticated {
-                                break near_events_consumed;
-                            }
-                            let event = tokio::time::timeout(
-                                Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
-                                linked.near.receive_ready.link.left_events_mut().recv(),
-                            )
-                            .await
-                            .expect("timed out waiting for A's paired predecessor terminal event")
-                            .expect("the near event pump yields A's paired predecessor terminal");
-                            near_events_consumed += 1;
-                            handle_transport_event(&state_a, device_b.clone(), event).await;
-                        }
-                    },
-                )
-                .await
-                .expect("timed out while pumping A's predecessor terminal callback")
-            }
+        handle_exact_promoted_terminal(&state_b, &owner_b, &old_b, DropReason::IceFailed).await;
+        assert!(
+            settle_until(|| {
+                !state_a
+                    .peers
+                    .owner(&device_b)
+                    .is_some_and(|owner| owner.connection().owns_authenticated_worker(&old_a))
+            })
+            .await,
+            "A's exact predecessor terminal is consumed by the duplex event pump"
         );
         let TransportEvent::Message(old_b_message) = old_b_message else {
             panic!("the retained predecessor callback is a message");
@@ -24728,10 +23924,6 @@ mod tests {
         handle_exact_promoted_message(&state_b, &owner_b, &old_b, old_b_message).await;
         drop(old_b_terminal_resources);
         drop(old_b_message_resources);
-        assert!(
-            near_events_consumed > 0,
-            "B's exact predecessor terminal is consumed through A's raw production callback"
-        );
         let selected_after_old_a = owner_a
             .connection()
             .select_unique_usable_channel()
@@ -25013,7 +24205,7 @@ mod tests {
                 .expect("the L1 left connector yields its exact handoff"),
             _ => panic!("the L1 left connector promotes exactly once"),
         };
-        l1_link.link._left_events.commit_data_channel_open();
+        l1_link.link.left_events_mut().commit_data_channel_open();
         drop(_l1_open_resources);
         let l1_right_handoff = l1_link.take_right_handoff();
         let l1_left = Arc::clone(&l1_link.link.left);

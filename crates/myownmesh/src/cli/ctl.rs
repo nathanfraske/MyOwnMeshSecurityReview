@@ -53,8 +53,6 @@ pub enum CtlCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum GovernanceCmd {
-    /// Show governance state (kind, roles, transition log, pending).
-    State { network: String },
     /// Propose granting `target` a role: `member` | `controller` | `owner`.
     GrantRole {
         network: String,
@@ -265,9 +263,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         },
         CtlCmd::Roster(RosterCmd::Remove { network, device_id }) => {
             Request::RosterRemove { network, device_id }
-        }
-        CtlCmd::Governance(GovernanceCmd::State { network }) => {
-            Request::GovernanceState { network }
         }
         CtlCmd::Governance(GovernanceCmd::GrantRole {
             network,

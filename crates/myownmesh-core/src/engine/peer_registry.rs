@@ -24,11 +24,12 @@
 //! synchronous, non-reentrant, and free to hand a value off but not to await.
 
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Weak,
 };
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::error::{Error, Result};
 use crate::resource::ResourceMailboxSender;
@@ -67,9 +68,44 @@ pub(crate) struct PeerRegistry {
     command_tx: std::sync::OnceLock<ResourceMailboxSender<super::state::NetworkCmd>>,
     speculative_promotion_tx:
         std::sync::OnceLock<ResourceMailboxSender<super::state::SpeculativePromotionCmd>>,
-    retired_closes: Arc<Mutex<Vec<Arc<PeerConnection>>>>,
+    close_tasks: Arc<CloseTaskTracker>,
     signaling_runtime:
         parking_lot::RwLock<Option<Weak<super::signaling_ingress::SignalingRuntime>>>,
+}
+
+/// Detached close tasks own their exact peer until transport cleanup settles.
+/// The registry tracks only completion, never a second growable collection of
+/// connection Arcs.
+struct CloseTaskTracker {
+    pending: AtomicUsize,
+    changed: Notify,
+}
+
+impl CloseTaskTracker {
+    fn new() -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            changed: Notify::new(),
+        }
+    }
+
+    fn start(&self) {
+        self.pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn complete(&self) {
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self) {
+        loop {
+            if self.pending.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            self.changed.notified().await;
+        }
+    }
 }
 
 struct PeerRegistryEntry {
@@ -401,7 +437,7 @@ impl PeerRegistry {
             next_binding_epoch: AtomicU64::new(1),
             command_tx: std::sync::OnceLock::new(),
             speculative_promotion_tx: std::sync::OnceLock::new(),
-            retired_closes: Arc::new(Mutex::new(Vec::new())),
+            close_tasks: Arc::new(CloseTaskTracker::new()),
             signaling_runtime: parking_lot::RwLock::new(None),
         }
     }
@@ -424,38 +460,27 @@ impl PeerRegistry {
     /// replacement; shutdown drains it rather than guessing which removed
     /// peer tasks still exist.
     pub(super) fn track_replaced_close(&self, peer: Arc<PeerConnection>) {
-        self.retired_closes.lock().push(Arc::clone(&peer));
-        let custody = Arc::clone(&self.retired_closes);
+        self.close_tasks.start();
+        let tasks = Arc::clone(&self.close_tasks);
         tokio::spawn(async move {
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, "replaced peer cleanup did not complete successfully");
             }
-            custody
-                .lock()
-                .retain(|current| !Arc::ptr_eq(current, &peer));
+            tasks.complete();
         });
     }
 
-    pub(super) fn track_removed_close(&self, peer: Arc<PeerConnection>) {
-        let mut closes = self.retired_closes.lock();
-        if !closes.iter().any(|current| Arc::ptr_eq(current, &peer)) {
-            closes.push(peer);
-        }
+    pub(super) fn track_removed_close(&self, _peer: Arc<PeerConnection>) {
+        // Terminal operations retain the removed peer until their exact
+        // transport close waiter completes. No registry-level Arc is needed.
     }
 
-    pub(super) fn complete_removed_close(&self, peer: &Arc<PeerConnection>) {
-        self.retired_closes
-            .lock()
-            .retain(|current| !Arc::ptr_eq(current, peer));
+    pub(super) fn complete_removed_close(&self, _peer: &Arc<PeerConnection>) {
+        // The terminal operation owns and releases the peer itself.
     }
 
     pub(super) async fn await_replaced_closes(&self) {
-        let closes = std::mem::take(&mut *self.retired_closes.lock());
-        for close in closes {
-            if let Err(error) = close.retire_and_close().await {
-                tracing::warn!(%error, "replaced peer cleanup did not complete successfully");
-            }
-        }
+        self.close_tasks.wait().await;
     }
 
     /// Bind the verified bootstrap and the one authoritative FactGraph used

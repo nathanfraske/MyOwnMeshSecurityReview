@@ -1809,6 +1809,19 @@ pub(crate) struct CarrierAttach {
     guard: Arc<CarrierInstanceGuard>,
 }
 
+/// The ephemeral-transport port. Its only input is a carrier observation and
+/// its only output is the typed admission result; it has no durable semantic
+/// or endpoint-authentication arm. The attach remains the owner of runtime,
+/// provenance, and exact carrier-emission custody.
+pub(crate) struct EphemeralTransportPort;
+
+impl EphemeralTransportPort {
+    /// Admit an already carrier-owned observation before domain parsing.
+    pub(crate) fn admit(attach: &CarrierAttach, observation: CarrierObservation) -> Delivered {
+        attach.runtime.deliver(observation)
+    }
+}
+
 impl CarrierAttach {
     /// A carrier reported that a device is present.
     ///
@@ -1874,7 +1887,7 @@ impl CarrierAttach {
     /// production consumers that need to distinguish refusal, unavailability,
     /// duplicate suppression, acceptance, and shutdown.
     pub(crate) fn admit(&self, observation: CarrierObservation) -> Delivered {
-        self.runtime.deliver(observation)
+        EphemeralTransportPort::admit(self, observation)
     }
 
     pub(crate) fn guard(&self) -> Arc<CarrierInstanceGuard> {

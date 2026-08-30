@@ -126,6 +126,20 @@ pub fn capability_advert_planning_claim(
 }
 
 impl super::ApplicationGateway {
+    /// Queue a committed local advertisement for the engine's exact per-owner
+    /// fan-out. The gateway owns the application value; the engine owns the
+    /// transport command and its bounded execution lifecycle.
+    pub(crate) fn fanout_capabilities(
+        &self,
+        state: &crate::engine::state::NetworkState,
+        caps: crate::protocol::CapabilityAdvert,
+    ) -> crate::error::Result<()> {
+        Ok(state
+            .cmd_tx
+            .send(crate::engine::state::NetworkCmd::FanoutCapabilities { caps })
+            .map_err(|error| error.into_admission_error())?)
+    }
+
     /// Replace the retained advert only while this gateway is still live.
     ///
     /// The second close check is under the same mutex that `clear` takes. A

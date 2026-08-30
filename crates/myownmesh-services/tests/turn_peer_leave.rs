@@ -133,6 +133,7 @@ fn config(id: &str, turn_url: String) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: vec![IceTurnServer {
             urls: vec![turn_url],

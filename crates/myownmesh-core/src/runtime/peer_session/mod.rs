@@ -52,7 +52,9 @@ use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
 use crate::protocol::CapabilityAdvert;
-use crate::resource::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
+use crate::resource::{
+    LeasedMap, LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease,
+};
 use crate::runtime::session_broker::{SessionCapability, SessionValidityWitness};
 
 /// Opaque process-local custody for one retained signaling key. This type lives
@@ -66,6 +68,9 @@ pub(crate) struct DedupTokenInner {
     /// Funds this exact lifecycle custody independently of the weak retained
     /// ingress record. The lease dies with the last strong token owner.
     _lease: ResourceLease,
+    /// The same local scope funds a detached map node if signaling runtime
+    /// teardown races the token's final release.
+    scope: LocalApplicationResourceScope,
 }
 
 impl DedupToken {
@@ -76,11 +81,87 @@ impl DedupToken {
                 1,
             ))
             .ok()?;
-        Some(Self(Arc::new(DedupTokenInner { _lease: lease })))
+        Some(Self(Arc::new(DedupTokenInner {
+            _lease: lease,
+            scope: scope.clone(),
+        })))
+    }
+
+    pub(crate) fn reserve(
+        &self,
+        claim: ResourceClaim,
+    ) -> std::result::Result<ResourceLease, crate::resource::ResourceUnavailable> {
+        self.0.scope.acquire(claim)
     }
 
     pub(crate) fn weak(&self) -> std::sync::Weak<DedupTokenInner> {
         Arc::downgrade(&self.0)
+    }
+}
+
+/// Provider-funded detached custody for ingress tokens whose signaling runtime
+/// is gone. Each token occupies one leased map node; no engine Vec capacity is
+/// retained past the exact token's lifetime.
+pub(crate) struct DetachedDedupSet {
+    entries: LeasedMap<usize, DedupToken>,
+    next: usize,
+}
+
+impl DetachedDedupSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: LeasedMap::new(),
+            next: 0,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, token: DedupToken) -> bool {
+        let Some(lease) = token
+            .reserve(
+                LeasedMap::<usize, DedupToken>::entry_claim()
+                    .expect("dedup node claim is representable"),
+            )
+            .ok()
+        else {
+            return false;
+        };
+        let Some(next) = self.next.checked_add(1) else {
+            drop(lease);
+            return false;
+        };
+        let key = self.next;
+        self.next = next;
+        self.entries.insert(key, token, lease).is_ok()
+    }
+
+    pub(crate) fn drain(self) -> DetachedDedupDrain {
+        DetachedDedupDrain { set: Some(self) }
+    }
+}
+
+pub(crate) struct DetachedDedupDrain {
+    set: Option<DetachedDedupSet>,
+}
+
+impl Iterator for DetachedDedupDrain {
+    type Item = DedupToken;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let set = self.set.as_mut()?;
+        let token = set.entries.pop_first_entry().map(|(_, token)| token);
+        if token.is_none() {
+            drop(self.set.take());
+        }
+        token
+    }
+}
+
+impl IntoIterator for DetachedDedupSet {
+    type Item = DedupToken;
+    type IntoIter = DetachedDedupDrain;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.drain()
     }
 }
 

@@ -25,8 +25,7 @@ use anyhow::{Context, Result};
 use super::{funded, refused_text, unknown_network, Answer};
 use crate::control::framing::FrameAdmission;
 use crate::control::reply::{
-    FundedDiagnostic, FundedVariableReply, GovernanceDiagnostic, OperationReplyData, PreparedReply,
-    ResponseOwner,
+    FundedDiagnostic, FundedVariableReply, OperationReplyData, PreparedReply, ResponseOwner,
 };
 use crate::control::ControlState;
 
@@ -72,35 +71,6 @@ pub(in crate::control) async fn roster_list(
         admission,
     )
     .context("RosterList response line was not admitted")
-}
-
-/// Governance state — proposals, roles, topology — measured before it is walked.
-pub(in crate::control) async fn governance_state(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-) -> Result<Answer> {
-    let Some(joined) = state.registry.get(&network) else {
-        return unknown_network(&network, admission);
-    };
-    let owner = ResponseOwner::acquire(admission)
-        .context("GovernanceState diagnostic snapshot was not admitted")?;
-    let state = joined.governance_state().await?;
-    let evicted = myownmesh_core::network_state::member_log_removed(
-        &state,
-        &state.member_log,
-        &state.network_id,
-    )
-    .into_iter()
-    .collect();
-    funded(
-        PreparedReply::Governance(FundedDiagnostic::new(
-            GovernanceDiagnostic { state, evicted },
-            owner,
-        )),
-        admission,
-    )
-    .context("GovernanceState response line was not admitted")
 }
 
 /// Admit a device onto the roster.

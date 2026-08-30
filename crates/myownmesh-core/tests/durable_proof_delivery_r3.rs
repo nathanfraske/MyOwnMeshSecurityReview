@@ -9,8 +9,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::governance;
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::transport_lab::{
     admit_durable_proof, durable_proof_records, install_capability_replay_park_for_lab,
     materialize_durable_proof_delivery, pending_durable_proofs, promote_exact_owner_for_lab,
@@ -48,6 +49,7 @@ fn closed_config(id: &str) -> NetworkConfig {
         roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
+        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 
@@ -1055,9 +1057,7 @@ async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
         .compact_semantic_state()
         .expect("durably commit cross-target eviction closure");
     assert!(
-        governance::snapshot(&state)
-            .stood_down
-            .contains(target.public_id()),
+        !state.is_rostered(target.public_id()),
         "the target's terminal projection is active before delivery"
     );
 
@@ -1158,9 +1158,7 @@ async fn r3_cross_target_pending_approval_proof_acknowledges_exact_closure() {
         "cross-target dependency is durably resolved before ACK"
     );
     assert!(
-        governance::snapshot(&restarted_target)
-            .stood_down
-            .contains(target.public_id()),
+        !restarted_target.is_rostered(target.public_id()),
         "target terminal projection holds after exact delivery"
     );
     let ack = ProofAckMessage::for_delivery(&delivery);
@@ -1212,9 +1210,7 @@ async fn r3_resolution_selected_evict_delivers_exact_pending_approval_closure() 
         .compact_semantic_state()
         .expect("durably commit concurrent Evict/MembershipAdmit resolution");
     assert!(
-        governance::snapshot(&state)
-            .stood_down
-            .contains(target.public_id()),
+        !state.is_rostered(target.public_id()),
         "the selected Evict resolution keeps the target stood down"
     );
 
@@ -1319,9 +1315,7 @@ async fn r3_resolution_selected_evict_delivers_exact_pending_approval_closure() 
     assert!(restarted_target.semantic_fact_count() > target_initial_fact_count);
     assert_eq!(restarted_target.semantic_unresolved_count(), 0);
     assert!(
-        governance::snapshot(&restarted_target)
-            .stood_down
-            .contains(&target_id.to_string()),
+        !restarted_target.is_rostered(&target_id.to_string()),
         "target stand-down projection holds after exact closure delivery"
     );
     let ack = ProofAckMessage::for_delivery(&delivery);
@@ -1593,9 +1587,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         .compact_semantic_state()
         .expect("durably commit G1 while E0 is paused");
     assert!(
-        !governance::snapshot(&state)
-            .stood_down
-            .contains(target.public_id()),
+        state.is_rostered(target.public_id()),
         "G1 clears the old stand-down before E1 is authored"
     );
     let mut g1_history = facts.clone();
@@ -1783,10 +1775,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
     assert_eq!(e1_rebound.target, target_id);
     assert_exact_delivery_metadata(&e1_rebound, &rebound_e1);
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !governance::snapshot(&restarted_target)
-        .stood_down
-        .contains(target.public_id())
-    {
+    while restarted_target.is_rostered(target.public_id()) {
         if Instant::now() > deadline {
             panic!("canonical E1 was not sent after external transport resumed");
         }
@@ -1819,9 +1808,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         target_root,
     ) = create_fixture(&root, "r3-regrant-race").await;
     assert!(
-        !governance::snapshot(&target_state)
-            .stood_down
-            .contains(target.public_id()),
+        target_state.is_rostered(target.public_id()),
         "initial authenticated target has not received a stand-down proof"
     );
 
@@ -1921,9 +1908,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         .compact_semantic_state()
         .expect("durably commit G1 before resume");
     assert!(
-        !governance::snapshot(&reopened)
-            .stood_down
-            .contains(target.public_id()),
+        reopened.is_rostered(target.public_id()),
         "G1 restoration clears the sender's active stand-down before replay"
     );
     let selected_before_resume = durable_proof_records(&reopened)
@@ -1933,14 +1918,13 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         .expect("E0 remains durable across the regrant");
     assert_exact_delivery_metadata(&selected_before_resume, &e0);
     assert_eq!(selected_before_resume.state, ProofRecordState::Pending);
-    let restored_projection = governance::snapshot(&reopened);
     assert_eq!(
-        restored_projection.roles.get(target.public_id()),
-        Some(&myownmesh_core::network_state::Role::Member),
+        reopened.is_rostered(target.public_id()),
+        true,
         "G1 restores the target role before the parked replay begins"
     );
     assert!(
-        !restored_projection.stood_down.contains(target.public_id()),
+        reopened.is_rostered(target.public_id()),
         "G1 restores session policy while E0 is still pending"
     );
 
@@ -1999,9 +1983,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         "the selected E0 is never replayed after G1 restoration"
     );
     assert!(
-        !governance::snapshot(&reopened_target)
-            .stood_down
-            .contains(target.public_id()),
+        reopened_target.is_rostered(target.public_id()),
         "the stale E0 never reaches the target as a stand-down-causing proof"
     );
 
@@ -2025,9 +2007,7 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         "released capability replay still cannot emit E0"
     );
     assert!(
-        !governance::snapshot(&reopened_target)
-            .stood_down
-            .contains(target.public_id()),
+        reopened_target.is_rostered(target.public_id()),
         "releasing the parked capability send preserves the no-E0 terminal"
     );
 
@@ -2143,9 +2123,7 @@ async fn r3_receiver_refuses_pre_stand_down_ack_and_stale_owner_binding() {
         .compact_semantic_state()
         .expect("receiver durably commits the proof graph");
     assert!(
-        governance::snapshot(&receiver_state)
-            .stood_down
-            .contains(target.public_id()),
+        !receiver_state.is_rostered(target.public_id()),
         "receiver projection is stood down only after complete proof admission"
     );
     let ack = ProofAckMessage::for_delivery(&delivery);
@@ -2246,9 +2224,8 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     attach_local(&reopened, &broker);
     let reopened_owner = wait_for_proof_owner(&reopened, target.public_id()).await;
     let (rebound, replay_was_pending) = wait_for_replayed_proof(&reopened, &record).await;
-    let snapshot = governance::snapshot(&reopened);
     assert!(
-        snapshot.stood_down.contains(target.public_id()),
+        !reopened.is_rostered(target.public_id()),
         "restart preserves the adopted eviction/stand-down projection"
     );
     assert!(
@@ -2289,9 +2266,7 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
         .compact_semantic_state()
         .expect("self-evicted receiver commits proof graph");
     assert!(
-        governance::snapshot(&receiver_state)
-            .stood_down
-            .contains(target.public_id()),
+        !receiver_state.is_rostered(target.public_id()),
         "self-eviction remains active after receiver restart/adoption"
     );
 

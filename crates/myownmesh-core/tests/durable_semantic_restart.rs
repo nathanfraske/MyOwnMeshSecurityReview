@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::{
     create_network_in_instance_root, ingest_semantic_fact, spawn_network_in_instance_root,
@@ -35,6 +37,7 @@ fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
         roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: false,
+        closed_relay: ClosedRelayPolicyConfig::default(),
     }
 }
 
@@ -109,8 +112,8 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
     .await
     .expect("commit canonical member grant");
     assert_eq!(
-        governance::snapshot(&state).roles.get(target.public_id()),
-        Some(&Role::Member),
+        state.is_rostered(target.public_id()),
+        true,
         "the live state observes the committed canonical grant"
     );
     state
@@ -130,10 +133,8 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
     .expect("reopen Closed network");
     assert_eq!(reopened.mesh_context_id(), context);
     assert_eq!(
-        governance::snapshot(&reopened)
-            .roles
-            .get(target.public_id()),
-        Some(&Role::Member),
+        reopened.is_rostered(target.public_id()),
+        true,
         "restart restores the exact admitted graph through NetworkState"
     );
     reopened.request_shutdown();
@@ -225,10 +226,8 @@ async fn quarantine_unrelated_commit_restart_then_parent_settles_exact_custody()
         "resolving the exact parent settles its provisional custody"
     );
     assert_eq!(
-        governance::snapshot(&reopened)
-            .roles
-            .get(target.public_id()),
-        Some(&Role::Member),
+        reopened.is_rostered(target.public_id()),
+        true,
         "the resolved child is projected after durable settlement"
     );
     reopened.request_shutdown();
@@ -366,10 +365,8 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     .expect("commit the fact preserved across reopen");
     let committed_count = state.semantic_fact_count();
     assert_eq!(
-        governance::snapshot(&state)
-            .roles
-            .get(preserved_target.public_id()),
-        Some(&Role::Member),
+        state.is_rostered(preserved_target.public_id()),
+        true,
         "the pre-shutdown canonical projection is present"
     );
 
@@ -412,10 +409,8 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     .expect("same-slot reopen after shutdown");
     assert_eq!(reopened.semantic_fact_count(), committed_count);
     assert_eq!(
-        governance::snapshot(&reopened)
-            .roles
-            .get(preserved_target.public_id()),
-        Some(&Role::Member),
+        reopened.is_rostered(preserved_target.public_id()),
+        true,
         "reopened state preserves the pre-shutdown canonical projection"
     );
 
@@ -431,10 +426,8 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     .expect("replacement state appends a fresh canonical fact");
     assert_eq!(reopened.semantic_fact_count(), committed_count + 1);
     assert_eq!(
-        governance::snapshot(&reopened)
-            .roles
-            .get(replacement_target.public_id()),
-        Some(&Role::Member),
+        reopened.is_rostered(replacement_target.public_id()),
+        true,
         "replacement append projects through the same durable owner"
     );
     assert_eq!(reopened.semantic_unresolved_count(), 0);

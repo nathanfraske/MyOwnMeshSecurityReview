@@ -20,7 +20,9 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::transport_lab::{
     attach_local, channel, depart_for_lab, departure_receipt_gate_arrival_for_lab,
     install_departure_receipt_gate_for_lab, join_open_participation,
@@ -68,6 +70,7 @@ fn fresh_network(id: &str) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

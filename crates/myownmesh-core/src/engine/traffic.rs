@@ -42,7 +42,8 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::Shelve(_)
         | MeshMessage::Unshelve(_)
         | MeshMessage::SessionControl(_)
-        | MeshMessage::CapabilitiesUpdate(_) => FrameClass::Control,
+        | MeshMessage::CapabilitiesUpdate(_)
+        | MeshMessage::ClosedRelayControl(_) => FrameClass::Control,
         MeshMessage::NetworkState(_)
         | MeshMessage::Fact(_)
         | MeshMessage::FactBundle(_)
@@ -56,6 +57,7 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
+        | MeshMessage::ClosedRelayData(_)
         | MeshMessage::RpcRequest(_)
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)

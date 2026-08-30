@@ -3191,17 +3191,7 @@ impl Rpc {
         // and every session established afterwards is sent the stored value
         // regardless, so the refusal costs reachable peers a push, not the
         // advertisement.
-        if let Err(error) = net
-            .cmd_tx
-            .send(crate::engine::state::NetworkCmd::FanoutCapabilities { caps })
-        {
-            // Converted before it is logged. The send error still owns the
-            // command it refused, and it has no `Display` of its own precisely
-            // because rendering it would mean rendering that payload;
-            // `into_admission_error` drops it and answers with the typed reason
-            // alone, which is all this line has to say. The advert itself is
-            // already committed locally and is not lost by being dropped here.
-            let error = error.into_admission_error();
+        if let Err(error) = net.application_gateway.fanout_capabilities(&net, caps) {
             tracing::warn!(
                 %error,
                 "capability fan-out was not admitted after local commit"

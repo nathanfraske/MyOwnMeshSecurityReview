@@ -13,7 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::events::DropReason;
 use myownmesh_core::identity::Identity;
@@ -29,6 +31,7 @@ fn fresh_network(id: &str) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

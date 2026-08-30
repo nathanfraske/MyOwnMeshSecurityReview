@@ -78,6 +78,7 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

@@ -32,7 +32,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::transport_lab::NetworkState;
 use myownmesh_core::engine::transport_lab::{
@@ -58,6 +60,7 @@ fn silent_cfg(id: &str) -> NetworkConfig {
         kind: NetworkKind::Silent,
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

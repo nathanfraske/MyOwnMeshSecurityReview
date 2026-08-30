@@ -14,14 +14,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::transport_lab::{
     attach_local, create_network_in_instance_root, import_network_in_instance_root, NetworkState,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::{
-    NetworkKind, NetworkState as CanonicalNetworkState, Role, TransitionVariant,
-};
+use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
 use myownmesh_core::semantic::{ClosedProfileId, VerifiedProjectPolicy};
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
@@ -36,6 +36,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
@@ -119,8 +120,8 @@ async fn spawn_closed_creator(
             if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
     ));
     assert_eq!(
-        canonical_snapshot(&state).roles.get(identity.public_id()),
-        Some(&Role::Owner),
+        state.verified_authority_root(),
+        Some(identity.public_id()),
         "the explicit Closed creator must be the verified bootstrap root"
     );
     Ok((state, driver))
@@ -201,11 +202,9 @@ async fn onboard_member(
         || {
             let bob_pk = bob_id.public_id();
             let alice_pk = alice_id.public_id();
-            let projected = canonical_snapshot(bob);
-            let policy_has_explicit_roles = projected.roles.get(bob_pk).copied()
-                == Some(Role::Member)
-                && projected.roles.contains_key(alice_pk)
-                && projected.roles.contains_key(bob_pk);
+            let policy_has_explicit_roles = bob.is_rostered(bob_pk)
+                && bob.is_rostered(alice_pk)
+                && roster_role(bob, bob_pk) == Some(Role::Member);
             policy_has_explicit_roles
                 && bob.is_rostered(bob_pk)
                 && roster_role(bob, bob_pk) == Some(Role::Member)
@@ -264,40 +263,49 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
     // The onboarding helper has completed the root-signed grant and the
     // production approval barriers. Both nodes began from the same verified
     // Closed bootstrap.
-    let alice_view = canonical_snapshot(&alice_state);
-    let bob_view = canonical_snapshot(&bob_state);
-    assert_eq!(alice_view.kind, NetworkKind::Closed);
-    assert_eq!(bob_view.kind, NetworkKind::Closed);
+    assert!(matches!(
+        alice_state.verified_policy(),
+        VerifiedProjectPolicy::Closed(_)
+    ));
+    assert!(matches!(
+        bob_state.verified_policy(),
+        VerifiedProjectPolicy::Closed(_)
+    ));
 
     // The verified bootstrap seats Alice as root Owner; the canonical RoleGrant
     // admits Bob as Member without a synthetic KindChange transition.
     {
-        assert_eq!(alice_view.kind, NetworkKind::Closed);
-        assert_eq!(bob_view.kind, NetworkKind::Closed);
-
         assert_eq!(
-            alice_view.role_of(alice_id.public_id()),
+            alice_state.verified_authority_root(),
+            Some(alice_id.public_id()),
+        );
+        assert_eq!(
+            bob_state.verified_authority_root(),
+            Some(alice_id.public_id()),
+        );
+        assert_eq!(
+            roster_role(&alice_state, alice_id.public_id()),
             Some(Role::Owner),
             "alice should be the verified bootstrap root Owner"
         );
         assert_eq!(
-            bob_view.role_of(alice_id.public_id()),
+            roster_role(&bob_state, alice_id.public_id()),
             Some(Role::Owner),
             "alice should remain the verified bootstrap root Owner on Bob's view"
         );
         assert_eq!(
-            alice_view.role_of(bob_id.public_id()),
+            roster_role(&alice_state, bob_id.public_id()),
             Some(Role::Member),
             "bob should be the root-signed plain Member, not an Owner"
         );
         assert_eq!(
-            bob_view.role_of(bob_id.public_id()),
+            roster_role(&bob_state, bob_id.public_id()),
             Some(Role::Member),
             "bob's own view agrees with the signed Member grant"
         );
 
         assert_eq!(
-            bob_view.roles.get(bob_id.public_id()).copied(),
+            roster_role(&bob_state, bob_id.public_id()),
             Some(Role::Member),
             "bob's canonical role projection must retain the exact Member entry"
         );
@@ -755,10 +763,7 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
         .await
         .expect("re-admit membership");
     assert_eq!(
-        canonical_snapshot(&alice_state)
-            .roles
-            .get(&carol_pk)
-            .copied(),
+        roster_role(&alice_state, &carol_pk),
         None,
         "membership admission alone must not grant a role"
     );
@@ -1427,16 +1432,6 @@ async fn local_topology_control_does_not_enter_canonical_governance() {
         *bob_state.topology.read() != governed,
         "a local topology policy must not reshape a different node"
     );
-    assert_eq!(
-        canonical_snapshot(&alice_state).topology,
-        None,
-        "local topology policy must not enter canonical governance"
-    );
-    assert_eq!(
-        canonical_snapshot(&bob_state).topology,
-        None,
-        "canonical governance must not carry a signed topology"
-    );
     shutdown_drivers([
         (alice_state.clone(), alice_driver),
         (bob_state.clone(), bob_driver),
@@ -1560,17 +1555,12 @@ async fn wait_for_two_owner_rosters(
     );
 }
 
-/// Whether `id` is in `state`'s on-disk roster — i.e. authorised membership.
-fn canonical_snapshot(state: &Arc<NetworkState>) -> CanonicalNetworkState {
-    myownmesh_core::engine::governance::snapshot(state)
-}
-
 fn canonical_role(state: &Arc<NetworkState>, id: &str) -> Option<Role> {
-    canonical_snapshot(state).role_of(id)
+    roster_role(state, id)
 }
 
 fn canonical_has_role(state: &Arc<NetworkState>, id: &str) -> bool {
-    canonical_snapshot(state).roles.contains_key(id)
+    roster_role(state, id).is_some()
 }
 
 fn rostered(state: &Arc<NetworkState>, id: &str) -> bool {

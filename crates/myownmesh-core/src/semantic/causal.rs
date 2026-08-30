@@ -902,6 +902,152 @@ impl FactGraph {
             projection: self.projection(),
         }
     }
+
+    /// Decide the canonical session policy for two devices.  The bootstrap
+    /// binding is checked here so callers cannot pair a graph with an
+    /// unrelated policy or context; transport callers only consume this
+    /// typed verdict.
+    pub fn admits_policy_session(
+        &self,
+        bootstrap: &VerifiedBootstrap,
+        local: &DeviceId,
+        remote: &DeviceId,
+    ) -> bool {
+        if self.context_id != bootstrap.context_id() {
+            return false;
+        }
+        let evaluator = self.evaluator();
+        match bootstrap.policy() {
+            VerifiedProjectPolicy::Open => {
+                evaluator.effective_open_participation(local) == Some(true)
+                    && evaluator.effective_open_participation(remote) == Some(true)
+            }
+            VerifiedProjectPolicy::Closed(_) => evaluator.admits_closed_session(local, remote),
+        }
+    }
+
+    /// Return the complete causal proof for the currently effective positive
+    /// Open-participation value.  This is a semantic bundle, independent of
+    /// any route, owner, or transport custody.
+    pub fn open_participation_bundle(&self, subject: &DeviceId) -> Option<Vec<SignedFact>> {
+        let cell = ExclusiveCell::open_participation(subject.clone());
+        let head = *self.cell_heads(&cell).first()?;
+        if self.evaluator().effective_open_participation(subject) != Some(true) {
+            return None;
+        }
+
+        let mut terminal = head;
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert(terminal) {
+                return None;
+            }
+            let fact = self.get(&terminal)?;
+            match &fact.content.body {
+                FactBody::Resolution {
+                    cell: resolution_cell,
+                    selected_head,
+                    ..
+                } if resolution_cell == &cell => terminal = *selected_head,
+                FactBody::OpenParticipation {
+                    device_id,
+                    joined: true,
+                } if device_id == subject => break,
+                _ => return None,
+            }
+        }
+
+        let mut ids = BTreeSet::new();
+        let mut pending = vec![head];
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id) {
+                continue;
+            }
+            let fact = self.get(&id)?;
+            pending.extend(dependencies(fact));
+            if let FactBody::Resolution {
+                cell: resolution_cell,
+                selected_head,
+                ..
+            } = &fact.content.body
+            {
+                if resolution_cell == &cell {
+                    pending.push(*selected_head);
+                }
+            }
+        }
+        ids.into_iter().map(|id| self.get(&id).cloned()).collect()
+    }
+
+    /// Return the complete causal closure for a currently projected Closed
+    /// eviction.  The role and membership cells are both roots because an
+    /// eviction advances both independent semantic cells.
+    pub fn eviction_proof_bundle(&self, target: &DeviceId) -> Option<Vec<SignedFact>> {
+        if self.evaluator().effective_membership(target) != Some(false) {
+            return None;
+        }
+        let mut pending = self.cell_heads(&ExclusiveCell::role(target.clone()));
+        pending.extend(self.cell_heads(&ExclusiveCell::membership(target.clone())));
+        let mut ids = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !ids.insert(id) {
+                continue;
+            }
+            let fact = self.get(&id)?;
+            pending.extend(dependencies(fact));
+        }
+        ids.into_iter().map(|id| self.get(&id).cloned()).collect()
+    }
+
+    /// Verify projection conditions for a received ordinary fact bundle.
+    /// The graph remains the sole authority; this method does not inspect its
+    /// carrier or route.
+    pub fn bundle_projection_is_verified(&self, facts: &[SignedFact]) -> bool {
+        let evaluator = self.evaluator();
+        facts.iter().all(|fact| match &fact.content.body {
+            FactBody::Evict { target } => evaluator.effective_membership(target) == Some(false),
+            FactBody::EvictionProof { target, .. }
+            | FactBody::SelfStandDown {
+                device_id: target, ..
+            } => evaluator.is_stood_down(target),
+            _ => true,
+        })
+    }
+
+    /// Verify that a proof bundle is exactly the causal closure of the
+    /// selected target evidence and that the target is currently stood down.
+    pub fn proof_bundle_is_verified(&self, target: &DeviceId, facts: &[SignedFact]) -> bool {
+        let projection = self.projection();
+        let evaluator = self.evaluator();
+        if evaluator.effective_membership(target) != Some(false)
+            && !projection.is_stood_down(target)
+        {
+            return false;
+        }
+        let mut selected_roots = BTreeSet::new();
+        selected_roots.extend(self.cell_heads(&ExclusiveCell::role(target.clone())));
+        selected_roots.extend(self.cell_heads(&ExclusiveCell::membership(target.clone())));
+        if let Some(stand_down) = projection.stand_down(target) {
+            selected_roots.insert(stand_down.proof);
+        }
+        if selected_roots.is_empty() || facts.iter().any(|fact| self.get(&fact.id) != Some(fact)) {
+            return false;
+        }
+
+        let delivered_ids = facts.iter().map(|fact| fact.id).collect::<BTreeSet<_>>();
+        let mut closure = BTreeSet::new();
+        let mut pending = selected_roots.into_iter().collect::<Vec<_>>();
+        while let Some(id) = pending.pop() {
+            if !closure.insert(id) {
+                continue;
+            }
+            let Some(fact) = self.get(&id) else {
+                return false;
+            };
+            pending.extend(dependencies(fact));
+        }
+        closure == delivered_ids
+    }
 }
 
 /// Canonical authority evaluator for the validated V4 semantic profile.
@@ -943,6 +1089,18 @@ impl<'a> SemanticEvaluator<'a> {
                 .then_some(Role::Owner);
         };
         self.effective_role_from_fact(&id, subject)
+    }
+
+    /// Effective role for policy projection.  A role-cell value is not enough
+    /// to authorize a session while the subject's independent AuthorityUse
+    /// relation is forked; the typed relation must be empty (bootstrap) or
+    /// singular first.
+    pub fn effective_authorized_role(&self, subject: &DeviceId) -> Option<Role> {
+        self.graph
+            .authority_lineage(subject)
+            .is_singular()
+            .then(|| self.effective_role(subject))
+            .flatten()
     }
 
     fn effective_role_from_fact(&self, id: &FactId, subject: &DeviceId) -> Option<Role> {
@@ -1069,7 +1227,10 @@ impl<'a> SemanticEvaluator<'a> {
         if matches!(&self.graph.policy, VerifiedProjectPolicy::Open) {
             return true;
         }
-        self.role_admits(local) && self.role_admits(remote)
+        self.graph.authority_lineage(local).is_singular()
+            && self.graph.authority_lineage(remote).is_singular()
+            && self.role_admits(local)
+            && self.role_admits(remote)
     }
 
     pub fn is_conflicted(&self, cell: &ExclusiveCell) -> bool {

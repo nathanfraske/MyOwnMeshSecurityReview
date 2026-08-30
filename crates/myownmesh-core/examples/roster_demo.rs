@@ -10,7 +10,9 @@
 //! `Active`.
 
 #[cfg(feature = "transport-lab")]
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 #[cfg(feature = "transport-lab")]
 use myownmesh_core::identity::Identity;
 #[cfg(feature = "transport-lab")]
@@ -34,6 +36,7 @@ fn cfg(label: &str, auto_approve: bool) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

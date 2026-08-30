@@ -32,6 +32,7 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: vec![IceTurnServer {
             urls: vec![turn_url],

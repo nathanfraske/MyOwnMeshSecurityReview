@@ -86,6 +86,16 @@ use tokio::sync::{broadcast, oneshot, watch};
 #[cfg(feature = "transport-lab")]
 use tokio::task::JoinHandle;
 
+use super::carrier_state::{
+    CarrierAttemptCarrier, CarrierAttemptList, CarrierAttemptNode, CarrierInstanceList,
+    CarrierInstanceNode, CarrierState, RecoveryCohort, RecoveryCohortCause,
+    RecoveryCohortCauseList, RecoveryCohortGeneration, RecoveryPublication,
+};
+pub(crate) use super::carrier_state::{
+    CarrierEmissionAdmission, CarrierEmissionRecord, CarrierEmissionSettlement,
+    RecoveryPublicationStart,
+};
+pub(crate) use super::command::NetworkCmd;
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
 use crate::semantic::store::{DurableSemanticOwner, DurableSemanticStore, ProvisionalCustody};
@@ -138,14 +148,6 @@ impl DurableProofSendAdmission {
             self.work,
         )
     }
-}
-
-struct RecoveryCohort {
-    pending: RecoveryCohortCauseList,
-    in_flight: Option<RecoveryCohortGeneration>,
-    next_generation: u64,
-    queued_publication: Option<RecoveryPublishId>,
-    publication: Option<RecoveryPublication>,
 }
 
 /// Process-local identity for one exact recovery cohort publication.  It is
@@ -205,490 +207,6 @@ fn checked_local_id_exhaustion_does_not_reuse_the_last_value() {
     assert_eq!(next_non_wrapping(&counter), Some(u64::MAX));
     assert_eq!(next_non_wrapping(&counter), None);
     assert_eq!(next_non_wrapping(&counter), None);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CarrierEmissionRecord {
-    Stale,
-    Pending,
-    Accepted,
-    FinalRefusal,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CarrierEmissionAdmission {
-    Admitted,
-    Existing,
-    Stale,
-    Refused,
-}
-
-impl CarrierEmissionAdmission {
-    pub(crate) fn is_admitted(self) -> bool {
-        matches!(self, Self::Admitted | Self::Existing)
-    }
-}
-
-pub(crate) struct CarrierEmissionSettlement {
-    pub(crate) record: CarrierEmissionRecord,
-    pub(crate) owner: Option<PeerOwnerToken>,
-}
-
-struct RecoveryPublication {
-    id: RecoveryPublishId,
-    remaining: CarrierInstanceList,
-}
-
-/// Outcome of admitting one queued recovery generation to a finite carrier
-/// cohort.  `Refused` is terminal for this carrier admission only: the exact
-/// generation is rolled back to pending so a later explicit attach can retry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RecoveryPublicationStart {
-    Started(RecoveryPublishId),
-    Stale,
-    Refused(ResourceUnavailable),
-}
-
-impl RecoveryPublicationStart {
-    fn into_started(self) -> Option<RecoveryPublishId> {
-        match self {
-            Self::Started(id) => Some(id),
-            Self::Stale | Self::Refused(_) => None,
-        }
-    }
-}
-
-#[derive(Default)]
-struct CarrierInstanceList {
-    head: Option<Box<CarrierInstanceNode>>,
-}
-
-struct CarrierInstanceNode {
-    instance: RecoveryCarrierInstance,
-    _lease: ResourceLease,
-    next: Option<Box<CarrierInstanceNode>>,
-}
-
-impl CarrierInstanceList {
-    fn is_empty(&self) -> bool {
-        self.head.is_none()
-    }
-
-    fn contains(&self, instance: RecoveryCarrierInstance) -> bool {
-        let mut cursor = self.head.as_deref();
-        while let Some(node) = cursor {
-            if node.instance == instance {
-                return true;
-            }
-            cursor = node.next.as_deref();
-        }
-        false
-    }
-
-    fn push_front(&mut self, mut node: Box<CarrierInstanceNode>) {
-        node.next = self.head.take();
-        self.head = Some(node);
-    }
-
-    fn pop_front(&mut self) -> Option<Box<CarrierInstanceNode>> {
-        let mut node = self.head.take()?;
-        self.head = node.next.take();
-        Some(node)
-    }
-
-    fn remove(&mut self, instance: RecoveryCarrierInstance) -> Option<Box<CarrierInstanceNode>> {
-        let mut link = &mut self.head;
-        loop {
-            match link {
-                Some(node) if node.instance == instance => {
-                    let mut removed = link.take().expect("matched carrier instance");
-                    *link = removed.next.take();
-                    return Some(removed);
-                }
-                Some(node) => link = &mut node.next,
-                None => return None,
-            }
-        }
-    }
-}
-
-impl Drop for CarrierInstanceList {
-    fn drop(&mut self) {
-        while self.pop_front().is_some() {}
-    }
-}
-
-struct CarrierAttemptNode {
-    emission: SignalingEmissionId,
-    attempt: String,
-    owner: Option<PeerOwnerToken>,
-    _entry_lease: Option<ResourceLease>,
-    carriers: Option<Box<CarrierAttemptCarrier>>,
-    expected: usize,
-    resolved: usize,
-    accepted: bool,
-    claimed: bool,
-    fenced: bool,
-    terminal: Option<CarrierEmissionRecord>,
-    next: Option<Box<CarrierAttemptNode>>,
-}
-
-struct CarrierAttemptCarrier {
-    instance: RecoveryCarrierInstance,
-    resolved: bool,
-    accepted: bool,
-    next: Option<Box<CarrierAttemptCarrier>>,
-}
-
-impl CarrierAttemptNode {
-    fn carrier_mut(
-        &mut self,
-        instance: RecoveryCarrierInstance,
-    ) -> Option<&mut CarrierAttemptCarrier> {
-        let mut cursor = self.carriers.as_deref_mut();
-        while let Some(carrier) = cursor {
-            if carrier.instance == instance {
-                return Some(carrier);
-            }
-            cursor = carrier.next.as_deref_mut();
-        }
-        None
-    }
-
-    fn remove_carrier(&mut self, instance: RecoveryCarrierInstance) -> bool {
-        let mut link = &mut self.carriers;
-        loop {
-            if link
-                .as_ref()
-                .is_some_and(|carrier| carrier.instance == instance)
-            {
-                let mut removed = link.take().expect("matched carrier copy");
-                *link = removed.next.take();
-                return true;
-            }
-            match link.as_mut() {
-                Some(carrier) => link = &mut carrier.next,
-                None => return false,
-            }
-        }
-    }
-
-    fn remaining_carriers(&self) -> usize {
-        let mut count = 0usize;
-        let mut cursor = self.carriers.as_deref();
-        while let Some(carrier) = cursor {
-            count = count.saturating_add(1);
-            cursor = carrier.next.as_deref();
-        }
-        count
-    }
-
-    fn resize_tombstone_lease(&mut self) {
-        let remaining = self.remaining_carriers();
-        let Some(bytes) = std::mem::size_of::<CarrierAttemptNode>()
-            .checked_add(self.attempt.len())
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    remaining.checked_mul(std::mem::size_of::<CarrierAttemptCarrier>())?,
-                )
-            })
-            .and_then(|bytes| u64::try_from(bytes).ok())
-        else {
-            return;
-        };
-        let Some(residuals) = remaining.checked_add(1).and_then(|n| u64::try_from(n).ok()) else {
-            return;
-        };
-        let Ok(claim) = ResourceClaim::try_from_entries([
-            (ResourceClass::AccountedMemoryBytes, bytes),
-            (ResourceClass::OpaqueDependencyResidual, residuals),
-        ]) else {
-            return;
-        };
-        let Some(lease) = self._entry_lease.as_mut() else {
-            return;
-        };
-        // A reduction can only fail if the provider itself is inconsistent;
-        // retaining the larger already-funded lease is safe in that case.
-        let _ = lease.transition(claim);
-    }
-}
-
-impl Drop for CarrierAttemptNode {
-    fn drop(&mut self) {
-        let mut cursor = self.carriers.take();
-        while let Some(mut carrier) = cursor {
-            cursor = carrier.next.take();
-        }
-    }
-}
-
-#[derive(Default)]
-struct CarrierAttemptList {
-    head: Option<Box<CarrierAttemptNode>>,
-}
-
-impl CarrierAttemptList {
-    fn emissions_for_owner(&self, owner: &PeerOwnerToken) -> Vec<(SignalingEmissionId, String)> {
-        let mut emissions = Vec::new();
-        let mut cursor = self.head.as_deref();
-        while let Some(node) = cursor {
-            if node.owner.as_ref().is_some_and(|candidate| {
-                Arc::ptr_eq(candidate.connection(), owner.connection())
-                    && candidate.binding_coordinate() == owner.binding_coordinate()
-            }) {
-                emissions.push((node.emission, node.attempt.clone()));
-            }
-            cursor = node.next.as_deref();
-        }
-        emissions
-    }
-
-    fn settle_emission(&mut self, emission: SignalingEmissionId, attempt: &str) -> bool {
-        self.remove_emission(emission, attempt).is_some()
-    }
-
-    fn find_emission_mut(
-        &mut self,
-        emission: SignalingEmissionId,
-        attempt: &str,
-    ) -> Option<&mut CarrierAttemptNode> {
-        let mut cursor = self.head.as_deref_mut();
-        while let Some(node) = cursor {
-            if node.emission == emission && node.attempt == attempt {
-                return Some(node);
-            }
-            cursor = node.next.as_deref_mut();
-        }
-        None
-    }
-
-    fn push_front(&mut self, mut node: Box<CarrierAttemptNode>) {
-        node.next = self.head.take();
-        self.head = Some(node);
-    }
-
-    fn remove_emission(
-        &mut self,
-        emission: SignalingEmissionId,
-        attempt: &str,
-    ) -> Option<Box<CarrierAttemptNode>> {
-        let mut link = &mut self.head;
-        loop {
-            if link
-                .as_ref()
-                .is_some_and(|node| node.emission == emission && node.attempt == attempt)
-            {
-                let mut removed = link.take().expect("matched emission node");
-                *link = removed.next.take();
-                return Some(removed);
-            }
-            match link.as_mut() {
-                Some(node) => link = &mut node.next,
-                None => return None,
-            }
-        }
-    }
-
-    fn fence_attempt(&mut self, attempt: &str) {
-        let mut cursor = self.head.as_deref_mut();
-        while let Some(node) = cursor {
-            if node.attempt == attempt {
-                node.fenced = true;
-                node.terminal = Some(CarrierEmissionRecord::Stale);
-                // Retain only the bounded stale witness. The lease is reduced
-                // to the exact remaining physical carrier copies below; it is
-                // never dropped while one delayed copy can still acknowledge.
-                node.owner = None;
-                node.resize_tombstone_lease();
-            }
-            cursor = node.next.as_deref_mut();
-        }
-        self.remove_empty_fenced();
-    }
-
-    fn acknowledge_terminal(
-        &mut self,
-        emission: SignalingEmissionId,
-        attempt: &str,
-        instance: RecoveryCarrierInstance,
-    ) -> bool {
-        let mut link = &mut self.head;
-        loop {
-            let matches = link.as_ref().is_some_and(|node| {
-                node.emission == emission && node.attempt == attempt && node.terminal.is_some()
-            });
-            if matches {
-                let remove = {
-                    let node = link.as_mut().expect("matched terminal emission");
-                    if !node.remove_carrier(instance) {
-                        return false;
-                    }
-                    if node.carriers.is_none() && node.fenced {
-                        true
-                    } else {
-                        node.resize_tombstone_lease();
-                        false
-                    }
-                };
-                if remove {
-                    let mut removed = link.take().expect("matched fenced emission");
-                    *link = removed.next.take();
-                    return true;
-                }
-                return false;
-            }
-            match link.as_mut() {
-                Some(node) => link = &mut node.next,
-                None => return false,
-            }
-        }
-    }
-
-    fn remove_empty_fenced(&mut self) {
-        let mut link = &mut self.head;
-        loop {
-            let remove = link
-                .as_ref()
-                .is_some_and(|node| node.fenced && node.carriers.is_none());
-            if remove {
-                let mut removed = link.take().expect("matched empty fenced emission");
-                *link = removed.next.take();
-                continue;
-            }
-            match link.as_mut() {
-                Some(node) => link = &mut node.next,
-                None => return,
-            }
-        }
-    }
-
-    fn remove_unfenced(&mut self, attempt: &str) {
-        let mut link = &mut self.head;
-        loop {
-            let remove = link
-                .as_ref()
-                .is_some_and(|node| node.attempt == attempt && !node.fenced);
-            if remove {
-                let mut removed = link.take().expect("matched unfenced attempt node");
-                *link = removed.next.take();
-                continue;
-            }
-            match link.as_mut() {
-                Some(node) => link = &mut node.next,
-                None => return,
-            }
-        }
-    }
-}
-
-impl Drop for CarrierAttemptList {
-    fn drop(&mut self) {
-        while let Some(mut node) = self.head.take() {
-            self.head = node.next.take();
-        }
-    }
-}
-
-struct RecoveryCohortGeneration {
-    id: RecoveryPublishId,
-    causes: RecoveryCohortCauseList,
-}
-
-struct RecoveryCohortCause {
-    owner: PeerOwnerToken,
-    demand: crate::runtime::peer_session::RecoveryDemandHandle,
-    collection_lease: ResourceLease,
-    next: Option<Box<RecoveryCohortCause>>,
-}
-
-impl RecoveryCohortCause {
-    fn release(self) {
-        let Self {
-            owner,
-            demand,
-            collection_lease,
-            next,
-        } = self;
-        drop(next);
-        drop(collection_lease);
-        drop(demand);
-        drop(owner);
-    }
-
-    fn cancel(self) {
-        let Self {
-            owner,
-            demand,
-            collection_lease,
-            next,
-        } = self;
-        demand.cancel();
-        drop(next);
-        drop(collection_lease);
-        drop(demand);
-        drop(owner);
-    }
-}
-
-#[derive(Default)]
-struct RecoveryCohortCauseList {
-    head: Option<Box<RecoveryCohortCause>>,
-}
-
-impl RecoveryCohortCauseList {
-    fn is_empty(&self) -> bool {
-        self.head.is_none()
-    }
-
-    fn push_front(&mut self, mut cause: Box<RecoveryCohortCause>) {
-        cause.next = self.head.take();
-        self.head = Some(cause);
-    }
-
-    fn pop_front(&mut self) -> Option<Box<RecoveryCohortCause>> {
-        let mut cause = self.head.take()?;
-        self.head = cause.next.take();
-        Some(cause)
-    }
-
-    fn append(&mut self, other: &mut Self) {
-        while let Some(cause) = other.pop_front() {
-            self.push_front(cause);
-        }
-    }
-
-    fn contains_owner(&self, owner: &PeerOwnerToken) -> bool {
-        let mut cursor = self.head.as_deref();
-        while let Some(cause) = cursor {
-            if NetworkState::same_recovery_owner(&cause.owner, owner) {
-                return true;
-            }
-            cursor = cause.next.as_deref();
-        }
-        false
-    }
-}
-
-impl Drop for RecoveryCohortCauseList {
-    fn drop(&mut self) {
-        let mut cursor = self.head.take();
-        while let Some(mut cause) = cursor {
-            cursor = cause.next.take();
-        }
-    }
-}
-
-impl RecoveryCohort {
-    fn new() -> Self {
-        Self {
-            pending: RecoveryCohortCauseList::default(),
-            in_flight: None,
-            next_generation: 0,
-            queued_publication: None,
-            publication: None,
-        }
-    }
 }
 
 /// Internal driver work for reducing one authenticated candidate.
@@ -819,303 +337,11 @@ fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
     intent.next_retry_at = now + std::time::Duration::from_millis(step);
 }
 
-/// General engine command queue entry. Application requests and network
-/// reconfiguration use this serialized path. Connector events remain on their
-/// bounded per-worker runtime path and do not enter this enum.
-pub enum NetworkCmd {
-    /// A session was just minted for this exact owner.
-    ///
-    /// Enqueued synchronously by the registry fence at the moment of promotion,
-    /// and handled here so the work happens after every fence lock is released.
-    /// It carries the exact owner rather than a device id: a replacement
-    /// resolves to a different token, so a command cannot be applied to a
-    /// session that did not mint it.
-    ///
-    /// Emitted once per session, on the call that minted it — never on reuse and
-    /// never on a refusal. A promotion the provider refuses mints nothing and
-    /// announces nothing; the later operation that finally promotes is the one
-    /// that announces.
-    ReplayCapabilities {
-        owner: super::peer_registry::PeerOwnerToken,
-    },
-    /// Switch the topology selector at runtime.
-    SetTopology(TopologyMode),
-    /// Approve a peer into the roster (and emit the approve frame).
-    ApproveRoster {
-        device_id: String,
-        label: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Remove a peer from the roster and drop any active session.
-    RemoveRoster {
-        device_id: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Drop a single peer, surfacing the given reason in the
-    /// `Dropped` event.
-    DropPeer {
-        device_id: String,
-        reason: DropReason,
-    },
-    /// Drop only the exact installed owner that produced an early carrier
-    /// refusal.  The command handler rechecks installation and worker fences;
-    /// it must never resolve the owner by its device id.
-    DropPeerIfCurrent {
-        owner: super::peer_registry::PeerOwnerToken,
-        /// The exact outbound attempt that produced the refusal.  This is
-        /// mandatory because a speculative worker is not an authenticated
-        /// worker and therefore cannot be reverse-resolved to its attempt.
-        attempt: String,
-        reason: DropReason,
-    },
-    /// A Nostr provider refused this exact outbound attempt before it could
-    /// enter the driver's live delivery map.  The owner token is captured at
-    /// refusal routing time; the command must never re-resolve by device id.
-    AttemptRefused {
-        owner: super::peer_registry::PeerOwnerToken,
-        refusal: myownmesh_signaling::AttemptRefusal,
-    },
-    /// An authoritative terminal emitted by the provider-owned Nostr store.
-    /// The owner token and attempt are both rechecked by the engine handler;
-    /// stale outcomes are discarded and never settle a successor.
-    AttemptOutcome {
-        owner: super::peer_registry::PeerOwnerToken,
-        outcome: myownmesh_signaling::AttemptOutcome,
-    },
-    /// Manually triggered in-place reconnect — the non-destructive twin of a
-    /// leave-then-rejoin. `peer == None` reconnects the whole network (redial
-    /// signaling + renegotiate ICE with every peer); `peer == Some(id)`
-    /// reconnects just that one peer. Nothing is torn down and no `Leave` is
-    /// announced, so peers keep their sessions and app-level state — this is
-    /// the gentle recovery the GUI's refresh / reconnect controls drive, in
-    /// place of a `NetworkRemove` + `NetworkAdd` pair. See
-    /// [`super::network_watch::reconnect_all_in_place`].
-    Reconnect { peer: Option<String> },
-    /// Deliberately dial exactly one signaling-discovered peer as the
-    /// offerer, opening the WebRTC session the announce path would have
-    /// opened automatically on a non-Silent network. This is the manual
-    /// "dial by device id" a `Silent` network exposes (via
-    /// [`crate::JoinedNetwork::connect_peer`]): on a Silent mesh nothing
-    /// connects on its own, so a connection is initiated only here or by
-    /// answering an inbound offer. Idempotent — a no-op if a live session
-    /// already exists; upgrades a discovery-only `Sighted` placeholder to a
-    /// real session otherwise.
-    ConnectPeer {
-        device_id: String,
-        /// Record a standing dial for this peer (see
-        /// [`NetworkState::sticky_peers`]) so the engine keeps
-        /// re-establishing the link across drops and announces.
-        sticky: bool,
-        /// When present, resolved once the peer reaches ACTIVE (or
-        /// with the reason on a terminal failure). `None` preserves
-        /// the fire-and-forget contract.
-        reply: Option<ConnectWaiterRegistration>,
-    },
-    /// Retain a channel frame for acknowledged delivery under the peer's
-    /// current session (see [`super::reliable`]), resolved on the peer's
-    /// cumulative acknowledgement.
-    ///
-    /// Refused outright, with the reason, when the peer has no live session or
-    /// when the provider will not fund retaining the frame. There is no deadline to expire against and
-    /// no ceiling to be backpressured by: an entry ends when it is acknowledged
-    /// or when its session does, and both are events, not guesses.
-    SendChannelReliable {
-        peer: String,
-        channel: String,
-        payload: serde_json::Value,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Send a [`crate::protocol::MeshMessage::Channel`] frame to
-    /// one peer.
-    SendChannelFrame {
-        peer: String,
-        channel: String,
-        payload: serde_json::Value,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Broadcast a channel frame to every active peer.
-    BroadcastChannelFrame {
-        channel: String,
-        payload: serde_json::Value,
-        reply: oneshot::Sender<usize>,
-    },
-    /// Send an RPC request frame to one peer.
-    SendRpcRequest {
-        peer: String,
-        request: RpcRequestMessage,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    /// Push a new capabilities advert to every active peer.
-    ///
-    /// Fire-and-forget, and deliberately so: it replaced a variant that carried
-    /// a `oneshot::Sender<usize>` for the caller to wait on. A oneshot nobody
-    /// reads is still an allocation the command retains and the mailbox funds,
-    /// and `Rpc::advertise`'s documented answer is its local commit rather than
-    /// how many peers the push reached — so the reply channel was charged for on
-    /// every advertisement and read on none.
-    ///
-    /// Fire-and-forget, but not unaccounted: the resource mailbox funds the
-    /// payload, its node, and the scheduled work, and the driver's own lifecycle
-    /// owns the running of it. That is the difference between this and the
-    /// detached task it replaces, which was scheduled work no owner had funded
-    /// and no shutdown could wait for.
-    FanoutCapabilities { caps: CapabilityAdvert },
-    // ---- governance (closed networks) ----
-    /// Float a new signed transition. The engine signs with the
-    /// local identity, persists the proposal to the governance
-    /// state's pending list, and broadcasts a
-    /// `NetworkStatePropose` to every active peer that supports
-    /// the current closed governance profile. Reply carries the new proposal id so
-    /// the caller can correlate acks.
-    ProposeTransition {
-        variant: crate::network_state::TransitionVariant,
-        /// Per-device custody second factor, if the network requires one on
-        /// this device. `None` when no custody lock is enrolled.
-        mfa_code: Option<String>,
-        reply: oneshot::Sender<Result<crate::semantic::FactId>>,
-    },
-    /// Snapshot of the current governance state. Used by the
-    /// control protocol to surface live state to the GUI.
-    GovernanceSnapshot {
-        reply: oneshot::Sender<crate::network_state::NetworkState>,
-    },
-}
-
-impl ResourceMailboxItem for NetworkCmd {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
-        let measure = match self {
-            Self::ReplayCapabilities { .. } | Self::GovernanceSnapshot { .. } => (0, 0, 0),
-            Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
-            Self::ApproveRoster {
-                device_id, label, ..
-            } => strings_measure([device_id.as_str(), label.as_str()])?,
-            Self::RemoveRoster { device_id, .. } | Self::ConnectPeer { device_id, .. } => {
-                strings_measure([device_id.as_str()])?
-            }
-            Self::DropPeer { device_id, reason } => {
-                let reason = match reason {
-                    DropReason::TransportError { message } => Some(message.as_str()),
-                    DropReason::Denied
-                    | DropReason::IceFailed
-                    | DropReason::AuthFailed
-                    | DropReason::UserLeft
-                    | DropReason::TopologyPruned
-                    | DropReason::HeartbeatTimeout => None,
-                };
-                strings_measure([Some(device_id.as_str()), reason].into_iter().flatten())?
-            }
-            Self::DropPeerIfCurrent {
-                attempt, reason, ..
-            } => {
-                let reason = match reason {
-                    DropReason::TransportError { message } => Some(message.as_str()),
-                    DropReason::Denied
-                    | DropReason::IceFailed
-                    | DropReason::AuthFailed
-                    | DropReason::UserLeft
-                    | DropReason::TopologyPruned
-                    | DropReason::HeartbeatTimeout => None,
-                };
-                strings_measure([Some(attempt.as_str()), reason].into_iter().flatten())?
-            }
-            Self::AttemptRefused { refusal, .. } => {
-                let reason = match &refusal.refusal {
-                    myownmesh_signaling::NegotiationRefusal::DuplicateLiveEvent => None,
-                    myownmesh_signaling::NegotiationRefusal::Provider(reason) => {
-                        Some(reason.as_str())
-                    }
-                };
-                strings_measure(
-                    [
-                        Some(refusal.attempt.as_str()),
-                        Some(refusal.event_id.as_str()),
-                        reason,
-                    ]
-                    .into_iter()
-                    .flatten(),
-                )?
-            }
-            Self::AttemptOutcome { outcome, .. } => {
-                let reason = match &outcome.kind {
-                    myownmesh_signaling::AttemptOutcomeKind::TypedRefused(reason) => {
-                        Some(reason.as_str())
-                    }
-                    _ => None,
-                };
-                strings_measure(
-                    [
-                        Some(outcome.attempt.as_str()),
-                        Some(outcome.event_id.as_str()),
-                        reason,
-                    ]
-                    .into_iter()
-                    .flatten(),
-                )?
-            }
-            Self::Reconnect { peer } => strings_measure(peer.iter().map(String::as_str))?,
-            Self::SendChannelReliable {
-                peer,
-                channel,
-                payload,
-                ..
-            }
-            | Self::SendChannelFrame {
-                peer,
-                channel,
-                payload,
-                ..
-            } => checked_measure_add(
-                strings_measure([peer.as_str(), channel.as_str()])?,
-                mailbox_measure_serialized(payload)?,
-            )?,
-            Self::BroadcastChannelFrame {
-                channel, payload, ..
-            } => checked_measure_add(
-                strings_measure([channel.as_str()])?,
-                mailbox_measure_serialized(payload)?,
-            )?,
-            Self::SendRpcRequest { peer, request, .. } => checked_measure_add(
-                strings_measure([peer.as_str()])?,
-                mailbox_measure_serialized(request)?,
-            )?,
-            Self::FanoutCapabilities { caps } => mailbox_measure_serialized(caps)?,
-            Self::ProposeTransition {
-                variant, mfa_code, ..
-            } => checked_measure_add(
-                mailbox_measure_serialized(variant)?,
-                strings_measure(mfa_code.iter().map(String::as_str))?,
-            )?,
-        };
-        // Channel/Arc-backed effects are opaque dependency allocations, not OS
-        // sockets or handles. The payload walk above counts its own allocations;
-        // this adds only allocations retained by reply/cancellation effects.
-        let effect_allocations = match self {
-            // No reply, no cancellation, no channel: nothing to fund past the
-            // payload the walk above already measured.
-            Self::ReplayCapabilities { .. } | Self::FanoutCapabilities { .. } => 0,
-            Self::SetTopology(_)
-            | Self::DropPeer { .. }
-            | Self::DropPeerIfCurrent { .. }
-            | Self::Reconnect { .. } => 0,
-            Self::AttemptRefused { .. } | Self::AttemptOutcome { .. } => 1,
-            Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
-            Self::ApproveRoster { .. }
-            | Self::RemoveRoster { .. }
-            | Self::SendChannelReliable { .. }
-            | Self::SendChannelFrame { .. }
-            | Self::BroadcastChannelFrame { .. }
-            | Self::SendRpcRequest { .. }
-            | Self::ProposeTransition { .. }
-            | Self::GovernanceSnapshot { .. } => 1,
-        };
-        let allocations = measure.2.checked_add(effect_allocations).ok_or(
-            ResourceClaimArithmeticError::Overflow {
-                dimension: ResourceClass::OpaqueDependencyResidual,
-            },
-        )?;
-        mailbox_retained_claim::<Self>(measure.0, measure.1, allocations)
-    }
-}
+/// Emitted once per session, on the call that minted it — never on reuse and
+/// Manually triggered in-place reconnect — the non-destructive twin of a
+/// announced, so peers keep their sessions and app-level state — this is
+/// answering an inbound offer. Idempotent — a no-op if a live session
+/// how many peers the push reached — so the reply channel was charged for on
 
 pub struct ConnectWaiterRegistration {
     pub(super) id: u64,
@@ -1409,17 +635,6 @@ pub struct NetworkState {
 
     pub(crate) peers: PeerRegistry,
     pub roster: RwLock<Roster>,
-    /// Signed governance state — kind + role assignments + the
-    /// append-only signed transition log + pending proposals.
-    /// Authority on a `closed` network derives from this; on an
-    /// `open` network it's a no-op tracker that ratifies the
-    /// open→closed transition if one ever fires.
-    ///
-    /// The on-disk projection lives at
-    /// `~/.myownmesh/mesh/states/{network_id}.json` (per-network,
-    /// 0600 on Unix). Loaded once on construction; the engine
-    /// persists after every signed transition that lands.
-    pub governance_state: Arc<RwLock<crate::network_state::NetworkState>>,
     /// The one authoritative semantic graph for this joined network.
     ///
     /// This is persistent for the lifetime of the shared `NetworkState`: all
@@ -1429,6 +644,25 @@ pub struct NetworkState {
     /// carrier/session identities are selectors and never become semantic
     /// authority.
     pub(crate) fact_graph: Arc<RwLock<crate::semantic::FactGraph>>,
+    /// The concrete provider-backed Closed relay runtime for this network
+    /// instance. It is created only after the verified Closed profile and
+    /// canonical local identity have been validated; disabled policy keeps
+    /// this port empty rather than exposing a compatibility runtime.
+    closed_relay_runtime: Option<crate::runtime::relay::ClosedRelayRuntime>,
+    /// Exact admitted Closed relay allocations. The registry is bounded by
+    /// the same owner-selected maximum as the runtime and is only a custody
+    /// index; packet forwarding and terminal settlement remain runtime-owned.
+    closed_relay_allocations: Mutex<Option<super::closed_relay::ClosedRelayRegistry>>,
+    closed_relay_closing: Mutex<Option<super::closed_relay::ClosedRelayClosingRegistry>>,
+    /// Bounded Open/Offer/Accept custody. Runtime handshake guards remain
+    /// owned here until the exact control reaches Accept or is refused.
+    closed_relay_pending: Mutex<Option<super::closed_relay::ClosedRelayPendingRegistry>>,
+    /// Bounded endpoint-owned opaque sessions. Endpoint crypto remains here,
+    /// never in the relay allocation registry or on the wire.
+    closed_relay_endpoints: Mutex<Option<super::closed_relay::ClosedRelayEndpointRegistry>>,
+    /// One-consumer handoff for target-side accepted endpoint sessions.
+    closed_relay_target_accepts:
+        Mutex<Option<super::closed_relay::ClosedRelayTargetAcceptedRegistry>>,
     /// The one durable owner for this instance's canonical graph, projection
     /// commitment, and provisional semantic custody.  Its slot is local
     /// (`config.id`) while the snapshot itself is bound to the immutable
@@ -1509,7 +743,7 @@ pub struct NetworkState {
     /// keyed by the authenticated attempt correlation; each entry is a finite
     /// attach cohort and is removed once every carrier refuses or the attempt
     /// is settled.
-    carrier_attempts: Mutex<CarrierAttemptList>,
+    carrier_state: CarrierState,
 
     /// Peers this node maintains a standing dial for (config
     /// `pinned_peers` plus runtime `connect_peer(…, sticky)`). On a
@@ -1864,29 +1098,6 @@ impl NetworkState {
             config.pinned_peers.iter().cloned().collect();
         let persistence_root = instance_root.as_deref();
         let roster = crate::roster::load_at(persistence_root, &config.network_id)?;
-        // The legacy NetworkState is a derived compatibility snapshot only.
-        // Never load its transitions, member log, pending proposals, or split
-        // records as authority. Canonical bootstrap policy supplies the kind
-        // and initial root role; Silent remains a local transport behavior on
-        // the verified Open semantic profile.
-        let governance_kind = if bootstrap_is_closed {
-            crate::network_state::NetworkKind::Closed
-        } else {
-            crate::network_state::NetworkKind::Open
-        };
-        let mut governance_roles = std::collections::BTreeMap::new();
-        if let crate::semantic::VerifiedProjectPolicy::Closed(policy) = verified_bootstrap.policy()
-        {
-            governance_roles.insert(
-                policy.authority_root().to_string(),
-                crate::network_state::Role::Owner,
-            );
-        }
-        let governance_state = crate::network_state::NetworkState::from_canonical_projection(
-            &config.network_id,
-            governance_kind,
-            governance_roles,
-        );
         // Topology is connector/deployment policy, not a canonical
         // authority-bearing fact. It therefore remains local configuration.
         let effective_topology = config.topology.clone();
@@ -1906,8 +1117,89 @@ impl NetworkState {
         let (signaling_inbound_tx, signaling_inbound_rx) =
             crate::resource::resource_mailbox(local_resources.child()?)?;
         let session_broker = transport.session_broker();
-        let governance_state = Arc::new(RwLock::new(governance_state));
         let local_device_id = identity.public_id().to_string();
+        let closed_relay_runtime = if config.closed_relay.enabled {
+            let profile_is_supported = matches!(
+                verified_bootstrap.policy(),
+                crate::semantic::VerifiedProjectPolicy::Closed(policy)
+                    if policy.profile()
+                        == crate::semantic::ClosedProfileId::SingleRootSignedMemberLogV1
+            );
+            if !profile_is_supported {
+                return Err(Error::Network(
+                    "enabled closed relay requires the verified Closed SingleRootSignedMemberLogV1 policy"
+                        .into(),
+                ));
+            }
+            let local_device = crate::semantic::DeviceId::from_canonical_str(&local_device_id)
+                .map_err(|_| Error::Network("local identity is not a canonical DeviceId".into()))?;
+            Some(
+                crate::runtime::relay::ClosedRelayRuntime::new(
+                    config.closed_relay.clone(),
+                    local_device,
+                )
+                .map_err(|error| {
+                    Error::Network(format!("closed relay policy rejected: {error}"))
+                })?,
+            )
+        } else {
+            None
+        };
+        let closed_relay_allocations = if config.closed_relay.enabled {
+            Some(
+                super::closed_relay::ClosedRelayRegistry::new(&config.closed_relay).map_err(
+                    |error| {
+                        Error::Network(format!(
+                            "closed relay allocation registry rejected: {error}"
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
+        let closed_relay_closing = if config.closed_relay.enabled {
+            Some(
+                super::closed_relay::ClosedRelayClosingRegistry::new(&config.closed_relay)
+                    .map_err(|error| {
+                        Error::Network(format!("closed relay closing registry rejected: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let closed_relay_pending = if config.closed_relay.enabled {
+            Some(
+                super::closed_relay::ClosedRelayPendingRegistry::new(&config.closed_relay)
+                    .map_err(|error| {
+                        Error::Network(format!("closed relay handshake registry rejected: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let closed_relay_endpoints = if config.closed_relay.enabled {
+            Some(
+                super::closed_relay::ClosedRelayEndpointRegistry::new(&config.closed_relay)
+                    .map_err(|error| {
+                        Error::Network(format!("closed relay endpoint registry rejected: {error}"))
+                    })?,
+            )
+        } else {
+            None
+        };
+        let closed_relay_target_accepts = if config.closed_relay.enabled {
+            Some(
+                super::closed_relay::ClosedRelayTargetAcceptedRegistry::new(&config.closed_relay)
+                    .map_err(|error| {
+                    Error::Network(format!(
+                        "closed relay target handoff registry rejected: {error}"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
         let durable_root = instance_root
             .clone()
             .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
@@ -1954,8 +1246,13 @@ impl NetworkState {
             topology_impl: RwLock::new(topology_impl),
             peers: PeerRegistry::new(local_device_id),
             roster: RwLock::new(roster),
-            governance_state,
             fact_graph,
+            closed_relay_runtime,
+            closed_relay_allocations: Mutex::new(closed_relay_allocations),
+            closed_relay_closing: Mutex::new(closed_relay_closing),
+            closed_relay_pending: Mutex::new(closed_relay_pending),
+            closed_relay_endpoints: Mutex::new(closed_relay_endpoints),
+            closed_relay_target_accepts: Mutex::new(closed_relay_target_accepts),
             durable_semantic_owner,
             durable_publication_gate: Mutex::new(()),
             durable_provisional: Mutex::new(durable_provisional),
@@ -1982,7 +1279,7 @@ impl NetworkState {
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             recovery_cohort: Mutex::new(RecoveryCohort::new()),
-            carrier_attempts: Mutex::new(CarrierAttemptList::default()),
+            carrier_state: CarrierState::default(),
             sticky_peers: Mutex::new(pinned),
             self_evicted: std::sync::atomic::AtomicBool::new(false),
             traffic: super::traffic::TrafficCounters::default(),
@@ -2058,6 +1355,477 @@ impl NetworkState {
     /// supply roots or mutate the bootstrap through this reference.
     pub fn verified_policy(&self) -> &crate::semantic::VerifiedProjectPolicy {
         self.verified_bootstrap.policy()
+    }
+
+    /// The instance-owned Closed relay runtime, when the owner-selected
+    /// policy enabled it during construction. The runtime itself remains the
+    /// sole owner of relay allocation permits and queues.
+    pub(crate) fn closed_relay_runtime(
+        &self,
+    ) -> Option<&crate::runtime::relay::ClosedRelayRuntime> {
+        self.closed_relay_runtime.as_ref()
+    }
+
+    /// Admit one exact A-B-C Closed relay allocation. Semantic binding and
+    /// provider permit issuance happen before this bounded state registry is
+    /// mutated; a refusal therefore leaves both runtime and registry
+    /// unchanged.
+    pub(crate) fn admit_closed_relay(
+        self: &Arc<Self>,
+        requester: crate::semantic::DeviceId,
+        relay: crate::semantic::DeviceId,
+        target: crate::semantic::DeviceId,
+        session_id: [u8; 16],
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        let runtime = self
+            .closed_relay_runtime
+            .as_ref()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
+        let profile = self.config.read().closed_relay.clone();
+        let admission = super::closed_relay::admit_closed_relay(
+            self, runtime, &profile, requester, relay, target, session_id,
+        )?;
+        self.closed_relay_allocations
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .insert(session_id, admission)
+            .map(|_| ())
+    }
+
+    pub(crate) fn insert_closed_relay_admission(
+        &self,
+        session_id: [u8; 16],
+        admission: super::closed_relay::ClosedRelayAdmission,
+    ) -> std::result::Result<
+        super::closed_relay::ClosedRelayGeneration,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        self.closed_relay_allocations
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .insert(session_id, admission)
+    }
+
+    pub(crate) fn begin_closed_relay_close(
+        &self,
+        record: super::closed_relay::ClosedRelayCloseRecord,
+    ) -> std::result::Result<bool, crate::runtime::relay::ClosedRelayRefusal> {
+        let session_id = record.session_id;
+        let has_allocation = self
+            .closed_relay_allocations
+            .lock()
+            .as_ref()
+            .is_some_and(|registry| registry.contains(session_id));
+        let has_pending = self
+            .closed_relay_pending
+            .lock()
+            .as_ref()
+            .is_some_and(|registry| registry.contains(session_id));
+        if !has_allocation && !has_pending {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+        }
+        let allocation_generation = record.allocation_generation.clone();
+        if has_allocation != allocation_generation.is_some() {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+        }
+        let inserted = self
+            .closed_relay_closing
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .begin(record)?;
+        if !inserted {
+            return Ok(false);
+        }
+        if has_allocation {
+            let wake = match self
+                .closed_relay_allocations
+                .lock()
+                .as_mut()
+                .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)
+                .and_then(|registry| {
+                    registry.mark_closing_exact(
+                        session_id,
+                        allocation_generation
+                            .as_ref()
+                            .expect("allocation generation checked above"),
+                    )
+                }) {
+                Ok(wake) => wake,
+                Err(error) => {
+                    let _ = self.cancel_closed_relay_close(session_id);
+                    return Err(error);
+                }
+            };
+            if let Some(wake) = wake {
+                wake.request_close();
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn closed_relay_generation(
+        &self,
+        session_id: [u8; 16],
+    ) -> Option<super::closed_relay::ClosedRelayGeneration> {
+        self.closed_relay_allocations
+            .lock()
+            .as_ref()
+            .and_then(|registry| registry.generation(session_id))
+    }
+
+    pub(crate) fn has_closed_relay_custody(&self, session_id: [u8; 16]) -> bool {
+        self.closed_relay_allocations
+            .lock()
+            .as_ref()
+            .is_some_and(|registry| registry.contains(session_id))
+            || self
+                .closed_relay_pending
+                .lock()
+                .as_ref()
+                .is_some_and(|registry| registry.contains(session_id))
+            || self
+                .closed_relay_closing
+                .lock()
+                .as_ref()
+                .is_some_and(|registry| registry.contains(session_id))
+    }
+
+    pub(crate) fn take_closed_relay_close(
+        &self,
+        session_id: [u8; 16],
+        opposite: &crate::semantic::DeviceId,
+        witness: &crate::runtime::session_broker::SessionValidityWitness,
+    ) -> Option<super::closed_relay::ClosedRelayCloseRecord> {
+        self.closed_relay_closing
+            .lock()
+            .as_mut()?
+            .take(session_id, opposite, witness)
+    }
+
+    pub(crate) fn cancel_closed_relay_close(
+        &self,
+        session_id: [u8; 16],
+    ) -> Option<super::closed_relay::ClosedRelayCloseRecord> {
+        self.closed_relay_closing
+            .lock()
+            .as_mut()?
+            .remove(session_id)
+    }
+
+    pub(crate) fn finish_closed_relay_checkout(
+        &self,
+        session_id: [u8; 16],
+        generation: super::closed_relay::ClosedRelayGeneration,
+        handle: crate::runtime::relay::ClosedRelayHandle,
+        terminal: super::closed_relay::ClosedRelayTerminalWitness,
+        control: std::sync::Arc<super::closed_relay::ClosedRelayCheckoutControl>,
+    ) {
+        let settlement = self
+            .closed_relay_allocations
+            .lock()
+            .as_mut()
+            .and_then(|registry| {
+                registry.finish_checkout(session_id, generation, handle, terminal, control)
+            });
+        if let Some((handle, terminal)) = settlement {
+            let _ = super::closed_relay::settle_closed_relay(handle, terminal);
+        }
+    }
+
+    /// Forward one packet through the exact allocation and direction. The
+    /// registry lock is held only while taking and restoring the synchronous
+    /// handle; runtime packet validation and queue accounting remain bounded
+    /// and exact.
+    pub(crate) fn forward_closed_relay(
+        &self,
+        session_id: [u8; 16],
+        direction: crate::runtime::relay::RelayDirection,
+        packet: crate::protocol::OpaqueRelayPacket,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        self.closed_relay_allocations
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
+            .forward(session_id, direction, packet)
+    }
+
+    /// Receive from one direction without holding the state mutex across the
+    /// runtime await. The exact slot remains present while its handle is
+    /// temporarily owned by this operation, so a concurrent successor cannot
+    /// be substituted under the same session id.
+    pub(crate) async fn recv_closed_relay(
+        self: &Arc<Self>,
+        session_id: [u8; 16],
+        direction: crate::runtime::relay::RelayDirection,
+    ) -> Option<crate::protocol::OpaqueRelayPacket> {
+        let mut checkout = {
+            let mut allocations = self.closed_relay_allocations.lock();
+            allocations.as_mut()?.take_checkout(self, session_id)?
+        };
+        let closing_control = std::sync::Arc::clone(checkout.control());
+        let closing_notified = closing_control.closing_notified();
+        tokio::pin!(closing_notified);
+        closing_notified.as_mut().enable();
+        let packet = if checkout.is_closing() {
+            None
+        } else {
+            tokio::select! {
+                packet = checkout.recv(direction) => packet,
+                _ = &mut closing_notified => None,
+                _ = self.wait_for_shutdown() => None,
+            }
+        };
+        if self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            checkout.control().request_close();
+        }
+        packet
+    }
+
+    pub(crate) fn closed_relay_route(
+        &self,
+        session_id: [u8; 16],
+    ) -> Option<(
+        crate::semantic::MeshContextId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+    )> {
+        self.closed_relay_allocations
+            .lock()
+            .as_ref()?
+            .route(session_id)
+    }
+
+    pub(crate) fn settle_closed_relay_exact(
+        &self,
+        session_id: [u8; 16],
+        generation: &super::closed_relay::ClosedRelayGeneration,
+    ) -> std::result::Result<
+        crate::runtime::relay::ClosedRelayTerminal,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        self.closed_relay_allocations
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
+            .settle_exact(session_id, generation)
+    }
+
+    /// Shutdown fence for the driver owner. Every slot is attempted once;
+    /// slots temporarily receiving a packet are left for their owner to
+    /// restore, while no lock is ever held across an await here.
+    pub(crate) fn settle_all_closed_relay(&self) -> usize {
+        let mut allocations = self.closed_relay_allocations.lock();
+        let Some(registry) = allocations.as_mut() else {
+            return 0;
+        };
+        registry.settle_all()
+    }
+
+    pub(crate) fn cancel_all_closed_relay_pending(&self) -> usize {
+        self.closed_relay_pending
+            .lock()
+            .as_mut()
+            .map_or(0, super::closed_relay::ClosedRelayPendingRegistry::clear)
+    }
+
+    pub(crate) fn insert_closed_relay_pending(
+        &self,
+        pending: super::closed_relay::ClosedRelayPending,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        self.closed_relay_pending
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .insert(pending)
+    }
+
+    pub(crate) fn take_closed_relay_pending(
+        &self,
+        session_id: [u8; 16],
+    ) -> Option<super::closed_relay::ClosedRelayPending> {
+        self.closed_relay_pending.lock().as_mut()?.take(session_id)
+    }
+
+    pub(crate) fn pending_closed_relay_count(&self) -> usize {
+        self.closed_relay_pending
+            .lock()
+            .as_ref()
+            .map_or(0, super::closed_relay::ClosedRelayPendingRegistry::len)
+    }
+
+    pub(crate) fn insert_closed_relay_endpoint(
+        &self,
+        session: super::closed_relay::EndpointSession,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        self.closed_relay_endpoints
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .insert(session)
+    }
+
+    pub(crate) fn closed_relay_endpoint(
+        &self,
+        session_id: [u8; 16],
+    ) -> Option<super::closed_relay::EndpointSession> {
+        self.closed_relay_endpoints
+            .lock()
+            .as_ref()
+            .and_then(|registry| registry.find(session_id))
+    }
+
+    pub(crate) fn complete_closed_relay_endpoint(
+        &self,
+        session_id: [u8; 16],
+        target_share: &crate::protocol::relay::RelayKeyShare,
+    ) -> std::result::Result<
+        super::closed_relay::EndpointSession,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        let session = self
+            .closed_relay_endpoints
+            .lock()
+            .as_ref()
+            .and_then(|registry| registry.find(session_id))
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
+        session.complete(target_share)?;
+        Ok(session)
+    }
+
+    pub(crate) fn deliver_closed_relay_endpoint(
+        &self,
+        session_id: [u8; 16],
+        packet: crate::protocol::OpaqueRelayPacket,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        let session = self
+            .closed_relay_endpoints
+            .lock()
+            .as_ref()
+            .and_then(|registry| registry.find(session_id))
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
+        session.deliver(packet)
+    }
+
+    pub(crate) fn remove_closed_relay_endpoint(
+        &self,
+        session: &super::closed_relay::EndpointSession,
+    ) {
+        if let Some(registry) = self.closed_relay_endpoints.lock().as_mut() {
+            registry.remove(session);
+        }
+        if let Some(registry) = self.closed_relay_target_accepts.lock().as_mut() {
+            registry.remove(session);
+        }
+    }
+
+    pub(crate) fn publish_closed_relay_target_accept(
+        &self,
+        session: super::closed_relay::EndpointSession,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        self.closed_relay_target_accepts
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .publish(session)
+    }
+
+    pub(crate) async fn await_closed_relay_target_accept(
+        &self,
+        session_id: [u8; 16],
+    ) -> std::result::Result<
+        super::closed_relay::EndpointSession,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        loop {
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+            let wake = {
+                let mut accepts = self.closed_relay_target_accepts.lock();
+                let registry = accepts
+                    .as_mut()
+                    .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
+                if let Some(session) = registry.take(session_id) {
+                    return Ok(session);
+                }
+                registry.wake()
+            };
+            if self
+                .closed_relay_endpoints
+                .lock()
+                .as_ref()
+                .and_then(|registry| registry.find(session_id))
+                .is_none()
+            {
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = self.wait_for_shutdown() => {
+                    return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn await_next_closed_relay_target_accept(
+        &self,
+    ) -> std::result::Result<
+        super::closed_relay::EndpointSession,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        loop {
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+            let wake = {
+                let mut accepts = self.closed_relay_target_accepts.lock();
+                let registry = accepts
+                    .as_mut()
+                    .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
+                if let Some(session) = registry.take_next() {
+                    return Ok(session);
+                }
+                registry.wake()
+            };
+            let notified = wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .shutdown_requested
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+            tokio::select! {
+                _ = &mut notified => {},
+                _ = self.wait_for_shutdown() => {
+                    return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+                }
+            }
+        }
     }
 
     /// The exact authority root, when this state is backed by a Closed
@@ -3431,7 +3199,7 @@ impl NetworkState {
         ]) else {
             return CarrierEmissionAdmission::Refused;
         };
-        let mut attempts = self.carrier_attempts.lock();
+        let mut attempts = self.carrier_state.attempts.lock();
         if let Some(existing) = attempts.find_emission_mut(emission, attempt) {
             if existing.terminal.is_some() {
                 return CarrierEmissionAdmission::Stale;
@@ -3502,7 +3270,7 @@ impl NetworkState {
         instance: RecoveryCarrierInstance,
         accepted: bool,
     ) -> CarrierEmissionSettlement {
-        let mut attempts = self.carrier_attempts.lock();
+        let mut attempts = self.carrier_state.attempts.lock();
         let result = {
             let Some(state) = attempts.find_emission_mut(emission, attempt) else {
                 return CarrierEmissionSettlement {
@@ -3603,7 +3371,7 @@ impl NetworkState {
         emission: SignalingEmissionId,
         attempt: &str,
     ) {
-        let mut attempts = self.carrier_attempts.lock();
+        let mut attempts = self.carrier_state.attempts.lock();
         if let Some(node) = attempts.find_emission_mut(emission, attempt) {
             node.claimed = true;
         }
@@ -3614,7 +3382,8 @@ impl NetworkState {
         emission: SignalingEmissionId,
         attempt: &str,
     ) -> bool {
-        self.carrier_attempts
+        self.carrier_state
+            .attempts
             .lock()
             .find_emission_mut(emission, attempt)
             .is_some_and(|node| node.fenced)
@@ -3625,7 +3394,8 @@ impl NetworkState {
         emission: SignalingEmissionId,
         attempt: &str,
     ) -> bool {
-        self.carrier_attempts
+        self.carrier_state
+            .attempts
             .lock()
             .find_emission_mut(emission, attempt)
             .is_some_and(|node| node.terminal.is_some())
@@ -3637,7 +3407,8 @@ impl NetworkState {
         attempt: &str,
         instance: RecoveryCarrierInstance,
     ) {
-        self.carrier_attempts
+        self.carrier_state
+            .attempts
             .lock()
             .acknowledge_terminal(emission, attempt, instance);
     }
@@ -3653,7 +3424,7 @@ impl NetworkState {
         emission: SignalingEmissionId,
         attempt: &str,
     ) -> bool {
-        let mut attempts = self.carrier_attempts.lock();
+        let mut attempts = self.carrier_state.attempts.lock();
         let is_final_refusal = attempts
             .find_emission_mut(emission, attempt)
             .is_some_and(|node| node.terminal == Some(CarrierEmissionRecord::FinalRefusal));
@@ -3664,7 +3435,7 @@ impl NetworkState {
     }
 
     pub(crate) fn clear_carrier_attempt(&self, attempt: &str) {
-        self.carrier_attempts.lock().remove_unfenced(attempt);
+        self.carrier_state.attempts.lock().remove_unfenced(attempt);
     }
 
     /// Settle only signaling emissions owned by a displaced peer installation.
@@ -3672,13 +3443,17 @@ impl NetworkState {
     /// broad attempt settlement here would incorrectly retire the successor's
     /// carrier custody.
     pub(crate) fn settle_displaced_owner_emissions(&self, owner: &PeerOwnerToken) -> usize {
-        let emissions = self.carrier_attempts.lock().emissions_for_owner(owner);
+        let emissions = self
+            .carrier_state
+            .attempts
+            .lock()
+            .emissions_for_owner(owner);
         if emissions.is_empty() {
             return 0;
         }
 
         let settled = {
-            let mut attempts = self.carrier_attempts.lock();
+            let mut attempts = self.carrier_state.attempts.lock();
             emissions
                 .iter()
                 .filter(|(emission, attempt)| attempts.settle_emission(*emission, attempt))
@@ -3706,7 +3481,7 @@ impl NetworkState {
         if let Some(runtime) = runtime.as_ref() {
             runtime.fence_attempt(attempt);
         }
-        self.carrier_attempts.lock().fence_attempt(attempt);
+        self.carrier_state.attempts.lock().fence_attempt(attempt);
         let settlement = self.attempt_settlement.lock().clone();
         let settled = settlement.map_or(0, |settlement| settlement(attempt, terminal));
         self.clear_carrier_attempt(attempt);
@@ -3831,7 +3606,7 @@ impl NetworkState {
         self.reconnect_intents.lock().contains_key(device_id)
     }
 
-    fn same_recovery_owner(left: &PeerOwnerToken, right: &PeerOwnerToken) -> bool {
+    pub(super) fn same_recovery_owner(left: &PeerOwnerToken, right: &PeerOwnerToken) -> bool {
         if !Arc::ptr_eq(left.connection(), right.connection()) {
             return false;
         }
@@ -5220,6 +4995,14 @@ impl NetworkState {
     /// driver's shutdown path.
     pub(crate) async fn shutdown(&self) {
         self.request_shutdown();
+        self.cancel_all_closed_relay_pending();
+        if let Some(registry) = self.closed_relay_allocations.lock().as_mut() {
+            registry.request_close_all();
+        }
+        self.closed_relay_closing.lock().take();
+        self.settle_all_closed_relay();
+        self.closed_relay_endpoints.lock().take();
+        self.closed_relay_target_accepts.lock().take();
         self.cancel_all_recovery_demands();
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is

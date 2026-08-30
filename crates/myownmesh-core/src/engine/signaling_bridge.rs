@@ -56,7 +56,7 @@ use myownmesh_signaling::nostr::driver::{
 };
 use myownmesh_signaling::{
     AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierCommit,
-    CarrierCommitUnit, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
+    CarrierCommitUnit, InboundOutcome, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
 };
 use tracing::{trace, warn};
 
@@ -68,7 +68,7 @@ use crate::resource::{
 
 use super::signaling_ingress::{
     outbound_signal, CarrierAttach, CarrierAttribution, CarrierInstanceGuard, CarrierObservation,
-    SignalingCarrier, SignalingRuntime,
+    Delivered, SignalingCarrier, SignalingRuntime,
 };
 use super::state::{
     CarrierEmissionAdmission, CarrierEmissionRecord, NetworkCmd, NetworkState,
@@ -1402,9 +1402,15 @@ fn carrier_sink<R>(attach: CarrierAttach) -> InboundSink<R>
 where
     R: Into<CarrierReport> + Send + 'static,
 {
-    InboundSink::new(move |report: R| {
+    InboundSink::new_typed(move |report: R| {
         let observed = observe(&attach, report.into());
-        attach.deliver(observed)
+        match attach.admit(observed) {
+            Delivered::Accepted => InboundOutcome::Accepted,
+            Delivered::Duplicate | Delivered::Refused | Delivered::Unavailable => {
+                InboundOutcome::Refused
+            }
+            Delivered::Closed => InboundOutcome::Closed,
+        }
     })
 }
 

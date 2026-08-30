@@ -8,6 +8,7 @@ pub mod attempt;
 /// owns it, and a public path would be a way to name one without holding it.
 pub(crate) mod peer_session;
 pub mod relay;
+pub(crate) mod signaling;
 // Crate-private: every production caller is inside this crate (the engine's
 // registry fence and the connector), and applications reach a session through
 // the daemon control boundary rather than by naming the type. A public path

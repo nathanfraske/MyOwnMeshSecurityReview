@@ -19,7 +19,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::conn_trace::ConnTrace;
 use myownmesh_core::engine::transport_lab::{
     attach_signaling, join_open_participation, spawn_network,
@@ -88,6 +90,7 @@ fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> Net
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling,
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,

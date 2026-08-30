@@ -34,12 +34,17 @@ use crate::error::Result;
 use super::state::NetworkState;
 
 /// Returns `true` when the new config differs from the current one in a
-/// way that can't be applied to a running network — only `network_id`
-/// (a different network) or `signaling` (the relay set the Nostr driver
-/// is bound to). STUN/TURN, topology, label, roster, and auto-approve
-/// are all applied in place by [`apply_hot`] without dropping peers.
+/// way that can't be applied to a running network — `network_id`
+/// (a different network), `signaling` (the relay set the Nostr driver
+/// is bound to), or `closed_relay` (the provider-backed runtime profile).
+/// STUN/TURN, topology, label, roster, and auto-approve are all applied in
+/// place by [`apply_hot`] without dropping peers.
+/// Changes to `closed_relay` require restart because its provider-backed
+/// runtime profile is fixed when `NetworkState` is constructed.
 pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
-    current.network_id != next.network_id || current.signaling != next.signaling
+    current.network_id != next.network_id
+        || current.signaling != next.signaling
+        || current.closed_relay != next.closed_relay
 }
 
 /// Apply the hot-reloadable subset of config without tearing down
@@ -59,16 +64,9 @@ pub fn apply_hot(state: &Arc<NetworkState>, next: NetworkConfig) -> Result<()> {
         cfg.stun_servers = next.stun_servers;
         cfg.turn_servers = next.turn_servers;
     }
-    // The config's topology only drives the runtime while governance
-    // hasn't spoken: a ratified TopologyChange in the signed log owns
-    // the shape (the same precedence `kind` has), and a config edit —
-    // which any device can make locally — must not clobber it.
-    let effective = state
-        .governance_state
-        .read()
-        .topology
-        .clone()
-        .unwrap_or(next.topology);
+    // Topology is connector/deployment policy, not semantic authority. A
+    // hot config edit updates the local runtime directly.
+    let effective = next.topology;
     {
         let mut topo = state.topology.write();
         *topo = effective.clone();
@@ -118,6 +116,14 @@ mod tests {
         let mut diff_sig = current.clone();
         diff_sig.signaling.servers = vec!["wss://relay.example.com".into()];
         assert!(requires_restart(&current, &diff_sig));
+    }
+
+    #[test]
+    fn closed_relay_profile_changes_require_restart() {
+        let current = base_config();
+        let mut next = current.clone();
+        next.closed_relay.enabled = !current.closed_relay.enabled;
+        assert!(requires_restart(&current, &next));
     }
 
     #[test]

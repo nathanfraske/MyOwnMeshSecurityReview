@@ -184,6 +184,34 @@ pub(crate) enum SemanticAdmission {
     NotDurable(Box<MeshMessage>),
 }
 
+/// The durable-semantic port.  It admits only the closed durable exchange set
+/// and returns every other wire frame untouched for the temporary engine
+/// supervisor.  Keeping this port separate from the compatibility result makes
+/// the durable lane available to a future store/file carrier without giving it
+/// an ephemeral transport value to parse.
+pub(crate) struct DurableSemanticPort;
+
+impl DurableSemanticPort {
+    /// Admit a wire frame before any domain reducer parsing.  The error is the
+    /// original frame, not a second representation or a generic envelope.
+    pub(crate) fn admit(message: MeshMessage) -> Result<DurableSemanticExchange, Box<MeshMessage>> {
+        let exchange = match message {
+            MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
+            MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
+            MeshMessage::ProofDelivery(m) => Exchange::ProofDelivery(m),
+            MeshMessage::NetworkState(m) => Exchange::Inventory(Inventory::NetworkState(m)),
+            MeshMessage::RosterSummary(m) => Exchange::Inventory(Inventory::Roster(m)),
+            MeshMessage::FactInventory(m) => Exchange::Inventory(Inventory::Facts(m)),
+            MeshMessage::RosterRequest(m) => {
+                Exchange::DependencyRequest(DependencyRequest::Roster(m))
+            }
+            MeshMessage::FactRequest(m) => Exchange::DependencyRequest(DependencyRequest::Facts(m)),
+            other => return Err(Box::new(other)),
+        };
+        Ok(DurableSemanticExchange { exchange })
+    }
+}
+
 /// Admit a decoded frame as a durable semantic exchange, or hand it straight
 /// back.
 ///
@@ -192,40 +220,10 @@ pub(crate) enum SemanticAdmission {
 /// than silently falling out of the durable set — and, now that the set has five
 /// classes, classified into the right one rather than into a single bucket.
 pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
-    let exchange = match message {
-        MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
-        MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
-        MeshMessage::ProofDelivery(m) => Exchange::ProofDelivery(m),
-        other @ MeshMessage::RosterEntries(_) => {
-            return SemanticAdmission::NotDurable(Box::new(other));
-        }
-        MeshMessage::NetworkState(m) => Exchange::Inventory(Inventory::NetworkState(m)),
-        MeshMessage::RosterSummary(m) => Exchange::Inventory(Inventory::Roster(m)),
-        MeshMessage::FactInventory(m) => Exchange::Inventory(Inventory::Facts(m)),
-        MeshMessage::RosterRequest(m) => Exchange::DependencyRequest(DependencyRequest::Roster(m)),
-        MeshMessage::FactRequest(m) => Exchange::DependencyRequest(DependencyRequest::Facts(m)),
-        other @ (MeshMessage::Ping(_)
-        | MeshMessage::Pong(_)
-        | MeshMessage::Hello(_)
-        | MeshMessage::AuthResponse(_)
-        | MeshMessage::Approve(_)
-        | MeshMessage::Deny(_)
-        | MeshMessage::Shelve(_)
-        | MeshMessage::Unshelve(_)
-        | MeshMessage::SessionControl(_)
-        | MeshMessage::CapabilitiesUpdate(_)
-        | MeshMessage::RpcRequest(_)
-        | MeshMessage::RpcResponse(_)
-        | MeshMessage::RpcStreamChunk(_)
-        | MeshMessage::RpcStreamEnd(_)
-        | MeshMessage::ProofAck(_)
-        | MeshMessage::Channel { .. }
-        | MeshMessage::ChannelSeq { .. }
-        | MeshMessage::ChannelAck { .. }) => {
-            return SemanticAdmission::NotDurable(Box::new(other));
-        }
-    };
-    SemanticAdmission::Durable(DurableSemanticExchange { exchange })
+    match DurableSemanticPort::admit(message) {
+        Ok(exchange) => SemanticAdmission::Durable(exchange),
+        Err(other) => SemanticAdmission::NotDurable(other),
+    }
 }
 
 /// What a delivery is called in a log line when no session carried it.

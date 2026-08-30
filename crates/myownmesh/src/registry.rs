@@ -1858,6 +1858,7 @@ mod tests {
             kind: Default::default(),
             topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),
+            closed_relay: Default::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
             roster_path: None,

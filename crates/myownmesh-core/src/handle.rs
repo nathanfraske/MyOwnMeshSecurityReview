@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tracing::info;
@@ -376,7 +377,72 @@ pub struct JoinedNetwork {
     lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
+/// A move-only opaque endpoint channel for a Closed-member relay route.
+///
+/// The relay and session identifiers are descriptive metadata only. Endpoint
+/// key material, authenticated peer ownership, and the bounded relay route
+/// remain inside the engine; callers can only exchange plaintext through this
+/// handle and close the exact endpoint session that opened it.
+pub struct ClosedRelayChannel {
+    session: crate::engine::closed_relay::EndpointSession,
+    peer: String,
+    relay: String,
+    session_id: [u8; 16],
+}
+
+impl ClosedRelayChannel {
+    /// The remote endpoint's canonical device id.
+    pub fn peer_device_id(&self) -> &str {
+        &self.peer
+    }
+
+    /// The canonical device id of the member forwarding this route.
+    pub fn relay_device_id(&self) -> &str {
+        &self.relay
+    }
+
+    /// The opaque session coordinate assigned to this exact endpoint pair.
+    pub fn session_id(&self) -> [u8; 16] {
+        self.session_id
+    }
+
+    /// Encrypt and send one plaintext through the exact endpoint session.
+    pub async fn send(&self, plaintext: &[u8]) -> Result<()> {
+        self.session
+            .send(plaintext)
+            .await
+            .map_err(|error| Error::Network(format!("Closed relay send refused: {error}")))
+    }
+
+    /// Receive and decrypt one plaintext from the exact endpoint session.
+    pub async fn recv(&self) -> Result<Vec<u8>> {
+        self.session
+            .recv()
+            .await
+            .map_err(|error| Error::Network(format!("Closed relay receive refused: {error}")))
+    }
+
+    /// Close this exact endpoint session and release its bounded custody.
+    pub async fn close(self) -> Result<()> {
+        self.session
+            .close()
+            .await
+            .map_err(|error| Error::Network(format!("Closed relay close refused: {error}")))
+    }
+}
+
 impl JoinedNetwork {
+    /// Import signed semantic facts through this network's durable reducer.
+    ///
+    /// The bundle is checked for canonical signatures and the exact verified
+    /// bootstrap context before it enters the reducer. Semantic authorization,
+    /// dependency quarantine, custody, and projection remain owned by the
+    /// canonical `FactGraph`; successful return means the bundle was handed to
+    /// that durable reducer, not that every fact has projected yet.
+    pub async fn import_signed_facts(&self, facts: Vec<crate::semantic::SignedFact>) -> Result<()> {
+        crate::engine::lifecycle::import_signed_facts(&self.state, facts).await
+    }
+
     pub fn network_id(&self) -> &str {
         &self.state.network_id
     }
@@ -537,11 +603,55 @@ impl JoinedNetwork {
         self.state.peer_info(device_id)
     }
 
-    /// Read the canonical governance projection as a compatibility snapshot.
-    /// Legacy transitions, pending proposals, and split records are never
-    /// exposed as mutable authority through this outer control seam.
-    pub async fn governance_state(&self) -> Result<crate::network_state::NetworkState> {
-        Ok(crate::engine::governance::snapshot(&self.state))
+    /// Open an opaque endpoint channel from this member to `target` through
+    /// the exact authenticated member `relay`. The session coordinate is
+    /// generated here and never accepted from a caller, while the engine
+    /// retains endpoint keys and current-owner checks behind this facade.
+    pub async fn open_closed_relay(&self, relay: &str, target: &str) -> Result<ClosedRelayChannel> {
+        let relay = crate::semantic::DeviceId::from_canonical_str(relay)
+            .map_err(|error| Error::Network(format!("invalid Closed relay member: {error}")))?;
+        let target = crate::semantic::DeviceId::from_canonical_str(target)
+            .map_err(|error| Error::Network(format!("invalid Closed relay target: {error}")))?;
+        let mut session_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut session_id);
+        if session_id.iter().all(|byte| *byte == 0) {
+            return Err(Error::Network(
+                "Closed relay generated an invalid all-zero session id".into(),
+            ));
+        }
+        let session = crate::engine::closed_relay::open_endpoint(
+            &self.state,
+            relay.clone(),
+            target.clone(),
+            session_id,
+        )
+        .await
+        .map_err(|error| Error::Network(format!("Closed relay open refused: {error}")))?;
+        Ok(ClosedRelayChannel {
+            session,
+            peer: target.base32(),
+            relay: relay.base32(),
+            session_id,
+        })
+    }
+
+    /// Accept the next authenticated endpoint Offer delivered to this
+    /// network. The engine selects the exact bounded FIFO entry and supplies
+    /// its observed requester, relay, and session metadata; callers cannot
+    /// inject or reconstruct a route identifier.
+    pub async fn accept_closed_relay(&self) -> Result<ClosedRelayChannel> {
+        let session = self
+            .state
+            .await_next_closed_relay_target_accept()
+            .await
+            .map_err(|error| Error::Network(format!("Closed relay accept refused: {error}")))?;
+        let metadata = session.metadata();
+        Ok(ClosedRelayChannel {
+            session,
+            peer: metadata.requester.base32(),
+            relay: metadata.relay.base32(),
+            session_id: metadata.session_id,
+        })
     }
 
     async fn propose_transition(

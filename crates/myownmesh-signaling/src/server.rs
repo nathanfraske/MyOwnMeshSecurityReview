@@ -493,7 +493,8 @@ async fn accept_loop(listener: TcpListener, context: AcceptLoopContext) {
                             conn_id,
                             &connections,
                             &hub,
-                            &registry_terminal,
+                            Arc::clone(&registry_terminal),
+                            writer_stop_timeout,
                         ).await;
                     }
                     None => break,
@@ -784,7 +785,8 @@ async fn observe_completed_connection(
     conn_id: u64,
     tasks: &ConnectionRegistry,
     hub: &Hub,
-    registry_terminal: &RegistryTerminal,
+    registry_terminal: Arc<RegistryTerminal>,
+    timeout: Duration,
 ) {
     let hub_idle_before_reap = hub.snapshot().connections == 0;
     let task = {
@@ -803,13 +805,40 @@ async fn observe_completed_connection(
             .hub_idle_before_reap
             .store(true, Ordering::Release);
     }
-    if let Err(error) = task.await {
+    // The accept loop may be aborted while this observation is pending. Keep
+    // the exact child in a dedicated owner so cancellation cannot detach it.
+    let reaper = tokio::spawn(async move {
+        reap_connection_task(conn_id, task, timeout).await;
+        publish_registry_progress(&registry_terminal);
+    });
+    if let Err(error) = reaper.await {
         warn!(
             conn_id,
-            "signaling connection task did not complete normally: {error}"
+            "signaling connection reaper did not complete normally: {error}"
         );
     }
-    publish_registry_progress(registry_terminal);
+}
+
+async fn reap_connection_task(conn_id: u64, mut task: JoinHandle<()>, timeout: Duration) {
+    match tokio::time::timeout(timeout, &mut task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                conn_id,
+                "signaling connection task did not complete normally: {error}"
+            );
+        }
+        Err(_) => {
+            warn!(conn_id, "signaling connection task exceeded reaper timeout");
+            task.abort();
+            if let Err(error) = task.await {
+                warn!(
+                    conn_id,
+                    "signaling connection task abort did not join normally: {error}"
+                );
+            }
+        }
+    }
 }
 
 fn publish_registry_progress(registry_terminal: &RegistryTerminal) {
@@ -2202,6 +2231,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropping_handle_during_connection_reap_keeps_child_owned() {
+        let hub = Hub::new(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let observer = hub.clone();
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_child = Arc::clone(&dropped);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let child = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                let _cleanup = ConnectionCleanup::new(hub, conn_id);
+                let _drop_flag = DropFlag(dropped_in_child);
+                armed_tx.send(()).expect("child must arm before completion");
+                std::future::pending::<()>().await;
+            }
+        });
+        let connections = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        connections.lock().insert(conn_id, child);
+        armed_rx.await.expect("child must arm before completion");
+
+        let writers = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        let registry_terminal = Arc::new(RegistryTerminal::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (completion_tx, completion_rx) = mpsc::channel(1);
+        let (settlement_tx, settlement_rx) = mpsc::channel(1);
+        let accept_task = tokio::spawn(accept_loop(
+            listener,
+            AcceptLoopContext {
+                hub: hub.clone(),
+                connections: Arc::clone(&connections),
+                writers: Arc::clone(&writers),
+                registry_terminal: Arc::clone(&registry_terminal),
+                registry_capacity: 1,
+                completion_rx,
+                writer_settlement_rx: settlement_rx,
+                completion_tx: completion_tx.clone(),
+                writer_settlement_tx: settlement_tx,
+                writer_stop_timeout: Duration::from_secs(2),
+            },
+        ));
+        let mut progress = registry_terminal.progress.subscribe();
+        let progress_before_drop = *progress.borrow();
+        completion_tx
+            .send(conn_id)
+            .await
+            .expect("completion must reach accept loop");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if connections.lock().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion must extract the exact child before drop");
+        tokio::task::yield_now().await;
+
+        let handle = SignalingServerHandle {
+            task: Some(accept_task),
+            heartbeat: None,
+            connections: Arc::clone(&connections),
+            writers: Arc::clone(&writers),
+            registry_terminal: Arc::clone(&registry_terminal),
+            writer_stop_timeout: Duration::from_secs(2),
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            hub,
+        };
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(4), progress.changed())
+            .await
+            .expect("connection reaper must publish terminal progress after Drop")
+            .expect("connection reaper progress sender must remain live");
+        assert!(*progress.borrow() > progress_before_drop);
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(connections.lock().is_empty());
+        assert!(writers.lock().is_empty());
+        let state = observer.inner.lock();
+        assert_eq!(state.active_connections, 0);
+        assert!(state.conns.is_empty());
+        assert!(state.presence.is_empty());
+        assert!(state.ip_counts.is_empty());
+    }
+
+    #[tokio::test]
     async fn registry_pressure_refuses_before_spawning_an_unowned_task() {
         let tasks = Arc::new(Mutex::new(HashMap::with_capacity(1)));
         tasks
@@ -2218,7 +2336,7 @@ mod tests {
     #[tokio::test]
     async fn finished_handler_and_writer_panics_are_reaped_and_observed() {
         let hub = Hub::new(Limits::default());
-        let registry_terminal = RegistryTerminal::new();
+        let registry_terminal = Arc::new(RegistryTerminal::new());
         let connections = Arc::new(Mutex::new(HashMap::with_capacity(1)));
         let writers = Arc::new(Mutex::new(HashMap::with_capacity(1)));
         let (settlement_tx, mut settlement_rx) = mpsc::channel(1);
@@ -2231,7 +2349,14 @@ mod tests {
         );
         tokio::task::yield_now().await;
 
-        observe_completed_connection(1, &connections, &hub, &registry_terminal).await;
+        observe_completed_connection(
+            1,
+            &connections,
+            &hub,
+            Arc::clone(&registry_terminal),
+            Duration::from_secs(2),
+        )
+        .await;
         settlement_tx.send(1).await.unwrap();
         process_writer_settlement(&mut settlement_rx, &writers, Duration::from_secs(2)).await;
         assert!(connections.lock().is_empty());

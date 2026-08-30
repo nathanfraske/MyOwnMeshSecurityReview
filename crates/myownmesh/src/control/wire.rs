@@ -235,12 +235,6 @@ pub enum Request {
     },
 
     // ---- closed-network governance --------------------------------
-    /// Snapshot the per-network signed governance state — kind,
-    /// roles. Legacy proposal queues and split state are not authority and
-    /// are absent from this read-only view.
-    GovernanceState {
-        network: String,
-    },
     /// Float a role-grant proposal.
     GovernanceProposeRoleGrant {
         network: String,

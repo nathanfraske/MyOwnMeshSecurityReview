@@ -10,11 +10,14 @@
 
 use std::sync::Arc;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{
+    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+};
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::create_network_in_instance_root;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
+use myownmesh_core::semantic::VerifiedProjectPolicy;
 
 fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
     NetworkConfig {
@@ -24,6 +27,7 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         kind: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
         roster_path: None,
@@ -55,7 +59,10 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     .await
     .expect("create Closed bootstrap for alice");
     assert_eq!(state.verified_authority_root(), Some(alice.public_id()));
-    assert_eq!(governance::snapshot(&state).kind, NetworkKind::Closed);
+    assert!(matches!(
+        state.verified_policy(),
+        VerifiedProjectPolicy::Closed(_)
+    ));
 
     // Enroll a custody lock for this network on this device.
     let enrolled = myownmesh_core::custody::enroll(&net_id, "alice-laptop").expect("enroll");
@@ -83,8 +90,7 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     );
 
     // With a valid one-time recovery code, the root-authorized member grant
-    // proceeds and projects into the canonical read-only snapshot and the
-    // production roster.
+    // proceeds and projects into the canonical production roster.
     let fact_id = governance::propose(
         &state,
         TransitionVariant::RoleGrant {
@@ -96,13 +102,6 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
     .await
     .expect("root-authorized RoleGrant with a valid recovery code");
     assert_eq!(fact_id.to_string().len(), 52, "returned canonical FactId");
-    let projected = governance::snapshot(&state);
-    assert_eq!(
-        projected.roles.get(&target_id).copied(),
-        Some(Role::Member),
-        "recovery-authored grant must project to Member"
-    );
-    assert!(projected.pending.is_empty());
     assert!(state.is_rostered(&target_id));
     assert_eq!(
         state

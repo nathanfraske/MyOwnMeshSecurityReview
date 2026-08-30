@@ -1389,6 +1389,7 @@ dependencies = [
 name = "myownmesh-core"
 version = "0.3.2"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "bytes",
  "dashmap",
@@ -1399,6 +1400,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.2.17",
  "hex",
+ "hkdf",
  "hmac",
  "if-addrs",
  "myownmesh-signaling",
@@ -1418,6 +1420,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webrtc",
+ "x25519-dalek",
 ]
 
 [[package]]

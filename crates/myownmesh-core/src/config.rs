@@ -411,6 +411,94 @@ pub struct MdnsPolicyConfig {
     pub accept_error_backoff_ms: u64,
 }
 
+/// Owner-selected bounds for the Closed member opaque relay. The relay only
+/// forwards ciphertext; endpoint key material remains in the endpoint session.
+/// Packet bytes are plaintext bytes before the AEAD tag is added, and all
+/// queue/replay values are finite persisted integers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ClosedRelayPolicyConfig {
+    pub enabled: bool,
+    pub max_allocations: u64,
+    pub max_allocations_per_member: u64,
+    pub max_pending_handshakes: u64,
+    pub replay_window: u64,
+    pub max_frame_ciphertext_bytes: u64,
+    pub queue_items_per_direction: u64,
+    pub queue_bytes_per_direction: u64,
+    pub bandwidth_rate_bytes_per_second: u64,
+    pub bandwidth_burst_bytes: u64,
+    pub idle_timeout_ms: u64,
+    pub max_lifetime_ms: u64,
+    pub max_control_bytes: u64,
+    pub shutdown_grace_ms: u64,
+}
+
+/// A bounded protocol allocation that keeps malformed or hostile config from
+/// asking the relay to construct an unbounded packet buffer.
+pub const MAX_CLOSED_RELAY_PACKET_BYTES: u64 = 1024 * 1024;
+
+impl Default for ClosedRelayPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_allocations: 64,
+            max_allocations_per_member: 8,
+            max_pending_handshakes: 32,
+            replay_window: 64,
+            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
+            queue_items_per_direction: 64,
+            queue_bytes_per_direction: 4 * 1024 * 1024,
+            bandwidth_rate_bytes_per_second: 1024 * 1024,
+            bandwidth_burst_bytes: 2 * 1024 * 1024,
+            idle_timeout_ms: 30_000,
+            max_lifetime_ms: 3_600_000,
+            max_control_bytes: 16 * 1024,
+            shutdown_grace_ms: 5_000,
+        }
+    }
+}
+
+impl ClosedRelayPolicyConfig {
+    pub fn validate(&self) -> bool {
+        let semaphore_max = match u64::try_from(tokio::sync::Semaphore::MAX_PERMITS) {
+            Ok(max) => max,
+            Err(_) => return false,
+        };
+        self.max_allocations > 0
+            && self.max_allocations <= semaphore_max
+            && self.max_allocations_per_member > 0
+            && self.max_allocations_per_member <= semaphore_max
+            && self.max_pending_handshakes > 0
+            && self.max_pending_handshakes <= semaphore_max
+            && self.replay_window > 0
+            && self.replay_window <= semaphore_max
+            && self.max_frame_ciphertext_bytes > 0
+            && self.max_frame_ciphertext_bytes
+                <= crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+            && self.queue_items_per_direction > 0
+            && self.queue_items_per_direction <= semaphore_max
+            && self.queue_bytes_per_direction > 0
+            && self.bandwidth_rate_bytes_per_second > 0
+            && self.bandwidth_burst_bytes > 0
+            && self.idle_timeout_ms > 0
+            && self.max_lifetime_ms > 0
+            && self.max_control_bytes > 0
+            && self.max_control_bytes <= MAX_CLOSED_RELAY_PACKET_BYTES
+            && self.shutdown_grace_ms > 0
+            && usize::try_from(self.max_allocations).is_ok()
+            && usize::try_from(self.max_allocations_per_member).is_ok()
+            && usize::try_from(self.max_pending_handshakes).is_ok()
+            && usize::try_from(self.replay_window).is_ok()
+            && usize::try_from(self.max_frame_ciphertext_bytes).is_ok()
+            && usize::try_from(self.queue_items_per_direction).is_ok()
+            && usize::try_from(self.queue_bytes_per_direction).is_ok()
+            && usize::try_from(self.bandwidth_rate_bytes_per_second).is_ok()
+            && usize::try_from(self.bandwidth_burst_bytes).is_ok()
+            && usize::try_from(self.max_control_bytes).is_ok()
+    }
+}
+
 impl Default for MdnsPolicyConfig {
     fn default() -> Self {
         Self {
@@ -544,27 +632,30 @@ pub struct NetworkConfig {
     /// Cosmetic display name. Empty falls back to `network_id`.
     #[serde(default)]
     pub label: String,
-    /// Initial governance kind for this network. Open is the
-    /// default. Closed sets up
-    /// the per-network signed state log so the founder
-    /// self-elects as `Owner` on first attach. Silent is Open
+    /// Initial governance kind for this network, matched to the verified
+    /// bootstrap's local shape. Open is the default. Closed enables closed
+    /// membership at bootstrap. Silent is Open
     /// governance plus two connection-behaviour changes — no
     /// auto-dial on presence (co-present peers surface as `Sighted`
     /// without a WebRTC session until an explicit `connect_peer` or
     /// an inbound offer) and no roster gossip — for a shared open
     /// mesh where every connection is deliberate.
     ///
-    /// At runtime, the *authoritative* kind is the one in the
-    /// signed [`crate::NetworkState`] log; this field is only the
-    /// initial value used to bootstrap the log on first attach.
-    /// Subsequent kind changes happen via signed transitions, not
-    /// by editing config.json.
+    /// At runtime, canonical verified facts are authoritative; this field is
+    /// only the local shape matched to verified bootstrap on first attach.
+    /// Subsequent kind changes come from canonical fact transitions, not from
+    /// editing config.json.
     #[serde(default)]
     pub kind: crate::network_state::NetworkKind,
     #[serde(default)]
     pub topology: TopologyMode,
     #[serde(default)]
     pub signaling: SignalingConfig,
+    /// Closed-member opaque relay policy for this network. It is a network
+    /// policy, not a signaling-carrier policy, because the closed projection
+    /// owns admission and endpoint membership.
+    #[serde(default)]
+    pub closed_relay: ClosedRelayPolicyConfig,
     #[serde(default = "default_stun_servers")]
     pub stun_servers: Vec<StunServer>,
     /// TURN servers. Defaults to the project's reference TURN (shared
@@ -611,6 +702,7 @@ impl NetworkConfig {
             kind: Default::default(),
             topology: Default::default(),
             signaling: Default::default(),
+            closed_relay: ClosedRelayPolicyConfig::default(),
             stun_servers: default_stun_servers(),
             turn_servers: default_turn_servers(),
             roster_path: None,
@@ -1601,6 +1693,92 @@ mod tests {
             };
             assert!(!overflow.validate());
         }
+    }
+
+    #[test]
+    fn closed_relay_policy_is_legacy_default_compatible_and_bounded() {
+        let legacy: NetworkConfig = serde_json::from_str(
+            r#"{"id":"legacy","network_id":"legacy-net","signaling":{"strategy":"none","mdns":false,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false},"stun_servers":[],"turn_servers":[],"pinned_peers":[],"auto_approve":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.closed_relay, ClosedRelayPolicyConfig::default());
+
+        let configured = ClosedRelayPolicyConfig {
+            enabled: true,
+            max_allocations: 3,
+            max_allocations_per_member: 2,
+            max_pending_handshakes: 5,
+            replay_window: 11,
+            max_frame_ciphertext_bytes: 8191,
+            queue_items_per_direction: 7,
+            queue_bytes_per_direction: 17_000,
+            bandwidth_rate_bytes_per_second: 19_000,
+            bandwidth_burst_bytes: 23_000,
+            idle_timeout_ms: 29_000,
+            max_lifetime_ms: 31_000,
+            max_control_bytes: 37_000,
+            shutdown_grace_ms: 41_000,
+        };
+        let network = NetworkConfig {
+            closed_relay: configured.clone(),
+            ..NetworkConfig::from_network_id("configured", "configured-net")
+        };
+        let encoded = serde_json::to_string(&network).unwrap();
+        let decoded: NetworkConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.closed_relay, configured);
+        assert!(decoded.closed_relay.validate());
+
+        assert!(!ClosedRelayPolicyConfig {
+            queue_items_per_direction: 0,
+            ..configured.clone()
+        }
+        .validate());
+        assert!(!ClosedRelayPolicyConfig {
+            max_frame_ciphertext_bytes: MAX_CLOSED_RELAY_PACKET_BYTES + 1,
+            ..configured
+        }
+        .validate());
+    }
+
+    #[test]
+    fn closed_relay_plaintext_ceiling_is_sctp_safe_and_checked() {
+        let exact = ClosedRelayPolicyConfig {
+            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
+            ..ClosedRelayPolicyConfig::default()
+        };
+        assert!(exact.validate());
+        assert!(!ClosedRelayPolicyConfig {
+            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+                + 1,
+            ..exact
+        }
+        .validate());
+        let exact_formula = crate::protocol::relay::closed_relay_worst_case_json_bytes(
+            crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+                + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES,
+        );
+        assert!(
+            exact_formula.expect("boundary arithmetic is representable")
+                <= crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
+        );
+        assert_eq!(exact_formula, Some(65_532));
+        assert!(
+            crate::protocol::relay::closed_relay_worst_case_json_bytes(
+                crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+                    + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES
+                    + 1
+            )
+            .expect("next boundary arithmetic is representable")
+                > crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
+        );
+        assert_eq!(
+            crate::protocol::relay::closed_relay_worst_case_json_bytes(
+                crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
+                    + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES
+                    + 1
+            ),
+            Some(65_536)
+        );
     }
 
     #[test]

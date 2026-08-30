@@ -9,7 +9,7 @@
 //!
 //! ```no_run
 //! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
-//! use myownmesh_core::{Mesh, MeshConfig, NetworkConfig, TopologyMode};
+//! use myownmesh_core::{ClosedRelayPolicyConfig, Mesh, MeshConfig, NetworkConfig, TopologyMode};
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
 //! let mesh = Mesh::open_connector_capable(
@@ -26,6 +26,7 @@
 //!     kind: Default::default(),                            // Open (default)
 //!     topology: TopologyMode::default(),
 //!     signaling: Default::default(),
+//!     closed_relay: ClosedRelayPolicyConfig::default(),
 //!     stun_servers: Default::default(),
 //!     turn_servers: Default::default(),
 //!     roster_path: None,

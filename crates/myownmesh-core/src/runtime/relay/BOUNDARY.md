@@ -2,11 +2,15 @@
 
 ## Purpose
 
-Own exact bounded opaque relay allocations. Arc 02 installs `RelayAllocationPermit`; Arc 12 supplies production allocation profiles and deletes ordinary member forwarding.
+Own exact bounded opaque relay allocations. The production runtime admits a
+provider-backed `RelayAllocationPermit` only after the engine binds the exact
+closed-member witnesses and owner-selected finite profile.
 
 ## Owned state
 
-The target owner holds exact allocation endpoints, bounded queues and buffers, allocation lifetime, and relay-local observations. No mutable relay state moves in Arc 02.
+The target owner holds exact allocation endpoints, both directional bounded
+queues and buffers, allocation lifetime, and relay-local observations. Endpoint
+key material remains outside this boundary.
 
 ## Inputs
 
@@ -26,11 +30,18 @@ Relay Node depends on typed attempt or session ports and the selected relay prof
 
 ## Resources
 
-Pre-authentication relay attempts and post-authentication relay data use separate reviewed resource families. Arc 02 creates no production permit issuer and selects no allocation, queue, lifetime, or bandwidth value.
+Pre-authentication handshakes and post-authentication relay data use separate
+reviewed resource families. The permit reserves the retained relay allocation;
+the immutable profile supplies every allocation, queue, lifetime, bandwidth,
+control, and shutdown bound.
 
 ## Restart behavior
 
-Possession of an allocation permit grants the authority represented by that type. Its runtime witness grants no authority. The witness only prevents use against a replacement runtime object. Allocation permits and live allocations are memory-only and disappear on process restart. Public destinations, route labels, and stored records cannot recreate them.
+Possession of an allocation permit grants only the exact provider-backed
+allocation represented by that type. Session witnesses prevent use against a
+replacement endpoint. The permit remains owned through shutdown grace and is
+released exactly once by settlement. Allocations disappear on process restart;
+public destinations, route labels, and stored records cannot recreate them.
 
 ## Forbidden responsibilities
 
