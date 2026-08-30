@@ -38,7 +38,9 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
-use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits};
+use super::discovery::{
+    Discovery, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits, MdnsTimingProfile,
+};
 use super::wire::{self, DeviceIdValidator, Frame};
 use crate::nostr::handle::derive_room_handle;
 use crate::{
@@ -55,6 +57,9 @@ pub struct MdnsLimits {
     pub max_discovered_peers: usize,
     pub outbound_queue_capacity: usize,
     pub discovery: DiscoveryLimits,
+    /// Owner-selected deadlines and cadence shared by all mDNS tasks and
+    /// discovery queries.
+    pub timing: MdnsTimingProfile,
 }
 
 impl Default for MdnsLimits {
@@ -64,6 +69,7 @@ impl Default for MdnsLimits {
             max_discovered_peers: 1024,
             outbound_queue_capacity: 128,
             discovery: DiscoveryLimits::default(),
+            timing: MdnsTimingProfile::default(),
         }
     }
 }
@@ -71,9 +77,12 @@ impl Default for MdnsLimits {
 impl MdnsLimits {
     pub fn validate(self) -> bool {
         self.max_active_connections > 0
+            && self.max_active_connections <= Semaphore::MAX_PERMITS
             && self.max_discovered_peers > 0
             && self.outbound_queue_capacity > 0
+            && self.outbound_queue_capacity <= Semaphore::MAX_PERMITS
             && self.discovery.validate()
+            && self.timing.validate()
     }
 }
 
@@ -361,24 +370,19 @@ pub enum MdnsOutbound {
     },
 }
 
-/// How long a dial to a peer's advertised exchange port may take
-/// before we try its next address (or give up).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+// Dial, idle, and re-announce deadlines come from `MdnsTimingProfile`.
 
-/// An outbound exchange connection is closed after this much idle —
-/// signaling for one handshake is bursty; anything longer-lived than
-/// a burst should re-dial.
-const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+// An outbound exchange connection is closed after this much idle —
+// signaling for one handshake is bursty; anything longer-lived than
+// a burst should re-dial.
 
-/// Inbound exchange connections are dropped after this much idle.
-const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+// Inbound exchange connections use the owner-selected idle deadline.
 
-/// Cadence of the local re-announce tick: every interval, each peer
-/// still present in the mDNS cache is re-surfaced to the engine as a
-/// `PeerAnnounced`. This mirrors the Nostr driver's ~60 s steady
-/// announce heartbeat, which the engine's re-offer pacing expects —
-/// a peer stuck at Sighted is re-offered on announce arrivals.
-const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+// The local re-announce cadence is owner-selected; each peer
+// still present in the mDNS cache is re-surfaced to the engine as a
+// `PeerAnnounced`. This mirrors the Nostr driver's ~60 s steady
+// announce heartbeat, which the engine's re-offer pacing expects —
+// a peer stuck at Sighted is re-offered on announce arrivals.
 
 /// Start the driver. Fails fast if the mDNS daemon or the TCP
 /// listener can't come up (unlike Nostr, the fallible setup here is
@@ -421,6 +425,7 @@ where
         port,
         txt: wire::txt_properties(&room_handle, &config.device_id),
         limits: config.limits.discovery,
+        timing: config.limits.timing,
     })?;
     let discovery_task = discovery.take_task();
     let discovery = Arc::new(discovery);
@@ -453,6 +458,7 @@ where
         conns: Mutex::new(ConnectionOwnership::default()),
         connection_slots: Arc::new(Semaphore::new(config.limits.max_active_connections)),
         outbound_queue_capacity: config.limits.outbound_queue_capacity,
+        timing: config.limits.timing,
         connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
         #[cfg(test)]
         test_half_gate: Arc::new(Mutex::new(None)),
@@ -496,7 +502,7 @@ where
         }));
     }
 
-    // Re-announce tick — see [`REANNOUNCE_INTERVAL`].
+    // Re-announce tick uses the owner-selected timing profile.
     {
         let shared = shared.clone();
         tasks.push(tokio::spawn(async move {
@@ -584,6 +590,7 @@ struct Shared {
     conns: Mutex<ConnectionOwnership>,
     connection_slots: Arc<Semaphore>,
     outbound_queue_capacity: usize,
+    timing: MdnsTimingProfile,
     connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
     #[cfg(test)]
     test_half_gate: Arc<Mutex<Option<Arc<TestHalfGate>>>>,
@@ -612,6 +619,7 @@ struct PeerOwnership {
     max_peers: usize,
 }
 
+#[cfg(test)]
 impl Default for PeerOwnership {
     fn default() -> Self {
         Self::with_max_peers(MdnsLimits::default().max_discovered_peers)
@@ -1341,8 +1349,9 @@ async fn send_directed(
     // All advertised addresses race concurrently and the first
     // connect wins — a host advertises every interface (docker
     // bridges, secondary NICs, …) and dialing serially would burn a
-    // full DIAL_TIMEOUT per dead address, longer than a handshake
+    // the full dial deadline per dead address, longer than a handshake
     // window.
+    let dial_timeout = shared.timing.dial_timeout;
     let attempts: Vec<_> = entry
         .addrs
         .iter()
@@ -1350,7 +1359,7 @@ async fn send_directed(
             let addr = *addr;
             let port = entry.port;
             Box::pin(async move {
-                timeout(DIAL_TIMEOUT, TcpStream::connect((addr, port)))
+                timeout(dial_timeout, TcpStream::connect((addr, port)))
                     .await
                     .map_err(|_| {
                         std::io::Error::new(std::io::ErrorKind::TimedOut, "dial timeout")
@@ -1475,7 +1484,14 @@ fn adopt_stream(
         #[cfg(test)]
         let writer_gate = shared.test_half_gate.lock().clone();
         let writer_task = async move {
-            run_writer(write_half, rx, cancel, local_cancel).await;
+            run_writer(
+                write_half,
+                rx,
+                cancel,
+                local_cancel,
+                shared.timing.connection_idle_timeout,
+            )
+            .await;
             let _ = local_stop.send(true);
             // Deregister — only our own generation; a newer connection
             // may have replaced this entry already.
@@ -1515,47 +1531,53 @@ fn adopt_stream(
         #[cfg(test)]
         let reader_gate = shared.test_half_gate.lock().clone();
         let reader_task = async move {
-            run_reader(&shared, read_half, local_cancel, |from| {
-                if shared.stopped.load(Ordering::Acquire) {
-                    return;
-                }
-                let mut reg = registered_as.lock();
-                if reg.is_none() {
-                    if !shared.peers.lock().contains(from) {
+            run_reader(
+                &shared,
+                read_half,
+                local_cancel,
+                shared.timing.inbound_idle_timeout,
+                |from| {
+                    if shared.stopped.load(Ordering::Acquire) {
                         return;
                     }
-                    let identity_retention = ConnectionIdentityRetention::for_peer(from);
-                    let identity_owner = match shared
-                        .alias_provider
-                        .retain_connection_identity(from, identity_retention)
-                    {
-                        Ok(owner) => owner,
-                        Err(refusal) => {
-                            debug!(?refusal, "mdns connection identity retention refused");
+                    let mut reg = registered_as.lock();
+                    if reg.is_none() {
+                        if !shared.peers.lock().contains(from) {
                             return;
                         }
-                    };
-                    let peer_key: Arc<str> = Arc::from(from);
-                    let displaced = shared.conns.lock().insert(
-                        peer_key.clone(),
-                        ConnHandle {
-                            generation,
-                            tx: tx.clone(),
-                            stop: local_stop.clone(),
-                        },
-                        Box::new((
-                            identity_owner,
-                            ConnectionCustodyNode {
-                                custody: Arc::clone(&custody),
+                        let identity_retention = ConnectionIdentityRetention::for_peer(from);
+                        let identity_owner = match shared
+                            .alias_provider
+                            .retain_connection_identity(from, identity_retention)
+                        {
+                            Ok(owner) => owner,
+                            Err(refusal) => {
+                                debug!(?refusal, "mdns connection identity retention refused");
+                                return;
+                            }
+                        };
+                        let peer_key: Arc<str> = Arc::from(from);
+                        let displaced = shared.conns.lock().insert(
+                            peer_key.clone(),
+                            ConnHandle {
+                                generation,
+                                tx: tx.clone(),
+                                stop: local_stop.clone(),
                             },
-                        )) as ErasedOwner,
-                    );
-                    if let Some(displaced) = displaced {
-                        let _ = displaced.stop.send(true);
+                            Box::new((
+                                identity_owner,
+                                ConnectionCustodyNode {
+                                    custody: Arc::clone(&custody),
+                                },
+                            )) as ErasedOwner,
+                        );
+                        if let Some(displaced) = displaced {
+                            let _ = displaced.stop.send(true);
+                        }
+                        *reg = Some(peer_key);
                     }
-                    *reg = Some(peer_key);
-                }
-            })
+                },
+            )
             .await;
             let _ = local_stop.send(true);
             // A dead read side means the conversation is over even if
@@ -1600,10 +1622,11 @@ async fn run_writer(
     mut rx: mpsc::Receiver<OwnedSignal<String, ErasedOwner>>,
     mut cancel: watch::Receiver<bool>,
     mut local_cancel: watch::Receiver<bool>,
+    idle_timeout: Duration,
 ) {
     loop {
         let next = tokio::select! {
-            next = timeout(CONN_IDLE_TIMEOUT, rx.recv()) => next,
+            next = timeout(idle_timeout, rx.recv()) => next,
             _ = cancel.changed() => return,
             _ = local_cancel.changed() => return,
         };
@@ -1646,9 +1669,23 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
             }
             Err(e) => {
                 debug!("mdns accept error: {e}");
-                sleep(Duration::from_millis(100)).await;
+                if !wait_for_accept_error_backoff(&mut cancel, shared.timing.accept_error_backoff)
+                    .await
+                {
+                    return;
+                }
             }
         }
+    }
+}
+
+async fn wait_for_accept_error_backoff(
+    cancel: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    tokio::select! {
+        _ = sleep(delay) => true,
+        _ = cancel.changed() => false,
     }
 }
 
@@ -1656,6 +1693,7 @@ async fn run_reader(
     shared: &Arc<Shared>,
     read_half: tokio::net::tcp::OwnedReadHalf,
     mut local_cancel: watch::Receiver<bool>,
+    idle_timeout: Duration,
     mut on_peer_frame: impl FnMut(&str),
 ) {
     let mut reader = BufReader::new(read_half);
@@ -1668,7 +1706,7 @@ async fn run_reader(
         buf.clear();
         let read = tokio::select! {
             read = timeout(
-                INBOUND_IDLE_TIMEOUT,
+                idle_timeout,
                 read_bounded_line(&mut reader, &mut buf),
             ) => read,
             _ = cancel.changed() => return,
@@ -1778,7 +1816,7 @@ async fn run_reannounce(shared: Arc<Shared>) {
     let mut cancel = shared.cancel.subscribe();
     loop {
         tokio::select! {
-            _ = sleep(REANNOUNCE_INTERVAL) => {}
+            _ = sleep(shared.timing.reannounce_interval) => {}
             _ = cancel.changed() => return,
         }
         if *cancel.borrow() {
@@ -1921,6 +1959,7 @@ mod tests {
                 event_capacity: 3,
                 max_event_epochs: 4,
             },
+            timing: MdnsTimingProfile::default(),
         };
         let released = Arc::new(AtomicU64::new(0));
         let attempted = Arc::new(AtomicUsize::new(0));
@@ -1930,6 +1969,7 @@ mod tests {
             port: 0,
             txt: Vec::new(),
             limits: limits.discovery,
+            timing: limits.timing,
         };
         let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
         let (in_tx, _in_rx) = mpsc::unbounded_channel();
@@ -1949,6 +1989,7 @@ mod tests {
             conns: Mutex::new(ConnectionOwnership::default()),
             connection_slots: Arc::new(Semaphore::new(limits.max_active_connections)),
             outbound_queue_capacity: limits.outbound_queue_capacity,
+            timing: limits.timing,
             connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             test_half_gate: Arc::new(Mutex::new(None)),
             stopped: Arc::new(AtomicBool::new(false)),
@@ -2098,6 +2139,40 @@ mod tests {
             ..limits
         }
         .validate());
+        assert!(!MdnsLimits {
+            timing: MdnsTimingProfile {
+                query_deadline: Duration::ZERO,
+                ..limits.timing
+            },
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            timing: MdnsTimingProfile {
+                accept_error_backoff: Duration::ZERO,
+                ..limits.timing
+            },
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            max_active_connections: Semaphore::MAX_PERMITS + 1,
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            outbound_queue_capacity: Semaphore::MAX_PERMITS + 1,
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            discovery: DiscoveryLimits {
+                event_capacity: Semaphore::MAX_PERMITS + 1,
+                ..limits.discovery
+            },
+            ..limits
+        }
+        .validate());
     }
 
     #[test]
@@ -2111,6 +2186,10 @@ mod tests {
                 event_capacity: 13,
                 max_event_epochs: 17,
             },
+            timing: MdnsTimingProfile {
+                accept_error_backoff: Duration::from_millis(41),
+                ..MdnsTimingProfile::default()
+            },
         };
         assert!(limits.validate());
         let peers = PeerOwnership::with_max_peers(limits.max_discovered_peers);
@@ -2121,6 +2200,35 @@ mod tests {
         assert_eq!(limits.discovery.event_capacity, 13);
         assert_eq!(limits.discovery.max_resolve_owners, 11);
         assert_eq!(limits.discovery.max_event_epochs, 17);
+        assert_eq!(
+            limits.timing.accept_error_backoff,
+            Duration::from_millis(41)
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_error_backoff_honors_profile_and_cancels_immediately() {
+        let profile = MdnsTimingProfile {
+            accept_error_backoff: Duration::from_millis(1),
+            ..MdnsTimingProfile::default()
+        };
+        assert!(profile.validate());
+
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        assert!(timeout(
+            Duration::from_secs(1),
+            wait_for_accept_error_backoff(&mut cancel, profile.accept_error_backoff),
+        )
+        .await
+        .expect("configured accept-error backoff completes"));
+
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        let backoff = wait_for_accept_error_backoff(&mut cancel, Duration::from_secs(60));
+        tokio::pin!(backoff);
+        cancel_tx.send(true).expect("cancellation receiver is live");
+        assert!(!timeout(Duration::from_secs(1), &mut backoff)
+            .await
+            .expect("accept-error cancellation is prompt"));
     }
 
     #[test]
@@ -2241,6 +2349,7 @@ mod tests {
                 event_capacity: 3,
                 max_event_epochs: 4,
             },
+            timing: MdnsTimingProfile::default(),
         };
         let released = Arc::new(AtomicU64::new(0));
         let attempted = Arc::new(AtomicUsize::new(0));
@@ -2250,6 +2359,7 @@ mod tests {
             port: 0,
             txt: Vec::new(),
             limits: limits.discovery,
+            timing: limits.timing,
         };
         let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
         let (in_tx, _in_rx) = mpsc::unbounded_channel();
@@ -2269,6 +2379,7 @@ mod tests {
             conns: Mutex::new(ConnectionOwnership::default()),
             connection_slots: Arc::new(Semaphore::new(limits.max_active_connections)),
             outbound_queue_capacity: limits.outbound_queue_capacity,
+            timing: limits.timing,
             connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
             test_half_gate: Arc::new(Mutex::new(None)),
             stopped: Arc::new(AtomicBool::new(false)),

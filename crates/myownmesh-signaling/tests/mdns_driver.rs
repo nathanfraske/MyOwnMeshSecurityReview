@@ -145,11 +145,10 @@ fn advertised_profile_excludes_other_room_and_recipient() {
 
 #[test]
 fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
-    use myownmesh_signaling::mdns::discovery::{
-        DiscoveryLimits, ResolveCompletion, ResolveHint, ResolveOwnership,
-    };
+    use myownmesh_signaling::mdns::discovery::{ResolveCompletion, ResolveHint, ResolveOwnership};
 
-    let ownership = ResolveOwnership::new();
+    let max_owners = 256;
+    let ownership = ResolveOwnership::with_max_owners(max_owners);
     let first = match ownership.admit("service-a") {
         ResolveHint::Started(lease) => lease,
         other => panic!("first service hint was not admitted: {other:?}"),
@@ -178,7 +177,6 @@ fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
     assert_eq!(ownership.active_count(), 0);
 
     let mut leases = Vec::new();
-    let max_owners = DiscoveryLimits::default().max_resolve_owners;
     for index in 0..max_owners {
         match ownership.admit(format!("service-{index}")) {
             ResolveHint::Started(lease) => leases.push(lease),
@@ -200,7 +198,7 @@ fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
 fn discovery_hint_cancellation_fences_stale_service_instance_owners() {
     use myownmesh_signaling::mdns::discovery::{ResolveHint, ResolveOwnership};
 
-    let ownership = ResolveOwnership::new();
+    let ownership = ResolveOwnership::with_max_owners(1);
     let stale = match ownership.admit("service-replaced") {
         ResolveHint::Started(lease) => lease,
         other => panic!("stale service hint was not admitted: {other:?}"),

@@ -22,7 +22,7 @@
 //!
 //! Long-lived refs (the browse, the registration) each get a thread for the
 //! driver's lifetime; per-instance resolve + address lookups are short-lived
-//! threads that exit once the answer (or a 5 s deadline) arrives.
+//! threads that exit once the answer or owner-selected query deadline arrives.
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -297,6 +297,7 @@ struct Inner {
     /// shutdown joins any that are still live. This keeps callback contexts
     /// and resolve ownership alive only for their owner.
     workers: WorkerRegistry,
+    query_deadline: Duration,
 }
 
 /// A checked, non-wrapping epoch for each exact DNS-SD service-instance key.
@@ -311,6 +312,7 @@ struct EventEpochs {
 }
 
 impl EventEpochs {
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_max_epochs(super::DiscoveryLimits::default().max_event_epochs)
     }
@@ -447,7 +449,7 @@ impl Discovery {
         let instance = CString::new(cfg.instance.as_str())
             .map_err(|e| Error::Other(format!("instance name: {e}")))?;
 
-        if !cfg.limits.validate() {
+        if !cfg.limits.validate() || !cfg.timing.validate() {
             return Err(Error::Other("invalid discovery limits".into()));
         }
         let (tx, rx) = mpsc::channel(cfg.limits.event_capacity);
@@ -463,6 +465,7 @@ impl Discovery {
             resolution_fence: Mutex::new(()),
             tx,
             workers: WorkerRegistry::new(),
+            query_deadline: cfg.timing.query_deadline,
         });
 
         // Browse first (mirrors the embedded backend: never miss resolves
@@ -690,7 +693,11 @@ unsafe extern "C" fn browse_cb(
     let Some(domain_bytes) = bounded_cstr(domain, MAX_DNS_NAME_BYTES) else {
         return;
     };
-    let Ok(_queue_slot) = inner.tx.try_reserve() else {
+    // Admit the callback's one bounded event slot before copying any backend
+    // bytes.  The same permit must be consumed by Removed; reserving again
+    // there would make a capacity-one queue reject the very withdrawal that
+    // was already admitted.
+    let Ok(queue_slot) = inner.tx.try_reserve() else {
         return;
     };
     let Ok(name) = String::from_utf8(name_bytes.to_vec()) else {
@@ -762,9 +769,6 @@ unsafe extern "C" fn browse_cb(
             }
         }
     } else {
-        let Ok(queue_slot) = inner.tx.try_reserve() else {
-            return;
-        };
         let generation = {
             let _resolution_fence = inner.resolution_fence.lock();
             inner.resolving.cancel(&name);
@@ -775,12 +779,16 @@ unsafe extern "C" fn browse_cb(
             generation
         };
         if let Some(generation) = generation {
-            let _ = queue_slot.send(DiscoveryEvent::Removed {
-                generation,
-                key: name,
-            });
+            publish_removed(queue_slot, generation, name);
         }
     }
+}
+
+/// Publish a withdrawal using the permit admitted by the callback. Keeping
+/// this as a consuming helper makes the one-reservation rule explicit for the
+/// system backend's capacity-one path.
+fn publish_removed(queue_slot: mpsc::Permit<'_, DiscoveryEvent>, generation: u64, key: String) {
+    let _ = queue_slot.send(DiscoveryEvent::Removed { generation, key });
 }
 
 /// Borrow a NUL-terminated C string only after proving its bound. This keeps
@@ -877,10 +885,6 @@ unsafe extern "C" fn addr_cb(
     }
 }
 
-/// How long a resolve or address query may take before we give up on the
-/// instance (it re-resolves on its next announce).
-const QUERY_DEADLINE: Duration = Duration::from_secs(5);
-
 fn run_resolve(
     inner: Arc<Inner>,
     name: String,
@@ -894,7 +898,14 @@ fn run_resolve(
         if inner.stopped.load(Ordering::Acquire) {
             return;
         }
-        let result = resolve_instance(&inner, &name, &regtype, &domain, interface_index);
+        let result = resolve_instance(
+            &inner,
+            &name,
+            &regtype,
+            &domain,
+            interface_index,
+            inner.query_deadline,
+        );
         let completion = {
             let _resolution_fence = inner.resolution_fence.lock();
             lease.complete_with(|| {
@@ -924,6 +935,7 @@ fn resolve_instance(
     regtype: &str,
     domain: &str,
     interface_index: u32,
+    query_deadline: Duration,
 ) -> Option<(Vec<IpAddr>, u16, HashMap<String, String>)> {
     let (Ok(c_name), Ok(c_regtype), Ok(c_domain)) = (
         CString::new(name),
@@ -936,6 +948,7 @@ fn resolve_instance(
     // SRV + TXT.
     let mut out = ResolveOut::default();
     let mut sd_ref: DNSServiceRef = std::ptr::null_mut();
+    let resolve_deadline = checked_query_deadline(query_deadline)?;
     let err = unsafe {
         DNSServiceResolve(
             &mut sd_ref,
@@ -956,7 +969,7 @@ fn resolve_instance(
         process_ref(
             sd_ref,
             || out.done || inner.stopped.load(Ordering::SeqCst),
-            Some(Instant::now() + QUERY_DEADLINE),
+            Some(resolve_deadline),
         );
         DNSServiceRefDeallocate(sd_ref);
     }
@@ -967,6 +980,7 @@ fn resolve_instance(
     let c_host = CString::new(host).ok()?;
     let mut addrs = AddrOut::default();
     let mut sd_ref: DNSServiceRef = std::ptr::null_mut();
+    let address_deadline = checked_query_deadline(query_deadline)?;
     let err = unsafe {
         DNSServiceQueryRecord(
             &mut sd_ref,
@@ -987,12 +1001,25 @@ fn resolve_instance(
         process_ref(
             sd_ref,
             || addrs.done || inner.stopped.load(Ordering::SeqCst),
-            Some(Instant::now() + QUERY_DEADLINE),
+            Some(address_deadline),
         );
         DNSServiceRefDeallocate(sd_ref);
     }
 
     Some((addrs.addrs, out.port, out.txt))
+}
+
+fn checked_query_deadline(query_deadline: Duration) -> Option<Instant> {
+    checked_query_deadline_with(query_deadline, |duration| {
+        Instant::now().checked_add(duration)
+    })
+}
+
+fn checked_query_deadline_with<F>(query_deadline: Duration, checked_add: F) -> Option<Instant>
+where
+    F: FnOnce(Duration) -> Option<Instant>,
+{
+    checked_add(query_deadline)
 }
 
 #[cfg(test)]
@@ -1028,6 +1055,32 @@ mod tests {
     }
 
     #[test]
+    fn checked_query_deadline_gates_backend_call_without_platform_assumptions() {
+        let mut backend_called = false;
+        let refused =
+            checked_query_deadline_with(Duration::from_secs(1), |_| None).and_then(|_| {
+                backend_called = true;
+                Some(())
+            });
+        assert!(refused.is_none());
+        assert!(
+            !backend_called,
+            "backend witness must follow checked deadline"
+        );
+
+        let mut backend_called = false;
+        let accepted = checked_query_deadline(Duration::from_secs(1)).and_then(|_| {
+            backend_called = true;
+            Some(())
+        });
+        assert!(accepted.is_some());
+        assert!(
+            backend_called,
+            "representable deadline reaches backend witness"
+        );
+    }
+
+    #[test]
     fn event_epochs_fence_stale_removal_and_exhaust_without_reuse() {
         let epochs = EventEpochs::new();
         let first = epochs.admit("service-a").expect("first epoch");
@@ -1059,6 +1112,32 @@ mod tests {
     }
 
     #[test]
+    fn event_epoch_capacity_one_fences_stale_withdrawal_and_allows_progress() {
+        let epochs = EventEpochs::with_max_epochs(1);
+        let first = epochs.admit("service-first").expect("first epoch");
+        assert_eq!(epochs.admit("service-blocked"), None);
+        assert!(!epochs.remove_if_current("service-first", first + 1));
+        assert_eq!(epochs.current("service-first"), Some(first));
+        assert!(epochs.remove_if_current("service-first", first));
+        let successor = epochs.admit("service-successor").expect("successor epoch");
+        assert_ne!(successor, first);
+        assert!(!epochs.remove_if_current("service-successor", first));
+        assert!(epochs.remove_if_current("service-successor", successor));
+    }
+
+    #[test]
+    fn removed_consumes_its_already_admitted_slot_at_capacity_one() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let slot = tx.try_reserve().expect("capacity-one slot is admitted");
+        publish_removed(slot, 7, "service-withdrawn".to_string());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Removed { generation: 7, key }) if key == "service-withdrawn"
+        ));
+        assert!(tx.try_reserve().is_ok(), "slot is reusable after delivery");
+    }
+
+    #[test]
     fn worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty() {
         let workers = WorkerRegistry::new();
         workers.push(std::thread::spawn(|| {}));
@@ -1086,7 +1165,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a running system mDNS daemon (mDNSResponder / avahi)"]
     async fn registers_and_browses_via_the_system_daemon() {
-        let limits = super::DiscoveryLimits {
+        let limits = crate::mdns::discovery::DiscoveryLimits {
             max_resolve_owners: 3,
             event_capacity: 5,
             max_event_epochs: 7,
@@ -1101,6 +1180,7 @@ mod tests {
                 ("peer".into(), "peerpubkey".into()),
             ],
             limits,
+            timing: crate::mdns::discovery::MdnsTimingProfile::default(),
         };
 
         // A browser under a different instance name, so the advertiser's

@@ -32,12 +32,14 @@
 //!   single-process apps).
 
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
 #[cfg(any(test, feature = "transport-lab"))]
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
+use myownmesh_signaling::mdns::discovery::MdnsTimingProfile;
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
     MdnsLimits, PeerRetention,
@@ -1030,6 +1032,36 @@ fn validate_mdns_device_id(value: &str) -> bool {
     crate::semantic::DeviceId::from_canonical_str(value).is_ok()
 }
 
+fn mdns_limits_from_policy(policy: &crate::config::MdnsPolicyConfig) -> Option<MdnsLimits> {
+    if !policy.validate() {
+        return None;
+    }
+    Some(MdnsLimits {
+        max_active_connections: usize::try_from(policy.max_active_connections).ok()?,
+        max_discovered_peers: usize::try_from(policy.max_discovered_peers).ok()?,
+        outbound_queue_capacity: usize::try_from(policy.outbound_queue_capacity).ok()?,
+        discovery: myownmesh_signaling::mdns::discovery::DiscoveryLimits {
+            max_resolve_owners: usize::try_from(policy.max_resolve_owners).ok()?,
+            event_capacity: usize::try_from(policy.event_capacity).ok()?,
+            max_event_epochs: usize::try_from(policy.max_event_epochs).ok()?,
+        },
+        timing: MdnsTimingProfile {
+            dial_timeout: mdns_duration(policy.dial_timeout_ms)?,
+            connection_idle_timeout: mdns_duration(policy.connection_idle_timeout_ms)?,
+            inbound_idle_timeout: mdns_duration(policy.inbound_idle_timeout_ms)?,
+            reannounce_interval: mdns_duration(policy.reannounce_interval_ms)?,
+            query_deadline: mdns_duration(policy.query_deadline_ms)?,
+            accept_error_backoff: mdns_duration(policy.accept_error_backoff_ms)?,
+        },
+    })
+}
+
+fn mdns_duration(milliseconds: u64) -> Option<Duration> {
+    let seconds = milliseconds / 1_000;
+    let nanos = (milliseconds % 1_000).checked_mul(1_000_000)?;
+    Some(Duration::new(seconds, nanos.try_into().ok()?))
+}
+
 struct CoreMdnsAliasProvider {
     scope: LocalApplicationResourceScope,
 }
@@ -1681,16 +1713,27 @@ fn attach_mdns_with(
 ) -> Option<MdnsDriverHandle> {
     let guard = attach.guard();
     let scope = local_scope(state, "mdns")?;
+    let (network_id, limits) = {
+        let config = state.config.read();
+        let Some(limits) = mdns_limits_from_policy(&config.signaling.mdns_policy) else {
+            warn!(
+                network = %state.network_id,
+                "mDNS driver not attached: invalid owner-selected policy"
+            );
+            return None;
+        };
+        (config.network_id.clone(), limits)
+    };
     let mdns_cfg = MdnsDriverConfig {
         app_id: resolve_app_id(),
-        network_id: state.config.read().network_id.clone(),
+        network_id,
         device_id: state.identity.public_id().to_string(),
         service_port: 0,
         device_id_validator: validate_mdns_device_id,
         alias_provider: Arc::new(CoreMdnsAliasProvider {
             scope: scope.clone(),
         }),
-        limits: MdnsLimits::default(),
+        limits,
     };
 
     let device_id = state.identity.public_id().to_string();
@@ -2339,6 +2382,53 @@ static FANOUT_AFTER_ADMISSION: OnceLock<Mutex<Option<Arc<FanoutTestGate>>>> = On
 mod tests {
     use super::*;
     use crate::engine::signaling_ingress::{self, EphemeralSignal};
+
+    #[test]
+    fn mdns_policy_translation_preserves_sentinels_and_rejects_zero() {
+        let policy = crate::config::MdnsPolicyConfig {
+            max_active_connections: 3,
+            max_discovered_peers: 5,
+            outbound_queue_capacity: 7,
+            max_resolve_owners: 11,
+            event_capacity: 13,
+            max_event_epochs: 17,
+            dial_timeout_ms: 19,
+            connection_idle_timeout_ms: 23,
+            inbound_idle_timeout_ms: 29,
+            reannounce_interval_ms: 31,
+            query_deadline_ms: 37,
+            accept_error_backoff_ms: 41,
+        };
+
+        let limits = mdns_limits_from_policy(&policy).expect("sentinel policy translates");
+        assert_eq!(limits.max_active_connections, 3);
+        assert_eq!(limits.max_discovered_peers, 5);
+        assert_eq!(limits.outbound_queue_capacity, 7);
+        assert_eq!(limits.discovery.max_resolve_owners, 11);
+        assert_eq!(limits.discovery.event_capacity, 13);
+        assert_eq!(limits.discovery.max_event_epochs, 17);
+        assert_eq!(limits.timing.dial_timeout, Duration::from_millis(19));
+        assert_eq!(
+            limits.timing.connection_idle_timeout,
+            Duration::from_millis(23)
+        );
+        assert_eq!(
+            limits.timing.inbound_idle_timeout,
+            Duration::from_millis(29)
+        );
+        assert_eq!(limits.timing.reannounce_interval, Duration::from_millis(31));
+        assert_eq!(limits.timing.query_deadline, Duration::from_millis(37));
+        assert_eq!(
+            limits.timing.accept_error_backoff,
+            Duration::from_millis(41)
+        );
+
+        let invalid_policy = crate::config::MdnsPolicyConfig {
+            event_capacity: 0,
+            ..policy
+        };
+        assert!(mdns_limits_from_policy(&invalid_policy).is_none());
+    }
 
     /// A scope on an isolated provider whose per-dimension grant is `budget`,
     /// plus a handle on the provider itself.

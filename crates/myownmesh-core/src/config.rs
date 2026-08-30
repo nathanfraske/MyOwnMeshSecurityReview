@@ -390,6 +390,76 @@ pub struct TurnServer {
     pub credential: Option<String>,
 }
 
+/// Owner-selected finite mDNS policy. Durations are integer milliseconds in
+/// the persisted config so the schema does not depend on Rust's `Duration`
+/// representation; the signaling bridge translates these values before
+/// creating any backend or socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct MdnsPolicyConfig {
+    pub max_active_connections: u64,
+    pub max_discovered_peers: u64,
+    pub outbound_queue_capacity: u64,
+    pub max_resolve_owners: u64,
+    pub event_capacity: u64,
+    pub max_event_epochs: u64,
+    pub dial_timeout_ms: u64,
+    pub connection_idle_timeout_ms: u64,
+    pub inbound_idle_timeout_ms: u64,
+    pub reannounce_interval_ms: u64,
+    pub query_deadline_ms: u64,
+    pub accept_error_backoff_ms: u64,
+}
+
+impl Default for MdnsPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_active_connections: 256,
+            max_discovered_peers: 1024,
+            outbound_queue_capacity: 128,
+            max_resolve_owners: 256,
+            event_capacity: 128,
+            max_event_epochs: 1024,
+            dial_timeout_ms: 5_000,
+            connection_idle_timeout_ms: 30_000,
+            inbound_idle_timeout_ms: 120_000,
+            reannounce_interval_ms: 60_000,
+            query_deadline_ms: 5_000,
+            accept_error_backoff_ms: 100,
+        }
+    }
+}
+
+impl MdnsPolicyConfig {
+    pub fn validate(&self) -> bool {
+        let semaphore_max = match u64::try_from(tokio::sync::Semaphore::MAX_PERMITS) {
+            Ok(max) => max,
+            Err(_) => return false,
+        };
+        self.max_active_connections > 0
+            && self.max_discovered_peers > 0
+            && self.outbound_queue_capacity > 0
+            && self.max_resolve_owners > 0
+            && self.event_capacity > 0
+            && self.max_event_epochs > 0
+            && self.dial_timeout_ms > 0
+            && self.connection_idle_timeout_ms > 0
+            && self.inbound_idle_timeout_ms > 0
+            && self.reannounce_interval_ms > 0
+            && self.query_deadline_ms > 0
+            && self.accept_error_backoff_ms > 0
+            && self.max_active_connections <= semaphore_max
+            && self.outbound_queue_capacity <= semaphore_max
+            && self.event_capacity <= semaphore_max
+            && usize::try_from(self.max_active_connections).is_ok()
+            && usize::try_from(self.max_discovered_peers).is_ok()
+            && usize::try_from(self.outbound_queue_capacity).is_ok()
+            && usize::try_from(self.max_resolve_owners).is_ok()
+            && usize::try_from(self.event_capacity).is_ok()
+            && usize::try_from(self.max_event_epochs).is_ok()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SignalingConfig {
@@ -430,6 +500,9 @@ pub struct SignalingConfig {
     /// moment one recovers — so steady state never touches public
     /// infrastructure. Set `false` to stay strictly on your own relays.
     pub public_fallback: bool,
+    /// Finite owner-selected mDNS workload and timing policy.
+    #[serde(default)]
+    pub mdns_policy: MdnsPolicyConfig,
 }
 
 impl Default for SignalingConfig {
@@ -441,6 +514,7 @@ impl Default for SignalingConfig {
             redundancy: DEFAULT_SIGNALING_REDUNDANCY,
             denylist: default_signaling_denylist(),
             public_fallback: true,
+            mdns_policy: MdnsPolicyConfig::default(),
         }
     }
 }
@@ -1455,6 +1529,78 @@ mod tests {
         assert_eq!(s.strategy, "nostr");
         assert_eq!(s.redundancy, DEFAULT_SIGNALING_REDUNDANCY);
         assert!(s.denylist.iter().any(|h| h == "relay.damus.io"));
+        assert!(s.mdns_policy.validate());
+    }
+
+    #[test]
+    fn mdns_policy_is_legacy_default_compatible_and_round_trips() {
+        let legacy: SignalingConfig = serde_json::from_str(
+            r#"{"strategy":"none","mdns":true,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.mdns_policy, MdnsPolicyConfig::default());
+
+        let configured = MdnsPolicyConfig {
+            max_active_connections: 3,
+            max_discovered_peers: 5,
+            outbound_queue_capacity: 7,
+            max_resolve_owners: 11,
+            event_capacity: 13,
+            max_event_epochs: 17,
+            dial_timeout_ms: 19,
+            connection_idle_timeout_ms: 23,
+            inbound_idle_timeout_ms: 29,
+            reannounce_interval_ms: 31,
+            query_deadline_ms: 37,
+            accept_error_backoff_ms: 41,
+        };
+        let signaling = SignalingConfig {
+            mdns_policy: configured.clone(),
+            ..SignalingConfig::default()
+        };
+        let encoded = serde_json::to_string(&signaling).unwrap();
+        let decoded: SignalingConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.mdns_policy, configured);
+    }
+
+    #[test]
+    fn mdns_policy_rejects_zero_and_platform_overflow() {
+        let zero = MdnsPolicyConfig {
+            event_capacity: 0,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!zero.validate());
+        let zero_backoff = MdnsPolicyConfig {
+            accept_error_backoff_ms: 0,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!zero_backoff.validate());
+
+        let semaphore_max = u64::try_from(tokio::sync::Semaphore::MAX_PERMITS)
+            .expect("Tokio semaphore ceiling fits persisted u64 limits");
+        let over_active = MdnsPolicyConfig {
+            max_active_connections: semaphore_max + 1,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!over_active.validate());
+        let over_outbound = MdnsPolicyConfig {
+            outbound_queue_capacity: semaphore_max + 1,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!over_outbound.validate());
+        let over_events = MdnsPolicyConfig {
+            event_capacity: semaphore_max + 1,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!over_events.validate());
+
+        if usize::BITS < 64 {
+            let overflow = MdnsPolicyConfig {
+                max_event_epochs: u64::MAX,
+                ..MdnsPolicyConfig::default()
+            };
+            assert!(!overflow.validate());
+        }
     }
 
     #[test]

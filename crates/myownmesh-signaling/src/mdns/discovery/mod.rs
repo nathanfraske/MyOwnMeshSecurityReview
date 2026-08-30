@@ -22,6 +22,44 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Owner-selected timing profile shared by the mDNS driver and discovery
+/// backends.  Keeping these values in the immutable driver limits means the
+/// planner and the enforcement paths consume the same source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MdnsTimingProfile {
+    pub dial_timeout: Duration,
+    pub connection_idle_timeout: Duration,
+    pub inbound_idle_timeout: Duration,
+    pub reannounce_interval: Duration,
+    pub query_deadline: Duration,
+    pub accept_error_backoff: Duration,
+}
+
+impl Default for MdnsTimingProfile {
+    fn default() -> Self {
+        Self {
+            dial_timeout: Duration::from_secs(5),
+            connection_idle_timeout: Duration::from_secs(30),
+            inbound_idle_timeout: Duration::from_secs(120),
+            reannounce_interval: Duration::from_secs(60),
+            query_deadline: Duration::from_secs(5),
+            accept_error_backoff: Duration::from_millis(100),
+        }
+    }
+}
+
+impl MdnsTimingProfile {
+    pub fn validate(self) -> bool {
+        self.dial_timeout > Duration::ZERO
+            && self.connection_idle_timeout > Duration::ZERO
+            && self.inbound_idle_timeout > Duration::ZERO
+            && self.reannounce_interval > Duration::ZERO
+            && self.query_deadline > Duration::ZERO
+            && self.accept_error_backoff > Duration::ZERO
+    }
+}
 
 /// Owner-selected finite limits for one discovery backend instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +85,10 @@ impl Default for DiscoveryLimits {
 
 impl DiscoveryLimits {
     pub fn validate(self) -> bool {
-        self.max_resolve_owners > 0 && self.event_capacity > 0 && self.max_event_epochs > 0
+        self.max_resolve_owners > 0
+            && self.event_capacity > 0
+            && self.event_capacity <= tokio::sync::Semaphore::MAX_PERMITS
+            && self.max_event_epochs > 0
     }
 }
 /// Maximum DNS-SD service-instance/name length accepted from a backend.
@@ -74,6 +115,8 @@ pub struct DiscoveryConfig {
     pub txt: Vec<(String, String)>,
     /// Validated owner-selected discovery workload limits.
     pub limits: DiscoveryLimits,
+    /// Validated owner-selected timing values used by system queries.
+    pub timing: MdnsTimingProfile,
 }
 
 /// One discovery observation. `key` is a backend-opaque identifier that is
@@ -321,18 +364,7 @@ pub struct ResolveOwnership {
     inner: Arc<ResolveOwnershipInner>,
 }
 
-impl Default for ResolveOwnership {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ResolveOwnership {
-    /// Create an empty, bounded ownership table.
-    pub fn new() -> Self {
-        Self::with_max_owners(DiscoveryLimits::default().max_resolve_owners)
-    }
-
     /// Create ownership with an explicit finite owner-selected bound.
     pub fn with_max_owners(max_owners: usize) -> Self {
         Self {
@@ -522,7 +554,7 @@ mod tests {
 
     #[test]
     fn generation_exhaustion_refuses_without_reuse() {
-        let ownership = ResolveOwnership::new();
+        let ownership = ResolveOwnership::with_max_owners(1);
         ownership
             .inner
             .next_generation
@@ -640,6 +672,21 @@ mod tests {
     }
 
     #[test]
+    fn timing_profile_rejects_zero_before_backend_start() {
+        let profile = MdnsTimingProfile {
+            query_deadline: Duration::ZERO,
+            ..MdnsTimingProfile::default()
+        };
+        assert!(!profile.validate());
+        let backoff_profile = MdnsTimingProfile {
+            accept_error_backoff: Duration::ZERO,
+            ..MdnsTimingProfile::default()
+        };
+        assert!(!backoff_profile.validate());
+        assert!(MdnsTimingProfile::default().validate());
+    }
+
+    #[test]
     fn resolve_ownership_uses_the_configured_non_default_cap() {
         let ownership = ResolveOwnership::with_max_owners(2);
         let first = ownership.admit("service-1");
@@ -650,6 +697,26 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(ownership.active_count(), 0);
+    }
+
+    #[test]
+    fn resolve_ownership_capacity_one_cancels_and_allows_unrelated_progress() {
+        let ownership = ResolveOwnership::with_max_owners(1);
+        let first = match ownership.admit("service-first") {
+            ResolveHint::Started(lease) => lease,
+            other => panic!("first service was not admitted: {other:?}"),
+        };
+        assert!(matches!(
+            ownership.admit("service-blocked"),
+            ResolveHint::Refused
+        ));
+        assert!(ownership.cancel("service-first"));
+        assert_eq!(ownership.active_count(), 0);
+        drop(first);
+        assert!(matches!(
+            ownership.admit("service-unrelated"),
+            ResolveHint::Started(_)
+        ));
     }
 }
 

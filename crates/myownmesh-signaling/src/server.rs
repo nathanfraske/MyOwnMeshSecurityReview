@@ -502,8 +502,12 @@ async fn accept_loop(listener: TcpListener, context: AcceptLoopContext) {
             settlement = writer_settlement_rx.recv() => {
                 match settlement {
                     Some(conn_id) => {
-                        settle_writer(&writers, conn_id, writer_stop_timeout).await;
-                        publish_registry_progress(&registry_terminal);
+                        settle_writer_with_progress(
+                            &writers,
+                            conn_id,
+                            writer_stop_timeout,
+                            Arc::clone(&registry_terminal),
+                        ).await;
                     }
                     None => break,
                 }
@@ -519,6 +523,7 @@ async fn accept_loop(listener: TcpListener, context: AcceptLoopContext) {
                 let hub = hub.clone();
                 let connections = Arc::clone(&connections);
                 let writers = Arc::clone(&writers);
+                let registry_terminal = Arc::clone(&registry_terminal);
                 let writer_settlement_tx = writer_settlement_tx.clone();
                 let Some(admission) = hub.admit(peer.ip()) else {
                     let mut stream = stream;
@@ -557,6 +562,7 @@ async fn accept_loop(listener: TcpListener, context: AcceptLoopContext) {
                         admission,
                         writers,
                         writer_settlement_tx,
+                        registry_terminal,
                     ))
                     .catch_unwind()
                     .await;
@@ -586,6 +592,7 @@ async fn handle_conn(
     admission: Admission,
     writers: WriterRegistry,
     writer_settlement_tx: WriterSettlementSender,
+    registry_terminal: Arc<RegistryTerminal>,
 ) -> Result<()> {
     let limits = hub.limits();
     let max_message_bytes = Limits::checked_usize(limits.max_message_bytes, "max_message_bytes")?;
@@ -717,7 +724,13 @@ async fn handle_conn(
     let mut shutdown = hub.shutdown_signal();
     if *shutdown.borrow() {
         let _ = closed_tx.send(true);
-        settle_writer(&writers, conn_id, limits.writer_stop_timeout()).await;
+        settle_writer_with_progress(
+            &writers,
+            conn_id,
+            limits.writer_stop_timeout(),
+            Arc::clone(&registry_terminal),
+        )
+        .await;
         cleanup.unregister();
         drop(out_tx);
         cleanup.disarm();
@@ -754,7 +767,13 @@ async fn handle_conn(
     }
 
     let _ = closed_tx.send(true);
-    settle_writer(&writers, conn_id, limits.writer_stop_timeout()).await;
+    settle_writer_with_progress(
+        &writers,
+        conn_id,
+        limits.writer_stop_timeout(),
+        registry_terminal,
+    )
+    .await;
     cleanup.unregister();
     drop(out_tx);
     cleanup.disarm();
@@ -809,14 +828,50 @@ fn writer_registry_slot_available(tasks: &WriterRegistry, capacity: usize) -> bo
 }
 
 async fn settle_writer(writers: &WriterRegistry, conn_id: u64, timeout: Duration) {
+    settle_writer_inner(writers, conn_id, timeout, None).await;
+}
+
+async fn settle_writer_with_progress(
+    writers: &WriterRegistry,
+    conn_id: u64,
+    timeout: Duration,
+    registry_terminal: Arc<RegistryTerminal>,
+) {
+    settle_writer_inner(writers, conn_id, timeout, Some(registry_terminal)).await;
+}
+
+async fn settle_writer_inner(
+    writers: &WriterRegistry,
+    conn_id: u64,
+    timeout: Duration,
+    registry_terminal: Option<Arc<RegistryTerminal>>,
+) {
     let writer = {
         let mut owned = writers.lock();
         owned.get_mut(&conn_id).and_then(Option::take)
     };
     if let Some(writer) = writer {
-        await_writer_with_timeout(writer, timeout).await;
+        // Once the placeholder is extracted, this dedicated owner is the
+        // cancellation-safe custody for the exact writer. If the accept or
+        // stop waiter is cancelled, this task still joins the writer and
+        // retires the same ID.
+        let writers = Arc::clone(writers);
+        let reaper = tokio::spawn(async move {
+            await_writer_with_timeout(writer, timeout).await;
+            writers.lock().remove(&conn_id);
+            if let Some(registry_terminal) = registry_terminal {
+                publish_registry_progress(&registry_terminal);
+            }
+        });
+        if let Err(error) = reaper.await {
+            warn!(
+                conn_id,
+                "writer settlement owner did not complete normally: {error}"
+            );
+        }
+    } else {
+        writers.lock().remove(&conn_id);
     }
-    writers.lock().remove(&conn_id);
 }
 
 #[cfg(test)]
@@ -2643,6 +2698,62 @@ mod tests {
         assert!(connections.lock().is_empty());
         assert!(writers.lock().is_empty());
         assert_eq!(hub.snapshot().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_server_after_writer_extraction_reaps_exact_writer() {
+        let _gate = TEST_GATE_SERIAL.lock().await;
+        let _reset = TestGateReset;
+        TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
+        TEST_WRITER_PARKED.store(false, Ordering::Release);
+        TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
+        let server = SignalingServer::start(
+            "127.0.0.1",
+            0,
+            Limits {
+                max_connections: 1,
+                writer_stop_timeout_secs: 1,
+                ..Limits::default()
+            },
+        )
+        .await
+        .unwrap();
+        let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+        let (first, _) = connect_async(&url).await.unwrap();
+        let mut progress = server.registry_terminal.progress.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if TEST_WRITER_PARKED.load(Ordering::Acquire)
+                    && server.stats().connections == 0
+                    && server
+                        .writers
+                        .lock()
+                        .values()
+                        .any(|writer| writer.is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer must be extracted before server drop");
+
+        let progress_before_drop = *progress.borrow_and_update();
+        let writers = Arc::clone(&server.writers);
+        drop(first);
+        drop(server);
+
+        tokio::time::timeout(Duration::from_secs(3), progress.changed())
+            .await
+            .expect("dedicated writer reaper must outlive waiter/server drop")
+            .expect("dedicated writer reaper must publish terminal progress");
+        assert!(
+            *progress.borrow() > progress_before_drop,
+            "writer terminal progress must be published after server drop"
+        );
+        assert!(writers.lock().is_empty());
     }
 
     #[tokio::test]

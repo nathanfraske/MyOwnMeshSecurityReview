@@ -34,7 +34,7 @@ impl Discovery {
     /// Browse starts before the first [`register`](Self::register) so we never
     /// miss a burst of resolves racing our own announce.
     pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
-        if !cfg.limits.validate() {
+        if !cfg.limits.validate() || !cfg.timing.validate() {
             return Err(Error::Other("invalid discovery limits".into()));
         }
         let daemon = ServiceDaemon::new().map_err(|e| Error::Other(format!("mdns daemon: {e}")))?;
