@@ -273,6 +273,128 @@ mod tests {
         WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
 
+    const MAX_ARC03_OBSERVED_DIMENSION: usize = 64;
+
+    fn arc03_observed_count(name: &str, default: usize) -> usize {
+        let value = match std::env::var(name) {
+            Ok(raw) => raw
+                .parse::<usize>()
+                .unwrap_or_else(|error| panic!("{name} must be a positive integer: {error}")),
+            Err(std::env::VarError::NotPresent) => default,
+            Err(error) => panic!("{name} is not valid Unicode: {error}"),
+        };
+        assert!(
+            (1..=MAX_ARC03_OBSERVED_DIMENSION).contains(&value),
+            "{name} must be between 1 and {MAX_ARC03_OBSERVED_DIMENSION}, got {value}"
+        );
+        value
+    }
+
+    fn observe_arc03_mesh_shape(
+        mesh_scope_count: usize,
+        candidates_per_mesh: usize,
+    ) -> ((usize, usize, usize, u64), usize) {
+        let candidate_total = mesh_scope_count
+            .checked_mul(candidates_per_mesh)
+            .expect("the bounded fixture candidate product is representable");
+        let grant = explicit_test_grant(
+            u64::try_from(candidate_total).expect("the fixture candidate count fits in u64"),
+            u64::try_from(mesh_scope_count).expect("the fixture mesh count fits in u64"),
+        );
+        let provider = FiniteResourceProvider::new(grant);
+        let (owner, scopes) = owner_and_scopes(&provider, mesh_scope_count);
+        assert_eq!(scopes.len(), mesh_scope_count);
+        let owner_mesh_scope_total = mesh_scope_count + 1;
+        assert_eq!(provider.active_scopes(), owner_mesh_scope_total);
+        let baseline = provider.in_use();
+
+        let mut attempts = Vec::with_capacity(mesh_scope_count);
+        let mut lifetimes = Vec::with_capacity(mesh_scope_count);
+        let mut candidates = Vec::with_capacity(candidate_total);
+        for scope in &scopes {
+            let (attempt, lifetime) =
+                PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scope.clone());
+            for _ in 0..candidates_per_mesh {
+                candidates.push(
+                    attempt
+                        .reserve_connector_candidate(candidate_claim())
+                        .expect("the requested provider-derived mesh shape is admitted"),
+                );
+            }
+            attempts.push(attempt);
+            lifetimes.push(lifetime);
+        }
+
+        let observed_scopes = provider.active_scopes();
+        let observed_candidates = owner.report().active_candidates;
+        let observed_native_transport_objects = provider
+            .in_use()
+            .amount(ResourceClass::NativeTransportObject);
+        let observed_active_reservations = provider.active_reservations();
+        let active_candidate_scope_total = owner_mesh_scope_total + candidate_total;
+        assert_eq!(observed_scopes, active_candidate_scope_total);
+        assert_eq!(observed_candidates, candidate_total);
+        assert_eq!(observed_native_transport_objects, candidate_total as u64);
+        let owner_cleanup_reservation_total = 1;
+        assert_eq!(
+            provider.active_reservations(),
+            candidate_total + owner_cleanup_reservation_total
+        );
+
+        drop(candidates);
+        assert_eq!(provider.active_scopes(), owner_mesh_scope_total);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(
+            provider.active_reservations(),
+            owner_cleanup_reservation_total
+        );
+        assert_eq!(owner.report().active_candidates, 0);
+
+        drop(attempts);
+        drop(lifetimes);
+        assert_eq!(provider.active_scopes(), owner_mesh_scope_total);
+        assert_eq!(
+            provider.active_reservations(),
+            owner_cleanup_reservation_total
+        );
+        assert_eq!(provider.in_use(), baseline);
+        drop(scopes);
+        assert_eq!(provider.active_scopes(), 1);
+        assert_eq!(provider.active_reservations(), 1);
+        drop(owner);
+        const CLEANUP_EXECUTOR_EXIT_YIELD_LIMIT: usize = 10_000;
+        for _ in 0..CLEANUP_EXECUTOR_EXIT_YIELD_LIMIT {
+            if provider.active_scopes() == 0
+                && provider.active_reservations() == 0
+                && provider.in_use() == ResourceClaim::ZERO
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            provider.active_scopes(),
+            0,
+            "cleanup executor did not release the provider root scope after {CLEANUP_EXECUTOR_EXIT_YIELD_LIMIT} scheduler yields"
+        );
+        assert_eq!(
+            provider.active_reservations(),
+            0,
+            "cleanup executor did not release its root reservation after {CLEANUP_EXECUTOR_EXIT_YIELD_LIMIT} scheduler yields"
+        );
+        assert_eq!(provider.in_use(), ResourceClaim::ZERO);
+
+        (
+            (
+                mesh_scope_count,
+                candidate_total,
+                observed_scopes,
+                observed_native_transport_objects,
+            ),
+            observed_active_reservations,
+        )
+    }
+
     #[test]
     fn v4_arc03_provider_policy_clone_shares_exact_provider_identity() {
         let grant = explicit_test_grant(1, 2);
@@ -288,6 +410,44 @@ mod tests {
 
     #[test]
     fn v4_arc03_mesh_scopes_share_one_grant_and_creation_does_not_multiply_it() {
+        let observation_requested = std::env::var_os("MYOWNMESH_ARC03_OBSERVE_MESHES").is_some()
+            || std::env::var_os("MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH").is_some();
+        if observation_requested {
+            let mesh_scope_count = arc03_observed_count("MYOWNMESH_ARC03_OBSERVE_MESHES", 2);
+            let candidates_per_mesh =
+                arc03_observed_count("MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH", 1);
+            let owner_mesh_scope_baseline = mesh_scope_count + 1;
+            let (
+                (
+                    observed_mesh_scope_count,
+                    observed_candidate_total,
+                    observed_active_scope_total,
+                    observed_native_transport_objects,
+                ),
+                observed_active_reservations,
+            ) = observe_arc03_mesh_shape(mesh_scope_count, candidates_per_mesh);
+            assert_eq!(observed_mesh_scope_count, mesh_scope_count);
+            assert_eq!(
+                observed_candidate_total,
+                mesh_scope_count * candidates_per_mesh
+            );
+            assert_eq!(
+                observed_active_scope_total,
+                owner_mesh_scope_baseline + observed_candidate_total
+            );
+            assert_eq!(
+                observed_native_transport_objects,
+                observed_candidate_total as u64
+            );
+            assert_eq!(observed_active_reservations, observed_candidate_total + 1);
+            if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
+                println!(
+                    "arc03_multi_mesh_raw requested_meshes={mesh_scope_count} candidates_per_mesh={candidates_per_mesh} observed_meshes={observed_mesh_scope_count} owner_mesh_scope_baseline={owner_mesh_scope_baseline} observed_active_scopes={observed_active_scope_total} observed_candidates={observed_candidate_total} observed_native_transport_objects={observed_native_transport_objects} observed_active_reservations={observed_active_reservations} provider_baseline_restored=true"
+                );
+            }
+            return;
+        }
+
         let refused_claim_without_native = ConnectorCandidateResourceClaim::exact_connector_floor()
             .opening
             .checked_sub(ResourceClaim::single(
@@ -328,6 +488,18 @@ mod tests {
         assert!(second_attempt
             .reserve_connector_candidate(candidate_claim())
             .is_some());
+    }
+
+    #[test]
+    fn v4_arc03_mesh_observation_shapes_are_discriminating() {
+        let (one_by_one, one_by_one_reservations) = observe_arc03_mesh_shape(1, 1);
+        let (three_by_four, three_by_four_reservations) = observe_arc03_mesh_shape(3, 4);
+
+        assert_eq!(one_by_one, (1, 1, 3, 1));
+        assert_eq!(three_by_four, (3, 12, 16, 12));
+        assert_eq!(one_by_one_reservations, 2);
+        assert_eq!(three_by_four_reservations, 13);
+        assert_ne!(one_by_one, three_by_four);
     }
 
     #[test]

@@ -13672,15 +13672,58 @@ mod tests {
                 .expect("finite observation burst content is representable");
             candidates.push(candidate);
         }
+        assert!(
+            candidates.iter().any(|candidate| {
+                candidate.candidate.capacity() > candidate.candidate.len()
+                    || candidate
+                        .sdp_mid
+                        .as_ref()
+                        .is_some_and(|value| value.capacity() > value.len())
+                    || candidate
+                        .username_fragment
+                        .as_ref()
+                        .is_some_and(|value| value.capacity() > value.len())
+            }),
+            "candidate burst includes retained string capacity beyond content"
+        );
+        let mut retained_capacity_claim = crate::resource::ResourceClaim::ZERO;
+        for candidate in &candidates {
+            let content = u64::try_from(
+                candidate_content_bytes(candidate)
+                    .expect("finite observation candidate content is representable"),
+            )
+            .expect("finite observation candidate content fits u64");
+            let baseline = pending_remote_candidate_queue_claim_with_content(0, 0)
+                .expect("candidate queue baseline claim is representable")
+                .checked_add(crate::resource::ResourceClaim::single(
+                    crate::resource::ResourceClass::AccountedMemoryBytes,
+                    content,
+                ))
+                .and_then(|claim| {
+                    claim.checked_add(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::QueuedBytes,
+                        content,
+                    ))
+                })
+                .expect("candidate queue baseline content claim is representable");
+            let retained = pending_remote_candidate_queue_claim(candidate)
+                .expect("candidate queue retained-capacity claim is representable")
+                .checked_sub(baseline)
+                .expect("production retained capacity covers the fixture baseline");
+            retained_capacity_claim = retained_capacity_claim
+                .checked_add(retained)
+                .expect("candidate queue retained-capacity total is representable");
+        }
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut state = RemoteCandidateState::new(RemoteCandidateFixtureWork::new(
-            candidate_count.get(),
-            total_content_bytes,
-        ));
+        let work = RemoteCandidateFixtureWork::new(candidate_count.get(), total_content_bytes);
+        let (provider, _owner, _candidate, _lifetime, work_scope) =
+            elastic_remote_candidate_test_resources_with_additional(work, retained_capacity_claim);
+        let baseline = provider.in_use();
+        let mut state = RemoteCandidateState::with_resources(work_scope);
         let started = Instant::now();
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
@@ -13706,6 +13749,11 @@ mod tests {
         );
         assert_eq!(state.current.pending.entries.len(), candidate_count.get());
         state.current.retire();
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "retiring the production-shaped attempt restores provider baseline"
+        );
         assert!(
             total_content_bytes > 0,
             "the observed burst carried real candidate content"

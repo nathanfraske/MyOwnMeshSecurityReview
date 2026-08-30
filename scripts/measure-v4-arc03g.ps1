@@ -258,6 +258,7 @@ foreach ($item in $selected) {
             Invoke-MeasuredTest -Label $item -Environment @{
                 MYOWNMESH_ARC03_OBSERVE_MESHES = $MultiMeshCount
                 MYOWNMESH_ARC03_OBSERVE_CANDIDATES_PER_MESH = $CandidatesPerMesh
+                MYOWNMESH_ARC03_OBSERVE_RAW = 1
             } -CargoTargetArguments "-p myownmesh-core --lib" -TestName "runtime::attempt::tests::v4_arc03_mesh_scopes_share_one_grant_and_creation_does_not_multiply_it"
         }
         "close-success" {
