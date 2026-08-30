@@ -25,13 +25,60 @@ use myownmesh_core::engine::transport_lab::{
     attach_signaling, join_open_participation, spawn_network,
 };
 use myownmesh_core::identity::Identity;
+use myownmesh_core::semantic::DeviceId;
 use myownmesh_core::{MeshEvent, PeerEvent};
+use myownmesh_signaling::mdns::driver::{
+    AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
+    PeerRetention,
+};
+use myownmesh_signaling::ErasedOwner;
 use tokio::time::Instant;
 
 /// Serializes the tests in this file — they mutate the process-wide
 /// `MYOWNMESH_HOME`. Async-aware so holding it across the tests'
 /// await points is well-defined.
 static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn accept_any(_: &str) -> bool {
+    true
+}
+
+struct TestAliasProvider;
+
+impl AliasProvider for TestAliasProvider {
+    fn retain_alias(
+        &self,
+        _key: &str,
+        _peer: &str,
+        _retention: AliasRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_peer(
+        &self,
+        _peer: &str,
+        _retention: PeerRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection(
+        &self,
+        _peer: Option<&str>,
+        _retention: ConnectionRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection_identity(
+        &self,
+        _peer: &str,
+        _retention: ConnectionIdentityRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+}
 
 fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> NetworkConfig {
     NetworkConfig {
@@ -62,6 +109,8 @@ async fn multicast_available() -> bool {
         network_id: network.clone(),
         device_id: device.into(),
         service_port: 0,
+        device_id_validator: accept_any,
+        alias_provider: Arc::new(TestAliasProvider),
     };
     let (_a_out_tx, a_out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
@@ -95,6 +144,32 @@ async fn multicast_available() -> bool {
         }
     }
     false
+}
+
+#[tokio::test]
+async fn mdns_injected_core_validator_rejects_noncanonical_local_identity() {
+    use myownmesh_signaling::mdns::{self, MdnsDriverConfig, MdnsInbound, MdnsOutbound};
+    use tokio::sync::mpsc;
+
+    let (_out_tx, out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
+    let (in_tx, _in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
+    let invalid = format!("{}-display", Identity::ephemeral().public_id());
+    let result = mdns::start(
+        MdnsDriverConfig {
+            app_id: "mdns-validator-test".into(),
+            network_id: "validator-network".into(),
+            device_id: invalid,
+            service_port: 0,
+            device_id_validator: |value| DeviceId::from_canonical_str(value).is_ok(),
+            alias_provider: Arc::new(TestAliasProvider),
+        },
+        Box::new(myownmesh_signaling::UnboundedSource::new(out_rx)),
+        myownmesh_signaling::InboundSink::from_unbounded(in_tx),
+    );
+    assert!(
+        result.is_err(),
+        "noncanonical local identity must fail before publication"
+    );
 }
 
 async fn wait_for_approval(

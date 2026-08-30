@@ -102,6 +102,10 @@ type QueryRecordReply = unsafe extern "C" fn(
 /// DNS A record / IN class, for the address query.
 const RR_TYPE_A: u16 = 1;
 const RR_CLASS_IN: u16 = 1;
+/// Retain one generation for each discovered peer that the mDNS driver can
+/// retain. This keeps the system backend's exact-key epoch table bounded by
+/// the existing peer-state ceiling rather than growing with stale callbacks.
+const MAX_EVENT_EPOCHS: usize = 1024;
 
 #[cfg_attr(not(target_vendor = "apple"), link(name = "dns_sd"))]
 extern "C" {
@@ -282,10 +286,147 @@ struct Inner {
     /// coalesce into one pending follow-up, and Removed/shutdown invalidates
     /// the active generation before any late result can be published.
     resolving: ResolveOwnership,
+    /// The discovery event generation outlives a completed resolve lease so a
+    /// later Removed callback can withdraw the exact Resolved state. Resolve
+    /// ownership is deliberately separate: it tracks work, while this table
+    /// tracks the published key epoch.
+    epochs: EventEpochs,
+    /// Serializes browse removals with resolve completion so a removal cannot
+    /// withdraw one epoch while a late completion publishes another.
+    resolution_fence: Mutex<()>,
     tx: mpsc::Sender<DiscoveryEvent>,
-    /// Every native worker is retained until shutdown joins it. This keeps
-    /// callback contexts and resolve ownership alive only for their owner.
+    /// Native workers remain retained until their terminal result is observed;
+    /// shutdown joins any that are still live. This keeps callback contexts
+    /// and resolve ownership alive only for their owner.
+    workers: WorkerRegistry,
+}
+
+/// A checked, non-wrapping epoch for each exact DNS-SD service-instance key.
+/// The C API's Removed callback carries only the key, so the epoch must remain
+/// after a resolve worker completes and must be removed atomically with the
+/// exact-key withdrawal.
+#[derive(Debug)]
+struct EventEpochs {
+    current: Mutex<HashMap<String, u64>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl EventEpochs {
+    fn new() -> Self {
+        Self {
+            current: Mutex::new(HashMap::new()),
+            next: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+
+    fn admit(&self, key: &str) -> Option<u64> {
+        let mut current = self.current.lock();
+        if let Some(&generation) = current.get(key) {
+            return Some(generation);
+        }
+        if current.len() >= MAX_EVENT_EPOCHS {
+            return None;
+        }
+        let generation = next_epoch(&self.next)?;
+        current.insert(key.to_owned(), generation);
+        Some(generation)
+    }
+
+    fn current(&self, key: &str) -> Option<u64> {
+        self.current.lock().get(key).copied()
+    }
+
+    fn remove_if_current(&self, key: &str, generation: u64) -> bool {
+        let mut current = self.current.lock();
+        if current.get(key).copied() == Some(generation) {
+            current.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clear(&self) {
+        self.current.lock().clear();
+    }
+}
+
+/// Own native worker handles until their terminal result has been observed.
+/// Extraction happens under the mutex; joining always happens after releasing
+/// it, so a worker cannot deadlock against a callback trying to register a
+/// successor worker.
+#[derive(Debug, Default)]
+struct WorkerRegistry {
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+impl WorkerRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&self, worker: std::thread::JoinHandle<()>) {
+        self.workers.lock().push(worker);
+    }
+
+    fn reap_finished(&self) {
+        let finished = {
+            let mut workers = self.workers.lock();
+            let mut finished = Vec::new();
+            let mut live = Vec::with_capacity(workers.len());
+            for worker in workers.drain(..) {
+                if worker.is_finished() {
+                    finished.push(worker);
+                } else {
+                    live.push(worker);
+                }
+            }
+            *workers = live;
+            finished
+        };
+        for worker in finished {
+            observe_worker(worker);
+        }
+    }
+
+    fn join_all(&self) {
+        loop {
+            let workers = std::mem::take(&mut *self.workers.lock());
+            if workers.is_empty() {
+                return;
+            }
+            for worker in workers {
+                observe_worker(worker);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.workers.lock().len()
+    }
+}
+
+fn observe_worker(worker: std::thread::JoinHandle<()>) {
+    if worker.join().is_err() {
+        warn!("system dns-sd worker terminated by panic");
+    }
+}
+
+/// Allocate an epoch without ever wrapping or reusing an exhausted value.
+/// Zero is the permanent exhausted sentinel.
+fn next_epoch(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            if value == 0 {
+                None
+            } else if value == u64::MAX {
+                Some(0)
+            } else {
+                Some(value + 1)
+            }
+        })
+        .ok()
 }
 
 pub struct Discovery {
@@ -311,8 +452,10 @@ impl Discovery {
             stopped: AtomicBool::new(false),
             registration: Mutex::new(None),
             resolving: ResolveOwnership::new(),
+            epochs: EventEpochs::new(),
+            resolution_fence: Mutex::new(()),
             tx,
-            workers: Mutex::new(Vec::new()),
+            workers: WorkerRegistry::new(),
         });
 
         // Browse first (mirrors the embedded backend: never miss resolves
@@ -369,7 +512,7 @@ impl Discovery {
                 return Err(Error::Other(format!("spawn dnssd browse thread: {e}")));
             }
         };
-        inner.workers.lock().push(browse_worker);
+        inner.workers.push(browse_worker);
 
         Ok((Discovery { inner }, rx))
     }
@@ -435,16 +578,19 @@ impl Discovery {
             });
         match spawned {
             Ok(worker) => {
-                let mut workers = self.inner.workers.lock();
                 if self.inner.stopped.load(Ordering::Acquire) {
                     stop.store(true, Ordering::Release);
-                    drop(workers);
-                    let _ = worker.join();
+                    drop(slot);
+                    observe_worker(worker);
                     return false;
                 }
                 *slot = Some(stop);
-                workers.retain(|worker| !worker.is_finished());
-                workers.push(worker);
+                // Keep the registration guard until the worker is retained so
+                // shutdown cannot drain the registry between the stop check
+                // and this insertion.
+                self.inner.workers.push(worker);
+                drop(slot);
+                self.inner.workers.reap_finished();
                 true
             }
             Err(e) => {
@@ -467,19 +613,15 @@ impl Discovery {
     pub fn shutdown(&self) {
         self.unregister();
         self.inner.stopped.store(true, Ordering::SeqCst);
-        self.inner.resolving.shutdown();
+        {
+            let _resolution_fence = self.inner.resolution_fence.lock();
+            self.inner.resolving.shutdown();
+            self.inner.epochs.clear();
+        }
         // Joining the browse worker first closes the only callback path that
         // can enqueue a new resolve worker. Drain in rounds so a callback
         // racing the first take cannot leave an unjoined worker behind.
-        loop {
-            let workers = std::mem::take(&mut *self.inner.workers.lock());
-            if workers.is_empty() {
-                break;
-            }
-            for worker in workers {
-                let _ = worker.join();
-            }
-        }
+        self.inner.workers.join_all();
     }
 
     /// The system backend owns native worker threads rather than a Tokio pump;
@@ -549,6 +691,7 @@ unsafe extern "C" fn browse_cb(
     };
 
     if flags & FLAG_ADD != 0 {
+        let _resolution_fence = inner.resolution_fence.lock();
         // Our own advertisement echoes back; wire::parse_advert drops it by
         // TXT peer id downstream, but skipping the resolve early saves a
         // thread + query per announce.
@@ -566,11 +709,17 @@ unsafe extern "C" fn browse_cb(
             }
         };
         let name = lease.instance().to_owned();
+        let Some(event_generation) = inner.epochs.admit(&name) else {
+            let _ = lease.cancel();
+            return;
+        };
+        let epoch_key = name.clone();
         let (Ok(regtype), Ok(domain)) = (
             String::from_utf8(regtype_bytes.to_vec()),
             String::from_utf8(domain_bytes.to_vec()),
         ) else {
             let _ = lease.cancel();
+            inner.epochs.remove_if_current(&name, event_generation);
             return;
         };
         let inner = {
@@ -578,22 +727,52 @@ unsafe extern "C" fn browse_cb(
             Arc::increment_strong_count(ctx as *const Inner);
             Arc::from_raw(ctx as *const Inner)
         };
-        match std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("dnssd-resolve".into())
-            .spawn(move || run_resolve(inner, name, regtype, domain, interface_index, lease))
-        {
+            .spawn(move || {
+                run_resolve(
+                    inner,
+                    name,
+                    regtype,
+                    domain,
+                    interface_index,
+                    lease,
+                    event_generation,
+                )
+            });
+        drop(_resolution_fence);
+        match spawn_result {
             Ok(worker) => {
-                let mut workers = (&*(ctx as *const Inner)).workers.lock();
-                workers.retain(|worker| !worker.is_finished());
-                workers.push(worker);
+                let callback_inner = &*(ctx as *const Inner);
+                callback_inner.workers.push(worker);
+                callback_inner.workers.reap_finished();
             }
             Err(_) => {
                 warn!("dnssd resolve thread failed to spawn");
+                (&*(ctx as *const Inner))
+                    .epochs
+                    .remove_if_current(&epoch_key, event_generation);
             }
         }
     } else {
-        inner.resolving.cancel(&name);
-        let _ = inner.tx.try_send(DiscoveryEvent::Removed { key: name });
+        let Ok(queue_slot) = inner.tx.try_reserve() else {
+            return;
+        };
+        let generation = {
+            let _resolution_fence = inner.resolution_fence.lock();
+            inner.resolving.cancel(&name);
+            let generation = inner.epochs.current(&name);
+            if let Some(generation) = generation {
+                inner.epochs.remove_if_current(&name, generation);
+            }
+            generation
+        };
+        if let Some(generation) = generation {
+            let _ = queue_slot.send(DiscoveryEvent::Removed {
+                generation,
+                key: name,
+            });
+        }
     }
 }
 
@@ -702,22 +881,29 @@ fn run_resolve(
     domain: String,
     interface_index: u32,
     mut lease: ResolveLease,
+    event_generation: u64,
 ) {
     loop {
         if inner.stopped.load(Ordering::Acquire) {
             return;
         }
         let result = resolve_instance(&inner, &name, &regtype, &domain, interface_index);
-        let completion = lease.complete_with(|| {
-            if let Some((addrs, port, txt)) = result {
-                let _ = inner.tx.try_send(DiscoveryEvent::Resolved {
-                    key: name.clone(),
-                    addrs,
-                    port,
-                    txt,
-                });
-            }
-        });
+        let completion = {
+            let _resolution_fence = inner.resolution_fence.lock();
+            lease.complete_with(|| {
+                if inner.epochs.current(&name) == Some(event_generation) {
+                    if let Some((addrs, port, txt)) = result {
+                        let _ = inner.tx.try_send(DiscoveryEvent::Resolved {
+                            generation: event_generation,
+                            key: name.clone(),
+                            addrs,
+                            port,
+                            txt,
+                        });
+                    }
+                }
+            })
+        };
         match completion {
             ResolveCompletion::Finished => return,
             ResolveCompletion::Followup(next) => lease = next,
@@ -832,6 +1018,47 @@ mod tests {
     fn regtype_strips_the_local_domain() {
         assert_eq!(regtype_of("_myownmesh._tcp.local."), "_myownmesh._tcp");
         assert_eq!(regtype_of("_myownmesh._tcp"), "_myownmesh._tcp");
+    }
+
+    #[test]
+    fn event_epochs_fence_stale_removal_and_exhaust_without_reuse() {
+        let epochs = EventEpochs::new();
+        let first = epochs.admit("service-a").expect("first epoch");
+        assert_eq!(epochs.current("service-a"), Some(first));
+        assert!(!epochs.remove_if_current("service-a", first + 1));
+        assert_eq!(epochs.current("service-a"), Some(first));
+        assert!(epochs.remove_if_current("service-a", first));
+
+        let successor = epochs.admit("service-a").expect("successor epoch");
+        assert_ne!(successor, first);
+        assert!(epochs.remove_if_current("service-a", successor));
+
+        epochs.next.store(u64::MAX, Ordering::Release);
+        let last = epochs.admit("service-last").expect("final epoch");
+        assert_eq!(last, u64::MAX);
+        assert!(epochs.remove_if_current("service-last", last));
+        assert_eq!(epochs.admit("service-exhausted"), None);
+    }
+
+    #[test]
+    fn worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty() {
+        let workers = WorkerRegistry::new();
+        workers.push(std::thread::spawn(|| {}));
+        workers.push(std::thread::spawn(|| panic!("injected worker failure")));
+
+        let canceled = Arc::new(AtomicBool::new(false));
+        let canceled_worker = Arc::clone(&canceled);
+        workers.push(std::thread::spawn(move || {
+            while !canceled_worker.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        }));
+        canceled.store(true, Ordering::Release);
+
+        workers.join_all();
+        assert_eq!(workers.len(), 0);
+        workers.reap_finished();
+        assert_eq!(workers.len(), 0);
     }
 
     /// End-to-end through the real system daemon: register an instance, browse

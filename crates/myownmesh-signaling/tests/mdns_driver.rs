@@ -11,8 +11,12 @@
 
 use std::time::Duration;
 
+use myownmesh_signaling::mdns::driver::{
+    AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
+    PeerRetention,
+};
 use myownmesh_signaling::mdns::{self, MdnsDriverConfig, MdnsInbound, MdnsOutbound};
-use myownmesh_signaling::{InboundSink, SignalingMessage, UnboundedSource};
+use myownmesh_signaling::{ErasedOwner, InboundSink, SignalingMessage, UnboundedSource};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -27,6 +31,94 @@ fn driver_config(network: &str, device: &str) -> MdnsDriverConfig {
         network_id: network.into(),
         device_id: device.into(),
         service_port: 0,
+        device_id_validator: accept_any,
+        alias_provider: std::sync::Arc::new(TestAliasProvider),
+    }
+}
+
+fn accept_any(_: &str) -> bool {
+    true
+}
+
+struct TestAliasProvider;
+
+impl AliasProvider for TestAliasProvider {
+    fn retain_alias(
+        &self,
+        _key: &str,
+        _peer: &str,
+        _retention: AliasRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_peer(
+        &self,
+        _peer: &str,
+        _retention: PeerRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection(
+        &self,
+        _peer: Option<&str>,
+        _retention: ConnectionRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection_identity(
+        &self,
+        _peer: &str,
+        _retention: ConnectionIdentityRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+}
+
+struct CountingOwner(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for CountingOwner {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+struct RefusingAliasProvider;
+
+impl AliasProvider for RefusingAliasProvider {
+    fn retain_alias(
+        &self,
+        _key: &str,
+        _peer: &str,
+        _retention: AliasRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Err(AliasRefusal::Provider("capacity".into()))
+    }
+
+    fn retain_peer(
+        &self,
+        _peer: &str,
+        _retention: PeerRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection(
+        &self,
+        _peer: Option<&str>,
+        _retention: ConnectionRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
+    }
+
+    fn retain_connection_identity(
+        &self,
+        _peer: &str,
+        _retention: ConnectionIdentityRetention,
+    ) -> Result<ErasedOwner, AliasRefusal> {
+        Ok(Box::new(()))
     }
 }
 
@@ -45,9 +137,9 @@ fn advertised_profile_excludes_other_room_and_recipient() {
             sdp: "v=0".into(),
         },
     };
-    assert!(frame_is_for_us(&frame, "room-a", "device-b"));
-    assert!(!frame_is_for_us(&frame, "room-b", "device-b"));
-    assert!(!frame_is_for_us(&frame, "room-a", "device-c"));
+    assert!(frame_is_for_us(&frame, "room-a", "device-b", accept_any));
+    assert!(!frame_is_for_us(&frame, "room-b", "device-b", accept_any));
+    assert!(!frame_is_for_us(&frame, "room-a", "device-c", accept_any));
 }
 
 #[test]
@@ -152,14 +244,24 @@ fn aliases_keep_a_peer_live_until_its_final_service_key_withdraws() {
     use myownmesh_signaling::mdns::AliasOwnership;
 
     let mut aliases = AliasOwnership::default();
-    assert_eq!(aliases.bind("if-a".into(), "peer-a".into()), None);
-    assert_eq!(aliases.bind("if-b".into(), "peer-a".into()), None);
+    assert_eq!(
+        aliases
+            .bind("if-a".into(), "peer-a".into(), 1, Box::new(()))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        aliases
+            .bind("if-b".into(), "peer-a".into(), 2, Box::new(()))
+            .unwrap(),
+        None
+    );
     assert_eq!(aliases.alias_count("peer-a"), 2);
-    assert_eq!(aliases.remove("if-a"), Some(("peer-a".into(), false)));
+    assert_eq!(aliases.remove("if-a", 1), Some(("peer-a".into(), false)));
     assert_eq!(aliases.alias_count("peer-a"), 1);
-    assert_eq!(aliases.remove("if-b"), Some(("peer-a".into(), true)));
+    assert_eq!(aliases.remove("if-b", 2), Some(("peer-a".into(), true)));
     assert_eq!(aliases.alias_count("peer-a"), 0);
-    assert_eq!(aliases.remove("if-b"), None);
+    assert_eq!(aliases.remove("if-b", 2), None);
 }
 
 #[test]
@@ -167,13 +269,80 @@ fn alias_replacement_withdraws_only_the_displaced_final_owner() {
     use myownmesh_signaling::mdns::AliasOwnership;
 
     let mut aliases = AliasOwnership::default();
-    aliases.bind("shared".into(), "peer-old".into());
-    aliases.bind("other".into(), "peer-old".into());
-    assert_eq!(aliases.bind("shared".into(), "peer-new".into()), None);
+    aliases
+        .bind("shared".into(), "peer-old".into(), 1, Box::new(()))
+        .unwrap();
+    aliases
+        .bind("other".into(), "peer-old".into(), 2, Box::new(()))
+        .unwrap();
+    assert_eq!(
+        aliases
+            .bind("shared".into(), "peer-new".into(), 3, Box::new(()))
+            .unwrap(),
+        None
+    );
     assert_eq!(aliases.alias_count("peer-old"), 1);
     assert_eq!(aliases.alias_count("peer-new"), 1);
-    assert_eq!(aliases.remove("other"), Some(("peer-old".into(), true)));
-    assert_eq!(aliases.remove("shared"), Some(("peer-new".into(), true)));
+    assert_eq!(
+        aliases.remove("shared", 1),
+        None,
+        "stale removal cannot delete successor"
+    );
+    assert_eq!(aliases.remove("other", 2), Some(("peer-old".into(), true)));
+    assert_eq!(aliases.remove("shared", 3), Some(("peer-new".into(), true)));
+}
+
+#[test]
+fn alias_provider_refusal_and_generation_fence_preserve_exact_state() {
+    use myownmesh_signaling::mdns::driver::AliasOwnership;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let released = std::sync::Arc::new(AtomicUsize::new(0));
+    let mut aliases = AliasOwnership::default();
+    aliases
+        .bind(
+            "stable".into(),
+            "canonical-peer".into(),
+            7,
+            Box::new(CountingOwner(std::sync::Arc::clone(&released))),
+        )
+        .unwrap();
+    assert_eq!(aliases.alias_count("canonical-peer"), 1);
+
+    // A provider refusal occurs before bind, so the existing entry is not
+    // altered and its owner remains live.
+    let refused = RefusingAliasProvider.retain_alias(
+        "stable",
+        "replacement-peer",
+        AliasRetention {
+            key_capacity: 6,
+            peer_capacity: 16,
+            node_bytes: 1,
+        },
+    );
+    assert!(refused.is_err());
+    assert_eq!(aliases.alias_count("canonical-peer"), 1);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+
+    // The old generation cannot remove a replacement; the replacement's
+    // owner is released only by its exact generation.
+    aliases
+        .bind(
+            "stable".into(),
+            "replacement-peer".into(),
+            8,
+            Box::new(CountingOwner(std::sync::Arc::clone(&released))),
+        )
+        .unwrap();
+    assert_eq!(
+        released.load(Ordering::SeqCst),
+        1,
+        "displaced owner released once"
+    );
+    assert!(aliases.remove("stable", 7).is_none());
+    assert_eq!(aliases.alias_count("replacement-peer"), 1);
+    assert!(aliases.remove("stable", 8).is_some());
+    assert_eq!(released.load(Ordering::SeqCst), 2);
 }
 
 async fn wait_for_announce(

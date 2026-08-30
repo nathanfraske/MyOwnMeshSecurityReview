@@ -651,6 +651,36 @@ async fn global_admission_cap_applies_before_websocket_handshake() {
 }
 
 #[tokio::test]
+async fn normal_connection_completion_releases_admission_before_shutdown() {
+    let server = SignalingServer::start(
+        "127.0.0.1",
+        0,
+        Limits {
+            max_connections: 1,
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("ws://{}", server.local_addr());
+    let (first, _) = connect_async(&url).await.unwrap();
+    drop(first);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if server.stats().connections == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("normal connection completion should release admission");
+    assert_eq!(server.stats().connections, 0);
+    server.stop_and_wait().await;
+}
+
+#[tokio::test]
 async fn handshake_bytes_are_bounded_before_websocket_parser() {
     let limits = Limits {
         max_handshake_bytes: 64,

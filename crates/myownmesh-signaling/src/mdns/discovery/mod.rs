@@ -62,13 +62,187 @@ pub enum DiscoveryEvent {
     /// A service instance resolved (first sight or cache refresh): where its
     /// exchange listens and its TXT records.
     Resolved {
+        /// Exact coalescer generation for this service-instance state.
+        generation: u64,
         key: String,
         addrs: Vec<IpAddr>,
         port: u16,
         txt: HashMap<String, String>,
     },
     /// An instance withdrew (goodbye) or expired from the cache.
-    Removed { key: String },
+    Removed {
+        /// Generation of the state being withdrawn, not a new successor token.
+        generation: u64,
+        key: String,
+    },
+}
+
+#[derive(Debug)]
+struct CoalescedDiscoveryEvent {
+    generation: u64,
+    event: Option<DiscoveryEvent>,
+    state: CoalescedDiscoveryState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoalescedDiscoveryState {
+    Active,
+    Removed,
+}
+
+/// A bounded latest-state table for events that are waiting for the delivery
+/// owner.  This table is deliberately keyed by the backend's exact service
+/// instance name; it never uses a device id decoded from TXT data.
+pub(crate) struct DiscoveryEventCoalescer {
+    pending: Mutex<HashMap<String, CoalescedDiscoveryEvent>>,
+    next_generation: AtomicU64,
+    stopped: AtomicBool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DiscoveryEventAdmission {
+    Started { generation: u64 },
+    Coalesced { generation: u64 },
+    Refused,
+}
+
+impl DiscoveryEventCoalescer {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    /// Admit the exact key before the caller copies its event payload.
+    pub(crate) fn admit(&self, key: &str) -> DiscoveryEventAdmission {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            return DiscoveryEventAdmission::Refused;
+        }
+        if let Some(existing) = pending.get(key) {
+            return DiscoveryEventAdmission::Coalesced {
+                generation: existing.generation,
+            };
+        }
+        if pending.len() >= MAX_RESOLVE_OWNERS {
+            return DiscoveryEventAdmission::Refused;
+        }
+        let Some(generation) = next_generation(&self.next_generation) else {
+            return DiscoveryEventAdmission::Refused;
+        };
+        pending.insert(
+            key.to_owned(),
+            CoalescedDiscoveryEvent {
+                generation,
+                event: None,
+                state: CoalescedDiscoveryState::Active,
+            },
+        );
+        DiscoveryEventAdmission::Started { generation }
+    }
+
+    /// Return the generation of an already active key without creating a
+    /// generation for an unrelated/stale removal notification.
+    pub(crate) fn admit_existing(&self, key: &str) -> Option<u64> {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(Ordering::Acquire) {
+            return None;
+        }
+        pending.get(key).map(|slot| slot.generation)
+    }
+
+    /// Replace the latest state for an admitted exact key. A stale generation
+    /// cannot publish into a replacement slot.
+    pub(crate) fn publish(&self, key: &str, generation: u64, event: DiscoveryEvent) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = pending.get_mut(key) else {
+            return false;
+        };
+        if slot.generation != generation
+            || event.generation() != generation
+            || self.stopped.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        slot.state = match event {
+            DiscoveryEvent::Resolved { .. } => CoalescedDiscoveryState::Active,
+            DiscoveryEvent::Removed { .. } => CoalescedDiscoveryState::Removed,
+        };
+        slot.event = Some(event);
+        true
+    }
+
+    pub(crate) fn take_ready(&self) -> Option<(String, u64, DiscoveryEvent)> {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let key = pending
+            .iter()
+            .find_map(|(key, slot)| slot.event.is_some().then(|| key.clone()))?;
+        let slot = pending.get_mut(&key)?;
+        let event = slot.event.take()?;
+        Some((key, slot.generation, event))
+    }
+
+    pub(crate) fn restore(&self, key: &str, generation: u64, event: DiscoveryEvent) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = pending.get_mut(key) else {
+            return false;
+        };
+        if slot.generation != generation || self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        slot.event = Some(event);
+        true
+    }
+
+    pub(crate) fn finish(&self, key: &str, generation: u64) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(slot) = pending.get(key) else {
+            return false;
+        };
+        if slot.generation != generation || slot.event.is_some() {
+            return false;
+        }
+        if slot.state == CoalescedDiscoveryState::Removed {
+            pending.remove(key);
+        }
+        true
+    }
+
+    pub(crate) fn cancel(&self, key: &str, generation: u64) -> bool {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending
+            .get(key)
+            .is_some_and(|slot| slot.generation == generation)
+        {
+            pending.remove(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+impl DiscoveryEvent {
+    pub(crate) fn generation(&self) -> u64 {
+        match self {
+            Self::Resolved { generation, .. } | Self::Removed { generation, .. } => *generation,
+        }
+    }
 }
 
 /// Result of admitting one exact service-instance browse hint.
@@ -328,6 +502,98 @@ mod tests {
             ownership.admit("still-exhausted"),
             ResolveHint::Refused
         ));
+    }
+
+    #[test]
+    fn event_coalescer_is_bounded_and_keeps_latest_exact_key_state() {
+        let coalescer = DiscoveryEventCoalescer::new();
+        let first_generation = match coalescer.admit("service-a") {
+            DiscoveryEventAdmission::Started { generation } => generation,
+            other => panic!("first event was not admitted: {other:?}"),
+        };
+        assert!(coalescer.publish(
+            "service-a",
+            first_generation,
+            DiscoveryEvent::Resolved {
+                generation: first_generation,
+                key: "service-a".into(),
+                addrs: vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+                port: 1,
+                txt: HashMap::new(),
+            }
+        ));
+        let coalesced_generation = match coalescer.admit("service-a") {
+            DiscoveryEventAdmission::Coalesced { generation } => generation,
+            other => panic!("same exact key was not coalesced: {other:?}"),
+        };
+        assert_eq!(coalesced_generation, first_generation);
+        assert_eq!(
+            coalescer.admit_existing("service-a"),
+            Some(first_generation)
+        );
+        assert!(coalescer.publish(
+            "service-a",
+            coalesced_generation,
+            DiscoveryEvent::Removed {
+                generation: coalesced_generation,
+                key: "service-a".into(),
+            }
+        ));
+        let (old_key, old_generation, old_event) = coalescer.take_ready().expect("latest state");
+        assert_eq!(old_key, "service-a");
+        assert_eq!(old_generation, first_generation);
+        assert_eq!(old_event.generation(), first_generation);
+        assert!(coalescer.finish(&old_key, old_generation));
+
+        let successor_generation = match coalescer.admit("service-a") {
+            DiscoveryEventAdmission::Started { generation } => generation,
+            other => panic!("successor was not admitted: {other:?}"),
+        };
+        assert_ne!(successor_generation, first_generation);
+        assert!(coalescer.publish(
+            "service-a",
+            successor_generation,
+            DiscoveryEvent::Removed {
+                generation: successor_generation,
+                key: "service-a".into(),
+            }
+        ));
+        assert!(!coalescer.restore("service-a", first_generation, old_event));
+        let (_, generation, event) = coalescer.take_ready().expect("successor state");
+        assert_eq!(generation, successor_generation);
+        assert_eq!(event.generation(), successor_generation);
+        assert!(coalescer.finish("service-a", successor_generation));
+    }
+
+    #[test]
+    fn event_coalescer_refuses_at_ownership_cap_and_clears_on_shutdown() {
+        let coalescer = DiscoveryEventCoalescer::new();
+        for index in 0..MAX_RESOLVE_OWNERS {
+            assert!(matches!(
+                coalescer.admit(&format!("service-{index}")),
+                DiscoveryEventAdmission::Started { .. }
+            ));
+        }
+        assert_eq!(coalescer.pending_count(), MAX_RESOLVE_OWNERS);
+        assert_eq!(
+            coalescer.admit("service-over-capacity"),
+            DiscoveryEventAdmission::Refused
+        );
+        let released_generation = match coalescer.admit("service-0") {
+            DiscoveryEventAdmission::Coalesced { generation } => generation,
+            other => panic!("existing exact key was not found: {other:?}"),
+        };
+        assert!(coalescer.cancel("service-0", released_generation));
+        assert!(matches!(
+            coalescer.admit("service-after-release"),
+            DiscoveryEventAdmission::Started { .. }
+        ));
+        coalescer.shutdown();
+        assert_eq!(coalescer.pending_count(), 0);
+        assert_eq!(
+            coalescer.admit("after-shutdown"),
+            DiscoveryEventAdmission::Refused
+        );
     }
 }
 

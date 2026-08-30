@@ -38,7 +38,6 @@
 //! no retry, timer, poll, or acknowledgement, and it changes no eviction
 //! behaviour. Nothing here can grant, revoke, or record membership.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -1218,12 +1217,14 @@ pub(crate) enum Delivered {
     Closed,
 }
 
-/// One retained de-duplication key, the attempt it belongs to, and the lease
-/// that funds it.
+/// One retained de-duplication node, the attempt key it carries, and the lease
+/// that funds the node and its owned key bytes.
 ///
 /// The lease is held for exactly as long as the key is remembered and released
-/// by the same `Drop` that forgets it, so the ring cannot outlive what pays for
-/// it. `_lease` is never read: holding it *is* the effect.
+/// by the same `Drop` that forgets it, so the list cannot outlive what pays for
+/// it. The `next` link is inline in the provider-funded node: there is no
+/// separately allocated container whose capacity could outrun its claims.
+/// `_lease` is never read: holding it *is* the effect.
 ///
 /// `attempt` is what makes the key mean something. Without it the key would be
 /// pure content, and two different questions would be indistinguishable: "is
@@ -1234,6 +1235,7 @@ struct SeenKey {
     key: DedupKey,
     token: std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
     _lease: ResourceLease,
+    next: Option<Box<SeenKey>>,
 }
 
 /// Exact, length-framed bytes for one duplicate-sensitive signal.
@@ -1302,7 +1304,7 @@ pub(crate) struct SignalingRuntime {
     scope: LocalApplicationResourceScope,
     instances: AtomicU64,
     dedup_instances: AtomicU64,
-    seen: Mutex<VecDeque<SeenKey>>,
+    seen: Mutex<Option<Box<SeenKey>>>,
     guards: Mutex<Option<Box<GuardIndex>>>,
 }
 
@@ -1319,6 +1321,49 @@ fn guard_index_claim() -> Option<ResourceClaim> {
         (crate::resource::ResourceClass::OpaqueDependencyResidual, 1),
     ])
     .ok()
+}
+
+/// Remove nodes whose exact lifecycle token has no remaining owner.
+///
+/// This runs under `SignalingRuntime::seen`, so duplicate admission and weak
+/// token pruning remain one atomic operation. Each removed node drops its own
+/// provider lease; no container capacity or side allocation is involved.
+fn prune_seen(seen: &mut Option<Box<SeenKey>>) {
+    let mut link = seen;
+    loop {
+        let remove = link
+            .as_ref()
+            .is_some_and(|entry| entry.token.strong_count() == 0);
+        if remove {
+            let mut removed = link.take().expect("matched stale seen node");
+            *link = removed.next.take();
+            continue;
+        }
+        match link.as_mut() {
+            Some(entry) => link = &mut entry.next,
+            None => return,
+        }
+    }
+}
+
+/// Remove one exact retained key by its lifecycle token identity.
+fn remove_seen_for_token(
+    seen: &mut Option<Box<SeenKey>>,
+    token: &std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
+) {
+    let mut link = seen;
+    loop {
+        let remove = link.as_ref().is_some_and(|entry| entry.token.ptr_eq(token));
+        if remove {
+            let mut removed = link.take().expect("matched seen token");
+            *link = removed.next.take();
+            return;
+        }
+        match link.as_mut() {
+            Some(entry) => link = &mut entry.next,
+            None => return,
+        }
+    }
 }
 
 fn next_non_wrapping(counter: &AtomicU64) -> Option<u64> {
@@ -1339,7 +1384,7 @@ impl SignalingRuntime {
             scope,
             instances: AtomicU64::new(0),
             dedup_instances: AtomicU64::new(0),
-            seen: Mutex::new(VecDeque::new()),
+            seen: Mutex::new(None),
             guards: Mutex::new(None),
         })
     }
@@ -1476,6 +1521,18 @@ impl SignalingRuntime {
     }
 
     #[cfg(test)]
+    fn seen_len(&self) -> usize {
+        let seen = self.seen.lock();
+        let mut count = 0usize;
+        let mut cursor = seen.as_deref();
+        while let Some(entry) = cursor {
+            count = count.saturating_add(1);
+            cursor = entry.next.as_deref();
+        }
+        count
+    }
+
+    #[cfg(test)]
     fn noop_guard(runtime: &Arc<Self>) -> Arc<CarrierInstanceGuard> {
         let _ = runtime;
         CarrierInstanceGuard::noop(None)
@@ -1596,9 +1653,17 @@ impl SignalingRuntime {
         let mut seen = self.seen.lock();
         // The remembered key is non-owning. If every lifecycle owner forgot or
         // dropped its token, release the lease before considering this copy;
-        // the ingress ring must never become a peer-lifetime tombstone.
-        seen.retain(|entry| entry.token.strong_count() != 0);
-        if seen.iter().any(|entry| entry.key == key) {
+        // the ingress list must never become a peer-lifetime tombstone.
+        prune_seen(&mut seen);
+        let mut cursor = seen.as_deref();
+        let duplicate = loop {
+            let Some(entry) = cursor else { break false };
+            if entry.key == key {
+                break true;
+            }
+            cursor = entry.next.as_deref();
+        };
+        if duplicate {
             drop(key_lease);
             trace!(
                 kind = ingress.kind_name(),
@@ -1606,11 +1671,14 @@ impl SignalingRuntime {
             );
             return Delivered::Duplicate;
         }
-        seen.push_back(SeenKey {
+        let mut node = Box::new(SeenKey {
             key,
             token: weak_token.clone(),
             _lease: key_lease,
+            next: None,
         });
+        node.next = seen.take();
+        *seen = Some(node);
         drop(seen);
         let kind = ingress.kind_name();
         match self.send(ingress) {
@@ -1647,7 +1715,7 @@ impl SignalingRuntime {
         &self,
         token: &std::sync::Weak<crate::runtime::peer_session::DedupTokenInner>,
     ) {
-        self.seen.lock().retain(|entry| !entry.token.ptr_eq(token));
+        remove_seen_for_token(&mut self.seen.lock(), token);
     }
 
     /// Forget exactly one retained ingress key.
@@ -1659,7 +1727,7 @@ impl SignalingRuntime {
     ///
     /// This is the other half of scoping the key. Scoping alone stops a retired
     /// attempt from suppressing a live one; releasing on the exact end is what
-    /// stops the ring from being a slowly filling record of every attempt the
+    /// stops the list from being a slowly filling record of every attempt the
     /// process ever made, emptied only by provider pressure.
     pub(crate) fn forget_token(&self, token: DedupToken) {
         // Consume the exact lifecycle owner before checking the weak key. Two
@@ -1672,20 +1740,25 @@ impl SignalingRuntime {
         if weak.strong_count() != 0 {
             return;
         }
-        seen.retain(|entry| !entry.token.ptr_eq(&weak));
+        remove_seen_for_token(&mut seen, &weak);
     }
 
     #[cfg(test)]
     pub(crate) fn remembers_attempt_for_test(&self, attempt: &str) -> bool {
-        self.seen
-            .lock()
-            .iter()
-            .any(|entry| entry.key.attempt.as_ref() == attempt)
+        let seen = self.seen.lock();
+        let mut cursor = seen.as_deref();
+        while let Some(entry) = cursor {
+            if entry.key.attempt.as_ref() == attempt {
+                return true;
+            }
+            cursor = entry.next.as_deref();
+        }
+        false
     }
 
     /// Fund one remembered key without evicting any live key.
     ///
-    /// No capacity constant: the ring is exactly as long as the provider will
+    /// No capacity constant: the list is exactly as long as the provider will
     /// pay for, which is the bound `TRANSITION-PLAYBOOK.md` asks for and an
     /// invented count is not.
     fn reserve_key(&self, key: &DedupKeyPlan<'_>) -> Option<ResourceLease> {
@@ -2335,7 +2408,7 @@ pub(super) mod tests {
     ///   correction;
     /// - after exact-token forget the first attempt's own candidate is delivered
     ///   again, which proves the keys were released rather than merely
-    ///   out-competed — a ring that had kept them would still swallow it.
+    ///   out-competed — a retained list that had kept them would still swallow it.
     #[test]
     fn a_key_is_scoped_to_its_attempt_and_released_when_the_attempt_ends() {
         let (runtime, mut rx) = runtime_with_rx();
@@ -2389,7 +2462,7 @@ pub(super) mod tests {
         assert_eq!(
             drain(&mut rx),
             1,
-            "and the ended attempt's key really went back — a ring that still \
+            "and the ended attempt's key really went back — a list that still \
              held it would swallow this"
         );
 
@@ -2399,7 +2472,7 @@ pub(super) mod tests {
         assert_eq!(
             drain(&mut rx),
             0,
-            "forgetting one attempt does not empty the ring"
+            "forgetting one attempt does not empty the list"
         );
         runtime.forget_token(second_token);
     }
@@ -2518,27 +2591,31 @@ pub(super) mod tests {
         );
     }
 
-    /// **The de-duplication ring is bounded by the provider, and unfunded
+    /// **The de-duplication list is bounded by the provider, and unfunded
     /// duplicate-sensitive traffic fails closed.**
     ///
     /// The bound is not a constant in this module, so the control cannot assert
     /// one: what it asserts is the two properties a constant was standing in for.
-    /// The ring stops well short of the number of distinct values offered to it.
+    /// The list stops well short of the number of distinct values offered to it.
     /// When pressure prevents either the exact key claim or the mailbox claim,
     /// the typed `Unavailable` or `Refused` result fails closed and the next
     /// copy can retry after pressure clears. No duplicate-sensitive value
     /// proceeds untracked, and a postclaim refusal rolls back exact custody.
     #[test]
-    fn the_dedup_ring_is_provider_bounded_and_unfunded_traffic_refuses() {
+    fn the_dedup_list_is_provider_bounded_and_unfunded_traffic_refuses() {
         const PUSHED: usize = 512;
         const RESIDUALS: u64 = 32;
 
         let Funded {
-            runtime, mut rx, ..
+            runtime,
+            mut rx,
+            provider,
+            ..
         } = funded(|dimension| match dimension {
             crate::resource::ResourceClass::OpaqueDependencyResidual => RESIDUALS,
             _ => 1_000_000,
         });
+        let baseline = provider.in_use();
         let relay = SignalingRuntime::attach(&runtime, SignalingCarrier::Nostr);
 
         let mut accepted = 0usize;
@@ -2567,14 +2644,14 @@ pub(super) mod tests {
             "the control exercised typed provider or mailbox pressure"
         );
         assert_eq!(accepted + unavailable + refused, PUSHED);
-        let retained = runtime.seen.lock().len();
+        let retained = runtime.seen_len();
         assert!(
             retained <= usize::try_from(RESIDUALS).expect("small"),
-            "the ring outgrew what funds it: {retained}"
+            "the list outgrew what funds it: {retained}"
         );
         assert!(
             retained < PUSHED,
-            "the ring grew with the traffic instead of with its funding: {retained}"
+            "the list grew with the traffic instead of with its funding: {retained}"
         );
 
         drop(retained_deliveries);
@@ -2586,10 +2663,21 @@ pub(super) mod tests {
             Delivered::Accepted,
             "funding returns after accepted custody is released"
         );
-        drop(rx.try_recv().expect("cleanup retry reaches the engine"));
+        let cleanup = rx.try_recv().expect("cleanup retry reaches the engine");
+        let cleanup_token = cleanup
+            .value()
+            .dedup_token()
+            .expect("cleanup retry carries exact dedup custody");
+        drop(cleanup);
+        runtime.forget_token(cleanup_token);
         assert!(
             !runtime.remembers_attempt_for_test("offer-1"),
             "released accepted offers no longer retain exact key custody"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "intrusive key nodes and their exact leases return to the provider baseline"
         );
     }
 

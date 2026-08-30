@@ -51,6 +51,10 @@ const FIXTURE_CAPABILITY_ADVERT_BYTES: usize = 128;
 /// correlation allocation through the broker planner.
 const FIXTURE_CHANNEL_CORRELATION: &str = "aaaaaaaaaaaaa";
 
+/// Canonical base32 wire representation of one 32-byte Ed25519 device id.
+/// This is a fixture representation length, not a product capacity selector.
+const FIXTURE_MDNS_DEVICE_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 /// Explicit integration-test resource owner.
 ///
 /// These values cover the known in-process multi-device test fixtures. They
@@ -236,6 +240,27 @@ pub fn test_transport() -> Transport {
             .checked_add(application_scope_claim)
             .and_then(|grant| grant.checked_add(application_claim))
             .expect("the fixture application retention grant is representable");
+        // One bounded two-peer mDNS fixture retains one known-peer outbound
+        // endpoint, one unknown-peer inbound endpoint, and one inbound sender
+        // identity buffer. Price each exact production plan, including the
+        // finite provider's reservation bookkeeping, and scale only by the
+        // existing test-worker concurrency.
+        let mdns_outbound =
+            myownmesh_core::mdns_connection_planning_claim(Some(FIXTURE_MDNS_DEVICE_ID))
+                .expect("the exact mDNS outbound plan is available");
+        let mdns_inbound = myownmesh_core::mdns_connection_planning_claim(None)
+            .expect("the exact mDNS inbound plan is available");
+        let mdns_identity =
+            myownmesh_core::mdns_connection_identity_planning_claim(FIXTURE_MDNS_DEVICE_ID)
+                .expect("the exact mDNS identity plan is available");
+        let mdns_connection_pair = mdns_outbound
+            .checked_add(mdns_inbound)
+            .and_then(|pair| pair.checked_add(mdns_identity))
+            .and_then(|pair| pair.checked_scale(mesh_scopes))
+            .expect("the bounded mDNS connection-pair workload is representable");
+        let grant = grant
+            .checked_add(mdns_connection_pair)
+            .expect("the fixture mDNS connection grant is representable");
         ResourceProviderPort::new(FiniteResourceProvider::new(grant))
             .expect("the fixture provider accounts for its process scope")
     });

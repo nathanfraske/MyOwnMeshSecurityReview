@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::SignalingMessage;
 
+/// Required identity policy supplied by the application layer.  The
+/// signaling crate deliberately does not know the core identity encoding.
+pub type DeviceIdValidator = fn(&str) -> bool;
+
 /// DNS-SD service type every MyOwnMesh mDNS driver registers and
 /// browses. One type for all networks — the TXT `room` record is the
 /// authoritative network discriminator, mirroring how the Nostr
@@ -79,6 +83,7 @@ pub fn parse_advert(
     txt: impl Fn(&str) -> Option<String>,
     our_room: &str,
     our_device_id: &str,
+    validate_device_id: DeviceIdValidator,
 ) -> Option<PeerAdvert> {
     let v = txt(TXT_VERSION)?;
     if v != PROTOCOL_VERSION.to_string() {
@@ -89,7 +94,7 @@ pub fn parse_advert(
         return None;
     }
     let peer = txt(TXT_PEER)?;
-    if peer.is_empty() || peer == our_device_id {
+    if peer.is_empty() || peer == our_device_id || !validate_device_id(&peer) {
         return None;
     }
     Some(PeerAdvert { room, peer })
@@ -127,13 +132,27 @@ pub fn decode_frame(line: &str) -> Result<Frame, serde_json::Error> {
 
 /// Whether an inbound frame should be delivered to the engine:
 /// protocol version, room, and recipient must all match.
-pub fn frame_is_for_us(frame: &Frame, our_room: &str, our_device_id: &str) -> bool {
-    frame.v == PROTOCOL_VERSION && frame.room == our_room && frame.to == our_device_id
+pub fn frame_is_for_us(
+    frame: &Frame,
+    our_room: &str,
+    our_device_id: &str,
+    validate_device_id: DeviceIdValidator,
+) -> bool {
+    frame.v == PROTOCOL_VERSION
+        && frame.room == our_room
+        && validate_device_id(&frame.from)
+        && validate_device_id(&frame.to)
+        && frame.from != our_device_id
+        && frame.to == our_device_id
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accept_any(_: &str) -> bool {
+        true
+    }
 
     fn txt_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k| {
@@ -156,7 +175,7 @@ mod tests {
     #[test]
     fn advert_parses_when_room_and_version_match() {
         let txt = txt_of(&[("v", "1"), ("room", "roomA"), ("peer", "peer-1")]);
-        let advert = parse_advert(txt, "roomA", "self").expect("valid advert");
+        let advert = parse_advert(txt, "roomA", "self", accept_any).expect("valid advert");
         assert_eq!(
             advert,
             PeerAdvert {
@@ -172,25 +191,28 @@ mod tests {
         assert!(parse_advert(
             txt_of(&[("v", "1"), ("room", "roomB"), ("peer", "peer-1")]),
             "roomA",
-            "self"
+            "self",
+            accept_any
         )
         .is_none());
         // Our own registration echoed back by the daemon.
         assert!(parse_advert(
             txt_of(&[("v", "1"), ("room", "roomA"), ("peer", "self")]),
             "roomA",
-            "self"
+            "self",
+            accept_any
         )
         .is_none());
         // Future protocol version.
         assert!(parse_advert(
             txt_of(&[("v", "2"), ("room", "roomA"), ("peer", "peer-1")]),
             "roomA",
-            "self"
+            "self",
+            accept_any
         )
         .is_none());
         // Missing keys entirely.
-        assert!(parse_advert(txt_of(&[("v", "1")]), "roomA", "self").is_none());
+        assert!(parse_advert(txt_of(&[("v", "1")]), "roomA", "self", accept_any).is_none());
     }
 
     #[test]
@@ -244,10 +266,66 @@ mod tests {
                 peer_id: "peer-1".into(),
             },
         };
-        assert!(frame_is_for_us(&frame, "roomA", "peer-2"));
-        assert!(!frame_is_for_us(&frame, "roomA", "peer-3"), "wrong to");
-        assert!(!frame_is_for_us(&frame, "roomB", "peer-2"), "wrong room");
+        assert!(frame_is_for_us(&frame, "roomA", "peer-2", accept_any));
+        assert!(
+            !frame_is_for_us(&frame, "roomA", "peer-3", accept_any),
+            "wrong to"
+        );
+        assert!(
+            !frame_is_for_us(&frame, "roomB", "peer-2", accept_any),
+            "wrong room"
+        );
         frame.v = 99;
-        assert!(!frame_is_for_us(&frame, "roomA", "peer-2"), "wrong version");
+        assert!(
+            !frame_is_for_us(&frame, "roomA", "peer-2", accept_any),
+            "wrong version"
+        );
+    }
+
+    fn only_canonical(value: &str) -> bool {
+        value == "canonical-peer" || value == "canonical-self"
+    }
+
+    #[test]
+    fn identity_validator_rejects_aliases_and_noncanonical_frame_endpoints() {
+        let valid_entries = [("v", "1"), ("room", "roomA"), ("peer", "canonical-peer")];
+        let valid = txt_of(&valid_entries);
+        assert!(parse_advert(valid, "roomA", "canonical-self", only_canonical).is_some());
+        for peer in ["", "CANONICAL-PEER", "canonical-peer-suffix", "other"] {
+            let entries = [("v", "1"), ("room", "roomA"), ("peer", peer)];
+            let txt = txt_of(&entries);
+            assert!(parse_advert(txt, "roomA", "canonical-self", only_canonical).is_none());
+        }
+
+        let mut frame = Frame {
+            v: PROTOCOL_VERSION,
+            room: "roomA".into(),
+            from: "canonical-peer".into(),
+            to: "canonical-self".into(),
+            msg: SignalingMessage::Announce {
+                peer_id: "canonical-peer".into(),
+            },
+        };
+        assert!(frame_is_for_us(
+            &frame,
+            "roomA",
+            "canonical-self",
+            only_canonical
+        ));
+        frame.from = "peer-alias".into();
+        assert!(!frame_is_for_us(
+            &frame,
+            "roomA",
+            "canonical-self",
+            only_canonical
+        ));
+        frame.from = "canonical-peer".into();
+        frame.to = "CANONICAL-SELF".into();
+        assert!(!frame_is_for_us(
+            &frame,
+            "roomA",
+            "canonical-self",
+            only_canonical
+        ));
     }
 }

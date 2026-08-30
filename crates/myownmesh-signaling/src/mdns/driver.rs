@@ -23,7 +23,6 @@
 //!   the `dnssd` C API on iOS (raw multicast sockets are entitlement-gated
 //!   there; mDNSResponder isn't). The exchange below is backend-independent.
 
-use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -38,7 +37,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
 use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
-use super::wire::{self, Frame};
+use super::wire::{self, DeviceIdValidator, Frame};
 use crate::nostr::handle::derive_room_handle;
 use crate::{
     CarrierAttribution, ErasedOwner, ErasedSource, Error, InboundSink, OutboundSource, OwnedSignal,
@@ -49,7 +48,7 @@ use crate::{
 pub const MAX_ACTIVE_CONNECTIONS: usize = 256;
 
 /// Configuration for one driver instance.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MdnsDriverConfig {
     /// App-id used in the room-handle derivation — same value the
     /// Nostr driver uses, so both transports converge on one room
@@ -64,6 +63,233 @@ pub struct MdnsDriverConfig {
     /// Port for the TCP exchange listener. 0 (the default) binds an
     /// ephemeral port; the actual port is advertised via SRV.
     pub service_port: u16,
+    /// Application-owned canonical Device-ID policy. Signaling must not
+    /// duplicate the identity representation used by the core crate.
+    pub device_id_validator: DeviceIdValidator,
+    /// Application-owned custody for every retained service alias.
+    pub alias_provider: Arc<dyn AliasProvider>,
+}
+
+impl std::fmt::Debug for MdnsDriverConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MdnsDriverConfig")
+            .field("app_id", &self.app_id)
+            .field("network_id", &self.network_id)
+            .field("device_id", &self.device_id)
+            .field("service_port", &self.service_port)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Typed refusal from the application's exact alias custody provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AliasRefusal {
+    Provider(String),
+    Arithmetic(String),
+}
+
+/// The complete pre-admission retention plan for one alias. The application
+/// provider charges both content and the fixed structural cells before the
+/// alias table is mutated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AliasRetention {
+    pub key_capacity: usize,
+    pub peer_capacity: usize,
+    pub node_bytes: usize,
+}
+
+/// Complete pre-admission plan for one retained peer observation. The peer
+/// table is intrusive, so these are the exact moved buffers and node rather
+/// than an estimate for a collection's hidden bucket capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerRetention {
+    pub peer_capacity: usize,
+    pub address_capacity: usize,
+    pub node_bytes: usize,
+}
+
+impl PeerRetention {
+    fn for_peer(peer: &String, addrs: &Vec<IpAddr>) -> Self {
+        Self::from_parts(peer.capacity(), addrs)
+    }
+
+    fn from_parts(peer_capacity: usize, addrs: &Vec<IpAddr>) -> Self {
+        Self {
+            peer_capacity,
+            address_capacity: addrs.capacity(),
+            node_bytes: std::mem::size_of::<PeerNode>(),
+        }
+    }
+
+    pub fn accounted_bytes(self) -> std::result::Result<u64, AliasRefusal> {
+        let address_bytes = self
+            .address_capacity
+            .checked_mul(std::mem::size_of::<IpAddr>())
+            .ok_or_else(|| AliasRefusal::Arithmetic("peer address size overflow".into()))?;
+        self.peer_capacity
+            .checked_add(address_bytes)
+            .and_then(|bytes| bytes.checked_add(self.node_bytes))
+            .ok_or_else(|| AliasRefusal::Arithmetic("peer content size overflow".into()))?
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("peer content size exceeds u64".into()))
+    }
+
+    pub fn allocation_count(self) -> std::result::Result<u64, AliasRefusal> {
+        let count = 1usize
+            .checked_add(usize::from(self.peer_capacity != 0))
+            .and_then(|count| count.checked_add(usize::from(self.address_capacity != 0)))
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| AliasRefusal::Arithmetic("peer allocation count overflow".into()))?;
+        count
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("peer allocation count exceeds u64".into()))
+    }
+}
+
+/// Exact stream-time custody plan. The fixed queue and worker shape comes
+/// from the existing driver constants; no future connection is reserved at
+/// discovery time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionRetention {
+    pub key_capacity: usize,
+    pub node_bytes: usize,
+    pub socket_handles: usize,
+    pub native_objects: usize,
+    pub queue_slots: usize,
+    pub worker_tasks: usize,
+    pub opaque_allocations: usize,
+}
+
+/// Additional exact identity-buffer plan for an inbound stream whose sender
+/// is not known until its first validated frame. This is acquired before the
+/// sender key enters the intrusive connection registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionIdentityRetention {
+    pub key_capacity: usize,
+}
+
+impl ConnectionIdentityRetention {
+    /// Plan the exact identity buffer retained when an inbound peer becomes
+    /// known from its first validated frame.
+    pub fn for_peer(peer: &str) -> Self {
+        Self {
+            key_capacity: peer.len(),
+        }
+    }
+
+    pub fn accounted_bytes(self) -> std::result::Result<u64, AliasRefusal> {
+        self.key_capacity
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("connection identity size exceeds u64".into()))
+    }
+
+    pub fn opaque_count(self) -> std::result::Result<u64, AliasRefusal> {
+        1u64.checked_add(u64::from(self.key_capacity != 0))
+            .ok_or_else(|| {
+                AliasRefusal::Arithmetic("connection identity residual count overflow".into())
+            })
+    }
+}
+
+impl ConnectionRetention {
+    /// Plan one concrete connection using the exact wire representation of
+    /// its known peer, when present.  An inbound stream has no peer key until
+    /// its first authenticated frame and therefore contributes no key bytes
+    /// to this plan; its identity buffer is planned separately.
+    pub fn for_peer(key: Option<&str>) -> Self {
+        Self {
+            key_capacity: key.map_or(0, str::len),
+            node_bytes: std::mem::size_of::<ConnNode>(),
+            socket_handles: 2,
+            native_objects: 1,
+            queue_slots: OUTBOUND_QUEUE_CAP,
+            worker_tasks: 2,
+            // One channel allocation and one erased provider-owner allocation.
+            opaque_allocations: 2,
+        }
+    }
+
+    pub fn accounted_bytes(self) -> std::result::Result<u64, AliasRefusal> {
+        self.key_capacity
+            .checked_add(self.node_bytes)
+            .ok_or_else(|| AliasRefusal::Arithmetic("connection content size overflow".into()))?
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("connection content size exceeds u64".into()))
+    }
+
+    pub fn opaque_count(self) -> std::result::Result<u64, AliasRefusal> {
+        self.queue_slots
+            .checked_add(self.worker_tasks)
+            .and_then(|count| count.checked_add(self.opaque_allocations))
+            .ok_or_else(|| AliasRefusal::Arithmetic("connection residual count overflow".into()))?
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("connection residual count exceeds u64".into()))
+    }
+}
+
+impl AliasRetention {
+    fn for_alias(key: &String, peer: &String) -> Self {
+        Self {
+            key_capacity: key.capacity(),
+            peer_capacity: peer.capacity(),
+            node_bytes: std::mem::size_of::<AliasNode>(),
+        }
+    }
+
+    pub fn accounted_bytes(self) -> std::result::Result<u64, AliasRefusal> {
+        self.key_capacity
+            .checked_add(self.peer_capacity)
+            .and_then(|bytes| bytes.checked_add(self.node_bytes))
+            .ok_or_else(|| AliasRefusal::Arithmetic("alias content size overflow".into()))?
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("alias content size exceeds u64".into()))
+    }
+
+    pub fn allocation_count(self) -> std::result::Result<u64, AliasRefusal> {
+        let count = 1usize
+            .checked_add(usize::from(self.key_capacity != 0))
+            .and_then(|count| count.checked_add(usize::from(self.peer_capacity != 0)))
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| AliasRefusal::Arithmetic("alias allocation count overflow".into()))?;
+        count
+            .try_into()
+            .map_err(|_| AliasRefusal::Arithmetic("alias allocation count exceeds u64".into()))
+    }
+}
+
+/// Required application seam for retaining one discovered service alias.
+/// The returned owner is held until that exact alias is removed or displaced.
+pub trait AliasProvider: Send + Sync {
+    fn retain_alias(
+        &self,
+        key: &str,
+        peer: &str,
+        retention: AliasRetention,
+    ) -> std::result::Result<ErasedOwner, AliasRefusal>;
+
+    /// Reserve the exact intrusive peer node and moved endpoint buffers
+    /// before the peer registry is changed.
+    fn retain_peer(
+        &self,
+        peer: &str,
+        retention: PeerRetention,
+    ) -> std::result::Result<ErasedOwner, AliasRefusal>;
+
+    /// Reserve one concrete stream, its fixed queue/task shape, and registry
+    /// node immediately before the stream is split or published.
+    fn retain_connection(
+        &self,
+        peer: Option<&str>,
+        retention: ConnectionRetention,
+    ) -> std::result::Result<ErasedOwner, AliasRefusal>;
+
+    /// Reserve the exact sender identity buffer for an inbound stream whose
+    /// peer becomes known only after its first validated frame.
+    fn retain_connection_identity(
+        &self,
+        peer: &str,
+        retention: ConnectionIdentityRetention,
+    ) -> std::result::Result<ErasedOwner, AliasRefusal>;
 }
 
 /// Inbound signaling events the driver pushes to the engine.
@@ -136,6 +362,9 @@ where
     S: OutboundSource<MdnsOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
 {
+    if !(config.device_id_validator)(&config.device_id) {
+        return Err(Error::Other("mDNS local device id is not canonical".into()));
+    }
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -178,11 +407,13 @@ where
     let shared = Arc::new(Shared {
         room_handle,
         device_id: config.device_id,
+        device_id_validator: config.device_id_validator,
+        alias_provider: config.alias_provider,
         discovery: discovery.clone(),
         registered: AtomicBool::new(registered),
-        peers: Mutex::new(HashMap::new()),
+        peers: Mutex::new(PeerOwnership::default()),
         aliases: Mutex::new(AliasOwnership::default()),
-        conns: Mutex::new(HashMap::new()),
+        conns: Mutex::new(ConnectionOwnership::default()),
         connection_slots: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
         connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
         stopped: Arc::new(AtomicBool::new(false)),
@@ -297,10 +528,12 @@ impl Drop for MdnsDriverHandle {
 struct Shared {
     room_handle: String,
     device_id: String,
+    device_id_validator: DeviceIdValidator,
+    alias_provider: Arc<dyn AliasProvider>,
     discovery: Arc<Discovery>,
     registered: AtomicBool,
     /// Peers resolved in our room: device id → exchange endpoint.
-    peers: Mutex<HashMap<String, PeerEntry>>,
+    peers: Mutex<PeerOwnership>,
     /// Exact backend service aliases grouped by decoded peer. A peer is
     /// withdrawn only after its final alias disappears.
     aliases: Mutex<AliasOwnership>,
@@ -308,7 +541,7 @@ struct Shared {
     /// writer. Outbound dials register at connect; inbound accepts
     /// register under the first `from` their frames carry, so a reply
     /// can ride the same socket the request arrived on.
-    conns: Mutex<HashMap<String, ConnHandle>>,
+    conns: Mutex<ConnectionOwnership>,
     connection_slots: Arc<Semaphore>,
     connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
     stopped: Arc<AtomicBool>,
@@ -323,64 +556,246 @@ struct PeerEntry {
     port: u16,
 }
 
+struct PeerNode {
+    peer: String,
+    entry: PeerEntry,
+    owner: ErasedOwner,
+    next: Option<Box<PeerNode>>,
+}
+
+#[derive(Default)]
+struct PeerOwnership {
+    head: Option<Box<PeerNode>>,
+    count: usize,
+}
+
+impl PeerOwnership {
+    fn contains(&self, peer: &str) -> bool {
+        self.get(peer).is_some()
+    }
+
+    fn get(&self, peer: &str) -> Option<PeerEntry> {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.peer == peer {
+                return Some(current.entry.clone());
+            }
+            node = current.next.as_deref();
+        }
+        None
+    }
+
+    fn keys(&self) -> Vec<String> {
+        let mut peers = Vec::with_capacity(self.count);
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            peers.push(current.peer.clone());
+            node = current.next.as_deref();
+        }
+        peers
+    }
+
+    fn can_insert(&self, peer: &str) -> std::result::Result<(), AliasRefusal> {
+        if self.contains(peer) || self.count < MAX_DISCOVERED_PEERS {
+            return Ok(());
+        }
+        Err(AliasRefusal::Provider("peer capacity exhausted".into()))
+    }
+
+    fn peer_capacity(&self, peer: &str) -> Option<usize> {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.peer == peer {
+                return Some(current.peer.capacity());
+            }
+            node = current.next.as_deref();
+        }
+        None
+    }
+
+    fn refresh(
+        &mut self,
+        peer: &str,
+        entry: PeerEntry,
+        owner: ErasedOwner,
+    ) -> std::result::Result<(), AliasRefusal> {
+        if let Some(node) = self.find_mut(peer) {
+            node.entry = entry;
+            node.owner = owner;
+            return Ok(());
+        }
+        Err(AliasRefusal::Provider("peer refresh lost its node".into()))
+    }
+
+    fn insert_new(
+        &mut self,
+        peer: String,
+        entry: PeerEntry,
+        owner: ErasedOwner,
+    ) -> std::result::Result<(), AliasRefusal> {
+        self.can_insert(&peer)?;
+        let next = self.head.take();
+        self.head = Some(Box::new(PeerNode {
+            peer,
+            entry,
+            owner,
+            next,
+        }));
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or_else(|| AliasRefusal::Arithmetic("peer count overflow".into()))?;
+        Ok(())
+    }
+
+    fn remove(&mut self, peer: &str) -> Option<PeerEntry> {
+        let mut link = &mut self.head;
+        loop {
+            let node = link.as_ref()?;
+            if node.peer == peer {
+                let mut removed = link.take().expect("peer link still present");
+                *link = removed.next.take();
+                self.count = self.count.checked_sub(1).expect("peer count present");
+                return Some(removed.entry);
+            }
+            link = &mut link.as_mut().expect("peer link present").next;
+        }
+    }
+
+    fn find_mut(&mut self, peer: &str) -> Option<&mut PeerNode> {
+        let mut node = self.head.as_deref_mut();
+        while let Some(current) = node {
+            if current.peer == peer {
+                return Some(current);
+            }
+            node = current.next.as_deref_mut();
+        }
+        None
+    }
+}
+
 /// Exact DNS-SD alias ownership. A decoded peer may be represented by more
 /// than one backend service key (for example, one per interface), so one key's
 /// removal cannot withdraw the peer while another key remains live.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AliasOwnership {
-    by_key: HashMap<String, String>,
-    by_peer: HashMap<String, HashSet<String>>,
+    head: Option<Box<AliasNode>>,
+    count: usize,
+}
+
+struct AliasNode {
+    key: String,
+    peer: String,
+    generation: u64,
+    owner: ErasedOwner,
+    next: Option<Box<AliasNode>>,
 }
 
 impl AliasOwnership {
     /// Bind one exact service key to a decoded peer. Returns an old peer only
     /// when rebinding made that peer lose its final alias.
-    pub fn bind(&mut self, key: String, peer: String) -> Option<String> {
-        let old = self.by_key.insert(key.clone(), peer.clone());
-        if old.as_deref() == Some(peer.as_str()) {
-            return None;
-        }
-        let displaced = old.and_then(|old_peer| {
-            let last = self
-                .by_peer
-                .get_mut(&old_peer)
-                .map(|keys| {
-                    keys.remove(&key);
-                    keys.is_empty()
-                })
-                .unwrap_or(true);
-            if last {
-                self.by_peer.remove(&old_peer);
-                Some(old_peer)
-            } else {
-                None
+    pub fn bind(
+        &mut self,
+        key: String,
+        peer: String,
+        generation: u64,
+        owner: ErasedOwner,
+    ) -> std::result::Result<Option<String>, AliasRefusal> {
+        let displaced = self
+            .peer_for_key(&key)
+            .filter(|old_peer| old_peer != &peer)
+            .filter(|old_peer| !self.has_other_alias(&key, old_peer));
+        let mut cursor = self.head.as_mut();
+        while let Some(node) = cursor {
+            if node.key == key {
+                node.peer = peer;
+                node.generation = generation;
+                node.owner = owner;
+                return Ok(displaced);
             }
+            cursor = node.next.as_mut();
+        }
+        if self.count == usize::MAX {
+            drop(owner);
+            return Err(AliasRefusal::Arithmetic("alias count overflow".into()));
+        }
+        let node = Box::new(AliasNode {
+            key,
+            peer: peer.clone(),
+            generation,
+            owner,
+            next: self.head.take(),
         });
-        self.by_peer.entry(peer).or_default().insert(key);
-        displaced
+        self.head = Some(node);
+        self.count = self.count.checked_add(1).expect("alias count prechecked");
+        Ok(None)
     }
 
     /// Remove one exact service key. The boolean is true only when its peer
     /// has no remaining aliases.
-    pub fn remove(&mut self, key: &str) -> Option<(String, bool)> {
-        let peer = self.by_key.remove(key)?;
-        let last = self
-            .by_peer
-            .get_mut(&peer)
-            .map(|keys| {
-                keys.remove(key);
-                keys.is_empty()
-            })
-            .unwrap_or(true);
-        if last {
-            self.by_peer.remove(&peer);
+    pub fn remove(&mut self, key: &str, generation: u64) -> Option<(String, bool)> {
+        let mut link = &mut self.head;
+        loop {
+            let node = link.as_ref()?;
+            if node.key == key {
+                if node.generation != generation {
+                    return None;
+                }
+                let mut removed = link.take().expect("alias link still present");
+                *link = removed.next.take();
+                self.count = self.count.checked_sub(1).expect("alias count present");
+                let peer = removed.peer;
+                let last = !self.contains_peer(&peer);
+                return Some((peer, last));
+            }
+            link = &mut link.as_mut().expect("alias link present").next;
         }
-        Some((peer, last))
     }
 
     /// Number of aliases currently attached to one decoded peer.
     pub fn alias_count(&self, peer: &str) -> usize {
-        self.by_peer.get(peer).map_or(0, HashSet::len)
+        let mut count = 0;
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.peer == peer {
+                count += 1;
+            }
+            node = current.next.as_deref();
+        }
+        count
+    }
+
+    fn contains_peer(&self, peer: &str) -> bool {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.peer == peer {
+                return true;
+            }
+            node = current.next.as_deref();
+        }
+        false
+    }
+
+    fn has_other_alias(&self, key: &str, peer: &str) -> bool {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.key != key && current.peer == peer {
+                return true;
+            }
+            node = current.next.as_deref();
+        }
+        false
+    }
+
+    fn peer_for_key(&self, key: &str) -> Option<String> {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.key == key {
+                return Some(current.peer.clone());
+            }
+            node = current.next.as_deref();
+        }
+        None
     }
 }
 
@@ -389,6 +804,66 @@ struct ConnHandle {
     generation: u64,
     tx: mpsc::Sender<OwnedSignal<String, ErasedOwner>>,
     stop: watch::Sender<bool>,
+}
+
+struct ConnNode {
+    peer: Arc<str>,
+    handle: ConnHandle,
+    _owner: ErasedOwner,
+    next: Option<Box<ConnNode>>,
+}
+
+#[derive(Default)]
+struct ConnectionOwnership {
+    head: Option<Box<ConnNode>>,
+}
+
+impl ConnectionOwnership {
+    fn sender(&self, peer: &str) -> Option<mpsc::Sender<OwnedSignal<String, ErasedOwner>>> {
+        let mut node = self.head.as_deref();
+        while let Some(current) = node {
+            if current.peer.as_ref() == peer {
+                return Some(current.handle.tx.clone());
+            }
+            node = current.next.as_deref();
+        }
+        None
+    }
+
+    fn insert(
+        &mut self,
+        peer: Arc<str>,
+        handle: ConnHandle,
+        owner: ErasedOwner,
+    ) -> Option<ConnHandle> {
+        let displaced = self.remove(&peer, None).map(|node| node.handle);
+        self.head = Some(Box::new(ConnNode {
+            peer,
+            handle,
+            _owner: owner,
+            next: self.head.take(),
+        }));
+        displaced
+    }
+
+    fn remove(&mut self, peer: &str, generation: Option<u64>) -> Option<ConnNode> {
+        let mut link = &mut self.head;
+        loop {
+            let node = link.as_ref()?;
+            if node.peer.as_ref() == peer
+                && generation.is_none_or(|generation| node.handle.generation == generation)
+            {
+                let mut removed = link.take().expect("connection link still present");
+                *link = removed.next.take();
+                return Some(*removed);
+            }
+            link = &mut link.as_mut().expect("connection link present").next;
+        }
+    }
+
+    fn remove_generation(&mut self, peer: &str, generation: u64) {
+        let _ = self.remove(peer, Some(generation));
+    }
 }
 
 /// A connection slot remains occupied until both halves have observed the
@@ -428,6 +903,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
         }
         match event {
             DiscoveryEvent::Resolved {
+                generation,
                 key,
                 mut addrs,
                 port,
@@ -437,6 +913,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                     |k| txt.get(k).cloned(),
                     &shared.room_handle,
                     &shared.device_id,
+                    shared.device_id_validator,
                 );
                 let Some(advert) = advert else { continue };
                 if addrs.is_empty() {
@@ -445,14 +922,58 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                 }
                 addrs.sort();
                 let entry = PeerEntry { addrs, port };
+                let peer = advert.peer;
                 let peers = shared.peers.lock();
-                let known = peers.contains_key(&advert.peer);
-                let at_capacity = peers.len() >= MAX_DISCOVERED_PEERS;
+                let known = peers.contains(&peer);
+                let at_capacity = peers.count >= MAX_DISCOVERED_PEERS;
+                let peer_capacity_ok = peers.can_insert(&peer).is_ok();
+                let existing_peer_capacity = peers.peer_capacity(&peer);
                 drop(peers);
-                if !known && at_capacity {
+                if (!known && at_capacity) || !peer_capacity_ok {
                     continue;
                 }
-                let displaced = shared.aliases.lock().bind(key, advert.peer.clone());
+                let peer_node = (!known).then(|| peer.clone());
+                let peer_retention = match peer_node.as_ref() {
+                    Some(peer_node) => PeerRetention::for_peer(peer_node, &entry.addrs),
+                    None => {
+                        PeerRetention::from_parts(existing_peer_capacity.unwrap_or(0), &entry.addrs)
+                    }
+                };
+                let peer_owner = match shared.alias_provider.retain_peer(&peer, peer_retention) {
+                    Ok(owner) => owner,
+                    Err(refusal) => {
+                        debug!(?refusal, "mdns peer retention refused");
+                        continue;
+                    }
+                };
+                let retention = AliasRetention::for_alias(&key, &peer);
+                let alias_owner = match shared.alias_provider.retain_alias(&key, &peer, retention) {
+                    Ok(owner) => owner,
+                    Err(refusal) => {
+                        drop(peer_owner);
+                        debug!(?refusal, "mdns alias retention refused");
+                        continue;
+                    }
+                };
+                let bind_result = {
+                    let mut aliases = shared.aliases.lock();
+                    aliases.bind(key.clone(), peer, generation, alias_owner)
+                };
+                let (displaced, current_peer) = match bind_result {
+                    Ok(displaced) => {
+                        let current_peer = shared
+                            .aliases
+                            .lock()
+                            .peer_for_key(&key)
+                            .expect("bound alias has a peer");
+                        (displaced, current_peer)
+                    }
+                    Err(refusal) => {
+                        drop(peer_owner);
+                        debug!(?refusal, "mdns alias bind refused");
+                        continue;
+                    }
+                };
                 if let Some(old_peer) = displaced {
                     shared.peers.lock().remove(&old_peer);
                     stop_connection(&shared, &old_peer);
@@ -469,8 +990,23 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                         return;
                     }
                 }
-                shared.peers.lock().insert(advert.peer.clone(), entry);
-                debug!(peer = %&advert.peer[..advert.peer.len().min(16)], "mdns peer resolved");
+                let peer_result = if known {
+                    shared
+                        .peers
+                        .lock()
+                        .refresh(&current_peer, entry, peer_owner)
+                } else {
+                    shared.peers.lock().insert_new(
+                        peer_node.expect("new peer node was prepared"),
+                        entry,
+                        peer_owner,
+                    )
+                };
+                if let Err(refusal) = peer_result {
+                    debug!(?refusal, "mdns peer bind refused after pre-admission");
+                    return;
+                }
+                debug!(peer = %&current_peer[..current_peer.len().min(16)], "mdns peer resolved");
                 // Every resolve (first sight or cache refresh) surfaces as
                 // an announce; the engine is idempotent on repeats, same
                 // as with periodic Nostr announces.
@@ -490,7 +1026,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                     .inbound_tx
                     .send(MdnsInbound::PeerAnnounced {
                         attribution: CarrierAttribution::SenderClaimed,
-                        device_id: advert.peer,
+                        device_id: current_peer,
                     })
                     .is_err()
                 {
@@ -498,8 +1034,8 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                     return;
                 }
             }
-            DiscoveryEvent::Removed { key } => {
-                if let Some((peer, last)) = shared.aliases.lock().remove(&key) {
+            DiscoveryEvent::Removed { generation, key } => {
+                if let Some((peer, last)) = shared.aliases.lock().remove(&key, generation) {
                     if !last {
                         continue;
                     }
@@ -626,9 +1162,9 @@ async fn send_directed(
     // returns the line *and its owner* here rather than dropping either: the
     // dial below reuses the same allocation and the same funding.
     let commit = line.commit_unit();
-    let existing = shared.conns.lock().get(&to).cloned();
+    let existing = shared.conns.lock().sender(&to);
     let line = match existing {
-        Some(handle) => match handle.tx.try_send(line) {
+        Some(handle) => match handle.try_send(line) {
             Ok(()) => {
                 if let Some(commit) = &commit {
                     commit.accept();
@@ -645,7 +1181,7 @@ async fn send_directed(
     };
 
     // Dial. Snapshot the endpoint before awaiting anything.
-    let Some(entry) = shared.peers.lock().get(&to).cloned() else {
+    let Some(entry) = shared.peers.lock().get(&to) else {
         debug!(peer = %&to[..to.len().min(16)], "mdns directed message for unknown peer dropped");
         return false;
     };
@@ -708,6 +1244,17 @@ fn adopt_stream(
     if shared.stopped.load(Ordering::Acquire) {
         return None;
     }
+    let connection_retention = ConnectionRetention::for_peer(known_peer.as_deref());
+    let connection_owner = match shared
+        .alias_provider
+        .retain_connection(known_peer.as_deref(), connection_retention)
+    {
+        Ok(owner) => owner,
+        Err(refusal) => {
+            debug!(?refusal, "mdns connection retention refused");
+            return None;
+        }
+    };
     let slot = shared
         .connection_slots
         .clone()
@@ -731,23 +1278,30 @@ fn adopt_stream(
     }
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
-    let registered_as = Arc::new(Mutex::new(None::<String>));
+    let registered_as = Arc::new(Mutex::new(None::<Arc<str>>));
+    let pending_owner = Arc::new(Mutex::new(Some(connection_owner)));
     if let Some(peer) = known_peer {
         if shared.stopped.load(Ordering::Acquire) {
             return None;
         }
+        let owner = pending_owner
+            .lock()
+            .take()
+            .expect("outbound connection owner is available");
+        let peer_key: Arc<str> = Arc::from(peer.as_str());
         let displaced = shared.conns.lock().insert(
-            peer.clone(),
+            peer_key.clone(),
             ConnHandle {
                 generation,
                 tx: tx.clone(),
                 stop: local_stop.clone(),
             },
+            owner,
         );
         if let Some(displaced) = displaced {
             let _ = displaced.stop.send(true);
         }
-        *registered_as.lock() = Some(peer);
+        *registered_as.lock() = Some(peer_key);
     }
 
     // Writer: drains the queue onto the socket; exits on idle, write
@@ -765,10 +1319,7 @@ fn adopt_stream(
             // Deregister — only our own generation; a newer connection
             // may have replaced this entry already.
             if let Some(peer) = registered_as.lock().clone() {
-                let mut conns = shared.conns.lock();
-                if conns.get(&peer).is_some_and(|h| h.generation == generation) {
-                    conns.remove(&peer);
-                }
+                shared.conns.lock().remove_generation(&peer, generation);
             }
         };
         let tasks = connection_tasks.as_mut()?;
@@ -781,6 +1332,7 @@ fn adopt_stream(
         let shared = shared.clone();
         let tx = tx.clone();
         let registered_as = registered_as.clone();
+        let pending_owner = pending_owner.clone();
         let local_cancel = local_stop.subscribe();
         let local_stop = local_stop.clone();
         let _slot = slot;
@@ -791,18 +1343,38 @@ fn adopt_stream(
                 }
                 let mut reg = registered_as.lock();
                 if reg.is_none() {
+                    if !shared.peers.lock().contains(from) {
+                        return;
+                    }
+                    let identity_retention = ConnectionIdentityRetention::for_peer(from);
+                    let identity_owner = match shared
+                        .alias_provider
+                        .retain_connection_identity(from, identity_retention)
+                    {
+                        Ok(owner) => owner,
+                        Err(refusal) => {
+                            debug!(?refusal, "mdns connection identity retention refused");
+                            return;
+                        }
+                    };
+                    let Some(owner) = pending_owner.lock().take() else {
+                        drop(identity_owner);
+                        return;
+                    };
+                    let peer_key: Arc<str> = Arc::from(from);
                     let displaced = shared.conns.lock().insert(
-                        from.to_string(),
+                        peer_key.clone(),
                         ConnHandle {
                             generation,
                             tx: tx.clone(),
                             stop: local_stop.clone(),
                         },
+                        Box::new((owner, identity_owner)) as ErasedOwner,
                     );
                     if let Some(displaced) = displaced {
                         let _ = displaced.stop.send(true);
                     }
-                    *reg = Some(from.to_string());
+                    *reg = Some(peer_key);
                 }
             })
             .await;
@@ -811,10 +1383,7 @@ fn adopt_stream(
             // writes would still go through — deregister so the next
             // exchange re-dials.
             if let Some(peer) = registered_as.lock().clone() {
-                let mut conns = shared.conns.lock();
-                if conns.get(&peer).is_some_and(|h| h.generation == generation) {
-                    conns.remove(&peer);
-                }
+                shared.conns.lock().remove_generation(&peer, generation);
             }
             trace!("mdns exchange connection closed");
         };
@@ -930,7 +1499,12 @@ async fn run_reader(
                 return;
             }
         };
-        if !wire::frame_is_for_us(&frame, &shared.room_handle, &shared.device_id) {
+        if !wire::frame_is_for_us(
+            &frame,
+            &shared.room_handle,
+            &shared.device_id,
+            shared.device_id_validator,
+        ) {
             trace!("mdns frame for another room/recipient dropped");
             continue;
         }
@@ -1001,8 +1575,8 @@ async fn read_bounded_line(
 /// Signaling the owner before the stale task can publish another frame keeps
 /// alias withdrawal and connection replacement on the same lifecycle fence.
 fn stop_connection(shared: &Shared, peer: &str) {
-    if let Some(handle) = shared.conns.lock().remove(peer) {
-        let _ = handle.stop.send(true);
+    if let Some(node) = shared.conns.lock().remove(peer, None) {
+        let _ = node.handle.stop.send(true);
     }
 }
 
@@ -1027,7 +1601,7 @@ async fn run_reannounce(shared: Arc<Shared>) {
         // that never sent its goodbye lingers until its record TTL
         // expires — the engine tolerates announces for unreachable
         // peers, so this is noise, not harm.
-        let peers: Vec<String> = shared.peers.lock().keys().cloned().collect();
+        let peers: Vec<String> = shared.peers.lock().keys();
         for device_id in peers {
             if shared
                 .inbound_tx
@@ -1047,6 +1621,93 @@ async fn run_reannounce(shared: Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropCounter(Arc<AtomicU64>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn peer_retention_replacement_and_refusal_preserve_registry_state() {
+        let released = Arc::new(AtomicU64::new(0));
+        let mut peers = PeerOwnership::default();
+        peers
+            .insert_new(
+                "peer-a".into(),
+                PeerEntry {
+                    addrs: vec!["127.0.0.1".parse().unwrap()],
+                    port: 1,
+                },
+                Box::new(DropCounter(Arc::clone(&released))),
+            )
+            .unwrap();
+        peers
+            .refresh(
+                "peer-a",
+                PeerEntry {
+                    addrs: vec!["127.0.0.2".parse().unwrap()],
+                    port: 2,
+                },
+                Box::new(DropCounter(Arc::clone(&released))),
+            )
+            .unwrap();
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        assert_eq!(peers.get("peer-a").unwrap().port, 2);
+
+        let mut full = PeerOwnership {
+            head: None,
+            count: MAX_DISCOVERED_PEERS,
+        };
+        let refusal = full.insert_new(
+            "peer-b".into(),
+            PeerEntry {
+                addrs: Vec::new(),
+                port: 3,
+            },
+            Box::new(DropCounter(Arc::clone(&released))),
+        );
+        assert!(refusal.is_err());
+        assert_eq!(full.count, MAX_DISCOVERED_PEERS);
+        assert!(!full.contains("peer-b"));
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+        drop(peers.remove("peer-a"));
+        assert_eq!(released.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn connection_registry_replacement_and_generation_removal_release_owner() {
+        let released = Arc::new(AtomicU64::new(0));
+        let (tx, _rx) = mpsc::channel(1);
+        let (stop, _) = watch::channel(false);
+        let mut conns = ConnectionOwnership::default();
+        conns.insert(
+            Arc::from("peer-a"),
+            ConnHandle {
+                generation: 1,
+                tx: tx.clone(),
+                stop: stop.clone(),
+            },
+            Box::new(DropCounter(Arc::clone(&released))),
+        );
+        conns.insert(
+            Arc::from("peer-a"),
+            ConnHandle {
+                generation: 2,
+                tx,
+                stop,
+            },
+            Box::new(DropCounter(Arc::clone(&released))),
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        conns.remove_generation("peer-a", 1);
+        assert!(conns.sender("peer-a").is_some());
+        conns.remove_generation("peer-a", 2);
+        assert!(conns.sender("peer-a").is_none());
+        assert_eq!(released.load(Ordering::SeqCst), 2);
+    }
 
     #[tokio::test]
     async fn connection_slots_have_a_finite_cap_and_release() {

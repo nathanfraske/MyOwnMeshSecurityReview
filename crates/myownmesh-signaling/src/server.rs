@@ -59,40 +59,6 @@ use crate::nostr::event::{
 };
 use crate::{Error, Result};
 
-/// Max stored (replayable) events retained across all rooms. Presence is
-/// low-volume; this is a generous ceiling that still bounds memory.
-const MAX_STORED_EVENTS: usize = 8192;
-
-/// How long a stored event stays replayable. The mesh driver only asks
-/// for the last 5 minutes (`since = now - 300`), so 15 minutes covers it
-/// with headroom while keeping the buffer fresh.
-const STORED_RETENTION: Duration = Duration::from_secs(15 * 60);
-
-/// Hard cap on how many events a single `REQ` can replay, so a broad
-/// filter can't dump the whole buffer onto a new subscriber.
-const MAX_REPLAY_PER_REQ: usize = 500;
-
-/// Bound each connection's pending wire frames. A slow or dead subscriber
-/// must not turn relay fanout into an unbounded allocation path.
-const OUTBOUND_QUEUE_CAP: usize = 128;
-
-/// Bound the bytes read while parsing the HTTP upgrade request. This is
-/// separate from the WebSocket frame/message limits because the upgrade is
-/// parsed before a WebSocket stream exists.
-const DEFAULT_MAX_HANDSHAKE_BYTES: u32 = 16 * 1024;
-
-/// A slow client must not hold a pre-admission slot forever while trickling an
-/// incomplete HTTP upgrade.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Bound writer shutdown while preserving an awaited, joined stop path.
-const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How many rate-limit violations a connection may rack up before the
-/// relay closes it. Generous enough to ride out a legitimate burst,
-/// tight enough to evict a persistent abuser.
-const STRIKE_LIMIT: u32 = 50;
-
 /// Flood-protection limits for the signaling relay. Every field is finite and
 /// non-zero: an unbounded deployment is not a valid server configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +87,20 @@ pub struct Limits {
     pub max_handshake_bytes: u32,
     /// Max payload bytes in one incoming WebSocket frame.
     pub max_frame_bytes: u32,
+    /// Max replayable events retained across all rooms.
+    pub max_stored_events: u32,
+    /// Seconds a stored event remains replayable.
+    pub stored_retention_secs: u64,
+    /// Max events materialized for one `REQ` replay.
+    pub max_replay_per_req: u32,
+    /// Max pending wire frames per connection.
+    pub outbound_queue_cap: u32,
+    /// Rate-limit violations allowed before disconnect.
+    pub strike_limit: u32,
+    /// Seconds a trickling HTTP upgrade may hold its admission reservation.
+    pub handshake_timeout_secs: u64,
+    /// Seconds allowed for a writer to finish after connection shutdown.
+    pub writer_stop_timeout_secs: u64,
 }
 
 impl Default for Limits {
@@ -134,8 +114,15 @@ impl Default for Limits {
             max_message_bytes: 65_536,
             max_connections_per_ip: 64,
             max_presence_memberships: 256,
-            max_handshake_bytes: DEFAULT_MAX_HANDSHAKE_BYTES,
+            max_handshake_bytes: 16 * 1024,
             max_frame_bytes: 65_536,
+            max_stored_events: 8192,
+            stored_retention_secs: 15 * 60,
+            max_replay_per_req: 500,
+            outbound_queue_cap: 128,
+            strike_limit: 50,
+            handshake_timeout_secs: 10,
+            writer_stop_timeout_secs: 2,
         }
     }
 }
@@ -157,11 +144,85 @@ impl Limits {
             ("max_presence_memberships", self.max_presence_memberships),
             ("max_handshake_bytes", self.max_handshake_bytes),
             ("max_frame_bytes", self.max_frame_bytes),
+            ("max_stored_events", self.max_stored_events),
+            ("max_replay_per_req", self.max_replay_per_req),
+            ("outbound_queue_cap", self.outbound_queue_cap),
+            ("strike_limit", self.strike_limit),
         ];
-        if let Some((name, _)) = fields.into_iter().find(|(_, value)| *value == 0) {
+        if let Some((name, _)) = fields.iter().find(|(_, value)| *value == 0) {
             return Err(Error::Other(format!("{name} must be finite and non-zero")));
         }
+        for (name, value) in fields {
+            if usize::try_from(value).is_err() {
+                return Err(Error::Other(format!(
+                    "{name} does not fit the platform usize"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("stored_retention_secs", self.stored_retention_secs),
+            ("handshake_timeout_secs", self.handshake_timeout_secs),
+            ("writer_stop_timeout_secs", self.writer_stop_timeout_secs),
+        ] {
+            if value == 0 {
+                return Err(Error::Other(format!("{name} must be finite and non-zero")));
+            }
+        }
+        for (name, left, right) in [
+            (
+                "stored event byte ceiling",
+                self.max_stored_events,
+                self.max_message_bytes,
+            ),
+            (
+                "replay byte ceiling",
+                self.max_replay_per_req,
+                self.max_message_bytes,
+            ),
+            (
+                "outbound queue slot ceiling",
+                self.max_connections,
+                self.outbound_queue_cap,
+            ),
+        ] {
+            Self::checked_product(name, left, right)?;
+        }
+        let write_buffer = u64::from(self.max_message_bytes)
+            .checked_mul(2)
+            .ok_or_else(|| Error::Other("max write buffer size overflow".into()))?;
+        usize::try_from(write_buffer).map_err(|_| {
+            Error::Other("max write buffer size does not fit platform usize".into())
+        })?;
         Ok(())
+    }
+
+    fn checked_usize(value: u32, name: &'static str) -> Result<usize> {
+        usize::try_from(value)
+            .map_err(|_| Error::Other(format!("{name} does not fit the platform usize")))
+    }
+
+    fn checked_write_buffer_size(&self) -> Result<usize> {
+        let value = u64::from(self.max_message_bytes)
+            .checked_mul(2)
+            .ok_or_else(|| Error::Other("max write buffer size overflow".into()))?;
+        usize::try_from(value)
+            .map_err(|_| Error::Other("max write buffer size does not fit platform usize".into()))
+    }
+
+    fn handshake_timeout(&self) -> Duration {
+        Duration::from_secs(self.handshake_timeout_secs)
+    }
+
+    fn writer_stop_timeout(&self) -> Duration {
+        Duration::from_secs(self.writer_stop_timeout_secs)
+    }
+
+    fn checked_product(name: &'static str, left: u32, right: u32) -> Result<usize> {
+        let value = u64::from(left)
+            .checked_mul(u64::from(right))
+            .ok_or_else(|| Error::Other(format!("{name} overflow")))?;
+        usize::try_from(value)
+            .map_err(|_| Error::Other(format!("{name} does not fit platform usize")))
     }
 }
 
@@ -192,6 +253,8 @@ pub struct SignalingServerHandle {
     task: Option<JoinHandle<()>>,
     heartbeat: Option<JoinHandle<()>>,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    writer_stop_timeout: Duration,
     local_addr: SocketAddr,
     hub: Hub,
 }
@@ -228,7 +291,17 @@ impl SignalingServerHandle {
             std::mem::take(&mut *owned)
         };
         for task in tasks {
-            let _ = task.await;
+            if let Err(error) = task.await {
+                warn!("signaling connection task did not complete normally: {error}");
+            }
+        }
+
+        let writers = {
+            let mut owned = self.writers.lock();
+            std::mem::take(&mut *owned)
+        };
+        for writer in writers {
+            await_writer_with_timeout(writer, self.writer_stop_timeout).await;
         }
     }
 }
@@ -242,6 +315,20 @@ impl Drop for SignalingServerHandle {
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
+        let tasks = {
+            let mut owned = self.connections.lock();
+            std::mem::take(&mut *owned)
+        };
+        for task in tasks {
+            task.abort();
+        }
+        let writers = {
+            let mut owned = self.writers.lock();
+            std::mem::take(&mut *owned)
+        };
+        for writer in writers {
+            writer.abort();
+        }
     }
 }
 
@@ -251,6 +338,8 @@ impl SignalingServer {
     /// runs in a spawned task.
     pub async fn start(bind: &str, port: u16, limits: Limits) -> Result<SignalingServerHandle> {
         limits.validate()?;
+        let writer_stop_timeout = limits.writer_stop_timeout();
+        let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
         let addr = format!("{bind}:{port}");
         let listener = TcpListener::bind(&addr)
             .await
@@ -260,13 +349,25 @@ impl SignalingServer {
             .map_err(|e| Error::Bind(addr.clone(), e))?;
         info!(%local_addr, "signaling relay listening (NIP-01 over WebSocket)");
         let hub = Hub::new(limits);
-        let connections = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(accept_loop(listener, hub.clone(), Arc::clone(&connections)));
+        // Admission bounds live connections, and accept_loop reaps finished
+        // handles before the next admit; these registries therefore need no
+        // growth beyond one slot per admitted connection.
+        let connections = Arc::new(Mutex::new(Vec::with_capacity(registry_capacity)));
+        let writers = Arc::new(Mutex::new(Vec::with_capacity(registry_capacity)));
+        let task = tokio::spawn(accept_loop(
+            listener,
+            hub.clone(),
+            Arc::clone(&connections),
+            Arc::clone(&writers),
+            registry_capacity,
+        ));
         let heartbeat = tokio::spawn(stats_heartbeat(hub.clone()));
         Ok(SignalingServerHandle {
             task: Some(task),
             heartbeat: Some(heartbeat),
             connections,
+            writers,
+            writer_stop_timeout,
             local_addr,
             hub,
         })
@@ -296,12 +397,17 @@ async fn accept_loop(
     listener: TcpListener,
     hub: Hub,
     connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    registry_capacity: usize,
 ) {
     loop {
+        observe_finished_tasks(&connections, "connection").await;
+        observe_finished_tasks(&writers, "writer").await;
         match listener.accept().await {
             Ok((stream, peer)) => {
                 let hub = hub.clone();
                 let connections = Arc::clone(&connections);
+                let writers = Arc::clone(&writers);
                 let Some(admission) = hub.admit(peer.ip()) else {
                     let mut stream = stream;
                     let _ = stream
@@ -312,13 +418,25 @@ async fn accept_loop(
                     let _ = stream.shutdown().await;
                     continue;
                 };
+                let registry_available = {
+                    let owned = connections.lock();
+                    owned.len() < registry_capacity
+                        && registry_slot_available(&writers, registry_capacity)
+                };
+                if !registry_available {
+                    drop(admission);
+                    let mut stream = stream;
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
+                // The accept loop is the only connection-registry writer;
+                // publishing under this guard closes the check/spawn gap.
+                let mut owned = connections.lock();
                 let task = tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, peer, hub, admission).await {
+                    if let Err(e) = handle_conn(stream, peer, hub, admission, writers).await {
                         trace!(%peer, "signaling conn ended: {e}");
                     }
                 });
-                let mut owned = connections.lock();
-                owned.retain(|task| !task.is_finished());
                 owned.push(task);
             }
             Err(e) => warn!("signaling accept error: {e}"),
@@ -331,19 +449,27 @@ async fn handle_conn(
     peer: SocketAddr,
     hub: Hub,
     admission: Admission,
+    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 ) -> Result<()> {
     let limits = hub.limits();
+    let max_message_bytes = Limits::checked_usize(limits.max_message_bytes, "max_message_bytes")?;
+    let max_frame_bytes = Limits::checked_usize(limits.max_frame_bytes, "max_frame_bytes")?;
+    let max_handshake_bytes =
+        Limits::checked_usize(limits.max_handshake_bytes, "max_handshake_bytes")?;
+    let outbound_queue_cap =
+        Limits::checked_usize(limits.outbound_queue_cap, "outbound_queue_cap")?;
+    let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
     let ws_config = WebSocketConfig {
-        max_message_size: Some(limits.max_message_bytes as usize),
-        max_frame_size: Some(limits.max_frame_bytes as usize),
+        max_message_size: Some(max_message_bytes),
+        max_frame_size: Some(max_frame_bytes),
         write_buffer_size: 0,
-        max_write_buffer_size: (limits.max_message_bytes as usize).saturating_mul(2).max(1),
+        max_write_buffer_size: limits.checked_write_buffer_size()?,
         ..WebSocketConfig::default()
     };
     let handshake = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
+        limits.handshake_timeout(),
         accept_async_with_config(
-            HandshakeLimitedStream::new(stream, limits.max_handshake_bytes as usize),
+            HandshakeLimitedStream::new(stream, max_handshake_bytes),
             Some(ws_config),
         ),
     )
@@ -368,46 +494,76 @@ async fn handle_conn(
             return Ok(());
         }
     };
-    let (mut write, mut read) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(OUTBOUND_QUEUE_CAP);
+    let (write, mut read) = ws.split();
+    let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(outbound_queue_cap);
+    let mut write = Some(write);
 
+    let writer_slot_available = registry_slot_available(&writers, registry_capacity);
+    if !writer_slot_available {
+        if let Some(mut write) = write.take() {
+            let _ = write.close().await;
+        }
+        return Ok(());
+    }
     let Some(conn_id) = admission.activate(out_tx.clone()) else {
-        let _ = write.close().await;
+        if let Some(mut write) = write.take() {
+            let _ = write.close().await;
+        }
         return Ok(());
     };
+    let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
 
     // Writer task: drains the per-connection outbound queue to the
     // socket. The closed watch is the fence: queued frames are not drained
     // after the hub has revoked this connection's admission.
     let (closed_tx, mut closed_rx) = watch::channel(false);
-    let writer = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                changed = closed_rx.changed() => {
-                    if changed.is_err() || *closed_rx.borrow() {
-                        break;
+    let writer_registered = {
+        let mut owned_writers = writers.lock();
+        if owned_writers.len() >= registry_capacity {
+            false
+        } else {
+            let mut write = write.take().expect("writer slot was checked above");
+            let writer = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        changed = closed_rx.changed() => {
+                            if changed.is_err() || *closed_rx.borrow() {
+                                break;
+                            }
+                        }
+                        msg = out_rx.recv() => {
+                            let Some(msg) = msg else { break };
+                            if *closed_rx.borrow() {
+                                break;
+                            }
+                            if write.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
-                msg = out_rx.recv() => {
-                    let Some(msg) = msg else { break };
-                    if *closed_rx.borrow() {
-                        break;
-                    }
-                    if write.send(msg).await.is_err() {
-                        break;
-                    }
-                }
-            }
+                let _ = write.close().await;
+            });
+            owned_writers.push(writer);
+            true
         }
-        let _ = write.close().await;
-    });
+    };
+    if !writer_registered {
+        hub.unregister(conn_id);
+        if let Some(mut write) = write {
+            let _ = write.close().await;
+        }
+        drop(out_tx);
+        return Ok(());
+    }
+    cleanup.install_closed_signal(closed_tx.clone());
 
     let mut shutdown = hub.shutdown_signal();
     if *shutdown.borrow() {
         let _ = closed_tx.send(true);
-        hub.unregister(conn_id);
+        cleanup.unregister();
         drop(out_tx);
-        await_writer(writer).await;
+        cleanup.disarm();
         return Ok(());
     }
     loop {
@@ -441,19 +597,94 @@ async fn handle_conn(
     }
 
     let _ = closed_tx.send(true);
-    hub.unregister(conn_id);
+    cleanup.unregister();
     drop(out_tx);
-    await_writer(writer).await;
+    cleanup.disarm();
     Ok(())
 }
 
-async fn await_writer(mut writer: JoinHandle<()>) {
-    match tokio::time::timeout(WRITER_STOP_TIMEOUT, &mut writer).await {
-        Ok(_) => {}
+async fn observe_finished_tasks(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, role: &'static str) {
+    let finished = {
+        let mut owned = tasks.lock();
+        let mut finished = Vec::new();
+        let mut index = 0;
+        while index < owned.len() {
+            if owned[index].is_finished() {
+                finished.push(owned.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        finished
+    };
+    for task in finished {
+        if let Err(error) = task.await {
+            warn!(
+                task_role = role,
+                "signaling {role} task did not complete normally: {error}"
+            );
+        }
+    }
+}
+
+fn registry_slot_available(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, capacity: usize) -> bool {
+    tasks.lock().len() < capacity
+}
+
+async fn await_writer_with_timeout(mut writer: JoinHandle<()>, timeout: Duration) {
+    match tokio::time::timeout(timeout, &mut writer).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!("signaling writer task did not complete normally: {error}");
+        }
         Err(_) => {
             writer.abort();
-            let _ = writer.await;
+            if let Err(error) = writer.await {
+                warn!("signaling writer task aborted during bounded shutdown: {error}");
+            }
         }
+    }
+}
+
+struct ConnectionCleanup {
+    hub: Hub,
+    conn_id: u64,
+    closed: Option<watch::Sender<bool>>,
+    armed: bool,
+}
+
+impl ConnectionCleanup {
+    fn new(hub: Hub, conn_id: u64) -> Self {
+        Self {
+            hub,
+            conn_id,
+            closed: None,
+            armed: true,
+        }
+    }
+
+    fn install_closed_signal(&mut self, closed: watch::Sender<bool>) {
+        self.closed = Some(closed);
+    }
+
+    fn unregister(&self) {
+        self.hub.unregister(self.conn_id);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(closed) = &self.closed {
+            let _ = closed.send(true);
+        }
+        self.hub.unregister(self.conn_id);
     }
 }
 
@@ -870,7 +1101,7 @@ impl HubInner {
     fn strike(&mut self, conn_id: u64) -> bool {
         if let Some(conn) = self.conns.get_mut(&conn_id) {
             conn.strikes += 1;
-            if conn.strikes > STRIKE_LIMIT {
+            if conn.strikes > self.limits.strike_limit {
                 let _ = conn.out.try_send(WsMessage::Text(
                     json!(["NOTICE", "rate limit exceeded — closing"]).to_string(),
                 ));
@@ -888,16 +1119,19 @@ impl HubInner {
             return;
         };
         let subid = subid.to_string();
-        let mut filters: Vec<Value> = arr.get(2..).map(|s| s.to_vec()).unwrap_or_default();
-        if self.limits.max_filters_per_req > 0 {
-            filters.truncate(self.limits.max_filters_per_req as usize);
-        }
+        let filters = bounded_filters(
+            arr.get(2..).unwrap_or_default(),
+            Limits::checked_usize(self.limits.max_filters_per_req, "max_filters_per_req")
+                .unwrap_or(usize::MAX),
+        );
 
         // Enforce the per-connection subscription ceiling for new ids.
         if self.limits.max_subscriptions > 0 {
             if let Some(conn) = self.conns.get(&conn_id) {
                 if !conn.subs.contains_key(&subid)
-                    && conn.subs.len() >= self.limits.max_subscriptions as usize
+                    && conn.subs.len()
+                        >= Limits::checked_usize(self.limits.max_subscriptions, "max_subscriptions")
+                            .unwrap_or(usize::MAX)
                 {
                     if let Some(conn) = self.conns.get(&conn_id) {
                         let _ = conn.out.try_send(WsMessage::Text(
@@ -913,24 +1147,13 @@ impl HubInner {
         // Candidate replay set: stored matches ∪ live-presence announces,
         // deduped by event id. Presence catches members whose announce
         // aged out of the store — that's the "instant discovery" win.
-        let mut replay: Vec<NostrEvent> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for s in &self.stored {
-            if matches_any(&filters, &s.event) && seen.insert(s.event.id.clone()) {
-                replay.push(s.event.clone());
-            }
-        }
-        for room in self.presence.values() {
-            for p in room.values() {
-                if matches_any(&filters, &p.announce) && seen.insert(p.announce.id.clone()) {
-                    replay.push(p.announce.clone());
-                }
-            }
-        }
-        if replay.len() > MAX_REPLAY_PER_REQ {
-            let drop_n = replay.len() - MAX_REPLAY_PER_REQ;
-            replay.drain(0..drop_n);
-        }
+        let replay = bounded_replay(
+            &filters,
+            &self.stored,
+            &self.presence,
+            Limits::checked_usize(self.limits.max_replay_per_req, "max_replay_per_req")
+                .unwrap_or(usize::MAX),
+        );
 
         let Some(conn) = self.conns.get_mut(&conn_id) else {
             return;
@@ -992,7 +1215,14 @@ impl HubInner {
                 && self
                     .conns
                     .get(&conn_id)
-                    .map(|conn| conn.present.len() >= self.limits.max_presence_memberships as usize)
+                    .map(|conn| {
+                        conn.present.len()
+                            >= Limits::checked_usize(
+                                self.limits.max_presence_memberships,
+                                "max_presence_memberships",
+                            )
+                            .unwrap_or(usize::MAX)
+                    })
                     .unwrap_or(false);
             if over_cap {
                 if let Some(conn) = self.conns.get(&conn_id) {
@@ -1032,7 +1262,12 @@ impl HubInner {
                 received_at: Instant::now(),
                 event: event.clone(),
             });
-            prune(&mut self.stored);
+            prune(
+                &mut self.stored,
+                Limits::checked_usize(self.limits.max_stored_events, "max_stored_events")
+                    .unwrap_or(usize::MAX),
+                Duration::from_secs(self.limits.stored_retention_secs),
+            );
         }
 
         let delivered = fanout(&self.conns, ev_val, &event, None);
@@ -1053,6 +1288,44 @@ impl HubInner {
             conn.subs.remove(subid);
         }
     }
+}
+
+fn bounded_filters(filters: &[Value], max: usize) -> Vec<Value> {
+    filters.iter().take(max).cloned().collect()
+}
+
+/// Scan the replay sources while keeping both the retained event payload and
+/// deduplication working sets at the configured bound.
+fn bounded_replay(
+    filters: &[Value],
+    stored: &VecDeque<StoredEvent>,
+    presence: &HashMap<String, HashMap<String, Presence>>,
+    max: usize,
+) -> VecDeque<NostrEvent> {
+    let mut replay = VecDeque::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if max == 0 {
+        return replay;
+    }
+    let mut consider = |event: &NostrEvent| {
+        if matches_any(filters, event) && seen.insert(event.id.clone()) {
+            replay.push_back(event.clone());
+            if replay.len() > max {
+                if let Some(evicted) = replay.pop_front() {
+                    seen.remove(&evicted.id);
+                }
+            }
+        }
+    };
+    for stored in stored {
+        consider(&stored.event);
+    }
+    for room in presence.values() {
+        for member in room.values() {
+            consider(&member.announce);
+        }
+    }
+    replay
 }
 
 /// Fan an event out to every matching subscription on every connection
@@ -1235,16 +1508,16 @@ fn is_stored_kind(kind: u16) -> bool {
     !(20000..=29999).contains(&kind)
 }
 
-fn prune(stored: &mut VecDeque<StoredEvent>) {
+fn prune(stored: &mut VecDeque<StoredEvent>, max_stored_events: usize, retention: Duration) {
     let now = Instant::now();
     while let Some(front) = stored.front() {
-        if now.duration_since(front.received_at) > STORED_RETENTION {
+        if now.duration_since(front.received_at) > retention {
             stored.pop_front();
         } else {
             break;
         }
     }
-    while stored.len() > MAX_STORED_EVENTS {
+    while stored.len() > max_stored_events {
         stored.pop_front();
     }
 }
@@ -1252,6 +1525,15 @@ fn prune(stored: &mut VecDeque<StoredEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     fn ev(kind: u16, room: &str, created_at: u64) -> NostrEvent {
         NostrEvent {
@@ -1408,8 +1690,253 @@ mod tests {
             ..Limits::default()
         };
         cases.push(limits);
+        let limits = Limits {
+            max_stored_events: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            stored_retention_secs: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            max_replay_per_req: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            outbound_queue_cap: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            strike_limit: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            handshake_timeout_secs: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
+            writer_stop_timeout_secs: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
         assert!(cases.into_iter().all(|limits| limits.validate().is_err()));
         assert!(Limits::default().validate().is_ok());
+    }
+
+    #[test]
+    fn configured_transient_limits_bound_filter_and_replay_materialization() {
+        let filters = vec![json!({}), json!({"kinds": [1]}), json!({"kinds": [2]})];
+        assert_eq!(bounded_filters(&filters, 2).len(), 2);
+
+        let mut stored = VecDeque::new();
+        for created_at in 1..=4 {
+            stored.push_back(StoredEvent {
+                received_at: Instant::now(),
+                event: ev(1, "room", created_at),
+            });
+        }
+        let limits = Limits {
+            max_replay_per_req: 2,
+            ..Limits::default()
+        };
+        let replay = bounded_replay(
+            &[],
+            &stored,
+            &HashMap::new(),
+            Limits::checked_usize(limits.max_replay_per_req, "max_replay_per_req").unwrap(),
+        );
+        assert_eq!(replay.len(), 2);
+        assert_eq!(
+            replay
+                .iter()
+                .map(|event| event.created_at)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn configured_admission_refusal_does_not_mutate_counters() {
+        let hub = Hub::new(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let first = hub.admit("127.0.0.1".parse().unwrap()).unwrap();
+        let before = hub.inner.lock();
+        let next_id = before.next_id;
+        let active_connections = before.active_connections;
+        let connections_total = before.connections_total;
+        let ip_counts = before.ip_counts.clone();
+        drop(before);
+
+        assert!(hub.admit("127.0.0.2".parse().unwrap()).is_none());
+        let after = hub.inner.lock();
+        assert_eq!(after.next_id, next_id);
+        assert_eq!(after.active_connections, active_connections);
+        assert_eq!(after.connections_total, connections_total);
+        assert_eq!(after.ip_counts, ip_counts);
+        drop(after);
+        drop(first);
+    }
+
+    #[test]
+    fn configured_storage_limit_and_retention_are_applied() {
+        let limits = Limits {
+            max_stored_events: 2,
+            stored_retention_secs: 1,
+            ..Limits::default()
+        };
+        let mut stored = VecDeque::new();
+        stored.push_back(StoredEvent {
+            received_at: Instant::now() - Duration::from_secs(2),
+            event: ev(1, "room", 1),
+        });
+        stored.push_back(StoredEvent {
+            received_at: Instant::now(),
+            event: ev(1, "room", 2),
+        });
+        stored.push_back(StoredEvent {
+            received_at: Instant::now(),
+            event: ev(1, "room", 3),
+        });
+
+        prune(
+            &mut stored,
+            Limits::checked_usize(limits.max_stored_events, "max_stored_events").unwrap(),
+            Duration::from_secs(limits.stored_retention_secs),
+        );
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored.front().unwrap().event.created_at, 2);
+    }
+
+    #[test]
+    fn configured_queue_and_timeout_limits_are_consumed() {
+        let limits = Limits {
+            outbound_queue_cap: 2,
+            handshake_timeout_secs: 11,
+            writer_stop_timeout_secs: 3,
+            ..Limits::default()
+        };
+        limits.validate().unwrap();
+        assert_eq!(limits.handshake_timeout(), Duration::from_secs(11));
+        assert_eq!(limits.writer_stop_timeout(), Duration::from_secs(3));
+
+        let capacity =
+            Limits::checked_usize(limits.outbound_queue_cap, "outbound_queue_cap").unwrap();
+        let (sender, mut receiver) = mpsc::channel(capacity);
+        assert!(sender.try_send(WsMessage::Text("one".into())).is_ok());
+        assert!(sender.try_send(WsMessage::Text("two".into())).is_ok());
+        assert!(sender.try_send(WsMessage::Text("three".into())).is_err());
+        assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn configured_strike_limit_refuses_after_threshold() {
+        let hub = Hub::new(Limits {
+            strike_limit: 1,
+            ..Limits::default()
+        });
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let mut inner = hub.inner.lock();
+        assert!(inner.strike(conn_id));
+        assert!(!inner.strike(conn_id));
+        drop(inner);
+        hub.unregister(conn_id);
+    }
+
+    #[tokio::test]
+    async fn dropping_handle_aborts_tasks_and_releases_observer_state() {
+        let hub = Hub::new(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let observer = hub.clone();
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let identity = NostrIdentity::generate();
+        assert!(send_event(
+            &hub,
+            conn_id,
+            &announce(&identity, "room", "device", 1)
+        ));
+
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let connections = Arc::new(Mutex::new(vec![tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                let _cleanup = ConnectionCleanup::new(hub, conn_id);
+                armed_tx
+                    .send(())
+                    .expect("cleanup task start receiver must remain live");
+                std::future::pending::<()>().await;
+            }
+        })]));
+        armed_rx.await.expect("cleanup task must arm before drop");
+        let handle = SignalingServerHandle {
+            task: None,
+            heartbeat: None,
+            connections,
+            writers: Arc::new(Mutex::new(Vec::new())),
+            writer_stop_timeout: Duration::from_secs(2),
+            local_addr: "127.0.0.1:0".parse().unwrap(),
+            hub,
+        };
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let released = {
+                    let state = observer.inner.lock();
+                    state.active_connections == 0
+                        && state.conns.is_empty()
+                        && state.presence.is_empty()
+                        && state.ip_counts.is_empty()
+                };
+                if released {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the server handle must release connection state");
+    }
+
+    #[tokio::test]
+    async fn registry_pressure_refuses_before_spawning_an_unowned_task() {
+        let tasks = Arc::new(Mutex::new(Vec::with_capacity(1)));
+        tasks
+            .lock()
+            .push(tokio::spawn(std::future::pending::<()>()));
+        assert!(!registry_slot_available(&tasks, 1));
+        assert_eq!(tasks.lock().len(), 1);
+
+        let task = tasks.lock().pop().unwrap();
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn finished_handler_and_writer_panics_are_reaped_and_observed() {
+        let connections = Arc::new(Mutex::new(Vec::with_capacity(1)));
+        let writers = Arc::new(Mutex::new(Vec::with_capacity(1)));
+        connections
+            .lock()
+            .push(tokio::spawn(async { panic!("injected handler panic") }));
+        writers
+            .lock()
+            .push(tokio::spawn(async { panic!("injected writer panic") }));
+        tokio::task::yield_now().await;
+
+        observe_finished_tasks(&connections, "connection").await;
+        observe_finished_tasks(&writers, "writer").await;
+        assert!(connections.lock().is_empty());
+        assert!(writers.lock().is_empty());
     }
 
     #[test]
@@ -1516,5 +2043,95 @@ mod tests {
                 .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == "room-a"),
             "synthesized leave is room-addressed so narrowed subscriptions match it"
         );
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_observes_normal_writer_completion() {
+        let hub = Hub::new(Limits::default());
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let writers = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_in_writer = Arc::clone(&completed);
+        let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
+        writers.lock().push(tokio::spawn(async move {
+            completed_in_writer.store(true, Ordering::Release);
+        }));
+
+        cleanup.unregister();
+        cleanup.install_closed_signal(watch::channel(false).0);
+        cleanup.disarm();
+        let writers = {
+            let mut owned = writers.lock();
+            std::mem::take(&mut *owned)
+        };
+        for writer in writers {
+            await_writer_with_timeout(writer, Duration::from_secs(2)).await;
+        }
+
+        assert!(completed.load(Ordering::Acquire));
+        assert_eq!(hub.snapshot().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_aborts_writer_on_bounded_timeout() {
+        let hub = Hub::new(Limits::default());
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let writers = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_writer = Arc::clone(&dropped);
+        let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
+        writers.lock().push(tokio::spawn(async move {
+            let _drop_flag = DropFlag(dropped_in_writer);
+            std::future::pending::<()>().await;
+        }));
+
+        cleanup.unregister();
+        cleanup.install_closed_signal(watch::channel(false).0);
+        cleanup.disarm();
+        let writers = {
+            let mut owned = writers.lock();
+            std::mem::take(&mut *owned)
+        };
+        for writer in writers {
+            await_writer_with_timeout(writer, Duration::ZERO).await;
+        }
+        tokio::task::yield_now().await;
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(hub.snapshot().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn connection_cleanup_repairs_injected_panic_and_observes_join_error() {
+        let hub = Hub::new(Limits::default());
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let writers = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_writer = Arc::clone(&dropped);
+        let (closed_tx, mut closed_rx) = watch::channel(false);
+        let task_hub = hub.clone();
+        let task_writers = Arc::clone(&writers);
+        let task = tokio::spawn(async move {
+            let mut cleanup = ConnectionCleanup::new(task_hub, conn_id);
+            task_writers.lock().push(tokio::spawn(async move {
+                let _drop_flag = DropFlag(dropped_in_writer);
+                let _ = closed_rx.changed().await;
+            }));
+            cleanup.install_closed_signal(closed_tx);
+            panic!("injected connection panic after activation");
+        });
+
+        let error = task.await.expect_err("injected connection must panic");
+        assert!(error.is_panic());
+        let writers = {
+            let mut owned = writers.lock();
+            std::mem::take(&mut *owned)
+        };
+        for writer in writers {
+            await_writer_with_timeout(writer, Duration::from_secs(2)).await;
+        }
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(hub.snapshot().connections, 0);
     }
 }

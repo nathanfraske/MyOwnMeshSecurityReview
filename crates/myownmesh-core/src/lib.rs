@@ -152,6 +152,9 @@ pub use config::{
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;
+pub use engine::signaling_bridge::{
+    mdns_connection_identity_planning_claim, mdns_connection_planning_claim,
+};
 /// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
 /// it answers the same question under a different contract: measured before it
 /// is built, and refusable at four separate points.

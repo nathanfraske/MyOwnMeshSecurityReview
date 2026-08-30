@@ -38,6 +38,10 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(any(test, feature = "transport-lab"))]
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
+use myownmesh_signaling::mdns::driver::{
+    AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
+    PeerRetention,
+};
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
 };
@@ -1022,6 +1026,165 @@ fn local_scope(
     }
 }
 
+fn validate_mdns_device_id(value: &str) -> bool {
+    crate::semantic::DeviceId::from_canonical_str(value).is_ok()
+}
+
+struct CoreMdnsAliasProvider {
+    scope: LocalApplicationResourceScope,
+}
+
+fn mdns_connection_claim(
+    retention: ConnectionRetention,
+) -> std::result::Result<ResourceClaim, AliasRefusal> {
+    ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            retention.accounted_bytes()?,
+        ),
+        (
+            crate::resource::ResourceClass::SocketOrHandle,
+            retention
+                .socket_handles
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("socket count exceeds u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::NativeTransportObject,
+            retention
+                .native_objects
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("native count exceeds u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::WorkerOrTask,
+            retention
+                .worker_tasks
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("worker count exceeds u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention.opaque_count()?,
+        ),
+    ])
+    .map_err(|error| AliasRefusal::Provider(error.to_string()))
+}
+
+fn mdns_connection_identity_claim(
+    retention: ConnectionIdentityRetention,
+) -> std::result::Result<ResourceClaim, AliasRefusal> {
+    ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            retention.accounted_bytes()?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention.opaque_count()?,
+        ),
+    ])
+    .map_err(|error| AliasRefusal::Provider(error.to_string()))
+}
+
+fn mdns_planning_error(_: AliasRefusal) -> crate::resource::ResourceUnavailable {
+    crate::resource::ResourceUnavailable::ProviderInvariant {
+        dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
+    }
+}
+
+/// Return the exact finite-provider charge for one concrete mDNS connection.
+/// This is the same conversion used by the production custody provider and
+/// includes the provider's reservation bookkeeping charge.
+pub fn mdns_connection_planning_claim(
+    peer: Option<&str>,
+) -> std::result::Result<ResourceClaim, crate::resource::ResourceUnavailable> {
+    let claim =
+        mdns_connection_claim(ConnectionRetention::for_peer(peer)).map_err(mdns_planning_error)?;
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
+/// Return the exact finite-provider charge for an inbound mDNS sender
+/// identity buffer, including reservation bookkeeping.
+pub fn mdns_connection_identity_planning_claim(
+    peer: &str,
+) -> std::result::Result<ResourceClaim, crate::resource::ResourceUnavailable> {
+    let claim = mdns_connection_identity_claim(ConnectionIdentityRetention::for_peer(peer))
+        .map_err(mdns_planning_error)?;
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
+impl AliasProvider for CoreMdnsAliasProvider {
+    fn retain_alias(
+        &self,
+        _key: &str,
+        _peer: &str,
+        retention: AliasRetention,
+    ) -> std::result::Result<myownmesh_signaling::ErasedOwner, AliasRefusal> {
+        let claim = ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                retention.accounted_bytes()?,
+            ),
+            (
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                retention.allocation_count()?,
+            ),
+        ])
+        .map_err(|error| AliasRefusal::Provider(error.to_string()))?;
+        self.scope
+            .acquire(claim)
+            .map(|lease| Box::new(lease) as myownmesh_signaling::ErasedOwner)
+            .map_err(|error| AliasRefusal::Provider(error.to_string()))
+    }
+
+    fn retain_peer(
+        &self,
+        _peer: &str,
+        retention: PeerRetention,
+    ) -> std::result::Result<myownmesh_signaling::ErasedOwner, AliasRefusal> {
+        let claim = ResourceClaim::try_from_entries([
+            (
+                crate::resource::ResourceClass::AccountedMemoryBytes,
+                retention.accounted_bytes()?,
+            ),
+            (
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                retention.allocation_count()?,
+            ),
+        ])
+        .map_err(|error| AliasRefusal::Provider(error.to_string()))?;
+        self.scope
+            .acquire(claim)
+            .map(|lease| Box::new(lease) as myownmesh_signaling::ErasedOwner)
+            .map_err(|error| AliasRefusal::Provider(error.to_string()))
+    }
+
+    fn retain_connection(
+        &self,
+        _peer: Option<&str>,
+        retention: ConnectionRetention,
+    ) -> std::result::Result<myownmesh_signaling::ErasedOwner, AliasRefusal> {
+        let claim = mdns_connection_claim(retention)?;
+        self.scope
+            .acquire(claim)
+            .map(|lease| Box::new(lease) as myownmesh_signaling::ErasedOwner)
+            .map_err(|error| AliasRefusal::Provider(error.to_string()))
+    }
+
+    fn retain_connection_identity(
+        &self,
+        _peer: &str,
+        retention: ConnectionIdentityRetention,
+    ) -> std::result::Result<myownmesh_signaling::ErasedOwner, AliasRefusal> {
+        let claim = mdns_connection_identity_claim(retention)?;
+        self.scope
+            .acquire(claim)
+            .map(|lease| Box::new(lease) as myownmesh_signaling::ErasedOwner)
+            .map_err(|error| AliasRefusal::Provider(error.to_string()))
+    }
+}
+
 /// The ingress runtime for one network, funded by that network's scope.
 ///
 /// The scope is what bounds every record the runtime retains, so a runtime that
@@ -1516,11 +1679,16 @@ fn attach_mdns_with(
     allow_untracked_emission: bool,
 ) -> Option<MdnsDriverHandle> {
     let guard = attach.guard();
+    let scope = local_scope(state, "mdns")?;
     let mdns_cfg = MdnsDriverConfig {
         app_id: resolve_app_id(),
         network_id: state.config.read().network_id.clone(),
         device_id: state.identity.public_id().to_string(),
         service_port: 0,
+        device_id_validator: validate_mdns_device_id,
+        alias_provider: Arc::new(CoreMdnsAliasProvider {
+            scope: scope.clone(),
+        }),
     };
 
     let device_id = state.identity.public_id().to_string();
@@ -1528,7 +1696,6 @@ fn attach_mdns_with(
     // Outbound: engine SignalingOutbound → MdnsOutbound, built when the driver
     // pulls. The driver's registration doubles as the announce, so Announce is
     // a cheap idempotent nudge.
-    let scope = local_scope(state, "mdns")?;
     let outbound: Box<dyn OutboundSource<MdnsOutbound, Owner = CoreOutboundOwner>> =
         Box::new(TranslatedOutbound {
             first: None,
