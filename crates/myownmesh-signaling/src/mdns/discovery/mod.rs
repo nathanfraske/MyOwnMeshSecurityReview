@@ -23,13 +23,33 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Maximum number of distinct service instances that may own a resolve at
-/// once. Repeated browse hints for an owned instance coalesce into one pending
-/// follow-up instead of spawning an unbounded resolve herd.
-pub const MAX_RESOLVE_OWNERS: usize = 256;
-/// Capacity of the backend-to-driver discovery event queue. Browse callbacks
-/// must never be able to allocate without bound when the engine is stalled.
-pub const DISCOVERY_EVENT_CAPACITY: usize = 128;
+/// Owner-selected finite limits for one discovery backend instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryLimits {
+    /// Maximum exact service instances with an active resolve owner.
+    pub max_resolve_owners: usize,
+    /// Capacity of each bounded backend-to-driver event handoff.
+    pub event_capacity: usize,
+    /// Maximum exact system-backend service-key epochs retained for stale
+    /// removal fencing.
+    pub max_event_epochs: usize,
+}
+
+impl Default for DiscoveryLimits {
+    fn default() -> Self {
+        Self {
+            max_resolve_owners: 256,
+            event_capacity: 128,
+            max_event_epochs: 1024,
+        }
+    }
+}
+
+impl DiscoveryLimits {
+    pub fn validate(self) -> bool {
+        self.max_resolve_owners > 0 && self.event_capacity > 0 && self.max_event_epochs > 0
+    }
+}
 /// Maximum DNS-SD service-instance/name length accepted from a backend.
 pub const MAX_DNS_NAME_BYTES: usize = 255;
 /// Maximum number of TXT entries copied from one discovery response.
@@ -52,6 +72,8 @@ pub struct DiscoveryConfig {
     pub port: u16,
     /// TXT records for the advertisement ([`super::wire::txt_properties`]).
     pub txt: Vec<(String, String)>,
+    /// Validated owner-selected discovery workload limits.
+    pub limits: DiscoveryLimits,
 }
 
 /// One discovery observation. `key` is a backend-opaque identifier that is
@@ -97,6 +119,7 @@ pub(crate) struct DiscoveryEventCoalescer {
     pending: Mutex<HashMap<String, CoalescedDiscoveryEvent>>,
     next_generation: AtomicU64,
     stopped: AtomicBool,
+    max_pending: usize,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -107,11 +130,17 @@ pub(crate) enum DiscoveryEventAdmission {
 }
 
 impl DiscoveryEventCoalescer {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::with_limits(DiscoveryLimits::default())
+    }
+
+    pub(crate) fn with_limits(limits: DiscoveryLimits) -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(1),
             stopped: AtomicBool::new(false),
+            max_pending: limits.max_resolve_owners,
         }
     }
 
@@ -126,7 +155,7 @@ impl DiscoveryEventCoalescer {
                 generation: existing.generation,
             };
         }
-        if pending.len() >= MAX_RESOLVE_OWNERS {
+        if pending.len() >= self.max_pending {
             return DiscoveryEventAdmission::Refused;
         }
         let Some(generation) = next_generation(&self.next_generation) else {
@@ -277,6 +306,7 @@ struct ResolveOwnershipInner {
     slots: Mutex<HashMap<String, ResolveSlot>>,
     next_generation: AtomicU64,
     stopped: AtomicBool,
+    max_owners: usize,
 }
 
 /// Provider-side ownership for service-instance resolution.
@@ -300,11 +330,17 @@ impl Default for ResolveOwnership {
 impl ResolveOwnership {
     /// Create an empty, bounded ownership table.
     pub fn new() -> Self {
+        Self::with_max_owners(DiscoveryLimits::default().max_resolve_owners)
+    }
+
+    /// Create ownership with an explicit finite owner-selected bound.
+    pub fn with_max_owners(max_owners: usize) -> Self {
         Self {
             inner: Arc::new(ResolveOwnershipInner {
                 slots: Mutex::new(HashMap::new()),
                 next_generation: AtomicU64::new(1),
                 stopped: AtomicBool::new(false),
+                max_owners,
             }),
         }
     }
@@ -320,7 +356,7 @@ impl ResolveOwnership {
             slot.pending = true;
             return ResolveHint::Coalesced;
         }
-        if slots.len() >= MAX_RESOLVE_OWNERS {
+        if slots.len() >= self.inner.max_owners {
             return ResolveHint::Refused;
         }
         let Some(generation) = next_generation(&self.inner.next_generation) else {
@@ -567,14 +603,21 @@ mod tests {
 
     #[test]
     fn event_coalescer_refuses_at_ownership_cap_and_clears_on_shutdown() {
-        let coalescer = DiscoveryEventCoalescer::new();
-        for index in 0..MAX_RESOLVE_OWNERS {
+        let limits = DiscoveryLimits {
+            max_resolve_owners: 3,
+            event_capacity: 5,
+            max_event_epochs: 7,
+        };
+        assert!(limits.validate());
+        let coalescer = DiscoveryEventCoalescer::with_limits(limits);
+        let max_owners = limits.max_resolve_owners;
+        for index in 0..max_owners {
             assert!(matches!(
                 coalescer.admit(&format!("service-{index}")),
                 DiscoveryEventAdmission::Started { .. }
             ));
         }
-        assert_eq!(coalescer.pending_count(), MAX_RESOLVE_OWNERS);
+        assert_eq!(coalescer.pending_count(), max_owners);
         assert_eq!(
             coalescer.admit("service-over-capacity"),
             DiscoveryEventAdmission::Refused
@@ -594,6 +637,19 @@ mod tests {
             coalescer.admit("after-shutdown"),
             DiscoveryEventAdmission::Refused
         );
+    }
+
+    #[test]
+    fn resolve_ownership_uses_the_configured_non_default_cap() {
+        let ownership = ResolveOwnership::with_max_owners(2);
+        let first = ownership.admit("service-1");
+        let second = ownership.admit("service-2");
+        assert!(matches!(&first, ResolveHint::Started(_)));
+        assert!(matches!(&second, ResolveHint::Started(_)));
+        assert!(matches!(ownership.admit("service-3"), ResolveHint::Refused));
+        drop(first);
+        drop(second);
+        assert_eq!(ownership.active_count(), 0);
     }
 }
 

@@ -245,11 +245,17 @@ pub fn test_transport() -> Transport {
         // identity buffer. Price each exact production plan, including the
         // finite provider's reservation bookkeeping, and scale only by the
         // existing test-worker concurrency.
-        let mdns_outbound =
-            myownmesh_core::mdns_connection_planning_claim(Some(FIXTURE_MDNS_DEVICE_ID))
-                .expect("the exact mDNS outbound plan is available");
-        let mdns_inbound = myownmesh_core::mdns_connection_planning_claim(None)
-            .expect("the exact mDNS inbound plan is available");
+        let mdns_limits = myownmesh_signaling::mdns::driver::MdnsLimits::default();
+        let mdns_outbound = myownmesh_core::mdns_connection_planning_claim(
+            Some(FIXTURE_MDNS_DEVICE_ID),
+            mdns_limits.outbound_queue_capacity,
+        )
+        .expect("the exact mDNS outbound plan is available");
+        let mdns_inbound = myownmesh_core::mdns_connection_planning_claim(
+            None,
+            mdns_limits.outbound_queue_capacity,
+        )
+        .expect("the exact mDNS inbound plan is available");
         let mdns_identity =
             myownmesh_core::mdns_connection_identity_planning_claim(FIXTURE_MDNS_DEVICE_ID)
                 .expect("the exact mDNS identity plan is available");

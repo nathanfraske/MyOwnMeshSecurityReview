@@ -14,8 +14,8 @@ use tracing::{debug, trace};
 
 use super::{
     DiscoveryConfig, DiscoveryEvent, DiscoveryEventAdmission, DiscoveryEventCoalescer,
-    DISCOVERY_EVENT_CAPACITY, MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES,
-    MAX_TXT_ENTRIES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
+    MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES, MAX_TXT_KEY_BYTES,
+    MAX_TXT_VALUE_BYTES,
 };
 use crate::Error;
 
@@ -34,6 +34,9 @@ impl Discovery {
     /// Browse starts before the first [`register`](Self::register) so we never
     /// miss a burst of resolves racing our own announce.
     pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+        if !cfg.limits.validate() {
+            return Err(Error::Other("invalid discovery limits".into()));
+        }
         let daemon = ServiceDaemon::new().map_err(|e| Error::Other(format!("mdns daemon: {e}")))?;
 
         let host_name = format!("{}.local.", cfg.instance);
@@ -54,16 +57,24 @@ impl Discovery {
             .browse(&cfg.service_type)
             .map_err(|e| Error::Other(format!("mdns browse: {e}")))?;
 
-        let (tx, rx) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
-        let (forward_tx, forward_rx) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
+        let (tx, rx) = mpsc::channel(cfg.limits.event_capacity);
+        let (forward_tx, forward_rx) = mpsc::channel(cfg.limits.event_capacity);
         let (progress_tx, progress_rx) = mpsc::channel(1);
         let (stop, stop_rx) = watch::channel(false);
+        let discovery_limits = cfg.limits;
         let forwarder = tokio::spawn(async move {
             deliver(forward_rx, tx, progress_tx, stop_rx).await;
         });
         let pump_stop = stop.subscribe();
         let pump = tokio::spawn(async move {
-            pump(browse_rx, forward_tx, progress_rx, pump_stop).await;
+            pump(
+                browse_rx,
+                forward_tx,
+                progress_rx,
+                pump_stop,
+                discovery_limits,
+            )
+            .await;
             trace!("mdns embedded browse pump exiting");
         });
         let (shutdown_request, shutdown_request_rx) = watch::channel(false);
@@ -145,8 +156,9 @@ async fn pump(
     forward_tx: mpsc::Sender<DiscoveryEvent>,
     mut progress_rx: mpsc::Receiver<()>,
     mut stop: watch::Receiver<bool>,
+    limits: crate::mdns::discovery::DiscoveryLimits,
 ) {
-    let coalescer = DiscoveryEventCoalescer::new();
+    let coalescer = DiscoveryEventCoalescer::with_limits(limits);
     loop {
         if !flush_pending(&coalescer, &forward_tx) {
             break;
@@ -451,8 +463,13 @@ mod tests {
     async fn daemon_shutdown_ack_progresses_while_handoff_is_full() {
         let daemon = ServiceDaemon::new().expect("daemon");
         let browse = daemon.browse("_mesh._tcp.local.").expect("browse");
-        let (forward_tx, _forward_rx) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
-        for index in 0..DISCOVERY_EVENT_CAPACITY {
+        let limits = crate::mdns::discovery::DiscoveryLimits {
+            max_resolve_owners: 2,
+            event_capacity: 3,
+            max_event_epochs: 4,
+        };
+        let (forward_tx, _forward_rx) = mpsc::channel(limits.event_capacity);
+        for index in 0..limits.event_capacity {
             forward_tx
                 .try_send(DiscoveryEvent::Removed {
                     generation: 1,
@@ -462,7 +479,7 @@ mod tests {
         }
         let (_progress_tx, progress_rx) = mpsc::channel(1);
         let (stop_tx, stop_rx) = watch::channel(false);
-        let pump = tokio::spawn(pump(browse, forward_tx, progress_rx, stop_rx));
+        let pump = tokio::spawn(pump(browse, forward_tx, progress_rx, stop_rx, limits));
 
         let ack = daemon.shutdown().expect("shutdown request");
         assert!(matches!(

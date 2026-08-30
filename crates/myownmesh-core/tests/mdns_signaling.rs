@@ -111,6 +111,7 @@ async fn multicast_available() -> bool {
         service_port: 0,
         device_id_validator: accept_any,
         alias_provider: Arc::new(TestAliasProvider),
+        limits: myownmesh_signaling::mdns::driver::MdnsLimits::default(),
     };
     let (_a_out_tx, a_out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (a_in_tx, mut a_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
@@ -162,6 +163,7 @@ async fn mdns_injected_core_validator_rejects_noncanonical_local_identity() {
             service_port: 0,
             device_id_validator: |value| DeviceId::from_canonical_str(value).is_ok(),
             alias_provider: Arc::new(TestAliasProvider),
+            limits: myownmesh_signaling::mdns::driver::MdnsLimits::default(),
         },
         Box::new(myownmesh_signaling::UnboundedSource::new(out_rx)),
         myownmesh_signaling::InboundSink::from_unbounded(in_tx),

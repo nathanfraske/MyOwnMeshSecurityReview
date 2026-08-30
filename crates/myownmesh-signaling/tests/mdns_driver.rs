@@ -33,6 +33,7 @@ fn driver_config(network: &str, device: &str) -> MdnsDriverConfig {
         service_port: 0,
         device_id_validator: accept_any,
         alias_provider: std::sync::Arc::new(TestAliasProvider),
+        limits: myownmesh_signaling::mdns::driver::MdnsLimits::default(),
     }
 }
 
@@ -145,7 +146,7 @@ fn advertised_profile_excludes_other_room_and_recipient() {
 #[test]
 fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
     use myownmesh_signaling::mdns::discovery::{
-        ResolveCompletion, ResolveHint, ResolveOwnership, MAX_RESOLVE_OWNERS,
+        DiscoveryLimits, ResolveCompletion, ResolveHint, ResolveOwnership,
     };
 
     let ownership = ResolveOwnership::new();
@@ -177,13 +178,14 @@ fn discovery_hints_are_bounded_and_coalesced_per_service_instance() {
     assert_eq!(ownership.active_count(), 0);
 
     let mut leases = Vec::new();
-    for index in 0..MAX_RESOLVE_OWNERS {
+    let max_owners = DiscoveryLimits::default().max_resolve_owners;
+    for index in 0..max_owners {
         match ownership.admit(format!("service-{index}")) {
             ResolveHint::Started(lease) => leases.push(lease),
             other => panic!("bounded service hint {index} was not admitted: {other:?}"),
         }
     }
-    assert_eq!(ownership.active_count(), MAX_RESOLVE_OWNERS);
+    assert_eq!(ownership.active_count(), max_owners);
     assert!(matches!(
         ownership.admit("service-over-capacity"),
         ResolveHint::Refused

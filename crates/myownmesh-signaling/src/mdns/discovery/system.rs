@@ -37,8 +37,8 @@ use tracing::{debug, trace, warn};
 
 use super::{
     DiscoveryConfig, DiscoveryEvent, ResolveCompletion, ResolveHint, ResolveLease,
-    ResolveOwnership, DISCOVERY_EVENT_CAPACITY, MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES,
-    MAX_TXT_BYTES, MAX_TXT_ENTRIES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
+    ResolveOwnership, MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES,
+    MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
 };
 use crate::Error;
 
@@ -102,11 +102,9 @@ type QueryRecordReply = unsafe extern "C" fn(
 /// DNS A record / IN class, for the address query.
 const RR_TYPE_A: u16 = 1;
 const RR_CLASS_IN: u16 = 1;
-/// Retain one generation for each discovered peer that the mDNS driver can
-/// retain. This keeps the system backend's exact-key epoch table bounded by
-/// the existing peer-state ceiling rather than growing with stale callbacks.
-const MAX_EVENT_EPOCHS: usize = 1024;
-
+// Retain one generation for each discovered peer that the mDNS driver can
+// retain. This keeps the system backend's exact-key epoch table bounded by
+// the configured peer-state ceiling rather than growing with stale callbacks.
 #[cfg_attr(not(target_vendor = "apple"), link(name = "dns_sd"))]
 extern "C" {
     fn DNSServiceRegister(
@@ -309,13 +307,19 @@ struct Inner {
 struct EventEpochs {
     current: Mutex<HashMap<String, u64>>,
     next: std::sync::atomic::AtomicU64,
+    max_epochs: usize,
 }
 
 impl EventEpochs {
     fn new() -> Self {
+        Self::with_max_epochs(super::DiscoveryLimits::default().max_event_epochs)
+    }
+
+    fn with_max_epochs(max_epochs: usize) -> Self {
         Self {
             current: Mutex::new(HashMap::new()),
             next: std::sync::atomic::AtomicU64::new(1),
+            max_epochs,
         }
     }
 
@@ -324,7 +328,7 @@ impl EventEpochs {
         if let Some(&generation) = current.get(key) {
             return Some(generation);
         }
-        if current.len() >= MAX_EVENT_EPOCHS {
+        if current.len() >= self.max_epochs {
             return None;
         }
         let generation = next_epoch(&self.next)?;
@@ -443,7 +447,10 @@ impl Discovery {
         let instance = CString::new(cfg.instance.as_str())
             .map_err(|e| Error::Other(format!("instance name: {e}")))?;
 
-        let (tx, rx) = mpsc::channel(DISCOVERY_EVENT_CAPACITY);
+        if !cfg.limits.validate() {
+            return Err(Error::Other("invalid discovery limits".into()));
+        }
+        let (tx, rx) = mpsc::channel(cfg.limits.event_capacity);
         let inner = Arc::new(Inner {
             regtype,
             instance,
@@ -451,8 +458,8 @@ impl Discovery {
             txt: encode_txt(&cfg.txt),
             stopped: AtomicBool::new(false),
             registration: Mutex::new(None),
-            resolving: ResolveOwnership::new(),
-            epochs: EventEpochs::new(),
+            resolving: ResolveOwnership::with_max_owners(cfg.limits.max_resolve_owners),
+            epochs: EventEpochs::with_max_epochs(cfg.limits.max_event_epochs),
             resolution_fence: Mutex::new(()),
             tx,
             workers: WorkerRegistry::new(),
@@ -1041,6 +1048,17 @@ mod tests {
     }
 
     #[test]
+    fn event_epochs_enforce_the_configured_non_default_cap() {
+        let epochs = EventEpochs::with_max_epochs(2);
+        assert!(epochs.admit("service-1").is_some());
+        assert!(epochs.admit("service-2").is_some());
+        assert_eq!(epochs.admit("service-3"), None);
+        let first = epochs.current("service-1").expect("first epoch");
+        assert!(epochs.remove_if_current("service-1", first));
+        assert!(epochs.admit("service-3").is_some());
+    }
+
+    #[test]
     fn worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty() {
         let workers = WorkerRegistry::new();
         workers.push(std::thread::spawn(|| {}));
@@ -1068,6 +1086,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a running system mDNS daemon (mDNSResponder / avahi)"]
     async fn registers_and_browses_via_the_system_daemon() {
+        let limits = super::DiscoveryLimits {
+            max_resolve_owners: 3,
+            event_capacity: 5,
+            max_event_epochs: 7,
+        };
         let cfg = DiscoveryConfig {
             service_type: "_momtest._tcp.local.".into(),
             instance: format!("mom-selftest-{}", std::process::id()),
@@ -1077,6 +1100,7 @@ mod tests {
                 ("room".into(), "roomhash".into()),
                 ("peer".into(), "peerpubkey".into()),
             ],
+            limits,
         };
 
         // A browser under a different instance name, so the advertiser's

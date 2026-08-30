@@ -681,6 +681,51 @@ async fn normal_connection_completion_releases_admission_before_shutdown() {
 }
 
 #[tokio::test]
+async fn stalled_peer_stays_admitted_until_writer_settlement_then_allows_successor() {
+    let server = SignalingServer::start(
+        "127.0.0.1",
+        0,
+        Limits {
+            max_connections: 1,
+            writer_stop_timeout_secs: 1,
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+    let (mut w0, _) = connect_async(&url).await.unwrap();
+
+    let refused = tokio::time::timeout(Duration::from_secs(2), connect_async(&url))
+        .await
+        .expect("successor admission should be decided within the configured bound");
+    assert!(refused.is_err(), "W1 must be refused while W0 is admitted");
+
+    // W0 ends its reader while the peer deliberately does not consume the
+    // server's close frame. The server must settle and join W0's writer
+    // before releasing the sole connection slot.
+    w0.send(Message::Close(None)).await.unwrap();
+    drop(w0);
+    let hub_was_idle_before_registry_reap =
+        tokio::time::timeout(Duration::from_secs(2), server.wait_for_registry_idle())
+            .await
+            .expect("W0 registry terminal observation should complete");
+    assert!(
+        hub_was_idle_before_registry_reap,
+        "Hub admission must reach zero before W0 registry retirement"
+    );
+    assert_eq!(server.stats().connections, 0);
+
+    let (w1, _) = connect_async(&url).await.unwrap();
+    drop(w1);
+    tokio::time::timeout(Duration::from_secs(2), server.wait_for_registry_idle())
+        .await
+        .expect("W1 registry terminal observation should complete");
+    assert_eq!(server.stats().connections, 0);
+    server.stop_and_wait().await;
+}
+
+#[tokio::test]
 async fn handshake_bytes_are_bounded_before_websocket_parser() {
     let limits = Limits {
         max_handshake_bytes: 64,

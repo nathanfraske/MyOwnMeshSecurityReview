@@ -40,7 +40,7 @@ use std::sync::{Mutex, OnceLock};
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
-    PeerRetention,
+    MdnsLimits, PeerRetention,
 };
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
@@ -1098,9 +1098,10 @@ fn mdns_planning_error(_: AliasRefusal) -> crate::resource::ResourceUnavailable 
 /// includes the provider's reservation bookkeeping charge.
 pub fn mdns_connection_planning_claim(
     peer: Option<&str>,
+    queue_capacity: usize,
 ) -> std::result::Result<ResourceClaim, crate::resource::ResourceUnavailable> {
-    let claim =
-        mdns_connection_claim(ConnectionRetention::for_peer(peer)).map_err(mdns_planning_error)?;
+    let claim = mdns_connection_claim(ConnectionRetention::for_peer(peer, queue_capacity))
+        .map_err(mdns_planning_error)?;
     crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
 }
 
@@ -1689,6 +1690,7 @@ fn attach_mdns_with(
         alias_provider: Arc::new(CoreMdnsAliasProvider {
             scope: scope.clone(),
         }),
+        limits: MdnsLimits::default(),
     };
 
     let device_id = state.identity.public_id().to_string();

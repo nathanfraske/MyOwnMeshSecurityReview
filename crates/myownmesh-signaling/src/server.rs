@@ -38,11 +38,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -58,6 +59,20 @@ use crate::nostr::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
 };
 use crate::{Error, Result};
+
+type WriterRegistry = Arc<Mutex<HashMap<u64, Option<JoinHandle<()>>>>>;
+type WriterSettlementSender = mpsc::Sender<u64>;
+type ConnectionRegistry = Arc<Mutex<HashMap<u64, JoinHandle<()>>>>;
+type ConnectionCompletionSender = mpsc::Sender<u64>;
+
+#[cfg(test)]
+static TEST_PARK_NEXT_WRITER: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_WRITER_PARKED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_PANIC_AFTER_WRITER: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_GATE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Flood-protection limits for the signaling relay. Every field is finite and
 /// non-zero: an unbounded deployment is not a valid server configuration.
@@ -247,13 +262,29 @@ pub struct RelayStatsSnapshot {
 /// A running signaling relay. Constructed via [`SignalingServer::start`].
 pub struct SignalingServer;
 
+struct RegistryTerminal {
+    progress: watch::Sender<u64>,
+    hub_idle_before_reap: AtomicBool,
+}
+
+impl RegistryTerminal {
+    fn new() -> Self {
+        let (progress, _) = watch::channel(0);
+        Self {
+            progress,
+            hub_idle_before_reap: AtomicBool::new(false),
+        }
+    }
+}
+
 /// Handle to a running signaling relay. Drop it (or call
 /// [`SignalingServerHandle::stop_and_wait`]) to shut the listener down.
 pub struct SignalingServerHandle {
     task: Option<JoinHandle<()>>,
     heartbeat: Option<JoinHandle<()>>,
-    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    connections: ConnectionRegistry,
+    writers: WriterRegistry,
+    registry_terminal: Arc<RegistryTerminal>,
     writer_stop_timeout: Duration,
     local_addr: SocketAddr,
     hub: Hub,
@@ -271,6 +302,26 @@ impl SignalingServerHandle {
         self.hub.snapshot()
     }
 
+    /// Wait until the accept loop has observed and awaited every finished
+    /// connection task and all exact writer placeholders are retired. The
+    /// return value records whether Hub admission was already idle before the
+    /// finished handler was extracted for observation.
+    pub async fn wait_for_registry_idle(&self) -> bool {
+        let mut progress = self.registry_terminal.progress.subscribe();
+        loop {
+            let idle = self.connections.lock().is_empty() && self.writers.lock().is_empty();
+            if idle {
+                return self
+                    .registry_terminal
+                    .hub_idle_before_reap
+                    .load(Ordering::Acquire);
+            }
+            if progress.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
     /// Gracefully stop the listener and heartbeat, signal every live
     /// connection, and await all owned connection/writer tasks. A writer that
     /// cannot close within the bounded stop interval is aborted and joined so
@@ -278,8 +329,9 @@ impl SignalingServerHandle {
     pub async fn stop_and_wait(mut self) {
         self.hub.shutdown();
         if let Some(task) = self.task.take() {
-            task.abort();
-            let _ = task.await;
+            if let Err(error) = task.await {
+                warn!("signaling accept loop did not complete normally: {error}");
+            }
         }
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
@@ -290,18 +342,15 @@ impl SignalingServerHandle {
             let mut owned = self.connections.lock();
             std::mem::take(&mut *owned)
         };
-        for task in tasks {
+        for (_, task) in tasks {
             if let Err(error) = task.await {
                 warn!("signaling connection task did not complete normally: {error}");
             }
         }
 
-        let writers = {
-            let mut owned = self.writers.lock();
-            std::mem::take(&mut *owned)
-        };
-        for writer in writers {
-            await_writer_with_timeout(writer, self.writer_stop_timeout).await;
+        let writer_ids = self.writers.lock().keys().copied().collect::<Vec<_>>();
+        for conn_id in writer_ids {
+            settle_writer(&self.writers, conn_id, self.writer_stop_timeout).await;
         }
     }
 }
@@ -319,15 +368,17 @@ impl Drop for SignalingServerHandle {
             let mut owned = self.connections.lock();
             std::mem::take(&mut *owned)
         };
-        for task in tasks {
+        for (_, task) in tasks {
             task.abort();
         }
         let writers = {
             let mut owned = self.writers.lock();
             std::mem::take(&mut *owned)
         };
-        for writer in writers {
-            writer.abort();
+        for (_, writer) in writers {
+            if let Some(writer) = writer {
+                writer.abort();
+            }
         }
     }
 }
@@ -349,17 +400,28 @@ impl SignalingServer {
             .map_err(|e| Error::Bind(addr.clone(), e))?;
         info!(%local_addr, "signaling relay listening (NIP-01 over WebSocket)");
         let hub = Hub::new(limits);
-        // Admission bounds live connections, and accept_loop reaps finished
-        // handles before the next admit; these registries therefore need no
-        // growth beyond one slot per admitted connection.
-        let connections = Arc::new(Mutex::new(Vec::with_capacity(registry_capacity)));
-        let writers = Arc::new(Mutex::new(Vec::with_capacity(registry_capacity)));
+        // Admission bounds live connections, and the completion channel lets
+        // accept_loop retire finished handles before the next admit; these
+        // registries therefore need no growth beyond one slot per admission.
+        let connections = Arc::new(Mutex::new(HashMap::with_capacity(registry_capacity)));
+        let writers = Arc::new(Mutex::new(HashMap::with_capacity(registry_capacity)));
+        let registry_terminal = Arc::new(RegistryTerminal::new());
+        let (writer_settlement_tx, writer_settlement_rx) = mpsc::channel(registry_capacity.max(1));
+        let (completion_tx, completion_rx) = mpsc::channel(registry_capacity);
         let task = tokio::spawn(accept_loop(
             listener,
-            hub.clone(),
-            Arc::clone(&connections),
-            Arc::clone(&writers),
-            registry_capacity,
+            AcceptLoopContext {
+                hub: hub.clone(),
+                connections: Arc::clone(&connections),
+                writers: Arc::clone(&writers),
+                registry_terminal: Arc::clone(&registry_terminal),
+                registry_capacity,
+                completion_rx,
+                writer_settlement_rx,
+                completion_tx,
+                writer_settlement_tx: writer_settlement_tx.clone(),
+                writer_stop_timeout,
+            },
         ));
         let heartbeat = tokio::spawn(stats_heartbeat(hub.clone()));
         Ok(SignalingServerHandle {
@@ -367,6 +429,7 @@ impl SignalingServer {
             heartbeat: Some(heartbeat),
             connections,
             writers,
+            registry_terminal,
             writer_stop_timeout,
             local_addr,
             hub,
@@ -393,21 +456,70 @@ async fn stats_heartbeat(hub: Hub) {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
+struct AcceptLoopContext {
     hub: Hub,
-    connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
-    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    connections: ConnectionRegistry,
+    writers: WriterRegistry,
+    registry_terminal: Arc<RegistryTerminal>,
     registry_capacity: usize,
-) {
+    completion_rx: mpsc::Receiver<u64>,
+    writer_settlement_rx: mpsc::Receiver<u64>,
+    completion_tx: ConnectionCompletionSender,
+    writer_settlement_tx: WriterSettlementSender,
+    writer_stop_timeout: Duration,
+}
+
+async fn accept_loop(listener: TcpListener, context: AcceptLoopContext) {
+    let AcceptLoopContext {
+        hub,
+        connections,
+        writers,
+        registry_terminal,
+        registry_capacity,
+        mut completion_rx,
+        mut writer_settlement_rx,
+        completion_tx,
+        writer_settlement_tx,
+        writer_stop_timeout,
+    } = context;
+    let mut shutdown = hub.shutdown_signal();
     loop {
-        observe_finished_tasks(&connections, "connection").await;
-        observe_finished_tasks(&writers, "writer").await;
-        match listener.accept().await {
-            Ok((stream, peer)) => {
+        tokio::select! {
+            biased;
+            completion = completion_rx.recv() => {
+                match completion {
+                    Some(conn_id) => {
+                        observe_completed_connection(
+                            conn_id,
+                            &connections,
+                            &hub,
+                            &registry_terminal,
+                        ).await;
+                    }
+                    None => break,
+                }
+            }
+            settlement = writer_settlement_rx.recv() => {
+                match settlement {
+                    Some(conn_id) => {
+                        settle_writer(&writers, conn_id, writer_stop_timeout).await;
+                        publish_registry_progress(&registry_terminal);
+                    }
+                    None => break,
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
+                }
+            }
+            result = listener.accept() => {
+                match result {
+                Ok((stream, peer)) => {
                 let hub = hub.clone();
                 let connections = Arc::clone(&connections);
                 let writers = Arc::clone(&writers);
+                let writer_settlement_tx = writer_settlement_tx.clone();
                 let Some(admission) = hub.admit(peer.ip()) else {
                     let mut stream = stream;
                     let _ = stream
@@ -418,10 +530,14 @@ async fn accept_loop(
                     let _ = stream.shutdown().await;
                     continue;
                 };
+                // Keep admission and exact registry capacity fail-closed for
+                // this accepted socket. Completed handlers are retired only
+                // by the exact-ID completion branch above; extraction is
+                // under the mutex and JoinError observation is outside it.
                 let registry_available = {
                     let owned = connections.lock();
                     owned.len() < registry_capacity
-                        && registry_slot_available(&writers, registry_capacity)
+                        && writer_registry_slot_available(&writers, registry_capacity)
                 };
                 if !registry_available {
                     drop(admission);
@@ -431,15 +547,34 @@ async fn accept_loop(
                 }
                 // The accept loop is the only connection-registry writer;
                 // publishing under this guard closes the check/spawn gap.
-                let mut owned = connections.lock();
+                let conn_id = admission.id;
+                let completion_tx = completion_tx.clone();
                 let task = tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, peer, hub, admission, writers).await {
-                        trace!(%peer, "signaling conn ended: {e}");
+                    let result = std::panic::AssertUnwindSafe(handle_conn(
+                        stream,
+                        peer,
+                        hub,
+                        admission,
+                        writers,
+                        writer_settlement_tx,
+                    ))
+                    .catch_unwind()
+                    .await;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => trace!(%peer, "signaling conn ended: {e}"),
+                        Err(_) => warn!(%peer, "signaling connection handler panicked"),
+                    }
+                    if completion_tx.send(conn_id).await.is_err() {
+                        trace!(conn_id, "signaling completion channel closed during shutdown");
                     }
                 });
-                owned.push(task);
+                let mut owned = connections.lock();
+                owned.insert(conn_id, task);
+                }
+                Err(e) => warn!("signaling accept error: {e}"),
+                }
             }
-            Err(e) => warn!("signaling accept error: {e}"),
         }
     }
 }
@@ -449,7 +584,8 @@ async fn handle_conn(
     peer: SocketAddr,
     hub: Hub,
     admission: Admission,
-    writers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    writers: WriterRegistry,
+    writer_settlement_tx: WriterSettlementSender,
 ) -> Result<()> {
     let limits = hub.limits();
     let max_message_bytes = Limits::checked_usize(limits.max_message_bytes, "max_message_bytes")?;
@@ -498,7 +634,7 @@ async fn handle_conn(
     let (out_tx, mut out_rx) = mpsc::channel::<WsMessage>(outbound_queue_cap);
     let mut write = Some(write);
 
-    let writer_slot_available = registry_slot_available(&writers, registry_capacity);
+    let writer_slot_available = writer_registry_slot_available(&writers, registry_capacity);
     if !writer_slot_available {
         if let Some(mut write) = write.take() {
             let _ = write.close().await;
@@ -512,6 +648,7 @@ async fn handle_conn(
         return Ok(());
     };
     let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
+    cleanup.install_settlement_sender(writer_settlement_tx);
 
     // Writer task: drains the per-connection outbound queue to the
     // socket. The closed watch is the fence: queued frames are not drained
@@ -524,6 +661,14 @@ async fn handle_conn(
         } else {
             let mut write = write.take().expect("writer slot was checked above");
             let writer = tokio::spawn(async move {
+                #[cfg(test)]
+                if TEST_PARK_NEXT_WRITER.swap(false, Ordering::AcqRel) {
+                    // This is a one-shot production-path test witness: the
+                    // real writer remains owned by the registry until the
+                    // configured settlement timeout aborts and joins it.
+                    TEST_WRITER_PARKED.store(true, Ordering::Release);
+                    std::future::pending::<()>().await;
+                }
                 loop {
                     tokio::select! {
                         changed = closed_rx.changed() => {
@@ -544,12 +689,13 @@ async fn handle_conn(
                 }
                 let _ = write.close().await;
             });
-            owned_writers.push(writer);
+            owned_writers.insert(conn_id, Some(writer));
             true
         }
     };
     if !writer_registered {
         hub.unregister(conn_id);
+        cleanup.disarm();
         if let Some(mut write) = write {
             let _ = write.close().await;
         }
@@ -558,9 +704,20 @@ async fn handle_conn(
     }
     cleanup.install_closed_signal(closed_tx.clone());
 
+    #[cfg(test)]
+    if TEST_PANIC_AFTER_WRITER.load(Ordering::Acquire) {
+        // Give the just-published writer one poll so the parked-writer
+        // witness is real before this injected terminal path drops cleanup.
+        tokio::task::yield_now().await;
+        if TEST_PANIC_AFTER_WRITER.swap(false, Ordering::AcqRel) {
+            panic!("injected connection panic after writer registration");
+        }
+    }
+
     let mut shutdown = hub.shutdown_signal();
     if *shutdown.borrow() {
         let _ = closed_tx.send(true);
+        settle_writer(&writers, conn_id, limits.writer_stop_timeout()).await;
         cleanup.unregister();
         drop(out_tx);
         cleanup.disarm();
@@ -597,38 +754,98 @@ async fn handle_conn(
     }
 
     let _ = closed_tx.send(true);
+    settle_writer(&writers, conn_id, limits.writer_stop_timeout()).await;
     cleanup.unregister();
     drop(out_tx);
     cleanup.disarm();
     Ok(())
 }
 
-async fn observe_finished_tasks(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, role: &'static str) {
-    let finished = {
+async fn observe_completed_connection(
+    conn_id: u64,
+    tasks: &ConnectionRegistry,
+    hub: &Hub,
+    registry_terminal: &RegistryTerminal,
+) {
+    let hub_idle_before_reap = hub.snapshot().connections == 0;
+    let task = {
         let mut owned = tasks.lock();
-        let mut finished = Vec::new();
-        let mut index = 0;
-        while index < owned.len() {
-            if owned[index].is_finished() {
-                finished.push(owned.swap_remove(index));
-            } else {
-                index += 1;
-            }
-        }
-        finished
+        owned.remove(&conn_id)
     };
-    for task in finished {
-        if let Err(error) = task.await {
-            warn!(
-                task_role = role,
-                "signaling {role} task did not complete normally: {error}"
-            );
-        }
+    let Some(task) = task else {
+        trace!(
+            conn_id,
+            "signaling completion arrived for an unowned connection"
+        );
+        return;
+    };
+    if hub_idle_before_reap {
+        registry_terminal
+            .hub_idle_before_reap
+            .store(true, Ordering::Release);
+    }
+    if let Err(error) = task.await {
+        warn!(
+            conn_id,
+            "signaling connection task did not complete normally: {error}"
+        );
+    }
+    publish_registry_progress(registry_terminal);
+}
+
+fn publish_registry_progress(registry_terminal: &RegistryTerminal) {
+    registry_terminal
+        .progress
+        .send_modify(|epoch| *epoch = epoch.checked_add(1).expect("registry progress exhausted"));
+}
+
+#[cfg(test)]
+fn connection_registry_slot_available(tasks: &ConnectionRegistry, capacity: usize) -> bool {
+    tasks.lock().len() < capacity
+}
+
+fn writer_registry_slot_available(tasks: &WriterRegistry, capacity: usize) -> bool {
+    tasks.lock().len() < capacity
+}
+
+async fn settle_writer(writers: &WriterRegistry, conn_id: u64, timeout: Duration) {
+    let writer = {
+        let mut owned = writers.lock();
+        owned.get_mut(&conn_id).and_then(Option::take)
+    };
+    if let Some(writer) = writer {
+        await_writer_with_timeout(writer, timeout).await;
+    }
+    writers.lock().remove(&conn_id);
+}
+
+#[cfg(test)]
+async fn process_writer_settlement(
+    receiver: &mut mpsc::Receiver<u64>,
+    writers: &WriterRegistry,
+    timeout: Duration,
+) {
+    if let Some(conn_id) = receiver.recv().await {
+        settle_writer(writers, conn_id, timeout).await;
     }
 }
 
-fn registry_slot_available(tasks: &Arc<Mutex<Vec<JoinHandle<()>>>>, capacity: usize) -> bool {
-    tasks.lock().len() < capacity
+fn notify_writer_settlement(sender: &WriterSettlementSender, conn_id: u64) -> bool {
+    match sender.try_send(conn_id) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(conn_id)) => {
+            debug_assert!(false, "writer settlement queue full for conn_id={conn_id}");
+            warn!(
+                conn_id,
+                "writer settlement queue full; cleanup requires owner attention"
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(conn_id)) => {
+            trace!(conn_id, "writer settlement queue closed during shutdown");
+            false
+        }
+    }
 }
 
 async fn await_writer_with_timeout(mut writer: JoinHandle<()>, timeout: Duration) {
@@ -650,6 +867,7 @@ struct ConnectionCleanup {
     hub: Hub,
     conn_id: u64,
     closed: Option<watch::Sender<bool>>,
+    settlement: Option<WriterSettlementSender>,
     armed: bool,
 }
 
@@ -659,12 +877,17 @@ impl ConnectionCleanup {
             hub,
             conn_id,
             closed: None,
+            settlement: None,
             armed: true,
         }
     }
 
     fn install_closed_signal(&mut self, closed: watch::Sender<bool>) {
         self.closed = Some(closed);
+    }
+
+    fn install_settlement_sender(&mut self, settlement: WriterSettlementSender) {
+        self.settlement = Some(settlement);
     }
 
     fn unregister(&self) {
@@ -685,6 +908,9 @@ impl Drop for ConnectionCleanup {
             let _ = closed.send(true);
         }
         self.hub.unregister(self.conn_id);
+        if let Some(settlement) = &self.settlement {
+            notify_writer_settlement(settlement, self.conn_id);
+        }
     }
 }
 
@@ -1526,12 +1752,23 @@ fn prune(stored: &mut VecDeque<StoredEvent>, max_stored_events: usize, retention
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_tungstenite::connect_async;
 
     struct DropFlag(Arc<AtomicBool>);
 
     impl Drop for DropFlag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct TestGateReset;
+
+    impl Drop for TestGateReset {
+        fn drop(&mut self) {
+            TEST_PARK_NEXT_WRITER.store(false, Ordering::Release);
+            TEST_WRITER_PARKED.store(false, Ordering::Release);
+            TEST_PANIC_AFTER_WRITER.store(false, Ordering::Release);
         }
     }
 
@@ -1866,7 +2103,7 @@ mod tests {
         ));
 
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
-        let connections = Arc::new(Mutex::new(vec![tokio::spawn({
+        let connection_task = tokio::spawn({
             let hub = hub.clone();
             async move {
                 let _cleanup = ConnectionCleanup::new(hub, conn_id);
@@ -1875,13 +2112,15 @@ mod tests {
                     .expect("cleanup task start receiver must remain live");
                 std::future::pending::<()>().await;
             }
-        })]));
+        });
+        let connections = Arc::new(Mutex::new(HashMap::from([(conn_id, connection_task)])));
         armed_rx.await.expect("cleanup task must arm before drop");
         let handle = SignalingServerHandle {
             task: None,
             heartbeat: None,
             connections,
-            writers: Arc::new(Mutex::new(Vec::new())),
+            writers: Arc::new(Mutex::new(HashMap::new())),
+            registry_terminal: Arc::new(RegistryTerminal::new()),
             writer_stop_timeout: Duration::from_secs(2),
             local_addr: "127.0.0.1:0".parse().unwrap(),
             hub,
@@ -1909,32 +2148,37 @@ mod tests {
 
     #[tokio::test]
     async fn registry_pressure_refuses_before_spawning_an_unowned_task() {
-        let tasks = Arc::new(Mutex::new(Vec::with_capacity(1)));
+        let tasks = Arc::new(Mutex::new(HashMap::with_capacity(1)));
         tasks
             .lock()
-            .push(tokio::spawn(std::future::pending::<()>()));
-        assert!(!registry_slot_available(&tasks, 1));
+            .insert(1, tokio::spawn(std::future::pending::<()>()));
+        assert!(!connection_registry_slot_available(&tasks, 1));
         assert_eq!(tasks.lock().len(), 1);
 
-        let task = tasks.lock().pop().unwrap();
+        let task = tasks.lock().remove(&1).unwrap();
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
     async fn finished_handler_and_writer_panics_are_reaped_and_observed() {
-        let connections = Arc::new(Mutex::new(Vec::with_capacity(1)));
-        let writers = Arc::new(Mutex::new(Vec::with_capacity(1)));
+        let hub = Hub::new(Limits::default());
+        let registry_terminal = RegistryTerminal::new();
+        let connections = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        let writers = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        let (settlement_tx, mut settlement_rx) = mpsc::channel(1);
         connections
             .lock()
-            .push(tokio::spawn(async { panic!("injected handler panic") }));
-        writers
-            .lock()
-            .push(tokio::spawn(async { panic!("injected writer panic") }));
+            .insert(1, tokio::spawn(async { panic!("injected handler panic") }));
+        writers.lock().insert(
+            1,
+            Some(tokio::spawn(async { panic!("injected writer panic") })),
+        );
         tokio::task::yield_now().await;
 
-        observe_finished_tasks(&connections, "connection").await;
-        observe_finished_tasks(&writers, "writer").await;
+        observe_completed_connection(1, &connections, &hub, &registry_terminal).await;
+        settlement_tx.send(1).await.unwrap();
+        process_writer_settlement(&mut settlement_rx, &writers, Duration::from_secs(2)).await;
         assert!(connections.lock().is_empty());
         assert!(writers.lock().is_empty());
     }
@@ -2049,24 +2293,21 @@ mod tests {
     async fn connection_cleanup_observes_normal_writer_completion() {
         let hub = Hub::new(Limits::default());
         let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
-        let writers = Arc::new(Mutex::new(Vec::new()));
+        let writers = Arc::new(Mutex::new(HashMap::new()));
         let completed = Arc::new(AtomicBool::new(false));
         let completed_in_writer = Arc::clone(&completed);
         let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
-        writers.lock().push(tokio::spawn(async move {
-            completed_in_writer.store(true, Ordering::Release);
-        }));
+        writers.lock().insert(
+            conn_id,
+            Some(tokio::spawn(async move {
+                completed_in_writer.store(true, Ordering::Release);
+            })),
+        );
 
         cleanup.unregister();
         cleanup.install_closed_signal(watch::channel(false).0);
         cleanup.disarm();
-        let writers = {
-            let mut owned = writers.lock();
-            std::mem::take(&mut *owned)
-        };
-        for writer in writers {
-            await_writer_with_timeout(writer, Duration::from_secs(2)).await;
-        }
+        settle_writer(&writers, conn_id, Duration::from_secs(2)).await;
 
         assert!(completed.load(Ordering::Acquire));
         assert_eq!(hub.snapshot().connections, 0);
@@ -2076,25 +2317,28 @@ mod tests {
     async fn connection_cleanup_aborts_writer_on_bounded_timeout() {
         let hub = Hub::new(Limits::default());
         let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
-        let writers = Arc::new(Mutex::new(Vec::new()));
+        let writers = Arc::new(Mutex::new(HashMap::new()));
         let dropped = Arc::new(AtomicBool::new(false));
         let dropped_in_writer = Arc::clone(&dropped);
         let mut cleanup = ConnectionCleanup::new(hub.clone(), conn_id);
-        writers.lock().push(tokio::spawn(async move {
-            let _drop_flag = DropFlag(dropped_in_writer);
-            std::future::pending::<()>().await;
-        }));
+        writers.lock().insert(
+            conn_id,
+            Some(tokio::spawn(async move {
+                let _drop_flag = DropFlag(dropped_in_writer);
+                std::future::pending::<()>().await;
+            })),
+        );
 
         cleanup.unregister();
         cleanup.install_closed_signal(watch::channel(false).0);
         cleanup.disarm();
-        let writers = {
-            let mut owned = writers.lock();
-            std::mem::take(&mut *owned)
-        };
-        for writer in writers {
-            await_writer_with_timeout(writer, Duration::ZERO).await;
-        }
+        let writer = writers
+            .lock()
+            .get_mut(&conn_id)
+            .and_then(Option::take)
+            .expect("writer remains owned until timeout settlement");
+        await_writer_with_timeout(writer, Duration::ZERO).await;
+        writers.lock().remove(&conn_id);
         tokio::task::yield_now().await;
 
         assert!(dropped.load(Ordering::Acquire));
@@ -2105,7 +2349,8 @@ mod tests {
     async fn connection_cleanup_repairs_injected_panic_and_observes_join_error() {
         let hub = Hub::new(Limits::default());
         let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
-        let writers = Arc::new(Mutex::new(Vec::new()));
+        let writers = Arc::new(Mutex::new(HashMap::new()));
+        let (settlement_tx, mut settlement_rx) = mpsc::channel(1);
         let dropped = Arc::new(AtomicBool::new(false));
         let dropped_in_writer = Arc::clone(&dropped);
         let (closed_tx, mut closed_rx) = watch::channel(false);
@@ -2113,25 +2358,363 @@ mod tests {
         let task_writers = Arc::clone(&writers);
         let task = tokio::spawn(async move {
             let mut cleanup = ConnectionCleanup::new(task_hub, conn_id);
-            task_writers.lock().push(tokio::spawn(async move {
-                let _drop_flag = DropFlag(dropped_in_writer);
-                let _ = closed_rx.changed().await;
-            }));
+            task_writers.lock().insert(
+                conn_id,
+                Some(tokio::spawn(async move {
+                    let _drop_flag = DropFlag(dropped_in_writer);
+                    let _ = closed_rx.changed().await;
+                })),
+            );
             cleanup.install_closed_signal(closed_tx);
+            cleanup.install_settlement_sender(settlement_tx);
             panic!("injected connection panic after activation");
         });
 
         let error = task.await.expect_err("injected connection must panic");
         assert!(error.is_panic());
-        let writers = {
-            let mut owned = writers.lock();
-            std::mem::take(&mut *owned)
-        };
-        for writer in writers {
-            await_writer_with_timeout(writer, Duration::from_secs(2)).await;
-        }
+        assert_eq!(writers.lock().len(), 1);
+        process_writer_settlement(&mut settlement_rx, &writers, Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
         assert!(dropped.load(Ordering::Acquire));
         assert_eq!(hub.snapshot().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn accept_reaper_settles_panic_and_cancel_before_successor_admission() {
+        let hub = Hub::new(Limits {
+            max_connections: 1,
+            ..Limits::default()
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let connections = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        let writers = Arc::new(Mutex::new(HashMap::with_capacity(1)));
+        let registry_terminal = Arc::new(RegistryTerminal::new());
+        let (completion_tx, completion_rx) = mpsc::channel(1);
+        let (settlement_tx, settlement_rx) = mpsc::channel(1);
+        let accept_task = tokio::spawn(accept_loop(
+            listener,
+            AcceptLoopContext {
+                hub: hub.clone(),
+                connections: Arc::clone(&connections),
+                writers: Arc::clone(&writers),
+                registry_terminal: Arc::clone(&registry_terminal),
+                registry_capacity: 1,
+                completion_rx,
+                writer_settlement_rx: settlement_rx,
+                completion_tx: completion_tx.clone(),
+                writer_settlement_tx: settlement_tx.clone(),
+                writer_stop_timeout: Duration::from_secs(1),
+            },
+        ));
+
+        let first = hub
+            .admit("127.0.0.1".parse().unwrap())
+            .expect("first admission must fit");
+        let first_id = first
+            .activate(mpsc::channel::<WsMessage>(1).0)
+            .expect("first connection must register");
+        writers
+            .lock()
+            .insert(first_id, Some(tokio::spawn(std::future::pending::<()>())));
+        let first_completion_tx = completion_tx.clone();
+        let first_task = tokio::spawn({
+            let hub = hub.clone();
+            let settlement_tx = settlement_tx.clone();
+            async move {
+                let _ = std::panic::AssertUnwindSafe(async move {
+                    let mut cleanup = ConnectionCleanup::new(hub, first_id);
+                    cleanup.install_settlement_sender(settlement_tx);
+                    panic!("injected handler panic after activation");
+                })
+                .catch_unwind()
+                .await;
+                let _ = first_completion_tx.send(first_id).await;
+            }
+        });
+        connections.lock().insert(first_id, first_task);
+
+        let mut progress = registry_terminal.progress.subscribe();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if hub.snapshot().connections == 0 && writers.lock().is_empty() {
+                    break;
+                }
+                progress
+                    .changed()
+                    .await
+                    .expect("completion progress must remain published");
+            }
+        })
+        .await
+        .expect("accept reaper must settle a panicked connection");
+        drop(
+            hub.admit("127.0.0.1".parse().unwrap())
+                .expect("successor must fit after panic settlement"),
+        );
+
+        let second = hub
+            .admit("127.0.0.1".parse().unwrap())
+            .expect("second admission must fit");
+        let second_id = second
+            .activate(mpsc::channel::<WsMessage>(1).0)
+            .expect("second connection must register");
+        writers
+            .lock()
+            .insert(second_id, Some(tokio::spawn(std::future::pending::<()>())));
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let second_handler = tokio::spawn({
+            let hub = hub.clone();
+            let settlement_tx = settlement_tx.clone();
+            async move {
+                let mut cleanup = ConnectionCleanup::new(hub, second_id);
+                cleanup.install_settlement_sender(settlement_tx);
+                armed_tx.send(()).expect("cancel witness must arm");
+                std::future::pending::<()>().await;
+            }
+        });
+        let second_abort = second_handler.abort_handle();
+        let second_task = tokio::spawn(async move {
+            let _ = second_handler.await;
+            let _ = completion_tx.send(second_id).await;
+        });
+        armed_rx
+            .await
+            .expect("cancel witness must arm before abort");
+        connections.lock().insert(second_id, second_task);
+        second_abort.abort();
+
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if hub.snapshot().connections == 0 && writers.lock().is_empty() {
+                    break;
+                }
+                progress
+                    .changed()
+                    .await
+                    .expect("completion progress must remain published");
+            }
+        })
+        .await
+        .expect("accept reaper must settle a cancelled connection");
+        drop(
+            hub.admit("127.0.0.1".parse().unwrap())
+                .expect("successor must fit after cancellation settlement"),
+        );
+
+        accept_task.abort();
+        let _ = accept_task.await;
+    }
+
+    #[tokio::test]
+    async fn production_writer_timeout_releases_placeholder_before_successor() {
+        let _gate = TEST_GATE_SERIAL.lock().await;
+        let _reset = TestGateReset;
+        TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
+        TEST_WRITER_PARKED.store(false, Ordering::Release);
+        TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
+        let server = SignalingServer::start(
+            "127.0.0.1",
+            0,
+            Limits {
+                max_connections: 1,
+                writer_stop_timeout_secs: 1,
+                ..Limits::default()
+            },
+        )
+        .await
+        .unwrap();
+        let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+        let (first, _) = connect_async(&url).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.stats().connections == 0
+                    && server
+                        .writers
+                        .lock()
+                        .values()
+                        .any(|writer| writer.is_none())
+                    && TEST_WRITER_PARKED.load(Ordering::Acquire)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("W0 cleanup must unregister Hub before settlement parks");
+        let successor_admission = server
+            .hub
+            .admit("127.0.0.1".parse().unwrap())
+            .expect("Hub admission must be available after W0 cleanup");
+        assert!(
+            !writer_registry_slot_available(&server.writers, 1),
+            "the exact writer placeholder must still fence the successor"
+        );
+        let combined_registry_available = {
+            let owned_connections = server.connections.lock();
+            owned_connections.is_empty() && writer_registry_slot_available(&server.writers, 1)
+        };
+        assert!(
+            !combined_registry_available,
+            "the production accept predicate must remain closed while W0 settles"
+        );
+        drop(successor_admission);
+        assert_eq!(server.writers.lock().len(), 1);
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if server.stats().connections == 0 && server.writers.lock().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configured writer timeout must abort, join, and release W0");
+
+        let (second, _) = connect_async(&url).await.unwrap();
+        drop(second);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if server.stats().connections == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("W1 must settle before shutdown");
+        server.stop_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_wait_finishes_inflight_settlement_before_draining_registries() {
+        let _gate = TEST_GATE_SERIAL.lock().await;
+        let _reset = TestGateReset;
+        TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
+        TEST_WRITER_PARKED.store(false, Ordering::Release);
+        TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
+        let server = SignalingServer::start(
+            "127.0.0.1",
+            0,
+            Limits {
+                max_connections: 1,
+                writer_stop_timeout_secs: 1,
+                ..Limits::default()
+            },
+        )
+        .await
+        .unwrap();
+        let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
+        let (first, _) = connect_async(&url).await.unwrap();
+        let progress = server.registry_terminal.progress.subscribe();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if TEST_WRITER_PARKED.load(Ordering::Acquire)
+                    && server.stats().connections == 0
+                    && server
+                        .writers
+                        .lock()
+                        .values()
+                        .any(|writer| writer.is_none())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer settlement must be in flight before shutdown");
+
+        let progress_before_shutdown = *progress.borrow();
+        drop(first);
+        let hub = server.hub.clone();
+        let connections = Arc::clone(&server.connections);
+        let writers = Arc::clone(&server.writers);
+        server.stop_and_wait().await;
+
+        assert!(
+            *progress.borrow() > progress_before_shutdown,
+            "stop_and_wait must publish progress after the parked writer's terminal join"
+        );
+        assert!(connections.lock().is_empty());
+        assert!(writers.lock().is_empty());
+        assert_eq!(hub.snapshot().connections, 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_settlement_queue_accepts_exact_connection_population() {
+        let limits = Limits {
+            max_connections: 3,
+            ..Limits::default()
+        };
+        let capacity = Limits::checked_usize(limits.max_connections, "max_connections").unwrap();
+        let writers = Arc::new(Mutex::new(HashMap::with_capacity(capacity)));
+        let (settlement_tx, settlement_rx) = mpsc::channel(capacity);
+
+        // Consume the first exact notification while its writer is parked;
+        // the remaining admitted population consumes the bounded queue slots
+        // derived from max_connections.
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        writers.lock().insert(
+            0,
+            Some(tokio::spawn(async move {
+                let _ = release_rx.await;
+            })),
+        );
+        assert!(notify_writer_settlement(&settlement_tx, 0));
+        let settlement_writers = Arc::clone(&writers);
+        let first_settlement = tokio::spawn(async move {
+            let mut settlement_rx = settlement_rx;
+            process_writer_settlement(
+                &mut settlement_rx,
+                &settlement_writers,
+                Duration::from_secs(2),
+            )
+            .await;
+            settlement_rx
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(writers.lock().get(&0), Some(None)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first exact writer must be in-flight during queue pressure");
+
+        for conn_id in 1..capacity as u64 {
+            writers.lock().insert(conn_id, Some(tokio::spawn(async {})));
+            assert!(notify_writer_settlement(&settlement_tx, conn_id));
+        }
+        assert_eq!(writers.lock().len(), capacity);
+
+        release_tx.send(()).unwrap();
+        let mut settlement_rx = first_settlement.await.unwrap();
+        for _ in 1..capacity {
+            process_writer_settlement(&mut settlement_rx, &writers, Duration::from_secs(2)).await;
+        }
+        assert!(writers.lock().is_empty());
+
+        // With no settlement in flight, the channel itself accepts exactly
+        // C one-shot notifications and rejects the next one explicitly.
+        for conn_id in 0..capacity as u64 {
+            writers.lock().insert(conn_id, Some(tokio::spawn(async {})));
+            assert!(notify_writer_settlement(&settlement_tx, conn_id));
+        }
+        assert!(matches!(
+            settlement_tx.try_send(capacity as u64),
+            Err(mpsc::error::TrySendError::Full(id)) if id == capacity as u64
+        ));
+
+        for _ in 0..capacity {
+            process_writer_settlement(&mut settlement_rx, &writers, Duration::from_secs(2)).await;
+        }
+        assert!(writers.lock().is_empty());
     }
 }

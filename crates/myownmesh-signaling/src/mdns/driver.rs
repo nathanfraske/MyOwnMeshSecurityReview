@@ -24,7 +24,7 @@
 //!   there; mDNSResponder isn't). The exchange below is backend-independent.
 
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,11 +32,13 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+#[cfg(test)]
+use tokio::sync::{Barrier, Notify};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
-use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent};
+use super::discovery::{Discovery, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits};
 use super::wire::{self, DeviceIdValidator, Frame};
 use crate::nostr::handle::derive_room_handle;
 use crate::{
@@ -45,7 +47,35 @@ use crate::{
 };
 
 /// Maximum number of accepted or dialed exchanges owned by one driver.
-pub const MAX_ACTIVE_CONNECTIONS: usize = 256;
+/// Owner-selected finite mDNS workload limits. Defaults preserve the prior
+/// profile, while each driver instance now carries the source of truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MdnsLimits {
+    pub max_active_connections: usize,
+    pub max_discovered_peers: usize,
+    pub outbound_queue_capacity: usize,
+    pub discovery: DiscoveryLimits,
+}
+
+impl Default for MdnsLimits {
+    fn default() -> Self {
+        Self {
+            max_active_connections: 256,
+            max_discovered_peers: 1024,
+            outbound_queue_capacity: 128,
+            discovery: DiscoveryLimits::default(),
+        }
+    }
+}
+
+impl MdnsLimits {
+    pub fn validate(self) -> bool {
+        self.max_active_connections > 0
+            && self.max_discovered_peers > 0
+            && self.outbound_queue_capacity > 0
+            && self.discovery.validate()
+    }
+}
 
 /// Configuration for one driver instance.
 #[derive(Clone)]
@@ -68,6 +98,9 @@ pub struct MdnsDriverConfig {
     pub device_id_validator: DeviceIdValidator,
     /// Application-owned custody for every retained service alias.
     pub alias_provider: Arc<dyn AliasProvider>,
+    /// Finite owner-selected workload limits used by all driver/backend
+    /// registries and queues.
+    pub limits: MdnsLimits,
 }
 
 impl std::fmt::Debug for MdnsDriverConfig {
@@ -196,13 +229,13 @@ impl ConnectionRetention {
     /// its known peer, when present.  An inbound stream has no peer key until
     /// its first authenticated frame and therefore contributes no key bytes
     /// to this plan; its identity buffer is planned separately.
-    pub fn for_peer(key: Option<&str>) -> Self {
+    pub fn for_peer(key: Option<&str>, queue_slots: usize) -> Self {
         Self {
             key_capacity: key.map_or(0, str::len),
             node_bytes: std::mem::size_of::<ConnNode>(),
             socket_handles: 2,
             native_objects: 1,
-            queue_slots: OUTBOUND_QUEUE_CAP,
+            queue_slots,
             worker_tasks: 2,
             // One channel allocation and one erased provider-owner allocation.
             opaque_allocations: 2,
@@ -339,8 +372,6 @@ const CONN_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inbound exchange connections are dropped after this much idle.
 const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_DISCOVERED_PEERS: usize = 1024;
-const OUTBOUND_QUEUE_CAP: usize = 128;
 
 /// Cadence of the local re-announce tick: every interval, each peer
 /// still present in the mDNS cache is re-surfaced to the engine as a
@@ -365,6 +396,9 @@ where
     if !(config.device_id_validator)(&config.device_id) {
         return Err(Error::Other("mDNS local device id is not canonical".into()));
     }
+    if !config.limits.validate() {
+        return Err(Error::Other("invalid mDNS workload limits".into()));
+    }
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -386,6 +420,7 @@ where
         instance,
         port,
         txt: wire::txt_properties(&room_handle, &config.device_id),
+        limits: config.limits.discovery,
     })?;
     let discovery_task = discovery.take_task();
     let discovery = Arc::new(discovery);
@@ -411,11 +446,16 @@ where
         alias_provider: config.alias_provider,
         discovery: discovery.clone(),
         registered: AtomicBool::new(registered),
-        peers: Mutex::new(PeerOwnership::default()),
+        peers: Mutex::new(PeerOwnership::with_max_peers(
+            config.limits.max_discovered_peers,
+        )),
         aliases: Mutex::new(AliasOwnership::default()),
         conns: Mutex::new(ConnectionOwnership::default()),
-        connection_slots: Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS)),
+        connection_slots: Arc::new(Semaphore::new(config.limits.max_active_connections)),
+        outbound_queue_capacity: config.limits.outbound_queue_capacity,
         connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
+        #[cfg(test)]
+        test_half_gate: Arc::new(Mutex::new(None)),
         stopped: Arc::new(AtomicBool::new(false)),
         // Zero is the permanent exhausted sentinel; live connections start
         // at the first nonzero generation so the first adoption is usable.
@@ -543,7 +583,10 @@ struct Shared {
     /// can ride the same socket the request arrived on.
     conns: Mutex<ConnectionOwnership>,
     connection_slots: Arc<Semaphore>,
+    outbound_queue_capacity: usize,
     connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
+    #[cfg(test)]
+    test_half_gate: Arc<Mutex<Option<Arc<TestHalfGate>>>>,
     stopped: Arc<AtomicBool>,
     conn_gen: AtomicU64,
     inbound_tx: InboundSink<MdnsInbound>,
@@ -563,13 +606,27 @@ struct PeerNode {
     next: Option<Box<PeerNode>>,
 }
 
-#[derive(Default)]
 struct PeerOwnership {
     head: Option<Box<PeerNode>>,
     count: usize,
+    max_peers: usize,
+}
+
+impl Default for PeerOwnership {
+    fn default() -> Self {
+        Self::with_max_peers(MdnsLimits::default().max_discovered_peers)
+    }
 }
 
 impl PeerOwnership {
+    fn with_max_peers(max_peers: usize) -> Self {
+        Self {
+            head: None,
+            count: 0,
+            max_peers,
+        }
+    }
+
     fn contains(&self, peer: &str) -> bool {
         self.get(peer).is_some()
     }
@@ -596,7 +653,7 @@ impl PeerOwnership {
     }
 
     fn can_insert(&self, peer: &str) -> std::result::Result<(), AliasRefusal> {
-        if self.contains(peer) || self.count < MAX_DISCOVERED_PEERS {
+        if self.contains(peer) || self.count < self.max_peers {
             return Ok(());
         }
         Err(AliasRefusal::Provider("peer capacity exhausted".into()))
@@ -813,6 +870,79 @@ struct ConnNode {
     next: Option<Box<ConnNode>>,
 }
 
+/// Provider custody for one connection remains live until the registry node
+/// and both stream halves have retired. A replacement only retires the node;
+/// a sibling task still holds its half and therefore keeps the exact owner.
+struct ConnectionCustody {
+    owner: Mutex<Option<ErasedOwner>>,
+    remaining_halves: AtomicUsize,
+    retired: AtomicBool,
+}
+
+impl ConnectionCustody {
+    fn new(owner: ErasedOwner) -> Arc<Self> {
+        Arc::new(Self {
+            owner: Mutex::new(Some(owner)),
+            remaining_halves: AtomicUsize::new(2),
+            retired: AtomicBool::new(false),
+        })
+    }
+
+    fn half(self: &Arc<Self>) -> ConnectionHalf {
+        ConnectionHalf {
+            custody: Arc::clone(self),
+        }
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.release_if_ready();
+    }
+
+    fn release_if_ready(&self) {
+        if self.retired.load(Ordering::Acquire)
+            && self.remaining_halves.load(Ordering::Acquire) == 0
+        {
+            let _ = self.owner.lock().take();
+        }
+    }
+}
+
+struct ConnectionCustodyNode {
+    custody: Arc<ConnectionCustody>,
+}
+
+impl Drop for ConnectionCustodyNode {
+    fn drop(&mut self) {
+        self.custody.retire();
+    }
+}
+
+#[cfg(test)]
+struct TestHalfGate {
+    generation: u64,
+    writer_ready: Arc<Barrier>,
+    reader_ready: Arc<Barrier>,
+    writer_release: Arc<Notify>,
+    reader_release: Arc<Notify>,
+    writer_exited: Arc<Notify>,
+    reader_exited: Arc<Notify>,
+}
+
+struct ConnectionHalf {
+    custody: Arc<ConnectionCustody>,
+}
+
+impl Drop for ConnectionHalf {
+    fn drop(&mut self) {
+        let previous = self.custody.remaining_halves.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "connection half retired more than once");
+        if previous == 1 {
+            self.custody.release_if_ready();
+        }
+    }
+}
+
 #[derive(Default)]
 struct ConnectionOwnership {
     head: Option<Box<ConnNode>>,
@@ -889,10 +1019,32 @@ fn next_connection_generation(counter: &AtomicU64) -> Option<u64> {
         .ok()
 }
 
+/// Reap connection workers while the driver is live. Without this drain a
+/// completed worker remains in the JoinSet until shutdown, so sequential
+/// connection churn grows the supervisor registry even though the sockets and
+/// provider owners have already retired.
+fn reap_connection_tasks(shared: &Shared) {
+    let mut tasks = shared.connection_tasks.lock();
+    let Some(tasks) = tasks.as_mut() else {
+        return;
+    };
+    while let Some(result) = tasks.try_join_next() {
+        match result {
+            Ok(()) => trace!("mdns connection worker completed"),
+            Err(error) if error.is_panic() => warn!(?error, "mdns connection worker panicked"),
+            Err(error) if error.is_cancelled() => {
+                debug!(?error, "mdns connection worker cancelled")
+            }
+            Err(error) => warn!(?error, "mdns connection worker failed"),
+        }
+    }
+}
+
 async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<DiscoveryEvent>) {
     // Stream closes when the backend shuts down.
     let mut cancel = shared.cancel.subscribe();
     loop {
+        reap_connection_tasks(&shared);
         let event = tokio::select! {
             event = browse_rx.recv() => event,
             _ = cancel.changed() => return,
@@ -925,7 +1077,7 @@ async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<Discovery
                 let peer = advert.peer;
                 let peers = shared.peers.lock();
                 let known = peers.contains(&peer);
-                let at_capacity = peers.count >= MAX_DISCOVERED_PEERS;
+                let at_capacity = peers.count >= peers.max_peers;
                 let peer_capacity_ok = peers.can_insert(&peer).is_ok();
                 let existing_peer_capacity = peers.peer_capacity(&peer);
                 drop(peers);
@@ -1065,6 +1217,7 @@ async fn run_outbound(
 ) {
     let mut cancel = shared.cancel.subscribe();
     loop {
+        reap_connection_tasks(&shared);
         let Some(outbound) = (tokio::select! {
             outbound = source.recv() => outbound,
             _ = cancel.changed() => return,
@@ -1207,7 +1360,12 @@ async fn send_directed(
         .collect();
     match futures::future::select_ok(attempts).await {
         Ok((stream, _rest)) => {
-            let Some(tx) = adopt_stream(shared, stream, Some(to.clone())) else {
+            let Some(tx) = adopt_stream(
+                shared,
+                stream,
+                Some(to.clone()),
+                shared.outbound_queue_capacity,
+            ) else {
                 debug!(peer = %&to[..to.len().min(16)], "mdns connection identity space exhausted");
                 return false;
             };
@@ -1240,11 +1398,12 @@ fn adopt_stream(
     shared: &Arc<Shared>,
     stream: TcpStream,
     known_peer: Option<String>,
+    queue_capacity: usize,
 ) -> Option<mpsc::Sender<OwnedSignal<String, ErasedOwner>>> {
     if shared.stopped.load(Ordering::Acquire) {
         return None;
     }
-    let connection_retention = ConnectionRetention::for_peer(known_peer.as_deref());
+    let connection_retention = ConnectionRetention::for_peer(known_peer.as_deref(), queue_capacity);
     let connection_owner = match shared
         .alias_provider
         .retain_connection(known_peer.as_deref(), connection_retention)
@@ -1267,7 +1426,7 @@ fn adopt_stream(
     }
     let generation = next_connection_generation(&shared.conn_gen)?;
     let (read_half, write_half) = stream.into_split();
-    let (tx, rx) = mpsc::channel::<OwnedSignal<String, ErasedOwner>>(OUTBOUND_QUEUE_CAP);
+    let (tx, rx) = mpsc::channel::<OwnedSignal<String, ErasedOwner>>(queue_capacity);
     let (local_stop, _) = watch::channel(false);
     // Serialize task registration with stop's drain. Once this guard is
     // acquired, shutdown cannot take the registry between the stopped check
@@ -1279,15 +1438,11 @@ fn adopt_stream(
     // The peer this connection is registered under — set at adopt
     // time for outbound dials, on first frame for inbound accepts.
     let registered_as = Arc::new(Mutex::new(None::<Arc<str>>));
-    let pending_owner = Arc::new(Mutex::new(Some(connection_owner)));
+    let custody = ConnectionCustody::new(connection_owner);
     if let Some(peer) = known_peer {
         if shared.stopped.load(Ordering::Acquire) {
             return None;
         }
-        let owner = pending_owner
-            .lock()
-            .take()
-            .expect("outbound connection owner is available");
         let peer_key: Arc<str> = Arc::from(peer.as_str());
         let displaced = shared.conns.lock().insert(
             peer_key.clone(),
@@ -1296,7 +1451,9 @@ fn adopt_stream(
                 tx: tx.clone(),
                 stop: local_stop.clone(),
             },
-            owner,
+            Box::new(ConnectionCustodyNode {
+                custody: Arc::clone(&custody),
+            }),
         );
         if let Some(displaced) = displaced {
             let _ = displaced.stop.send(true);
@@ -1313,6 +1470,10 @@ fn adopt_stream(
         let local_cancel = local_stop.subscribe();
         let local_stop = local_stop.clone();
         let _slot = slot.clone();
+        let writer_custody = Arc::clone(&custody);
+        let half = custody.half();
+        #[cfg(test)]
+        let writer_gate = shared.test_half_gate.lock().clone();
         let writer_task = async move {
             run_writer(write_half, rx, cancel, local_cancel).await;
             let _ = local_stop.send(true);
@@ -1320,6 +1481,20 @@ fn adopt_stream(
             // may have replaced this entry already.
             if let Some(peer) = registered_as.lock().clone() {
                 shared.conns.lock().remove_generation(&peer, generation);
+            } else {
+                writer_custody.retire();
+            }
+            #[cfg(test)]
+            let writer_gate = writer_gate.filter(|gate| gate.generation == generation);
+            #[cfg(test)]
+            if let Some(gate) = writer_gate.as_ref() {
+                gate.writer_ready.wait().await;
+                gate.writer_release.notified().await;
+            }
+            drop(half);
+            #[cfg(test)]
+            if let Some(gate) = writer_gate {
+                gate.writer_exited.notify_one();
             }
         };
         let tasks = connection_tasks.as_mut()?;
@@ -1332,10 +1507,13 @@ fn adopt_stream(
         let shared = shared.clone();
         let tx = tx.clone();
         let registered_as = registered_as.clone();
-        let pending_owner = pending_owner.clone();
         let local_cancel = local_stop.subscribe();
         let local_stop = local_stop.clone();
         let _slot = slot;
+        let reader_custody = Arc::clone(&custody);
+        let half = custody.half();
+        #[cfg(test)]
+        let reader_gate = shared.test_half_gate.lock().clone();
         let reader_task = async move {
             run_reader(&shared, read_half, local_cancel, |from| {
                 if shared.stopped.load(Ordering::Acquire) {
@@ -1357,10 +1535,6 @@ fn adopt_stream(
                             return;
                         }
                     };
-                    let Some(owner) = pending_owner.lock().take() else {
-                        drop(identity_owner);
-                        return;
-                    };
                     let peer_key: Arc<str> = Arc::from(from);
                     let displaced = shared.conns.lock().insert(
                         peer_key.clone(),
@@ -1369,7 +1543,12 @@ fn adopt_stream(
                             tx: tx.clone(),
                             stop: local_stop.clone(),
                         },
-                        Box::new((owner, identity_owner)) as ErasedOwner,
+                        Box::new((
+                            identity_owner,
+                            ConnectionCustodyNode {
+                                custody: Arc::clone(&custody),
+                            },
+                        )) as ErasedOwner,
                     );
                     if let Some(displaced) = displaced {
                         let _ = displaced.stop.send(true);
@@ -1384,6 +1563,20 @@ fn adopt_stream(
             // exchange re-dials.
             if let Some(peer) = registered_as.lock().clone() {
                 shared.conns.lock().remove_generation(&peer, generation);
+            } else {
+                reader_custody.retire();
+            }
+            #[cfg(test)]
+            let reader_gate = reader_gate.filter(|gate| gate.generation == generation);
+            #[cfg(test)]
+            if let Some(gate) = reader_gate.as_ref() {
+                gate.reader_ready.wait().await;
+                gate.reader_release.notified().await;
+            }
+            drop(half);
+            #[cfg(test)]
+            if let Some(gate) = reader_gate {
+                gate.reader_exited.notify_one();
             }
             trace!("mdns exchange connection closed");
         };
@@ -1440,13 +1633,14 @@ async fn run_accept(shared: Arc<Shared>, std_listener: std::net::TcpListener) {
     };
     let mut cancel = shared.cancel.subscribe();
     loop {
+        reap_connection_tasks(&shared);
         let accepted = tokio::select! {
             accepted = listener.accept() => Some(accepted),
             _ = cancel.changed() => return,
         };
         match accepted.expect("listener accept branch selected") {
             Ok((stream, _remote)) => {
-                if adopt_stream(&shared, stream, None).is_none() {
+                if adopt_stream(&shared, stream, None, shared.outbound_queue_capacity).is_none() {
                     debug!("mdns accepted connection identity space exhausted");
                 }
             }
@@ -1590,6 +1784,7 @@ async fn run_reannounce(shared: Arc<Shared>) {
         if *cancel.borrow() {
             return;
         }
+        reap_connection_tasks(&shared);
         // Registration retry — covers a register() that failed at
         // start (no usable interface yet) or a transient daemon error.
         if !shared.registered.load(Ordering::SeqCst) {
@@ -1657,9 +1852,11 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 1);
         assert_eq!(peers.get("peer-a").unwrap().port, 2);
 
+        let max_peers = 2;
         let mut full = PeerOwnership {
             head: None,
-            count: MAX_DISCOVERED_PEERS,
+            count: max_peers,
+            max_peers,
         };
         let refusal = full.insert_new(
             "peer-b".into(),
@@ -1670,7 +1867,7 @@ mod tests {
             Box::new(DropCounter(Arc::clone(&released))),
         );
         assert!(refusal.is_err());
-        assert_eq!(full.count, MAX_DISCOVERED_PEERS);
+        assert_eq!(full.count, max_peers);
         assert!(!full.contains("peer-b"));
         assert_eq!(released.load(Ordering::SeqCst), 2);
         drop(peers.remove("peer-a"));
@@ -1709,11 +1906,156 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 2);
     }
 
+    #[cfg_attr(
+        any(target_os = "ios", feature = "system-dnssd"),
+        ignore = "requires the system mDNS daemon"
+    )]
+    #[tokio::test]
+    async fn connection_registry_replacement_keeps_w0_until_both_halves_retire() {
+        let limits = MdnsLimits {
+            max_active_connections: 4,
+            max_discovered_peers: 1,
+            outbound_queue_capacity: 2,
+            discovery: DiscoveryLimits {
+                max_resolve_owners: 2,
+                event_capacity: 3,
+                max_event_epochs: 4,
+            },
+        };
+        let released = Arc::new(AtomicU64::new(0));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let cfg = DiscoveryConfig {
+            service_type: wire::SERVICE_TYPE.to_string(),
+            instance: format!("mdns-overlap-{}", std::process::id()),
+            port: 0,
+            txt: Vec::new(),
+            limits: limits.discovery,
+        };
+        let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
+        let (in_tx, _in_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            room_handle: "room".into(),
+            device_id: "local".into(),
+            device_id_validator: |_| true,
+            alias_provider: Arc::new(CountingProvider {
+                released: Arc::clone(&released),
+                attempted: Arc::clone(&attempted),
+                refuse_after: None,
+            }),
+            discovery: Arc::new(discovery),
+            registered: AtomicBool::new(false),
+            peers: Mutex::new(PeerOwnership::with_max_peers(limits.max_discovered_peers)),
+            aliases: Mutex::new(AliasOwnership::default()),
+            conns: Mutex::new(ConnectionOwnership::default()),
+            connection_slots: Arc::new(Semaphore::new(limits.max_active_connections)),
+            outbound_queue_capacity: limits.outbound_queue_capacity,
+            connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
+            test_half_gate: Arc::new(Mutex::new(None)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            conn_gen: AtomicU64::new(1),
+            inbound_tx: InboundSink::from_unbounded(in_tx),
+            cancel: watch::channel(false).0,
+        });
+
+        async fn adopt_loopback(shared: &Arc<Shared>, peer: &str) -> TcpStream {
+            let listener = TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("loopback listener");
+            let address = listener.local_addr().expect("loopback address");
+            let client = TcpStream::connect(address).await.expect("loopback client");
+            let (accepted, _) = listener.accept().await.expect("loopback accept");
+            assert!(adopt_stream(
+                shared,
+                accepted,
+                Some(peer.to_owned()),
+                shared.outbound_queue_capacity,
+            )
+            .is_some());
+            client
+        }
+
+        async fn wait_for_releases(released: &AtomicU64, expected: u64) {
+            for _ in 0..256 {
+                if released.load(Ordering::Acquire) == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(released.load(Ordering::Acquire), expected);
+        }
+
+        for (generation, release_writer_first) in [(1, true), (3, false)] {
+            let gate = Arc::new(TestHalfGate {
+                generation,
+                writer_ready: Arc::new(Barrier::new(2)),
+                reader_ready: Arc::new(Barrier::new(2)),
+                writer_release: Arc::new(Notify::new()),
+                reader_release: Arc::new(Notify::new()),
+                writer_exited: Arc::new(Notify::new()),
+                reader_exited: Arc::new(Notify::new()),
+            });
+            *shared.test_half_gate.lock() = Some(Arc::clone(&gate));
+            let old_client = adopt_loopback(&shared, "peer-a").await;
+            let new_client = adopt_loopback(&shared, "peer-a").await;
+            drop(old_client);
+
+            gate.writer_ready.wait().await;
+            gate.reader_ready.wait().await;
+            let prior_releases = generation - 1;
+            assert_eq!(released.load(Ordering::Acquire), prior_releases);
+            assert!(shared.conns.lock().sender("peer-a").is_some());
+
+            if release_writer_first {
+                gate.writer_release.notify_one();
+                gate.writer_exited.notified().await;
+                assert_eq!(released.load(Ordering::Acquire), prior_releases);
+                gate.reader_release.notify_one();
+                gate.reader_exited.notified().await;
+            } else {
+                gate.reader_release.notify_one();
+                gate.reader_exited.notified().await;
+                assert_eq!(released.load(Ordering::Acquire), prior_releases);
+                gate.writer_release.notify_one();
+                gate.writer_exited.notified().await;
+            }
+            wait_for_releases(&released, generation).await;
+            assert!(shared.conns.lock().sender("peer-a").is_some());
+
+            drop(new_client);
+            wait_for_releases(&released, generation + 1).await;
+            assert!(shared.conns.lock().sender("peer-a").is_none());
+        }
+
+        assert_eq!(attempted.load(Ordering::Acquire), 4);
+        for _ in 0..256 {
+            if shared.connection_slots.available_permits() == 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(shared.connection_slots.available_permits(), 4);
+        reap_connection_tasks(&shared);
+        let _ = shared.cancel.send(true);
+        let shared = match Arc::try_unwrap(shared) {
+            Ok(shared) => shared,
+            Err(_) => panic!("connection test retained shared ownership"),
+        };
+        let mut discovery = match Arc::try_unwrap(shared.discovery) {
+            Ok(discovery) => discovery,
+            Err(_) => panic!("connection test retained discovery ownership"),
+        };
+        discovery.shutdown();
+        if let Some(task) = discovery.take_task() {
+            task.await.expect("discovery shutdown task");
+        }
+    }
+
     #[tokio::test]
     async fn connection_slots_have_a_finite_cap_and_release() {
-        let slots = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
-        let mut leases = Vec::with_capacity(MAX_ACTIVE_CONNECTIONS);
-        for _ in 0..MAX_ACTIVE_CONNECTIONS {
+        let max_connections = 3;
+        let slots = Arc::new(Semaphore::new(max_connections));
+        let mut leases = Vec::with_capacity(max_connections);
+        for _ in 0..max_connections {
             leases.push(slots.clone().try_acquire_owned().expect("slot available"));
         }
         assert!(slots.clone().try_acquire_owned().is_err());
@@ -1727,6 +2069,290 @@ mod tests {
         supervisor.spawn(async {});
         assert!(supervisor.join_next().await.is_some());
         assert!(supervisor.join_next().await.is_none());
+    }
+
+    #[test]
+    fn configured_limits_are_finite_and_reject_zero() {
+        let limits = MdnsLimits::default();
+        assert!(limits.validate());
+        assert!(!MdnsLimits {
+            max_active_connections: 0,
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            max_discovered_peers: 0,
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            outbound_queue_capacity: 0,
+            ..limits
+        }
+        .validate());
+        assert!(!MdnsLimits {
+            discovery: DiscoveryLimits {
+                max_event_epochs: 0,
+                ..limits.discovery
+            },
+            ..limits
+        }
+        .validate());
+    }
+
+    #[test]
+    fn non_default_limits_reach_driver_retention_plans() {
+        let limits = MdnsLimits {
+            max_active_connections: 3,
+            max_discovered_peers: 5,
+            outbound_queue_capacity: 7,
+            discovery: DiscoveryLimits {
+                max_resolve_owners: 11,
+                event_capacity: 13,
+                max_event_epochs: 17,
+            },
+        };
+        assert!(limits.validate());
+        let peers = PeerOwnership::with_max_peers(limits.max_discovered_peers);
+        assert_eq!(peers.max_peers, 5);
+        let connection = ConnectionRetention::for_peer(None, limits.outbound_queue_capacity);
+        assert_eq!(connection.queue_slots, 7);
+        assert_eq!(connection.worker_tasks, 2);
+        assert_eq!(limits.discovery.event_capacity, 13);
+        assert_eq!(limits.discovery.max_resolve_owners, 11);
+        assert_eq!(limits.discovery.max_event_epochs, 17);
+    }
+
+    #[test]
+    fn driver_rejects_zero_limits_before_socket_or_daemon_creation() {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        drop(out_tx);
+        let (in_tx, _in_rx) = mpsc::unbounded_channel();
+        let limits = MdnsLimits {
+            max_active_connections: 0,
+            ..MdnsLimits::default()
+        };
+        let result = start(
+            MdnsDriverConfig {
+                app_id: "limits-test".into(),
+                network_id: "limits-network".into(),
+                device_id: "local".into(),
+                service_port: 0,
+                device_id_validator: |_| true,
+                alias_provider: Arc::new(CountingProvider {
+                    released: Arc::new(AtomicU64::new(0)),
+                    attempted: Arc::new(AtomicUsize::new(0)),
+                    refuse_after: None,
+                }),
+                limits,
+            },
+            crate::UnboundedSource::new(out_rx),
+            InboundSink::from_unbounded(in_tx),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn connection_owner_waits_for_registry_and_both_halves() {
+        let released = Arc::new(AtomicU64::new(0));
+        let custody = ConnectionCustody::new(Box::new(DropCounter(Arc::clone(&released))));
+        let node = ConnectionCustodyNode {
+            custody: Arc::clone(&custody),
+        };
+        let first = custody.half();
+        let second = custody.half();
+        drop(node);
+        drop(first);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(second);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+
+        let released = Arc::new(AtomicU64::new(0));
+        let custody = ConnectionCustody::new(Box::new(DropCounter(Arc::clone(&released))));
+        let node = ConnectionCustodyNode {
+            custody: Arc::clone(&custody),
+        };
+        let first = custody.half();
+        let second = custody.half();
+        drop(first);
+        drop(node);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(second);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    struct CountingProvider {
+        released: Arc<AtomicU64>,
+        attempted: Arc<AtomicUsize>,
+        refuse_after: Option<usize>,
+    }
+
+    impl AliasProvider for CountingProvider {
+        fn retain_alias(
+            &self,
+            _key: &str,
+            _peer: &str,
+            _retention: AliasRetention,
+        ) -> std::result::Result<ErasedOwner, AliasRefusal> {
+            Ok(Box::new(()))
+        }
+
+        fn retain_peer(
+            &self,
+            _peer: &str,
+            _retention: PeerRetention,
+        ) -> std::result::Result<ErasedOwner, AliasRefusal> {
+            Ok(Box::new(()))
+        }
+
+        fn retain_connection(
+            &self,
+            _peer: Option<&str>,
+            _retention: ConnectionRetention,
+        ) -> std::result::Result<ErasedOwner, AliasRefusal> {
+            let attempt = self.attempted.fetch_add(1, Ordering::AcqRel);
+            if self.refuse_after.is_some_and(|limit| attempt >= limit) {
+                return Err(AliasRefusal::Provider("test connection cap".into()));
+            }
+            Ok(Box::new(DropCounter(Arc::clone(&self.released))))
+        }
+
+        fn retain_connection_identity(
+            &self,
+            _peer: &str,
+            _retention: ConnectionIdentityRetention,
+        ) -> std::result::Result<ErasedOwner, AliasRefusal> {
+            Ok(Box::new(()))
+        }
+    }
+
+    #[cfg_attr(
+        any(target_os = "ios", feature = "system-dnssd"),
+        ignore = "requires the system mDNS daemon"
+    )]
+    #[tokio::test]
+    async fn live_driver_reaps_loopback_connection_churn_before_shutdown() {
+        let limits = MdnsLimits {
+            max_active_connections: 1,
+            max_discovered_peers: 1,
+            outbound_queue_capacity: 2,
+            discovery: DiscoveryLimits {
+                max_resolve_owners: 2,
+                event_capacity: 3,
+                max_event_epochs: 4,
+            },
+        };
+        let released = Arc::new(AtomicU64::new(0));
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let cfg = DiscoveryConfig {
+            service_type: wire::SERVICE_TYPE.to_string(),
+            instance: format!("mdns-reap-{}", std::process::id()),
+            port: 0,
+            txt: Vec::new(),
+            limits: limits.discovery,
+        };
+        let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
+        let (in_tx, _in_rx) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            room_handle: "room".into(),
+            device_id: "local".into(),
+            device_id_validator: |_| true,
+            alias_provider: Arc::new(CountingProvider {
+                released: Arc::clone(&released),
+                attempted: Arc::clone(&attempted),
+                refuse_after: Some(3),
+            }),
+            discovery: Arc::new(discovery),
+            registered: AtomicBool::new(false),
+            peers: Mutex::new(PeerOwnership::with_max_peers(limits.max_discovered_peers)),
+            aliases: Mutex::new(AliasOwnership::default()),
+            conns: Mutex::new(ConnectionOwnership::default()),
+            connection_slots: Arc::new(Semaphore::new(limits.max_active_connections)),
+            outbound_queue_capacity: limits.outbound_queue_capacity,
+            connection_tasks: Arc::new(Mutex::new(Some(JoinSet::new()))),
+            test_half_gate: Arc::new(Mutex::new(None)),
+            stopped: Arc::new(AtomicBool::new(false)),
+            conn_gen: AtomicU64::new(1),
+            inbound_tx: InboundSink::from_unbounded(in_tx),
+            cancel: watch::channel(false).0,
+        });
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(run_accept(Arc::clone(&shared), listener));
+        for generation in 0..3 {
+            let client = TcpStream::connect(address).await.unwrap();
+            drop(client);
+
+            let expected_releases = generation + 1;
+            for _ in 0..256 {
+                if released.load(Ordering::Acquire) == expected_releases
+                    && shared.connection_slots.available_permits() == limits.max_active_connections
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(released.load(Ordering::Acquire), expected_releases);
+            assert_eq!(
+                shared.connection_slots.available_permits(),
+                limits.max_active_connections
+            );
+        }
+
+        // A refused stream still reaches the production accept loop. The
+        // first refusal follows the third worker, and a second refusal wakes
+        // the loop once more so its runtime reaper consumes that completed
+        // worker before shutdown; neither refusal creates a worker/owner.
+        let refused = TcpStream::connect(address).await.unwrap();
+        drop(refused);
+        let reaper_wakeup = TcpStream::connect(address).await.unwrap();
+        drop(reaper_wakeup);
+        for _ in 0..256 {
+            if attempted.load(Ordering::Acquire) == 5
+                && released.load(Ordering::Acquire) == 3
+                && shared
+                    .connection_tasks
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|tasks| tasks.is_empty())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempted.load(Ordering::Acquire), 5);
+        assert_eq!(released.load(Ordering::Acquire), 3);
+        assert!(shared
+            .connection_tasks
+            .lock()
+            .as_ref()
+            .is_some_and(|tasks| tasks.is_empty()));
+        for _ in 0..256 {
+            if shared.connection_slots.available_permits() == limits.max_active_connections {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            shared.connection_slots.available_permits(),
+            limits.max_active_connections
+        );
+        let _ = shared.cancel.send(true);
+        accept_task.await.expect("accept loop shutdown");
+        let shared = match Arc::try_unwrap(shared) {
+            Ok(shared) => shared,
+            Err(_) => panic!("live driver retained a connection task reference"),
+        };
+        let mut discovery = match Arc::try_unwrap(shared.discovery) {
+            Ok(discovery) => discovery,
+            Err(_) => panic!("live driver retained a discovery reference"),
+        };
+        discovery.shutdown();
+        if let Some(task) = discovery.take_task() {
+            task.await.expect("discovery shutdown task");
+        }
     }
 
     /// An owner that records its own release.
