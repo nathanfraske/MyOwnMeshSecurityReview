@@ -73,6 +73,7 @@ use crate::runtime::peer_session::DedupToken;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalingCarrier {
     /// The in-process [`myownmesh_signaling::local::LocalBroker`].
+    #[cfg(any(test, feature = "transport-lab"))]
     Local,
     /// The Nostr relay driver.
     Nostr,
@@ -84,6 +85,7 @@ impl SignalingCarrier {
     /// Stable lowercase name for traces and diagnostics.
     pub(crate) fn name(self) -> &'static str {
         match self {
+            #[cfg(any(test, feature = "transport-lab"))]
             Self::Local => "local",
             Self::Nostr => "nostr",
             Self::Mdns => "mdns",
@@ -103,6 +105,7 @@ impl SignalingCarrier {
     /// would silently change the behaviour the deterministic suite runs on.
     fn restamps_duplicates(self) -> bool {
         match self {
+            #[cfg(any(test, feature = "transport-lab"))]
             Self::Local => false,
             Self::Nostr | Self::Mdns => true,
         }

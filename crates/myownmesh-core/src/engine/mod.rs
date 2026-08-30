@@ -39,7 +39,10 @@ pub mod tick;
 pub mod traffic;
 pub mod wake;
 
+#[cfg(not(feature = "transport-lab"))]
+pub(crate) use signaling_bridge::attach_signaling;
 pub use signaling_bridge::SignalingDrivers;
+#[cfg(feature = "transport-lab")]
 pub(crate) use signaling_bridge::{attach_local, attach_signaling};
 // The ingress boundary is the Signaling Node's, and none of it is public — not
 // the admitted value, not the thing that makes one. `EphemeralIngress` appears
@@ -94,9 +97,9 @@ use crate::protocol::{
     topology::ShelveMessage,
     CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
-use crate::resource::{
-    LocalApplicationResourceScope, MeshRuntimeResourceScope, ProcessResourceRoot,
-};
+#[cfg(feature = "transport-lab")]
+use crate::resource::ProcessResourceRoot;
+use crate::resource::{LocalApplicationResourceScope, MeshRuntimeResourceScope};
 use crate::semantic::{
     BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId, SignedFact,
     VerifiedBootstrap, VerifiedProjectPolicy,
@@ -238,6 +241,7 @@ fn test_departure_control() -> crate::protocol::SessionControl {
 /// Spawn the engine for a single joined network. Returns the
 /// shared [`NetworkState`] handle plus the join handle of the
 /// driver task (waitable for clean shutdown).
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn spawn_network(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -246,6 +250,7 @@ pub(crate) async fn spawn_network(
     spawn_network_impl(config, identity, transport).await
 }
 
+#[cfg(feature = "transport-lab")]
 async fn spawn_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -269,6 +274,7 @@ async fn spawn_network_impl(
 /// Create and durably install the local Closed bootstrap before exposing an
 /// engine for it. The creation id is caller-owned semantic input; the local
 /// signing key is the only authority root accepted by this profile.
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn create_network(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -278,6 +284,7 @@ pub(crate) async fn create_network(
     create_network_impl(config, identity, transport, creation_id).await
 }
 
+#[cfg(feature = "transport-lab")]
 async fn create_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -292,6 +299,7 @@ async fn create_network_impl(
 /// persistence. The record is verified and durably installed before the
 /// engine becomes observable, so a second node can import the exact same
 /// semantic context into a distinct root.
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn create_network_in_instance_root(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -306,6 +314,7 @@ pub(crate) async fn create_network_in_instance_root(
 /// Import and durably install a caller-provided bootstrap only after it has
 /// matched the locally expected semantic context. The expected context id is
 /// an import constraint, never a replacement for record verification.
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn import_network(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -316,6 +325,7 @@ pub(crate) async fn import_network(
     import_network_impl(config, identity, transport, expected_context_id, record).await
 }
 
+#[cfg(feature = "transport-lab")]
 async fn import_network_impl(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -330,6 +340,7 @@ async fn import_network_impl(
 /// Transport-lab variant of [`import_network`] that verifies and persists the
 /// supplied record below one explicit instance root before exposing the
 /// imported engine.
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn import_network_in_instance_root(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -350,6 +361,7 @@ pub(crate) async fn import_network_in_instance_root(
 /// constructor seam, which derives the normal `states/` and `rosters/`
 /// layouts. Ordinary production callers continue through [`spawn_network`]
 /// and retain the default root.
+#[cfg(feature = "transport-lab")]
 pub(crate) async fn spawn_network_in_instance_root(
     config: NetworkConfig,
     identity: Arc<Identity>,
@@ -443,6 +455,7 @@ pub(crate) async fn import_network_in_mesh_scope(
     .await
 }
 
+#[cfg(feature = "transport-lab")]
 async fn spawn_network_with_verified_bootstrap(
     config: NetworkConfig,
     identity: Arc<Identity>,

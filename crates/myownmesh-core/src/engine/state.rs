@@ -83,6 +83,7 @@ use crate::transport::webrtc::{
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{broadcast, oneshot, watch};
+#[cfg(feature = "transport-lab")]
 use tokio::task::JoinHandle;
 
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
@@ -1480,6 +1481,7 @@ pub struct NetworkState {
     /// means registration is open; shutdown takes the option under this mutex
     /// before awaiting the handles, so a concurrent late attach cannot become
     /// an untracked task.
+    #[cfg(feature = "transport-lab")]
     local_signaling_forwarders: Mutex<Option<Vec<JoinHandle<()>>>>,
     /// Controls that do not run an engine driver still need the command
     /// mailbox to be live: session promotion announces on it, and a closed
@@ -1972,6 +1974,7 @@ impl NetworkState {
             speculative_promotion_tx,
             speculative_promotion_rx: Mutex::new(Some(speculative_promotion_rx)),
             signaling_outbound_rx: Mutex::new(Some(signaling_outbound_rx)),
+            #[cfg(feature = "transport-lab")]
             local_signaling_forwarders: Mutex::new(Some(Vec::new())),
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
@@ -2600,6 +2603,7 @@ impl NetworkState {
     /// Observe every exact durable proof record, including terminal tombstones,
     /// for this live mesh context. The owner/liveness fence prevents a stale
     /// state facade from observing a released slot as if it were still live.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn durable_proof_records(&self) -> Result<Vec<ProofRecord>> {
         let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
@@ -2610,6 +2614,7 @@ impl NetworkState {
 
     /// Build a record from facts already admitted by this network's
     /// authoritative graph and bind it to the exact current owner.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn new_durable_proof_outbox_record(
         &self,
         owner: &PeerOwnerToken,
@@ -3009,6 +3014,7 @@ impl NetworkState {
 
     /// Persist one exact canonical proof record before send admission.
     /// Duplicate delivery ids return the existing record idempotently.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn admit_durable_proof_outbox(&self, record: ProofRecord) -> Result<ProofRecord> {
         let _publication = self.durable_publication_gate.lock();
         self.ensure_durable_owner_mutation_allowed()?;
@@ -3025,6 +3031,7 @@ impl NetworkState {
     /// CAS-rebind a Pending record to the exact authenticated installation.
     /// The registry mutation fence encloses the durable mutation, so a
     /// replacement cannot race the binding decision and the id is retained.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn rebind_durable_proof_outbox(
         &self,
         owner: &PeerOwnerToken,
@@ -3059,6 +3066,7 @@ impl NetworkState {
     /// Retire an obsolete exact-target proof delivery without fabricating an
     /// acknowledgement. The durable record remains as a non-replayable
     /// Superseded terminal until normal compaction.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(crate) fn supersede_durable_proof_outbox(
         self: &Arc<Self>,
         owner: &PeerOwnerToken,
@@ -3748,6 +3756,7 @@ impl NetworkState {
     /// The closure must return the exact spawned forwarder; keeping spawn and
     /// registration in this critical section prevents shutdown from taking the
     /// registry between those two operations.
+    #[cfg(feature = "transport-lab")]
     pub(crate) fn with_local_signaling_forwarder<R>(
         &self,
         start: impl FnOnce() -> (R, JoinHandle<()>),
@@ -3765,6 +3774,7 @@ impl NetworkState {
         Some(result)
     }
 
+    #[cfg(feature = "transport-lab")]
     fn take_local_signaling_forwarders(&self) -> Vec<JoinHandle<()>> {
         self.local_signaling_forwarders
             .lock()
@@ -5235,6 +5245,7 @@ impl NetworkState {
         drop(runtime);
         self.signaling_runtime.write().take();
         self.clear_attempt_settlement();
+        #[cfg(feature = "transport-lab")]
         for forwarder in self.take_local_signaling_forwarders() {
             if let Err(error) = forwarder.await {
                 tracing::warn!(%error, "local signaling forwarder failed during shutdown");

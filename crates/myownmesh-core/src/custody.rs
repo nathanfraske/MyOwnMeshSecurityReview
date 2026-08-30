@@ -975,6 +975,7 @@ fn is_prepared(enrollment: &Enrollment) -> bool {
     enrollment.phase == EnrollmentPhase::Prepared || enrollment.provisional
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
 fn prepared_enrollments_at(path: &Path) -> Result<Vec<PreparedEnrollment>> {
     let _serialized = store_guard();
     let store = load_at(path)?;
