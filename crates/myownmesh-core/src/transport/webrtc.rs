@@ -8712,6 +8712,7 @@ fn realtime_fixture_provider_grant(
     let mut grant = crate::resource::ResourceClaim::ZERO;
     for _ in 0..total_flows {
         add_lease(&mut grant, RealtimeFlowRegistry::flow_claim()?)?;
+        add_lease(&mut grant, RealtimeFlowRegistry::flow_map_node_claim()?)?;
         add_lease(&mut grant, RealtimeFlowRegistry::ready_claim()?)?;
         // One label per flow, sized by the longest name the frame can carry.
         // The fixture cannot know what an application will call its flows, and
@@ -8745,6 +8746,7 @@ fn realtime_fixture_provider_grant(
             &mut grant,
             RealtimeFlowRegistry::queue_claim(workload.max_unit_bytes)?,
         )?;
+        add_lease(&mut grant, RealtimeFlowRegistry::queued_event_node_claim()?)?;
     }
     // One packet-work lease per inbound pump, because each holds exactly one
     // for the duration of the packet it is classifying and releases it before
@@ -13675,19 +13677,18 @@ mod tests {
             .mesh_runtime_scope()
             .network_instance_scope()
             .peer_connection_scope();
-        let mut queue = PendingRemoteCandidateQueue::new();
+        let mut state = RemoteCandidateState::new(RemoteCandidateFixtureWork::new(
+            candidate_count.get(),
+            total_content_bytes,
+        ));
         let started = Instant::now();
         for (index, candidate) in candidates.iter().cloned().enumerate() {
             let pushed_at = Instant::now();
             assert_eq!(
-                queue.push_observed_for_test(
-                    candidate,
-                    Arc::new(RemoteCandidateAttemptIdentity::default()),
-                    &scope,
-                ),
+                state.admit(candidate, &scope),
                 PendingRemoteCandidateQueuePush::Queued
             );
-            let items = queue.entries.len();
+            let items = state.current.pending.entries.len();
             println!(
                 "arc03_candidate_burst_raw index={index} push_ns={} items={items}",
                 pushed_at.elapsed().as_nanos()
@@ -13695,11 +13696,7 @@ mod tests {
         }
         let duplicate_at = Instant::now();
         assert_eq!(
-            queue.push_observed_for_test(
-                candidates[0].clone(),
-                Arc::new(RemoteCandidateAttemptIdentity::default()),
-                &scope,
-            ),
+            state.admit(candidates[0].clone(), &scope),
             PendingRemoteCandidateQueuePush::Duplicate
         );
         println!(
@@ -13707,8 +13704,8 @@ mod tests {
             duplicate_at.elapsed().as_nanos(),
             started.elapsed().as_nanos()
         );
-        assert_eq!(queue.entries.len(), candidate_count.get());
-        drop(queue.take());
+        assert_eq!(state.current.pending.entries.len(), candidate_count.get());
+        state.current.retire();
         assert!(
             total_content_bytes > 0,
             "the observed burst carried real candidate content"
@@ -14008,19 +14005,27 @@ mod tests {
         // This raw laboratory envelope is derived only to hold the requested
         // finite observation workload. It is not a production policy or a
         // proposed default.
-        let policy = test_realtime_workload(callback_capacity);
+        let realtime_workload = TransportLabRealtimeWorkload {
+            inbound_flows: flows.get(),
+            outbound_flows: 0,
+            queued_units_per_flow: samples.get(),
+            in_progress_units_per_inbound_flow: 1,
+            fragments_per_unit: 1,
+            max_fragment_bytes: payload_bytes.get(),
+            max_unit_bytes: payload_bytes.get(),
+        };
 
         for class in [
             ConnectorCallbackClass::Control,
             ConnectorCallbackClass::EndpointData,
         ] {
             let (events, mut receiver) =
-                test_event_mailboxes_with_workload(callback_capacity, policy);
-            let sink = test_event_sink(events, policy, None);
+                test_event_mailboxes_with_workload(callback_capacity, realtime_workload);
+            let sink = test_event_sink(events, realtime_workload, None);
             let mut queued_at = std::collections::VecDeque::new();
             for index in 0..samples.get() {
                 let event = match class {
-                    ConnectorCallbackClass::Control => TransportEvent::DataChannelClosed,
+                    ConnectorCallbackClass::Control => TransportEvent::LocalIceCandidate(None),
                     ConnectorCallbackClass::EndpointData => {
                         TransportEvent::Message(Bytes::from(index.to_le_bytes().to_vec()))
                     }
@@ -14045,7 +14050,7 @@ mod tests {
 
         let observer = Arc::new(TestRealtimeObserver::default());
         let registry = test_realtime_registry_with_observer(
-            policy,
+            realtime_workload,
             observer.clone() as Arc<dyn RealtimeFlowObserver>,
         );
         let mut admitted_flows = Vec::with_capacity(flows.get());
