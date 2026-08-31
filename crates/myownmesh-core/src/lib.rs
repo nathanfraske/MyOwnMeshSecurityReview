@@ -24,6 +24,9 @@
 //!     network_id: "my-mesh".into(),
 //!     label: "Home".into(),
 //!     kind: Default::default(),                            // Open (default)
+//!     scheduler: Default::default(),
+//!     event_capacity: 256,
+//!     connection_trace_capacity: 512,
 //!     topology: TopologyMode::default(),
 //!     signaling: Default::default(),
 //!     closed_relay: ClosedRelayPolicyConfig::default(),
@@ -126,7 +129,6 @@ pub mod error;
 pub mod events;
 pub mod handle;
 pub mod identity;
-pub mod network_state;
 pub(crate) mod persist;
 pub mod protocol;
 pub mod realtime;
@@ -147,7 +149,7 @@ pub mod verification;
 pub use application_gateway::capability_advert_planning_claim;
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NodeServiceConfig, ServicesConfig,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, NetworkKind, NodeServiceConfig, ServicesConfig,
     SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode,
     TurnCredential, TurnServer, TurnServiceConfig,
 };
@@ -159,20 +161,21 @@ pub use engine::signaling_bridge::{
 /// The funded peers snapshot, exported at the root beside [`PeerInfo`] because
 /// it answers the same question under a different contract: measured before it
 /// is built, and refusable at four separate points.
-pub use error::{Error, Result};
+pub use error::{ClosedRelayError, Error, Result};
 pub use events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PeerEvent};
 /// The real-link fixture owner, exported at the root for the same reason the
 /// fixture exists: the controls that need it live in another crate.
 #[cfg(feature = "transport-lab")]
 pub use handle::TransportLabPromotedPeer;
-pub use handle::{JoinedNetwork, Mesh, MeshHandle, PeerInfo};
-pub use identity::{generate_network_id, normalize_network_id, DeviceId, Identity};
+pub use handle::{AuthenticatedProfile, JoinedNetwork, Mesh, MeshHandle, PeerInfo};
+pub use identity::{generate_network_id, normalize_network_id, Identity};
+pub use myownmesh_signaling::local::LocalBroker;
 pub use protocol::CapabilityAdvert;
 pub use resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim,
-    prepare_resource_mailbox, resource_mailbox, serialized_mailbox_item_claim,
-    serialized_mailbox_item_claim_as, FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap,
-    LeasedMapInsertRefusal, LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError,
+    checked_measure_add, mailbox_measure_serialized, measure_serialized_mailbox_item,
+    measure_serialized_mailbox_item_after_funded, prepare_resource_mailbox, resource_mailbox,
+    FiniteResourceProvider, FundedArc, FundedWeak, LeasedMap, LeasedMapInsertRefusal,
+    LocalApplicationResourceScope, LocalApplicationResourceScopeIssueError, MailboxMeasurement,
     PreparedResourceMailbox, ProcessResourceRoot, ResourceAuthorityClass, ResourceClaim,
     ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxAdmissionError,
     ResourceMailboxCreateError, ResourceMailboxDelivery, ResourceMailboxItem,
@@ -192,14 +195,7 @@ pub use runtime::attempt::{
     ConnectorResourceOwnerReport, ConnectorResourceStructuralClaims, MeshConnectorResourceReport,
     MeshConnectorResourceScopeIssueError, RealtimeConnectorPolicy, WebRtcConnectorCapablePolicy,
 };
-pub use runtime::session_broker::{
-    session_reservation_planning_claim, session_reservation_planning_claim_for_correlation,
-};
-pub use semantic::{
-    CanonicalFact, CellProjection, DurableCheckpoint, EvictionProofReference, ExclusiveCell,
-    FactBody, FactContent, FactDomain, FactGraph, FactId, Projection, Role as SemanticRole,
-    SemanticError, SignedFact,
-};
+pub use runtime::session_broker::session_reservation_planning_claim_for_correlation;
 pub use services::{ServiceAdvert, ServiceRole};
 pub use topology::Topology;
 #[cfg(feature = "transport-lab")]
@@ -228,7 +224,8 @@ pub use transport::{
 /// downstream forks can isolate their fleet.
 pub const TRYSTERO_APP_ID: &str = "myownmesh-cloud-mesh-v1";
 
-/// Wire-protocol version for the one current alpha profile. A receiver refuses
-/// any kind this build does not implement; there is no feature-negotiated or
-/// mixed-version fallback. Bump when the closed profile's wire shape changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Wire-protocol version for the one current closed profile. A receiver
+/// refuses a previous, future, or missing version before endpoint
+/// authentication; there is no feature-negotiated or mixed-version fallback.
+/// This bump records the incompatible addition of the Closed relay wire set.
+pub const PROTOCOL_VERSION: u32 = 2;

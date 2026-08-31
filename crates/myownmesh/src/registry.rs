@@ -381,10 +381,10 @@ struct PreparedNetworksData<'a> {
 
 /// The exact owned projection serialized by the prepared Status reply.
 ///
-/// Kept separate from [`FundedStatus`] so
-/// `serialized_mailbox_item_claim_as` receives the value whose inline shape
-/// and wire shape it actually prices. The lease is the funding for this value;
-/// including that handle in the priced type would make its own claim circular.
+/// Kept separate from [`FundedStatus`] so the central serialized measurement
+/// and exact owned type layout price the value it actually retains. The lease
+/// is the funding for this value; including that handle in the priced type
+/// would make its own claim circular.
 #[derive(serde::Serialize)]
 struct OwnedStatusData {
     version: &'static str,
@@ -437,7 +437,7 @@ impl serde::Serialize for DisplayIdWidth {
 struct VisibleNetworkIds<'a>(&'a RegistryState);
 
 impl RegistryState {
-    /// Visit canonical entries in the legacy `summaries()` order without a
+    /// Visit canonical entries in the current NetworksList/`summaries()` order without a
     /// staging allocation. Each step scans for the least config id greater
     /// than the previous one, so this is O(N²) comparisons and O(1) auxiliary
     /// space. Config ids are bounded control coordinates and the registry lock
@@ -477,6 +477,44 @@ fn checked_network_bytes_add(
                 "NetworksList retention length overflowed",
             ))?;
     Ok(())
+}
+
+fn serialized_typed_claim<T>(
+    value: &impl serde::Serialize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let (retained, queued, allocations) = myownmesh_core::mailbox_measure_serialized(value)?;
+    let fixed = std::mem::size_of::<T>().checked_add(retained).ok_or(
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let fixed = u64::try_from(fixed).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let queued = u64::try_from(queued).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::QueuedBytes,
+        }
+    })?;
+    let allocations = u64::try_from(allocations)
+        .map_err(|_| myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?
+        .checked_add(1)
+        .ok_or(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?;
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (myownmesh_core::ResourceClass::AccountedMemoryBytes, fixed),
+        (myownmesh_core::ResourceClass::QueuedBytes, queued),
+        (myownmesh_core::ResourceClass::ParsingOrCpuWork, queued),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            allocations,
+        ),
+    ])?)
 }
 
 fn checked_network_allocations_add(
@@ -1317,22 +1355,12 @@ impl NetworkRegistry {
             .is_some_and(|entry| entry.lifecycle.state() != RuntimeState::Stopped)
     }
 
-    /// Snapshot every distinct network. Each network appears once
-    /// even though the map stores aliases.
+    /// Snapshot every distinct network in canonical config-id order. Each
+    /// network appears once even though the map stores aliases.
     pub fn summaries(&self) -> Vec<NetworkSummary> {
         let state = self.state.lock();
-        let map = &state.aliases;
-        // Dedup by entry pointer — both the config-id and
-        // network-id aliases point at the same `Arc<Entry>`, so
-        // pointer identity is the cheapest dedup key.
-        let mut seen: Vec<*const Entry> = Vec::new();
         let mut out = Vec::new();
-        for entry in map.values() {
-            let ptr = Arc::as_ptr(entry);
-            if seen.contains(&ptr) {
-                continue;
-            }
-            seen.push(ptr);
+        state.for_each_canonical_in_config_order(|entry| {
             let j = &entry.joined;
             out.push(NetworkSummary {
                 config_id: j.config_id().to_string(),
@@ -1342,9 +1370,7 @@ impl NetworkRegistry {
                 topology: j.current_topology(),
                 traffic: j.traffic(),
             });
-        }
-        // Stable order across calls: alphabetical by config id.
-        out.sort_by(|a, b| a.config_id.cmp(&b.config_id));
+        });
         out
     }
 
@@ -1432,9 +1458,29 @@ impl NetworkRegistry {
     /// covers the remainder: `shutdown` returning proves the driver is retired,
     /// and not yet that this registry has recorded the fact and released the
     /// entry. A caller told `Stopped` can rely on both.
-    async fn await_winner(entry: &Arc<Entry>) -> RuntimeState {
-        let _ = entry.joined.shutdown().await;
-        entry.lifecycle.await_stopped().await
+    async fn await_winner(entry: &Arc<Entry>) -> TeardownObservation {
+        let outcome = Self::await_winner_result(entry).await;
+        TeardownObservation {
+            state: entry.lifecycle.state(),
+            outcome,
+        }
+    }
+
+    /// Await a teardown claimed by another caller while preserving its
+    /// terminal error for shutdown-all callers. The lifecycle wait remains
+    /// mandatory even when the driver reports a failure: ownership is not
+    /// released until the registry has recorded `Stopped`.
+    async fn await_winner_result(entry: &Arc<Entry>) -> Result<(), String> {
+        let outcome = entry
+            .joined
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string());
+        let state = entry.lifecycle.await_stopped().await;
+        if state != RuntimeState::Stopped {
+            return Err(format!("network teardown ended in {state:?} state"));
+        }
+        outcome
     }
 
     /// Drivers down, engine driver awaited, state advanced to `Stopped`, entry
@@ -1531,7 +1577,8 @@ impl NetworkRegistry {
     /// is the same live-runtime-after-removal shape one layer up. Its outcome
     /// belongs to the caller that claimed it, so it is not repeated in the
     /// returned vector — what comes back is one result per teardown this call
-    /// performed.
+    /// performed or observed. A concurrent loser observes the winner's exact
+    /// shutdown result rather than turning a failed teardown into success.
     pub async fn shutdown_all(&self) -> Vec<Result<(), String>> {
         let (winners, losers) = {
             let mut state = self.state.lock();
@@ -1559,7 +1606,7 @@ impl NetworkRegistry {
             outcomes.push(self.teardown(entry).await);
         }
         for entry in losers {
-            Self::await_winner(&entry).await;
+            outcomes.push(Self::await_winner_result(&entry).await);
         }
         outcomes
     }
@@ -1578,7 +1625,7 @@ impl StatusSource<'_> {
     pub(crate) fn typed_claim(
         &self,
     ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<OwnedStatusData>(&self.view())
+        serialized_typed_claim::<OwnedStatusData>(&self.view())
     }
 
     pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
@@ -1762,9 +1809,18 @@ pub enum RemoveResult {
     NotFound,
     /// A teardown for this runtime was already in progress, so this call
     /// started nothing — and **waited for it**. Carries the state observed
-    /// once that teardown finished, which is `Stopped`: the variant reports
-    /// who did the work, not that the caller gave up early.
-    AlreadyClosing(RuntimeState),
+    /// once that teardown finished, which is `Stopped`, together with the
+    /// exact success or failure observed from the winning owner. The variant
+    /// reports who did the work, not that the caller gave up early.
+    AlreadyClosing(TeardownObservation),
+}
+
+/// The terminal observation returned to a removal caller that lost the
+/// ownership claim to another concurrent remover.
+#[derive(Debug)]
+pub struct TeardownObservation {
+    pub state: RuntimeState,
+    pub outcome: Result<(), String>,
 }
 
 /// A rejected [`NetworkRegistry::insert`], handing the caller back exactly what
@@ -1854,8 +1910,12 @@ mod tests {
         myownmesh_core::NetworkConfig {
             id: config_id.to_string(),
             network_id: network_id.to_string(),
+            event_capacity: myownmesh_core::NetworkConfig::from_network_id("", "").event_capacity,
+            connection_trace_capacity: myownmesh_core::NetworkConfig::from_network_id("", "")
+                .connection_trace_capacity,
             label: config_id.to_string(),
             kind: Default::default(),
+            scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
             topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),
             closed_relay: Default::default(),
@@ -2093,7 +2153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_r3_daemon_the_prepared_network_rows_are_the_legacy_rows_on_the_wire() {
+    async fn v4_r3_daemon_prepared_rows_follow_the_canonical_config_order() {
         let _fixture = crate::exclusive_connector_fixture().await;
         let mesh = mesh().await;
         let registry = NetworkRegistry::new();
@@ -2177,18 +2237,22 @@ mod tests {
             Err((_typed, _work)) => panic!("the unchanged authoritative pass commits"),
         };
 
-        #[derive(serde::Serialize)]
-        struct LegacyNetworks<'a> {
-            networks: &'a [NetworkSummary],
-        }
-        let legacy = registry.summaries();
-        let legacy_json = serde_json::to_vec(&LegacyNetworks { networks: &legacy })
-            .expect("legacy NetworkSummary rows serialize");
         let prepared_json =
             serde_json::to_vec(&funded).expect("the funded prepared rows serialize");
+        let summary_ids: Vec<_> = registry
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.config_id)
+            .collect();
         assert_eq!(
-            prepared_json, legacy_json,
-            "all topology variants, escaped labels, field order, and config-id order match"
+            summary_ids,
+            vec![
+                "01-ring".to_owned(),
+                "02-star-\n-label".to_owned(),
+                "03-hubs".to_owned(),
+                "04-full".to_owned(),
+            ],
+            "the public snapshot uses the same canonical config-id order"
         );
         assert_eq!(
             line_ceiling,
@@ -2627,7 +2691,10 @@ mod tests {
         ));
         assert!(matches!(
             waiting.await.expect("the exact waiter does not panic"),
-            RemoveResult::AlreadyClosing(RuntimeState::Stopped)
+            RemoveResult::AlreadyClosing(TeardownObservation {
+                state: RuntimeState::Stopped,
+                outcome: Ok(()),
+            })
         ));
         assert!(
             registry.get("exact-closing-config").is_none(),

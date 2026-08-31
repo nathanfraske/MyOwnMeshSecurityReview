@@ -1,10 +1,10 @@
 #![cfg(feature = "transport-lab")]
 
-//! End-to-end engine integration test: roster persistence + gossip.
+//! End-to-end engine integration test: roster persistence + peer projection.
 //!
 //! Covers the contract that mutual active participation persists, while an
 //! absent non-participant cannot be approved or authorize others through
-//! roster gossip:
+//! peer projection:
 //!
 //!   1. When two peers complete the bilateral approve handshake and the
 //!      link goes ACTIVE, each side persists the other into its roster —
@@ -15,7 +15,7 @@
 //!   2. An approval attempt for a peer that isn't directly connected and has
 //!      no current self-authored participation is refused. It must not mutate
 //!      either roster or become cross-member authorization through unsigned
-//!      roster-entry gossip.
+//!      unsigned roster metadata exchange.
 //!
 //! Both scenarios live in ONE test on purpose: each integration-test file
 //! is its own process, but the tests *within* a file share it, and the
@@ -26,7 +26,7 @@
 //! distinct roster files) without that race.
 //!
 //! Companion to `two_peer_handshake.rs` (open-network handshake) and
-//! `closed_network_governance.rs` (signed transitions).
+//! `closed_network_governance.rs` (canonical signed facts).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,10 +34,12 @@ use std::time::Duration;
 use myownmesh_core::config::{
     ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
 };
+use myownmesh_core::engine::governance::propose_role_grant;
 use myownmesh_core::engine::transport_lab::{
-    approve_roster, attach_local, join_open_participation, spawn_network, NetworkState,
+    attach_local, join_open_participation, spawn_network, NetworkState,
 };
 use myownmesh_core::identity::Identity;
+use myownmesh_core::semantic::Role;
 use myownmesh_core::transport::Transport;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
@@ -47,8 +49,11 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: network_id.to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -154,7 +159,7 @@ async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() 
 
     // --- Scenario 1: the double handshake persists the roster ---------
     let (a1, a1_id, b1, b1_id, broker1, a1_driver, b1_driver) =
-        bring_up_pair("roster-gossip-persist", &transport).await;
+        bring_up_pair("roster-projection-persist", &transport).await;
     assert!(
         rostered(&a1, b1_id.public_id()),
         "alice should have rostered bob on mutual ACTIVE"
@@ -166,22 +171,22 @@ async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() 
 
     // --- Scenario 2: a local approval does not authorize another peer ---
     let (a2, _a2_id, b2, _b2_id, broker2, a2_driver, b2_driver) =
-        bring_up_pair("roster-gossip-local-authority", &transport).await;
+        bring_up_pair("roster-projection-local-authority", &transport).await;
     // Carol never connects — she's only ever a roster entry Alice vouches
     // for. Attempt to approve her through the command queue (the path the
     // GUI's Approve takes). Because Carol has no current self-authored
     // participation, the canonical evaluator must refuse the approval and
-    // neither side may gain a roster entry through unsigned gossip.
+    // neither side may gain a roster entry through unsigned peer metadata.
     let carol_id = Arc::new(Identity::ephemeral());
     let alice_before = rostered(&a2, carol_id.public_id());
     let bob_before = rostered(&b2, carol_id.public_id());
     assert!(!alice_before, "Carol starts absent from Alice's roster");
     assert!(!bob_before, "Carol starts absent from Bob's roster");
     assert!(
-        approve_roster(&a2, carol_id.public_id().to_string(), "carol".into())
+        propose_role_grant(&a2, carol_id.public_id(), Role::Member, None)
             .await
             .is_err(),
-        "approval for an absent, non-participating Carol must be refused"
+        "canonical admission for an absent, non-participating Carol must be refused"
     );
     assert_eq!(
         rostered(&a2, carol_id.public_id()),
@@ -191,7 +196,7 @@ async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() 
     assert_eq!(
         rostered(&b2, carol_id.public_id()),
         bob_before,
-        "unsigned roster gossip must not mutate Bob's roster"
+        "unsigned roster metadata must not mutate Bob's roster"
     );
 
     // Shut down every production driver before releasing the brokers or the

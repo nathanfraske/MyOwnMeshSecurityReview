@@ -11,11 +11,9 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::events::DropReason;
-use crate::network_state::{NetworkKind, Role, TransitionVariant};
 use crate::protocol::{
-    FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
-    ProofAckMessage, ProofDeliveryMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
-    RosterSummaryMessage,
+    FactBundleMessage, FactInventory, FactRequest, MeshMessage, ProofAckMessage,
+    ProofDeliveryMessage,
 };
 use crate::semantic::{DeviceId, FactBody, FactContent, FactId, SignedFact};
 
@@ -28,30 +26,6 @@ use super::state::NetworkState as EngineState;
 fn canonical_device(value: &str) -> Result<DeviceId> {
     DeviceId::from_canonical_str(value)
         .map_err(|error| Error::Other(format!("noncanonical DeviceId: {error}")))
-}
-
-fn fact_body(variant: &TransitionVariant) -> Result<FactBody> {
-    match variant {
-        TransitionVariant::RoleGrant { target, role } => Ok(FactBody::RoleGrant {
-            target: canonical_device(target)?,
-            role: match role {
-                Role::Member => crate::semantic::Role::Member,
-                Role::Controller => crate::semantic::Role::Controller,
-                Role::Owner => crate::semantic::Role::Owner,
-            },
-        }),
-        TransitionVariant::RoleRevoke { target } => Ok(FactBody::RoleRevoke {
-            target: canonical_device(target)?,
-        }),
-        TransitionVariant::Evict { target } => Ok(FactBody::Evict {
-            target: canonical_device(target)?,
-        }),
-        TransitionVariant::KindChange { .. }
-        | TransitionVariant::Split { .. }
-        | TransitionVariant::TopologyChange { .. } => Err(Error::Other(
-            "legacy transition is not a canonical V4 durable fact".into(),
-        )),
-    }
 }
 
 fn signed_fact(
@@ -112,10 +86,9 @@ fn author_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Res
 async fn commit_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<FactId> {
     let fact = author_open_self_participation(state, joined)?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state).await;
+    let _ = apply_canonical_projection(state);
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
-    broadcast_state(state).await;
     Ok(fact.id)
 }
 
@@ -181,8 +154,7 @@ fn pk(device_id: &str) -> String {
 }
 
 /// Canonical policy admission for registry and handshake fences. The bootstrap
-/// binding and the shared FactGraph are the only authority inputs;
-/// compatibility NetworkState roles are intentionally not consulted.
+/// binding and the shared FactGraph are the only authority inputs.
 /// The decision itself is always delegated to the graph's sealed semantic
 /// evaluator so every consumer uses one projection and one conflict rule.
 pub(super) fn canonical_policy_admits_from(
@@ -202,16 +174,15 @@ pub(super) fn canonical_policy_admits_from(
 
 #[derive(Default)]
 struct CanonicalProjection {
-    roles: BTreeMap<String, Role>,
+    roles: BTreeMap<String, crate::semantic::Role>,
     evicted: BTreeSet<String>,
     stood_down: BTreeSet<String>,
     open_participation: BTreeMap<String, bool>,
 }
 
-/// Convert the sealed semantic projection into the compatibility roster/snapshot
-/// shape.  The graph, evaluator, and typed projection decide every value;
-/// this adapter only performs compatibility-key conversion and must not grow
-/// independent governance rules.
+/// Convert the sealed semantic projection into the read-only roster shape. The
+/// graph, evaluator, and typed projection decide every value; this projection
+/// performs only key conversion and has no independent governance rules.
 fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjection {
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
@@ -262,9 +233,9 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
                 result.roles.insert(
                     subject_string,
                     match role {
-                        crate::semantic::Role::Member => Role::Member,
-                        crate::semantic::Role::Controller => Role::Controller,
-                        crate::semantic::Role::Owner => Role::Owner,
+                        crate::semantic::Role::Member => crate::semantic::Role::Member,
+                        crate::semantic::Role::Controller => crate::semantic::Role::Controller,
+                        crate::semantic::Role::Owner => crate::semantic::Role::Owner,
                     },
                 );
             }
@@ -273,7 +244,7 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
     result
 }
 
-async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
+pub(super) fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
     let projection = canonical_projection_snapshot(state);
     let CanonicalProjection {
         roles,
@@ -305,8 +276,6 @@ async fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
         }
         changed
     };
-    // The NetworkState compatibility object is deliberately not rewritten:
-    // callers that need a snapshot derive it from this graph projection.
     roster_changed
 }
 
@@ -334,8 +303,8 @@ async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
     for peer_id in active_peer_ids(state) {
         let result = super::send_to_peer(state, &peer_id, &msg).await;
         // Best-effort: a failure to send to one peer doesn't block
-        // delivery to the others. The next peer's `NetworkState`
-        // broadcast on its own ACTIVE transition will catch them up.
+        // delivery to the others. The next fact inventory pass will repair
+        // any advertisement lost while this channel was unavailable.
         if let Err(e) = result {
             tracing::debug!(peer = %peer_id, err = %e, "governance broadcast send failed");
         }
@@ -368,26 +337,80 @@ async fn broadcast_for_owner(
     state.peers.get_if_current(owner).is_some()
 }
 
-fn local_fact_inventory(state: &Arc<EngineState>) -> FactInventory {
-    let graph = state.authoritative_fact_graph();
-    let ids = graph.read().ids().copied().collect::<Vec<_>>();
-    FactInventory::new(state.mesh_context_id(), ids)
+struct FactInventoryCursor {
+    graph: Arc<parking_lot::RwLock<crate::semantic::FactGraph>>,
+    context_id: crate::semantic::MeshContextId,
+    cursor: Option<FactId>,
+    finished: bool,
+    invalid: bool,
+}
+
+impl FactInventoryCursor {
+    fn next_page(&mut self) -> Option<FactInventory> {
+        if self.finished || self.invalid {
+            return None;
+        }
+        let mut fact_ids = Vec::new();
+        let graph = self.graph.read();
+        for fact_id in graph.ids_after(self.cursor) {
+            let mut candidate_ids = fact_ids.clone();
+            candidate_ids.push(*fact_id);
+            let candidate = FactInventory::new(self.context_id, candidate_ids);
+            let encoded_len = match serde_json::to_vec(&MeshMessage::FactInventory(candidate)) {
+                Ok(encoded) => encoded.len(),
+                Err(_) => {
+                    self.invalid = true;
+                    return None;
+                }
+            };
+            if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
+                if fact_ids.is_empty() {
+                    self.invalid = true;
+                    return None;
+                }
+                break;
+            }
+            fact_ids.push(*fact_id);
+        }
+        drop(graph);
+        if fact_ids.is_empty() {
+            self.finished = true;
+            return None;
+        }
+        self.cursor = fact_ids.last().copied();
+        Some(FactInventory::new(self.context_id, fact_ids))
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.invalid
+    }
+}
+
+fn local_fact_inventory_cursor(state: &Arc<EngineState>) -> FactInventoryCursor {
+    FactInventoryCursor {
+        graph: state.authoritative_fact_graph(),
+        context_id: state.mesh_context_id(),
+        cursor: None,
+        finished: false,
+        invalid: false,
+    }
 }
 
 /// Advertise the exact canonical graph inventory to active peers.  The
 /// inventory contains identifiers only; it is a repair hint, never authority.
 pub async fn broadcast_fact_inventory(state: &Arc<EngineState>) {
-    let inventory = local_fact_inventory(state);
     let owners = inventory_peer_owners(state);
     for owner in owners {
-        let result = super::send_to_peer_owner(
-            state,
-            &owner,
-            &MeshMessage::FactInventory(inventory.clone()),
-        )
-        .await;
-        if let Err(error) = result {
-            tracing::debug!(peer = %owner.device_id(), %error, "fact inventory broadcast send failed");
+        let mut inventory = local_fact_inventory_cursor(state);
+        while let Some(page) = inventory.next_page() {
+            let result =
+                super::send_to_peer_owner(state, &owner, &MeshMessage::FactInventory(page)).await;
+            if let Err(error) = result {
+                tracing::debug!(peer = %owner.device_id(), %error, "fact inventory broadcast send failed");
+            }
+        }
+        if !inventory.is_valid() {
+            tracing::debug!(peer = %owner.device_id(), "fact inventory cannot fit the exact receive-safe frame boundary");
         }
     }
 }
@@ -402,8 +425,17 @@ pub(super) async fn broadcast_fact_inventory_for_owner(
     if state.peers.get_if_current(owner).is_none() {
         return false;
     }
-    let inventory = local_fact_inventory(state);
-    broadcast_for_owner(state, owner, MeshMessage::FactInventory(inventory)).await
+    let mut inventory = local_fact_inventory_cursor(state);
+    while let Some(page) = inventory.next_page() {
+        if !broadcast_for_owner(state, owner, MeshMessage::FactInventory(page)).await {
+            return false;
+        }
+    }
+    if !inventory.is_valid() {
+        tracing::debug!(peer = %owner.device_id(), "owner-bound fact inventory exceeds the exact receive-safe frame boundary");
+        return false;
+    }
+    true
 }
 
 /// Ask the exact logical sender for canonical facts absent from our graph.
@@ -415,46 +447,40 @@ pub(super) async fn on_fact_inventory(
     if inventory.context_id() != state.mesh_context_id() {
         return;
     }
-    let (missing, remote_missing) = {
+    // A page is only a one-way repair hint. Do not answer it with a partial
+    // reciprocal inventory: that would echo every page back and keep two
+    // incomparable inventories alive indefinitely. The periodic/event-driven
+    // full inventory pass repairs lost pages and converges once missing ids
+    // have been admitted.
+    let missing = {
         let graph = state.authoritative_fact_graph();
         let graph = graph.read();
-        let remote_ids = inventory
+        let missing = inventory
             .fact_ids()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let missing = remote_ids
             .iter()
             .copied()
             .filter(|id| graph.get(id).is_none())
             .collect::<Vec<_>>();
-        let remote_missing = graph.ids().any(|id| !remote_ids.contains(id));
-        (missing, remote_missing)
+        missing
     };
-    if remote_missing && missing.is_empty() {
-        // Return our current context-bound inventory on the same logical route
-        // when the remote inventory is a strict subset. Incomparable inventories
-        // issue requests only, avoiding reciprocal echo storms.
-        let reciprocal = MeshMessage::FactInventory(local_fact_inventory(state));
-        let result = super::send_logical_reply(state, route, &reciprocal).await;
-        if let Err(error) = result {
-            tracing::debug!(
-                peer = %route.owner().device_id(),
-                %error,
-                "reciprocal fact inventory send failed"
-            );
-        }
-    }
     if !missing.is_empty() {
         let request = FactRequest::new(state.mesh_context_id(), missing);
-        let result =
-            super::send_logical_reply(state, route, &MeshMessage::FactRequest(request)).await;
-        if let Err(error) = result {
-            tracing::debug!(
-                peer = %route.owner().device_id(),
-                %error,
-                "fact inventory request send failed"
-            );
+        let mut pages = request.pages();
+        while let Some(fact_ids) = pages.next() {
+            let page = FactRequest::new(request.context_id(), fact_ids);
+            let result =
+                super::send_logical_reply(state, route, &MeshMessage::FactRequest(page)).await;
+            if let Err(error) = result {
+                tracing::debug!(
+                    peer = %route.owner().device_id(),
+                    %error,
+                    "fact inventory request send failed"
+                );
+                break;
+            }
+        }
+        if !pages.is_valid() {
+            tracing::debug!(peer = %route.owner().device_id(), "fact inventory request exceeds the exact receive-safe frame boundary");
         }
     }
 }
@@ -470,24 +496,105 @@ pub(super) async fn on_fact_request(
     if request.context_id() != state.mesh_context_id() {
         return;
     }
-    let facts = {
-        let graph = state.authoritative_fact_graph();
-        let graph = graph.read();
-        request
-            .fact_ids()
-            .iter()
-            .filter_map(|id| graph.get(id).cloned())
-            .collect::<Vec<_>>()
-    };
-    let bundle = MeshMessage::FactBundle(FactBundleMessage { facts });
-    let result = super::send_logical_reply(state, route, &bundle).await;
-    if let Err(error) = result {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            %error,
-            "fact bundle reply send failed"
-        );
+    let mut page_facts = Vec::new();
+    for id in request.fact_ids() {
+        let Some(fact) = state.authoritative_fact_graph().read().get(id).cloned() else {
+            continue;
+        };
+        page_facts.push(fact);
+        let Some(encoded_len) = FactBundleMessage::encoded_len_for_facts(&page_facts) else {
+            tracing::debug!(peer = %route.owner().device_id(), "fact bundle page could not be sized");
+            return;
+        };
+        if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
+            let last = page_facts.pop().expect("the just-added fact is present");
+            if page_facts.is_empty() {
+                match send_single_fact_page(state, route, last).await {
+                    Ok(true) => continue,
+                    Ok(false) => {
+                        tracing::debug!(peer = %route.owner().device_id(), "fact bundle and single fact exceed the exact receive-safe frame boundary");
+                        // This exact fact cannot cross the receive boundary.
+                        // It is not a transport failure: continue the request
+                        // so later individually transmittable facts are not
+                        // starved behind it.
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %route.owner().device_id(), %error, "single fact reply send failed");
+                        return;
+                    }
+                }
+            }
+            if send_fact_bundle_page(state, route, std::mem::take(&mut page_facts))
+                .await
+                .is_err()
+            {
+                tracing::debug!(
+                    peer = %route.owner().device_id(),
+                    "fact bundle reply send failed"
+                );
+                return;
+            }
+            page_facts.push(last);
+            if FactBundleMessage::encoded_len_for_facts(&page_facts)
+                .is_none_or(|length| length > crate::protocol::RECEIVE_FRAME_BYTES)
+            {
+                let last = page_facts.pop().expect("the just-added fact is present");
+                match send_single_fact_page(state, route, last).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::debug!(peer = %route.owner().device_id(), "fact bundle and single fact exceed the exact receive-safe frame boundary");
+                        // Skip only this untransmittable fact. A later
+                        // request item still deserves its own exact attempt.
+                    }
+                    Err(error) => {
+                        tracing::debug!(peer = %route.owner().device_id(), %error, "single fact reply send failed");
+                        return;
+                    }
+                }
+            }
+        }
     }
+    if !page_facts.is_empty()
+        && send_fact_bundle_page(state, route, page_facts)
+            .await
+            .is_err()
+    {
+        tracing::debug!(peer = %route.owner().device_id(), "fact bundle reply send failed");
+    }
+}
+
+async fn send_fact_bundle_page(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    facts: Vec<crate::semantic::SignedFact>,
+) -> Result<()> {
+    super::send_logical_reply(
+        state,
+        route,
+        &MeshMessage::FactBundle(FactBundleMessage { facts }),
+    )
+    .await
+}
+
+/// Send one canonical fact when its one-item bundle envelope would be too
+/// large. The standalone `fact` frame has a different envelope and may still
+/// fit the exact receive boundary; refusing only after checking that frame
+/// preserves later requested IDs instead of abandoning the whole request.
+async fn send_single_fact_page(
+    state: &Arc<EngineState>,
+    route: &LogicalSessionOperation,
+    fact: crate::semantic::SignedFact,
+) -> Result<bool> {
+    let message = MeshMessage::Fact(fact);
+    let encoded_len = serde_json::to_vec(&message)
+        .map(|encoded| encoded.len())
+        .map_err(Error::Serde)?;
+    if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
+        return Ok(false);
+    }
+    super::send_logical_reply(state, route, &message).await?;
+    Ok(true)
 }
 
 /// Verify that any eviction material in a reduced bundle agrees with the
@@ -540,13 +647,21 @@ pub(super) async fn acknowledge_fact_bundle(
     state: &Arc<EngineState>,
     route: &LogicalSessionOperation,
 ) {
-    let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
-    if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            %error,
-            "fact bundle acknowledgement send failed"
-        );
+    let mut inventory = local_fact_inventory_cursor(state);
+    while let Some(page) = inventory.next_page() {
+        if let Err(error) =
+            super::send_logical_reply(state, route, &MeshMessage::FactInventory(page)).await
+        {
+            tracing::debug!(
+                peer = %route.owner().device_id(),
+                %error,
+                "fact bundle acknowledgement send failed"
+            );
+            break;
+        }
+    }
+    if !inventory.is_valid() {
+        tracing::debug!(peer = %route.owner().device_id(), "fact bundle acknowledgement exceeds the exact receive-safe frame boundary");
     }
 }
 
@@ -643,25 +758,24 @@ fn diag(state: &Arc<EngineState>, level: crate::events::DiagLevel, msg: impl Int
 
 // ---- local proposals ------------------------------------------------
 
-/// Author and broadcast one canonical governance fact. Compatibility state is
-/// projected only after graph admission; it never creates a proposal or a
-/// legacy transition entry.
-pub async fn propose(
+/// Admit, project, and publish one already-typed canonical governance fact.
+/// The read-only roster projection is refreshed only after durable graph
+/// admission.
+async fn commit_proposal(
     state: &Arc<EngineState>,
-    variant: TransitionVariant,
+    body: FactBody,
     mfa_code: Option<&str>,
 ) -> Result<FactId> {
     crate::custody::require(&state.network_id, mfa_code)?;
-    let fact = signed_fact(state, fact_body(&variant)?, Vec::new())?;
+    let fact = signed_fact(state, body, Vec::new())?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state).await;
+    let _ = apply_canonical_projection(state);
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
-    broadcast_state(state).await;
-
     if let FactBody::RoleGrant { target, role } = &fact.content.body {
         if *role == crate::semantic::Role::Member
-            && canonical_projection_snapshot(state).roles.get(&pk(target)) == Some(&Role::Member)
+            && canonical_projection_snapshot(state).roles.get(&pk(target))
+                == Some(&crate::semantic::Role::Member)
         {
             if let Some(owner) = send_pending_role_grant(state, target, &fact).await {
                 super::handshake::reevaluate_after_role_grant(state, &owner).await;
@@ -669,6 +783,56 @@ pub async fn propose(
         }
     }
     Ok(fact.id)
+}
+
+/// Author and publish an exact canonical role grant.
+pub async fn propose_role_grant(
+    state: &Arc<EngineState>,
+    target: &str,
+    role: crate::semantic::Role,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    commit_proposal(
+        state,
+        FactBody::RoleGrant {
+            target: canonical_device(target)?,
+            role,
+        },
+        mfa_code,
+    )
+    .await
+}
+
+/// Author and publish an exact canonical role revoke.
+pub async fn propose_role_revoke(
+    state: &Arc<EngineState>,
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    commit_proposal(
+        state,
+        FactBody::RoleRevoke {
+            target: canonical_device(target)?,
+        },
+        mfa_code,
+    )
+    .await
+}
+
+/// Author and publish an exact canonical eviction.
+pub async fn propose_evict(
+    state: &Arc<EngineState>,
+    target: &str,
+    mfa_code: Option<&str>,
+) -> Result<FactId> {
+    commit_proposal(
+        state,
+        FactBody::Evict {
+            target: canonical_device(target)?,
+        },
+        mfa_code,
+    )
+    .await
 }
 
 /// Author and broadcast the owner-signed membership restoration fact used
@@ -689,47 +853,14 @@ pub async fn propose_membership_admit(
         Vec::new(),
     )?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state).await;
+    let _ = apply_canonical_projection(state);
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
-    broadcast_state(state).await;
     Ok(fact.id)
 }
 
-/// Legacy proposal controls are inert during the canonical V4 migration.
-/// Callers must submit a canonical fact instead; no proposal or transition log
-/// is created here.
-pub async fn sign_proposal(
-    _state: &Arc<EngineState>,
-    _proposal_id: &str,
-    _mfa_code: Option<&str>,
-) -> Result<()> {
-    Err(Error::Other(
-        "legacy proposal signing is disabled; submit a canonical fact".into(),
-    ))
-}
-
-pub async fn deny_proposal(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<()> {
-    Err(Error::Other(
-        "legacy proposal denial is disabled; submit a canonical fact".into(),
-    ))
-}
-
-pub async fn withdraw_proposal(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<()> {
-    Err(Error::Other(
-        "legacy proposal withdrawal is disabled; submit a canonical fact".into(),
-    ))
-}
-
-pub async fn spawn_split(_state: &Arc<EngineState>, _proposal_id: &str) -> Result<String> {
-    Err(Error::Other(
-        "split is not an adopted V4 durable fact; create a new mesh explicitly".into(),
-    ))
-}
-
-/// Admit one verified canonical fact and project it into the read-only
-/// compatibility view. The carrier and compatibility logs are never used as
-/// authority.
+/// Admit one verified canonical fact and project it into the read-only roster
+/// view. The carrier and projection are never used as authority.
 pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
     if let Err(error) = fact.verify() {
         diag(
@@ -759,7 +890,7 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    let changed = apply_canonical_projection(state).await;
+    apply_canonical_projection(state);
     // Fact admission is the explicit lifecycle boundary for terminal recovery.
     // Refresh the local stand-down cache, then reconcile only the subject whose
     // canonical cell may have changed. Recovery never waits for a ticker to
@@ -791,10 +922,6 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         }
     }
     broadcast_fact_inventory(state).await;
-    if changed {
-        broadcast_roster_summary(state).await;
-        broadcast_state(state).await;
-    }
     match &fact.content.body {
         FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
             request_pending_approval(state, &fact.content.author, false).await;
@@ -809,206 +936,13 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
     }
 }
 
-/// What one received `NetworkState` snapshot obliges us to send back.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StateBroadcastReply {
-    /// Ask the sender for semantic facts: they hold something we do not.
-    pull_roster: bool,
-    /// Send our own snapshot straight back to the sender: we hold something
-    /// they do not, and nothing else is going to tell them.
-    re_advertise: bool,
-}
-
-#[cfg(test)]
-fn state_broadcast_reply(
-    local_transitions: u32,
-    local_members: u32,
-    msg: &NetworkStateBroadcast,
-    membership_differs: bool,
-) -> StateBroadcastReply {
-    let local_heads = local_transitions.saturating_add(local_members);
-    StateBroadcastReply {
-        pull_roster: membership_differs || msg.fact_heads_count > local_heads,
-        re_advertise: local_heads > msg.fact_heads_count,
-    }
-}
-
-/// Our current governance snapshot, as the wire carries it.
-///
-/// One builder for all three senders — the fleet broadcast, the
-/// activation-bound broadcast, and the targeted re-advertise above — so a
-/// change to what a snapshot states cannot reach two of them and miss the
-/// third.
-///
-/// The membership root is the *membership* root and not the full merkle root,
-/// so peers reconcile on who is in the network rather than on per-node label
-/// and timestamp churn — see [`crate::roster::membership_root`].
-fn local_state_snapshot(state: &Arc<EngineState>) -> NetworkStateBroadcast {
-    let graph = state.authoritative_fact_graph();
-    let fact_heads_count = graph.read().len() as u32;
-    let kind = if matches!(
-        state.verified_bootstrap().policy(),
-        crate::semantic::VerifiedProjectPolicy::Closed(_)
-    ) {
-        NetworkKind::Closed
-    } else if state.config.read().kind == NetworkKind::Silent {
-        NetworkKind::Silent
-    } else {
-        NetworkKind::Open
-    };
-    NetworkStateBroadcast {
-        kind,
-        fact_heads_count,
-        roster_root: crate::roster::membership_root(&state.roster.read()),
-    }
-}
-
-/// Reconcile canonical fact heads after receiving a compatibility snapshot.
-/// The snapshot is only a hint; all authority comes from FactInventory and
-/// FactRequest over the shared graph.
-pub(super) async fn on_state_broadcast(
-    state: &Arc<EngineState>,
-    route: &LogicalSessionOperation,
-    msg: NetworkStateBroadcast,
-) {
-    let local_heads = state.authoritative_fact_graph().read().len() as u32;
-    if msg.fact_heads_count != local_heads {
-        let inventory = MeshMessage::FactInventory(local_fact_inventory(state));
-        if let Err(error) = super::send_logical_reply(state, route, &inventory).await {
-            tracing::debug!(
-                peer = %route.owner().device_id(),
-                %error,
-                "canonical inventory reconciliation send failed"
-            );
-        }
-    }
-}
-
-/// Unsigned roster roots cannot authorize membership. Keep this compatibility
-/// hook side-effect free; canonical inventory reconciliation handles durable
-/// convergence.
-async fn maybe_request_roster(
-    _state: &Arc<EngineState>,
-    _route: &LogicalSessionOperation,
-    _their_root: &str,
-) {
-}
-
-// ---- roster gossip --------------------------------------------------
+// ---- retired roster wire hooks -------------------------------------
 //
-// Anti-entropy over the per-network roster. The contract (see
-// `docs/NETWORK-TYPES.md`): once a peer is *mutually* confirmed (the
-// bilateral approve handshake completes and the link goes ACTIVE) it is
-// persisted into the local roster and advertised to the rest of the
-// network so every member converges on the same membership.
+// The roster remains a local semantic projection. Legacy lifecycle call
+// sites are retained as no-op hooks; canonical signed facts are the only
+// authority and no unsigned roster wire frame is emitted or consumed.
 //
-// "Advertise, don't flood": we broadcast a compact membership *summary*
-// (a 52-char root, not the entries) to active peers. A peer whose root
-// disagrees pulls the full roster with one targeted `RosterRequest`; the
-// responder replies peer-to-peer with `RosterEntries`. Each node that
-// learns a new member re-summarises to ITS active peers, so an update
-// ripples hop-by-hop along whatever shape the network actually has — a
-// ring forwards it neighbour-to-neighbour, a star through the hub —
-// reaching members we have no direct link to, instead of every node
-// blasting its whole roster at every other node.
-//
-// Unsigned roster entries are carrier material only. They are never merged;
-// signed governance/member logs are the sole durable membership authority.
-
-/// Broadcast our roster membership summary to every active peer. Cheap —
-/// one small frame per peer carrying a root, not the roster itself.
-/// Called when our roster changes (a peer is confirmed / approved) and on
-/// each ACTIVE transition so a freshly-connected peer reconciles at once.
-pub async fn broadcast_roster_summary(state: &Arc<EngineState>) {
-    // Silent networks never gossip membership — every connection is
-    // deliberate, so there is nothing to converge. Presence and the per-peer
-    // handshake are unaffected; only this anti-entropy advertise is suppressed.
-    if !state.gossip_roster_enabled() {
-        return;
-    }
-    let summary = crate::roster::summary(&state.roster.read());
-    broadcast(state, MeshMessage::RosterSummary(summary)).await;
-}
-
-/// Activation-triggered roster summary. Unlike an ordinary durable
-/// governance broadcast, this effect is cancelled when its exact activating
-/// peer installation is replaced.
-pub(super) async fn broadcast_roster_summary_for_owner(
-    state: &Arc<EngineState>,
-    owner: &PeerOwnerToken,
-) -> bool {
-    if state.peers.get_if_current(owner).is_none() || !state.gossip_roster_enabled() {
-        return false;
-    }
-    let summary = crate::roster::summary(&state.roster.read());
-    broadcast_for_owner(state, owner, MeshMessage::RosterSummary(summary)).await
-}
-
-/// Inbound roster summary. If the sender's membership root differs from
-/// ours, ask for their full roster so we can merge what we're missing.
-pub(super) async fn on_roster_summary(
-    state: &Arc<EngineState>,
-    route: &LogicalSessionOperation,
-    msg: RosterSummaryMessage,
-) {
-    maybe_request_roster(state, route, &msg.root).await;
-}
-
-/// Inbound roster request. Reply peer-to-peer (not broadcast) with our
-/// full roster as entries. v1 always sends everything (`include_all`); a
-/// subtree-walk can ship later without changing the frame kind.
-pub(super) async fn on_roster_request(
-    state: &Arc<EngineState>,
-    route: &LogicalSessionOperation,
-    _msg: RosterRequestMessage,
-) {
-    // A Silent network never emits roster entries — membership is not gossiped
-    // in either direction. (It also never sends summaries, so a well-behaved
-    // peer won't request; this guards the unsolicited case.)
-    if !state.gossip_roster_enabled() {
-        return;
-    }
-    let entries: Vec<RosterEntry> = state
-        .roster
-        .read()
-        .authorized_devices
-        .iter()
-        .map(RosterEntry::from)
-        .collect();
-    // Carry the signed governance log with the roster so roles converge with
-    // membership: the requester verifies it from genesis and re-derives who is
-    // owner/controller, instead of trusting a gossiped role tag. Empty on an
-    // open network (no signed log).
-    let msg = MeshMessage::RosterEntries(RosterEntriesMessage { entries });
-    // Replying through the captured logical route is what keeps our full membership and
-    // signed governance log from being handed to whoever holds this device id
-    // by the time the reply goes out. A superseded requester gets nothing.
-    if let Err(e) = super::send_logical_reply(state, route, &msg).await {
-        tracing::debug!(
-            peer = %route.owner().device_id(),
-            err = %e,
-            "roster entries reply send failed"
-        );
-    }
-}
-
-/// Inbound roster entries. The unsigned entries are carrier material,
-/// never an authority-bearing membership update. Canonical signed facts arrive
-/// through semantic inventory/fact exchange and alone change durable state.
-pub async fn on_roster_entries(state: &Arc<EngineState>, source: &str, msg: RosterEntriesMessage) {
-    if !msg.entries.is_empty() {
-        diag(
-            state,
-            crate::events::DiagLevel::Debug,
-            format!(
-                "roster: ignored {} unsigned entry(ies) from {} (membership is derived from signed facts)",
-                msg.entries.len(),
-                &source[..source.len().min(12)]
-            ),
-        );
-    }
-}
+// No roster summary is broadcast; this retired hook area is intentionally empty.
 // ---- eviction enforcement -------------------------------------------
 //
 // The signed log is a closed network's tombstone: an `Evict` in the
@@ -1024,8 +958,8 @@ pub async fn on_roster_entries(state: &Arc<EngineState>, source: &str, msg: Rost
 /// Whether `device_id`'s pubkey is explicitly evicted by this network's
 /// signed state. Only meaningful on closed governance (open networks have no
 /// signed membership); false there. The verdict is derived from the sealed
-/// semantic membership projection, so compatibility roster data cannot outrank
-/// the canonical graph.
+/// semantic membership projection, so roster data cannot outrank the canonical
+/// graph.
 pub(super) fn log_evicted(state: &Arc<EngineState>, device_id: &str) -> bool {
     if matches!(
         state.verified_bootstrap().policy(),
@@ -1147,37 +1081,6 @@ pub(super) async fn deny_if_evicted(
     true
 }
 
-// ---- state broadcast ------------------------------------------------
-
-/// Emit a `NetworkState` snapshot to every active peer. Called
-/// after every mutation to keep peers in sync without waiting on
-/// the next ACTIVE transition.
-pub async fn broadcast_state(state: &Arc<EngineState>) {
-    broadcast(
-        state,
-        MeshMessage::NetworkState(local_state_snapshot(state)),
-    )
-    .await;
-}
-
-/// Activation-triggered state snapshot. Each outbound send retains the exact
-/// activating-owner fence, while ordinary governance mutations continue to use
-/// [`broadcast_state`].
-pub(super) async fn broadcast_state_for_owner(
-    state: &Arc<EngineState>,
-    owner: &PeerOwnerToken,
-) -> bool {
-    if state.peers.get_if_current(owner).is_none() {
-        return false;
-    }
-    broadcast_for_owner(
-        state,
-        owner,
-        MeshMessage::NetworkState(local_state_snapshot(state)),
-    )
-    .await
-}
-
 /// Controls for semantic proof forwarding.
 #[cfg(test)]
 mod governance_projection_controls {
@@ -1282,15 +1185,9 @@ mod governance_projection_controls {
         let target = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
-        let evict_id = propose(
-            &state,
-            TransitionVariant::Evict {
-                target: target.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("the verified root can author an eviction");
+        let evict_id = propose_evict(&state, &target, None)
+            .await
+            .expect("the verified root can author an eviction");
 
         let bundle = current_eviction_proof_bundle(&state, &target)
             .expect("a current eviction has a deliverable proof closure");
@@ -1305,165 +1202,58 @@ mod governance_projection_controls {
             "an offline proof bundle must carry every causal dependency"
         );
     }
-}
 
-/// Controls for [`state_broadcast_reply`], the anti-entropy decision.
-#[cfg(test)]
-mod state_broadcast_reply_controls {
-    use super::*;
-
-    /// One peer's snapshot as it arrives on the wire. `kind` and the root are
-    /// held constant in every control below that is about the counts, so a
-    /// verdict is attributable to the numbers under test and nothing else.
-    fn snapshot(transitions: u32, members: u32, root: &str) -> NetworkStateBroadcast {
-        NetworkStateBroadcast {
-            kind: NetworkKind::Open,
-            fact_heads_count: transitions.saturating_add(members),
-            roster_root: root.to_string(),
-        }
-    }
-
-    /// A peer that is **behind** us has to be told, because nothing else will.
-    ///
-    /// The load-bearing control for the whole repair. Every pull condition asks
-    /// whether the *sender* is ahead, so the peer holding the newer log used to
-    /// see a stale snapshot and say nothing: the staleness was visible to
-    /// exactly the one party that had the answer. This fails the moment
-    /// `re_advertise` stops firing on a strictly-ahead local count, in either
-    /// tier independently — the member tier is the one `cross_approve`'s
-    /// open-network grant rides, and the governance tier is the one a founder
-    /// election rides.
     #[test]
-    fn a_local_count_ahead_of_the_sender_re_advertises() {
-        let behind = snapshot(0, 0, "identical-root");
+    fn fact_inventory_cursor_streams_receive_safe_pages_and_reaches_quiescence() {
+        let state = crate::engine::build_test_state("fact-inventory-cursor-controls");
+        let context_id = state.mesh_context_id();
+        let author = DeviceId::from_canonical_str(state.identity.public_id())
+            .expect("fixture identity is canonical");
+        let mut graph = crate::semantic::FactGraph::from_bootstrap(state.verified_bootstrap());
 
-        let ahead_on_members = state_broadcast_reply(0, 1, &behind, false);
-        assert!(
-            ahead_on_members.re_advertise,
-            "a member log the sender has not got must be advertised back to it"
-        );
-        assert!(
-            !ahead_on_members.pull_roster,
-            "and we ask a peer that is strictly behind us for nothing"
-        );
-
-        let ahead_on_transitions = state_broadcast_reply(1, 0, &behind, false);
-        assert!(
-            ahead_on_transitions.re_advertise,
-            "the governance tier converges the same way — a founder election \
-             bumps only this count"
-        );
-        assert!(!ahead_on_transitions.pull_roster);
-    }
-
-    /// The direction that already worked still works, and does not answer.
-    ///
-    /// Without this half the repair could satisfy the control above by
-    /// re-advertising unconditionally, which would turn every received snapshot
-    /// into a reply and the pair into a pure echo.
-    #[test]
-    fn a_sender_ahead_of_us_still_pulls_and_stays_quiet() {
-        for ahead in [
-            snapshot(0, 1, "identical-root"),
-            snapshot(1, 0, "identical-root"),
-        ] {
-            let reply = state_broadcast_reply(0, 0, &ahead, false);
-            assert!(
-                reply.pull_roster,
-                "a sender holding more than we do is still pulled from"
+        // Use valid signed facts in a real graph, while varying only the
+        // causal parent so the producer sees a large deterministic key set.
+        // The cursor itself retains no graph-wide collection.
+        for index in 0..2_048u64 {
+            let mut parent = [0u8; 32];
+            parent[..8].copy_from_slice(&index.to_be_bytes());
+            let content = FactContent::open_participation(
+                context_id,
+                author.clone(),
+                index % 2 == 0,
+                vec![FactId::from_bytes(parent)],
             );
-            assert!(
-                !reply.re_advertise,
-                "and we do not answer a peer that already has everything we have"
-            );
+            let fact = SignedFact::sign(content, state.identity.signing_key())
+                .expect("fixture fact signs");
+            graph.facts.insert(fact.id, fact);
         }
-    }
+        let expected_ids = graph.len();
+        let graph = Arc::new(parking_lot::RwLock::new(graph));
+        let mut cursor = FactInventoryCursor {
+            graph,
+            context_id,
+            cursor: None,
+            finished: false,
+            invalid: false,
+        };
+        let mut page_count = 0;
+        let mut observed = BTreeSet::new();
 
-    /// A differing membership root pulls and must **not** re-advertise.
-    ///
-    /// The echo guard, stated on the one input that is symmetric: two peers
-    /// whose roots disagree both see `membership_differs`, so a re-advertise
-    /// triggered by it would have each answering the other's answer with no
-    /// count ever moving to end it. The roster pull is what resolves a root
-    /// disagreement; the snapshot reply is only ever about counts.
-    #[test]
-    fn a_differing_membership_root_pulls_without_re_advertising() {
-        let reply = state_broadcast_reply(2, 2, &snapshot(2, 2, "their-root"), true);
-        assert!(
-            reply.pull_roster,
-            "a root disagreement is resolved by pulling"
-        );
-        assert!(
-            !reply.re_advertise,
-            "a symmetric condition must never trigger a reply, or two peers \
-             answer each other forever"
-        );
-    }
-
-    /// Exhaustive: no pair of peers can re-advertise at each other forever.
-    ///
-    /// The termination argument as a control rather than as a comment. Over
-    /// every pair of count vectors in a small grid it checks two things: two
-    /// converged peers fall completely silent, which is the fixed point; and
-    /// the only way both peers reply at once is a genuine cross-divergence —
-    /// each strictly ahead in a *different* tier — in which case both also
-    /// pull, so the exchange that follows has equal counts and stops. Any
-    /// implementation that answered on a non-strict comparison, or on the
-    /// symmetric root, fails here rather than in a mesh three months later.
-    #[test]
-    fn no_pair_of_peers_can_re_advertise_at_each_other_forever() {
-        for a_transitions in 0..4u32 {
-            for a_members in 0..4u32 {
-                for b_transitions in 0..4u32 {
-                    for b_members in 0..4u32 {
-                        let a_sees_b = state_broadcast_reply(
-                            a_transitions,
-                            a_members,
-                            &snapshot(b_transitions, b_members, "identical-root"),
-                            false,
-                        );
-                        let b_sees_a = state_broadcast_reply(
-                            b_transitions,
-                            b_members,
-                            &snapshot(a_transitions, a_members, "identical-root"),
-                            false,
-                        );
-
-                        if a_transitions == b_transitions && a_members == b_members {
-                            assert_eq!(
-                                (a_sees_b, b_sees_a),
-                                (
-                                    StateBroadcastReply {
-                                        pull_roster: false,
-                                        re_advertise: false
-                                    },
-                                    StateBroadcastReply {
-                                        pull_roster: false,
-                                        re_advertise: false
-                                    }
-                                ),
-                                "two peers that agree must send nothing at all: \
-                                 convergence is the fixed point"
-                            );
-                            continue;
-                        }
-
-                        if a_sees_b.re_advertise && b_sees_a.re_advertise {
-                            assert!(
-                                (a_transitions > b_transitions && b_members > a_members)
-                                    || (a_members > b_members && b_transitions > a_transitions),
-                                "both sides may only reply when each is ahead in a \
-                                 different tier; anything else is an echo"
-                            );
-                            assert!(
-                                a_sees_b.pull_roster && b_sees_a.pull_roster,
-                                "and a real cross-divergence pulls both ways, so the \
-                                 next exchange has equal counts and falls silent"
-                            );
-                        }
-                    }
-                }
-            }
+        while let Some(page) = cursor.next_page() {
+            page_count += 1;
+            let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                .expect("inventory page serializes");
+            assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+            assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+            observed.extend(page.fact_ids().iter().copied());
         }
+
+        assert!(cursor.is_valid());
+        assert!(page_count >= 2, "control must exercise multiple pages");
+        assert_eq!(observed.len(), expected_ids);
+        assert!(
+            cursor.next_page().is_none(),
+            "a drained cursor is quiescent"
+        );
     }
 }

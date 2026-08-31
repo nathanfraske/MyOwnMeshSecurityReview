@@ -6,9 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
 };
-use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::resource::ResourceReport;
 use myownmesh_core::semantic::VerifiedBootstrap;
 use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, Role};
@@ -96,7 +95,7 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
     }
 }
 
-fn connector_policy() -> WebRtcConnectorCapablePolicy {
+fn connector_policy(session_identity: &str) -> WebRtcConnectorCapablePolicy {
     let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let connector_count = NonZeroU64::new(4).expect("connector count is nonzero");
     let max_relay_frame_bytes = usize::try_from(
@@ -138,9 +137,10 @@ fn connector_policy() -> WebRtcConnectorCapablePolicy {
     // retains one exact Session Broker reservation per real-link endpoint, so
     // price four promoted sessions separately rather than borrowing slack
     // from connector construction.
-    let promoted_sessions = myownmesh_core::session_reservation_planning_claim()
-        .checked_scale(connector_count.get())
-        .expect("four promoted-session planning claims are representable");
+    let promoted_sessions =
+        myownmesh_core::session_reservation_planning_claim_for_correlation(session_identity)
+            .checked_scale(connector_count.get())
+            .expect("four promoted-session planning claims are representable");
     // Native inbound frames are parsed twice at a live connector boundary:
     // one retained Hello and one current application frame. Use the public
     // gateway formula at the maximum serialized Closed relay frame, then add
@@ -222,12 +222,17 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.into(),
         network_id: network_id.into(),
+        event_capacity: 256,
+        connection_trace_capacity: 512,
         label: id.into(),
         kind: NetworkKind::Closed,
+        scheduler: Default::default(),
         topology: TopologyMode::Star { hub: relay.into() },
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig {
             enabled: true,
+            pending_handshake_timeout_ms: ClosedRelayPolicyConfig::default()
+                .pending_handshake_timeout_ms,
             ..ClosedRelayPolicyConfig::default()
         },
         stun_servers: Vec::new(),
@@ -291,7 +296,7 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     );
     let signed_members = vec![grant_relay, grant_carol];
 
-    let policy = connector_policy();
+    let policy = connector_policy(&relay_id);
     let alice_mesh = bounded_result(
         "open Alice mesh",
         Mesh::open_connector_capable_with_identity(MeshConfig::default(), alice, policy.clone()),
@@ -310,6 +315,32 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     let baseline_alice = alice_mesh.resource_report();
     let baseline_relay = relay_mesh.resource_report();
     let baseline_carol = carol_mesh.resource_report();
+
+    // An invalid finite relay profile is refused before NetworkState admits
+    // any pending handshake or allocation. Keep this production constructor
+    // control separate from the live three-member route below so a refusal
+    // cannot borrow or contaminate its custody.
+    let mut refused_profile = network_config(
+        "invalid-closed-relay",
+        "closed-opaque-relay-invalid-profile",
+        &relay_id,
+    );
+    refused_profile.closed_relay.max_allocations = 0;
+    assert!(!refused_profile.closed_relay.validate());
+    let refused_network = bounded_result(
+        "reject invalid closed relay profile",
+        alice_mesh.create_network(refused_profile, [0x91; 32]),
+    )
+    .await;
+    assert!(matches!(
+        refused_network,
+        Err(myownmesh_core::Error::Network(_))
+    ));
+    assert_eq!(
+        baseline_alice,
+        alice_mesh.resource_report(),
+        "profile refusal must preserve pre-admission custody"
+    );
 
     let alice_net = bounded_result(
         "create Alice network",
@@ -375,14 +406,30 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     assert!(alice_net.peer(&relay_id).is_some());
     assert!(carol_net.peer(&relay_id).is_some());
 
-    // A route that names C as the relay has no authenticated A-C leg and is
-    // refused before a relay allocation is admitted.
-    assert!(bounded_result(
-        "reject direct Alice-Carol route",
-        alice_net.open_closed_relay(&carol_id, &carol_id),
-    )
-    .await
-    .is_err());
+    // Route mismatches are refused before any pending or admitted relay
+    // custody is created. The public facade generates session IDs, so these
+    // malformed routes are the production-shaped admission boundary exposed
+    // to an integration test.
+    let relay_before_route_refusals = relay_mesh.resource_report();
+    for (label, relay_name, target_name) in [
+        ("direct Alice-Carol route", &carol_id, &carol_id),
+        ("relay-target collision", &relay_id, &relay_id),
+        ("requester-target collision", &relay_id, &alice_id),
+    ] {
+        let refused =
+            bounded_result(label, alice_net.open_closed_relay(relay_name, target_name)).await;
+        assert!(matches!(
+            refused,
+            Err(myownmesh_core::Error::ClosedRelay(
+                myownmesh_core::error::ClosedRelayError::InvalidPacket
+            ))
+        ));
+    }
+    assert_eq!(
+        relay_before_route_refusals,
+        relay_mesh.resource_report(),
+        "route refusal must preserve relay admission custody"
+    );
 
     let a_to_c = bounded_result(
         "open Alice-to-Carol relay",
@@ -415,8 +462,9 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     .await;
     assert!(matches!(
         oversized,
-        Err(myownmesh_core::Error::Network(message))
-            if message.contains("Closed relay send refused")
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::InvalidPacket
+        ))
     ));
     bounded_result(
         "send maximum Alice-to-Carol payload",
@@ -428,13 +476,49 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         max_a_to_c
     );
     bounded_result("close Carol endpoint", c_from_a.close()).await?;
-    assert!(bounded_result(
-        "reject send after Carol close",
-        a_to_c.send(b"after target close")
+    assert!(matches!(
+        bounded_result(
+            "reject send after Carol close",
+            a_to_c.send(b"after target close")
+        )
+        .await,
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::Owner
+        ))
+    ));
+
+    // Re-open the exact same route while the stale requester handle still
+    // exists. The fresh session must receive a new coordinate, and the old
+    // W0 handle must remain unable to forward through W1's allocation.
+    let w0_session_id = a_to_c.session_id();
+    let a_to_c_w1 = bounded_result(
+        "open Alice-to-Carol replacement relay",
+        alice_net.open_closed_relay(&relay_id, &carol_id),
     )
-    .await
-    .is_err());
-    let _ = bounded_result("close Alice endpoint", a_to_c.close()).await;
+    .await?;
+    let c_from_a_w1 = bounded_result(
+        "accept Alice-to-Carol replacement relay",
+        carol_net.accept_closed_relay(),
+    )
+    .await?;
+    assert_ne!(w0_session_id, a_to_c_w1.session_id());
+    assert_eq!(a_to_c_w1.session_id(), c_from_a_w1.session_id());
+    assert!(matches!(
+        bounded_result("reject stale W0 send", a_to_c.send(b"stale W0")).await,
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::Owner
+        ))
+    ));
+    bounded_result("send replacement W1 payload", a_to_c_w1.send(b"live W1")).await?;
+    assert_eq!(
+        bounded_result("receive replacement W1 payload", c_from_a_w1.recv()).await?,
+        b"live W1"
+    );
+    // W0 is terminal while W1 is live. Closing the retained W0 requester is
+    // the delayed-old-close control; W1 must remain the only usable route.
+    bounded_result("close delayed old W0 requester", a_to_c.close()).await?;
+    bounded_result("close replacement Alice endpoint", a_to_c_w1.close()).await?;
+    bounded_result("close replacement Carol endpoint", c_from_a_w1.close()).await?;
 
     let c_to_a = bounded_result(
         "open Carol-to-Alice relay",
@@ -463,8 +547,9 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     .await;
     assert!(matches!(
         oversized,
-        Err(myownmesh_core::Error::Network(message))
-            if message.contains("Closed relay send refused")
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::InvalidPacket
+        ))
     ));
     bounded_result(
         "send maximum Carol-to-Alice payload",
@@ -476,13 +561,84 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         max_c_to_a
     );
     bounded_result("close Alice endpoint", a_from_c.close()).await?;
-    assert!(bounded_result(
-        "reject send after Alice close",
-        c_to_a.send(b"after target close")
+    assert!(matches!(
+        bounded_result(
+            "reject send after Alice close",
+            c_to_a.send(b"after target close")
+        )
+        .await,
+        Err(myownmesh_core::Error::ClosedRelay(
+            myownmesh_core::error::ClosedRelayError::Owner
+        ))
+    ));
+    // The public channel consumes its handle, so duplicate terminal close is
+    // represented by closing the opposite endpoint after the round trip has
+    // already terminalized it; it must remain harmless and bounded.
+    bounded_result("duplicate terminal Carol close", c_to_a.close()).await?;
+
+    // Accepted endpoints are deliberately dropped without calling close;
+    // shutdown must still release their exact endpoint and relay custody.
+    let dropped_a_to_c = bounded_result(
+        "open dropped Alice-to-Carol relay",
+        alice_net.open_closed_relay(&relay_id, &carol_id),
     )
-    .await
-    .is_err());
-    let _ = bounded_result("close Carol endpoint", c_to_a.close()).await;
+    .await?;
+    let dropped_c_from_a = bounded_result(
+        "accept dropped Alice-to-Carol relay",
+        carol_net.accept_closed_relay(),
+    )
+    .await?;
+    assert_eq!(
+        dropped_a_to_c.session_id(),
+        dropped_c_from_a.session_id(),
+        "dropped endpoint pair must identify one exact route"
+    );
+    let dropped_session_id = dropped_a_to_c.session_id();
+    // The target has accepted the offer but has deliberately not pulled a
+    // packet. Dropping both public channels without close must retire only
+    // that exact route; a fresh same-route admission gets a new coordinate
+    // and remains independently usable.
+    drop(dropped_c_from_a);
+    drop(dropped_a_to_c);
+    let replacement_a_to_c = bounded_result(
+        "open successor after dropped Alice-to-Carol relay",
+        alice_net.open_closed_relay(&relay_id, &carol_id),
+    )
+    .await?;
+    let replacement_c_from_a = bounded_result(
+        "accept successor after dropped Alice-to-Carol relay",
+        carol_net.accept_closed_relay(),
+    )
+    .await?;
+    assert_ne!(replacement_a_to_c.session_id(), dropped_session_id);
+    assert_eq!(
+        replacement_a_to_c.session_id(),
+        replacement_c_from_a.session_id(),
+        "successor must be one exact endpoint pair"
+    );
+    bounded_result(
+        "send successor after dropped endpoint pair",
+        replacement_a_to_c.send(b"successor after dropped route"),
+    )
+    .await?;
+    assert_eq!(
+        bounded_result(
+            "receive successor after dropped endpoint pair",
+            replacement_c_from_a.recv(),
+        )
+        .await?,
+        b"successor after dropped route"
+    );
+    bounded_result(
+        "close successor target endpoint",
+        replacement_c_from_a.close(),
+    )
+    .await?;
+    bounded_result(
+        "close successor requester endpoint",
+        replacement_a_to_c.close(),
+    )
+    .await?;
 
     let _ = bounded_value("retire relay-Carol link", relay_carol.retire()).await?;
     let _ = bounded_value("retire Alice-relay link", alice_relay.retire()).await?;
@@ -498,5 +654,17 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     assert_live_custody_baseline("Alice", &baseline_alice, &live_alice);
     assert_live_custody_baseline("relay", &baseline_relay, &live_relay);
     assert_live_custody_baseline("Carol", &baseline_carol, &live_carol);
+    assert_eq!(
+        live_alice, baseline_alice,
+        "Alice shutdown must reach exact baseline"
+    );
+    assert_eq!(
+        live_relay, baseline_relay,
+        "relay shutdown must reach exact baseline"
+    );
+    assert_eq!(
+        live_carol, baseline_carol,
+        "Carol shutdown must reach exact baseline"
+    );
     Ok(())
 }

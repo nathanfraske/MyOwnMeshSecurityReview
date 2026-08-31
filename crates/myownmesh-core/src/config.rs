@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -16,8 +17,6 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(any(test, windows))]
-use std::time::Duration;
 #[cfg(windows)]
 use std::time::Instant;
 
@@ -33,6 +32,23 @@ use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 pub use myownmesh_signaling::server::Limits as SignalingLimits;
 
 pub const CONFIG_VERSION: u32 = 2;
+
+const DEFAULT_MESH_EVENT_CAPACITY: u64 = 256;
+const DEFAULT_NETWORK_EVENT_CAPACITY: u64 = 256;
+const DEFAULT_NETWORK_CONNECTION_TRACE_CAPACITY: u64 = 512;
+const MAX_NETWORK_BROADCAST_CAPACITY: usize = usize::MAX >> 1;
+
+fn default_mesh_event_capacity() -> u64 {
+    DEFAULT_MESH_EVENT_CAPACITY
+}
+
+fn default_network_event_capacity() -> u64 {
+    DEFAULT_NETWORK_EVENT_CAPACITY
+}
+
+fn default_network_connection_trace_capacity() -> u64 {
+    DEFAULT_NETWORK_CONNECTION_TRACE_CAPACITY
+}
 
 static CONFIG_TRANSACTION_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -422,6 +438,9 @@ pub struct ClosedRelayPolicyConfig {
     pub max_allocations: u64,
     pub max_allocations_per_member: u64,
     pub max_pending_handshakes: u64,
+    /// Maximum age of one pending handshake before it is rejected. This is
+    /// distinct from the lifetime of an established relay allocation.
+    pub pending_handshake_timeout_ms: u64,
     pub replay_window: u64,
     pub max_frame_ciphertext_bytes: u64,
     pub queue_items_per_direction: u64,
@@ -437,6 +456,11 @@ pub struct ClosedRelayPolicyConfig {
 /// A bounded protocol allocation that keeps malformed or hostile config from
 /// asking the relay to construct an unbounded packet buffer.
 pub const MAX_CLOSED_RELAY_PACKET_BYTES: u64 = 1024 * 1024;
+/// The largest encoded Closed relay control the receive callback can carry.
+/// This is separate from the ciphertext ceiling: controls are validated as
+/// their complete JSON `MeshMessage` representation, including the kind tag.
+pub const MAX_CLOSED_RELAY_CONTROL_BYTES: u64 =
+    crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES;
 
 impl Default for ClosedRelayPolicyConfig {
     fn default() -> Self {
@@ -445,6 +469,7 @@ impl Default for ClosedRelayPolicyConfig {
             max_allocations: 64,
             max_allocations_per_member: 8,
             max_pending_handshakes: 32,
+            pending_handshake_timeout_ms: 30_000,
             replay_window: 64,
             max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
             queue_items_per_direction: 64,
@@ -471,6 +496,7 @@ impl ClosedRelayPolicyConfig {
             && self.max_allocations_per_member <= semaphore_max
             && self.max_pending_handshakes > 0
             && self.max_pending_handshakes <= semaphore_max
+            && self.pending_handshake_timeout_ms > 0
             && self.replay_window > 0
             && self.replay_window <= semaphore_max
             && self.max_frame_ciphertext_bytes > 0
@@ -484,7 +510,7 @@ impl ClosedRelayPolicyConfig {
             && self.idle_timeout_ms > 0
             && self.max_lifetime_ms > 0
             && self.max_control_bytes > 0
-            && self.max_control_bytes <= MAX_CLOSED_RELAY_PACKET_BYTES
+            && self.max_control_bytes <= MAX_CLOSED_RELAY_CONTROL_BYTES
             && self.shutdown_grace_ms > 0
             && usize::try_from(self.max_allocations).is_ok()
             && usize::try_from(self.max_allocations_per_member).is_ok()
@@ -496,6 +522,26 @@ impl ClosedRelayPolicyConfig {
             && usize::try_from(self.bandwidth_rate_bytes_per_second).is_ok()
             && usize::try_from(self.bandwidth_burst_bytes).is_ok()
             && usize::try_from(self.max_control_bytes).is_ok()
+    }
+
+    /// Validate one control against this profile's exact encoded-byte budget.
+    /// The protocol layer performs both complete route binding and field-size
+    /// checks before this configured ceiling is applied.
+    pub fn validate_closed_relay_control(
+        &self,
+        control: &crate::protocol::relay::ClosedRelayControl,
+    ) -> bool {
+        self.validate() && control.validate_for_wire(self.max_control_bytes).is_ok()
+    }
+
+    /// Return the checked pending-handshake duration used by the relay.
+    pub fn pending_handshake_timeout(&self) -> Result<Duration> {
+        if !self.validate() {
+            return Err(Error::Config(
+                "closed relay pending handshake policy is invalid".into(),
+            ));
+        }
+        Ok(Duration::from_millis(self.pending_handshake_timeout_ms))
     }
 }
 
@@ -619,6 +665,159 @@ pub fn default_signaling_denylist() -> Vec<String> {
     vec!["relay.damus.io".to_string(), "chorus.pjv.me".to_string()]
 }
 
+/// Local configuration shape matched to the canonical verified bootstrap.
+/// Runtime authority remains in the semantic fact graph; this enum only
+/// selects the initial config shape presented to that authority.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkKind {
+    #[default]
+    Open,
+    Closed,
+    Silent,
+}
+
+/// Owner-selected policy for the engine's time-based safety net.
+///
+/// These values are persisted with the network rather than kept as process
+/// constants: two networks in one mesh may have different latency and power
+/// envelopes.  The fixed-size schedules are deliberate; accepting an
+/// arbitrary list here would make the scheduler's work itself unbounded.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SchedulerPolicyConfig {
+    pub reactive_announce_min_interval_ms: u64,
+    pub reoffer_min_interval_ms: u64,
+    pub probe_ttl_ms: u64,
+    pub probe_resolve_timeout_ms: u64,
+    pub skew_warn_ms: u64,
+    pub skew_clear_ms: u64,
+    pub skew_warn_ticks: u8,
+    pub handshake_timeout_ms: u64,
+    pub handshake_hello_retry_schedule_ms: [u64; 3],
+    pub heartbeat_interval_ms: u64,
+    pub heartbeat_timeout_ms: u64,
+    pub wake_coalesce_ms: u64,
+    pub wake_probe_delay_ms: u64,
+    pub liveness_probe_min_interval_ms: u64,
+    pub ice_disconnected_restart_ms: u64,
+    pub state_watch_interval_ms: u64,
+    pub reconnect_retry_backoff_ms: [u64; 4],
+    pub data_channel_open_timeout_ms: u64,
+    pub offer_build_timeout_ms: u64,
+    pub ice_introspect_timeout_ms: u64,
+    pub peer_send_timeout_ms: u64,
+    pub restart_traffic_grace_ms: u64,
+    pub relay_rescue_min_interval_ms: u64,
+    pub network_change_restart_cooldown_ms: u64,
+    pub reconnecting_grace_ms: u64,
+    pub signaling_diag_heartbeat_ms: u64,
+    pub diag_max: u64,
+}
+
+impl Default for SchedulerPolicyConfig {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl SchedulerPolicyConfig {
+    pub const DEFAULT: Self = Self {
+        reactive_announce_min_interval_ms: 1_000,
+        reoffer_min_interval_ms: 2_000,
+        probe_ttl_ms: 300_000,
+        probe_resolve_timeout_ms: 2_000,
+        skew_warn_ms: 10_000,
+        skew_clear_ms: 5_000,
+        skew_warn_ticks: 3,
+        handshake_timeout_ms: 30_000,
+        handshake_hello_retry_schedule_ms: [5_000, 7_000, 10_000],
+        heartbeat_interval_ms: 30_000,
+        heartbeat_timeout_ms: 30_000,
+        wake_coalesce_ms: 2_000,
+        wake_probe_delay_ms: 1_500,
+        liveness_probe_min_interval_ms: 5_000,
+        ice_disconnected_restart_ms: 1_000,
+        state_watch_interval_ms: 2_000,
+        reconnect_retry_backoff_ms: [2_000, 4_000, 8_000, 15_000],
+        data_channel_open_timeout_ms: 30_000,
+        offer_build_timeout_ms: 10_000,
+        ice_introspect_timeout_ms: 1_000,
+        peer_send_timeout_ms: 2_000,
+        restart_traffic_grace_ms: 10_000,
+        relay_rescue_min_interval_ms: 30_000,
+        network_change_restart_cooldown_ms: 5_000,
+        reconnecting_grace_ms: 90_000,
+        signaling_diag_heartbeat_ms: 5 * 60 * 1000,
+        diag_max: 80,
+    };
+
+    /// Validate before any engine, task, or transport side effect.
+    pub fn validate(&self) -> bool {
+        let nonzero = [
+            self.reactive_announce_min_interval_ms,
+            self.reoffer_min_interval_ms,
+            self.probe_ttl_ms,
+            self.probe_resolve_timeout_ms,
+            self.skew_warn_ms,
+            self.skew_clear_ms,
+            self.handshake_timeout_ms,
+            self.heartbeat_interval_ms,
+            self.heartbeat_timeout_ms,
+            self.wake_coalesce_ms,
+            self.wake_probe_delay_ms,
+            self.liveness_probe_min_interval_ms,
+            self.ice_disconnected_restart_ms,
+            self.state_watch_interval_ms,
+            self.data_channel_open_timeout_ms,
+            self.offer_build_timeout_ms,
+            self.ice_introspect_timeout_ms,
+            self.peer_send_timeout_ms,
+            self.restart_traffic_grace_ms,
+            self.relay_rescue_min_interval_ms,
+            self.network_change_restart_cooldown_ms,
+            self.reconnecting_grace_ms,
+            self.signaling_diag_heartbeat_ms,
+            self.diag_max,
+        ]
+        .into_iter()
+        .all(|value| value > 0);
+        let retries_are_ordered = self
+            .handshake_hello_retry_schedule_ms
+            .windows(2)
+            .all(|window| window[0] > 0 && window[0] < window[1])
+            && self
+                .reconnect_retry_backoff_ms
+                .windows(2)
+                .all(|window| window[0] > 0 && window[0] < window[1]);
+        nonzero
+            && retries_are_ordered
+            && self.heartbeat_interval_ms.checked_mul(2).is_some()
+            && self
+                .heartbeat_timeout_ms
+                .checked_add(self.heartbeat_interval_ms.checked_mul(2).unwrap_or(0))
+                .is_some()
+            && self.wake_probe_delay_ms <= self.state_watch_interval_ms
+            && self.skew_clear_ms < self.skew_warn_ms
+            && self.skew_warn_ms <= i64::MAX as u64
+            && self.skew_clear_ms <= i64::MAX as u64
+            && self.skew_warn_ticks > 0
+            && self.restart_traffic_grace_ms <= self.data_channel_open_timeout_ms
+            && self.relay_rescue_min_interval_ms >= self.data_channel_open_timeout_ms
+            && usize::try_from(self.diag_max).is_ok()
+    }
+
+    pub(crate) fn checked(self) -> Result<Self> {
+        if self.validate() {
+            Ok(self)
+        } else {
+            Err(Error::Config(
+                "scheduler policy contains zero, overflow, or inconsistent values".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetworkConfig {
     /// Local config record id. User-chosen, unique within this
@@ -629,6 +828,15 @@ pub struct NetworkConfig {
     /// Wire-level rendezvous handle. Normalised via
     /// [`crate::identity::normalize_network_id`] on load.
     pub network_id: String,
+    /// Finite history retained by this network's MeshEvent broadcaster.
+    /// The owner chooses it per network; no process-wide fallback is inferred
+    /// once a network policy exists.
+    #[serde(default = "default_network_event_capacity")]
+    pub event_capacity: u64,
+    /// Finite history retained by this network's connection-state tracer.
+    /// Kept separate so trace volume cannot evict user-visible events.
+    #[serde(default = "default_network_connection_trace_capacity")]
+    pub connection_trace_capacity: u64,
     /// Cosmetic display name. Empty falls back to `network_id`.
     #[serde(default)]
     pub label: String,
@@ -646,7 +854,10 @@ pub struct NetworkConfig {
     /// Subsequent kind changes come from canonical fact transitions, not from
     /// editing config.json.
     #[serde(default)]
-    pub kind: crate::network_state::NetworkKind,
+    pub kind: NetworkKind,
+    /// Checked owner-selected timing and watchdog policy for this network.
+    #[serde(default)]
+    pub scheduler: SchedulerPolicyConfig,
     #[serde(default)]
     pub topology: TopologyMode,
     #[serde(default)]
@@ -688,6 +899,18 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Return this network's finite event-history choice in the platform
+    /// representation required by its broadcaster.
+    pub(crate) fn event_capacity_usize(&self) -> Result<usize> {
+        checked_network_capacity(self.event_capacity, "event_capacity")
+    }
+
+    /// Return this network's finite connection-trace history choice in the
+    /// platform representation required by its tracer broadcaster.
+    pub(crate) fn connection_trace_capacity_usize(&self) -> Result<usize> {
+        checked_network_capacity(self.connection_trace_capacity, "connection_trace_capacity")
+    }
+
     /// Build a config from just the wire-level network id, filling every
     /// other field with its default (reference STUN/TURN, open
     /// governance, default topology, no roster override, manual
@@ -698,8 +921,11 @@ impl NetworkConfig {
         Self {
             id: id.into(),
             network_id: network_id.into(),
+            event_capacity: DEFAULT_NETWORK_EVENT_CAPACITY,
+            connection_trace_capacity: DEFAULT_NETWORK_CONNECTION_TRACE_CAPACITY,
             label: String::new(),
             kind: Default::default(),
+            scheduler: SchedulerPolicyConfig::default(),
             topology: Default::default(),
             signaling: Default::default(),
             closed_relay: ClosedRelayPolicyConfig::default(),
@@ -709,6 +935,13 @@ impl NetworkConfig {
             pinned_peers: Vec::new(),
             auto_approve: false,
         }
+    }
+
+    /// Return the checked policy before engine construction performs side
+    /// effects. Callers must pass this value through rather than substituting
+    /// process-wide timing constants.
+    pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
+        self.scheduler.checked()
     }
 }
 
@@ -727,7 +960,13 @@ pub struct AutoUpdateConfig {
     /// the sensible default once the wire format settles); `"none"`
     /// stages updates but waits for an explicit "apply".
     pub auto_apply: String,
+    /// Background feed-check cadence. Zero is invalid.
     pub check_interval_hours: u32,
+    /// Maximum time for one release-feed request, in milliseconds.
+    pub feed_request_timeout_ms: u64,
+    /// Maximum time for one artifact/checksum/signature request, in
+    /// milliseconds.
+    pub artifact_download_timeout_ms: u64,
     /// Override the release feed URL. Null = use the build-time
     /// `MYOWNMESH_RELEASE_URL_STABLE` env-var default.
     pub stable_url: Option<String>,
@@ -742,10 +981,49 @@ impl Default for AutoUpdateConfig {
             // Alpha default: take every release. See the field doc.
             auto_apply: "all".to_string(),
             check_interval_hours: 6,
+            feed_request_timeout_ms: 15_000,
+            artifact_download_timeout_ms: 300_000,
             stable_url: None,
             beta_url: None,
         }
     }
+}
+
+impl AutoUpdateConfig {
+    /// Validate updater timing policy before a client, request, or background
+    /// operation is created. There is no updater-side clamp or hidden
+    /// fallback.
+    pub fn validate(&self) -> Result<()> {
+        if self.check_interval_hours == 0 {
+            return Err(Error::Config(
+                "auto_update.check_interval_hours must be non-zero".into(),
+            ));
+        }
+        self.feed_request_timeout()?;
+        self.artifact_download_timeout()?;
+        Ok(())
+    }
+
+    pub fn feed_request_timeout(&self) -> Result<Duration> {
+        checked_auto_update_duration(
+            "auto_update.feed_request_timeout_ms",
+            self.feed_request_timeout_ms,
+        )
+    }
+
+    pub fn artifact_download_timeout(&self) -> Result<Duration> {
+        checked_auto_update_duration(
+            "auto_update.artifact_download_timeout_ms",
+            self.artifact_download_timeout_ms,
+        )
+    }
+}
+
+fn checked_auto_update_duration(name: &'static str, millis: u64) -> Result<Duration> {
+    if millis == 0 {
+        return Err(Error::Config(format!("{name} must be non-zero")));
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -962,6 +1240,11 @@ pub struct TurnCredential {
 #[serde(default)]
 pub struct MeshConfig {
     pub version: u32,
+    /// Finite history retained by the mesh-wide MeshEvent broadcaster.
+    /// The process owner chooses this independently of each network's
+    /// per-network event and connection-trace histories.
+    #[serde(default = "default_mesh_event_capacity")]
+    pub event_capacity: u64,
     /// Override the identity anchor file path. Null = use the default
     /// (`~/.myownmesh/.secrets/identity.json`).
     pub identity_path: Option<PathBuf>,
@@ -978,6 +1261,7 @@ impl Default for MeshConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
+            event_capacity: DEFAULT_MESH_EVENT_CAPACITY,
             identity_path: None,
             auto_update: AutoUpdateConfig::default(),
             auto_cleanup: AutoCleanupConfig::default(),
@@ -1324,7 +1608,29 @@ impl PreparedConfigLoad {
     }
 }
 
+fn checked_network_capacity(value: u64, field: &str) -> Result<usize> {
+    let capacity = usize::try_from(value)
+        .map_err(|_| Error::Config(format!("mesh {field} does not fit this platform")))?;
+    if capacity == 0 {
+        return Err(Error::Config(format!(
+            "mesh {field} must be greater than zero"
+        )));
+    }
+    if capacity > MAX_NETWORK_BROADCAST_CAPACITY {
+        return Err(Error::Config(format!(
+            "mesh {field} exceeds the broadcast capacity limit"
+        )));
+    }
+    Ok(capacity)
+}
+
 impl MeshConfig {
+    /// Return the mesh owner's finite event-history choice in the platform
+    /// representation required by the mesh-wide broadcaster.
+    pub(crate) fn event_capacity_usize(&self) -> Result<usize> {
+        checked_network_capacity(self.event_capacity, "event_capacity")
+    }
+
     /// Load the config from the default location. Missing file
     /// returns [`MeshConfig::default`] — embedders should call
     /// `save()` afterward if they want the file to exist.
@@ -1505,6 +1811,50 @@ mod tests {
     };
     use std::thread;
 
+    #[test]
+    fn scheduler_policy_rejects_zero_overflow_and_bad_order() {
+        let valid = SchedulerPolicyConfig::default();
+        assert!(valid.validate());
+        assert!(!SchedulerPolicyConfig {
+            heartbeat_interval_ms: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!SchedulerPolicyConfig {
+            heartbeat_interval_ms: u64::MAX,
+            ..valid
+        }
+        .validate());
+        assert!(!SchedulerPolicyConfig {
+            skew_warn_ms: (i64::MAX as u64) + 1,
+            ..valid
+        }
+        .validate());
+        assert!(!SchedulerPolicyConfig {
+            handshake_hello_retry_schedule_ms: [7_000, 5_000, 10_000],
+            ..valid
+        }
+        .validate());
+        assert!(!SchedulerPolicyConfig {
+            wake_probe_delay_ms: valid.state_watch_interval_ms + 1,
+            ..valid
+        }
+        .validate());
+
+        let mut network = NetworkConfig::from_network_id("scheduler", "scheduler-net");
+        network.scheduler.heartbeat_interval_ms = 42_000;
+        let encoded = serde_json::to_string(&network).expect("scheduler policy serializes");
+        let decoded: NetworkConfig =
+            serde_json::from_str(&encoded).expect("scheduler policy deserializes");
+        assert_eq!(
+            decoded
+                .scheduler_policy()
+                .expect("custom scheduler policy remains valid")
+                .heartbeat_interval_ms,
+            42_000
+        );
+    }
+
     fn transaction_test_path(label: &str) -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1556,13 +1906,115 @@ mod tests {
     fn default_is_current_with_defaults() {
         let cfg = MeshConfig::default();
         assert_eq!(cfg.version, CONFIG_VERSION);
+        assert_eq!(
+            cfg.event_capacity_usize()
+                .expect("default mesh event capacity is valid"),
+            DEFAULT_MESH_EVENT_CAPACITY as usize
+        );
         assert!(cfg.auto_update.enabled);
         assert_eq!(cfg.auto_update.channel, "stable");
         // Alpha default: ride every release.
         assert_eq!(cfg.auto_update.auto_apply, "all");
         assert_eq!(cfg.auto_update.check_interval_hours, 6);
+        assert_eq!(cfg.auto_update.feed_request_timeout_ms, 15_000);
+        assert_eq!(cfg.auto_update.artifact_download_timeout_ms, 300_000);
+        assert!(cfg.auto_update.validate().is_ok());
         assert!(cfg.daemon.enabled);
         assert!(cfg.networks.is_empty());
+    }
+
+    #[test]
+    fn configured_event_capacities_reject_zero_and_platform_overflow() {
+        fn assert_capacity_refusal(result: Result<usize>, field: &str) {
+            match result {
+                Err(Error::Config(message)) => assert!(message.contains(field)),
+                other => panic!("expected typed config refusal for {field}, got {other:?}"),
+            }
+        }
+
+        let zero = NetworkConfig {
+            event_capacity: 0,
+            ..NetworkConfig::from_network_id("zero", "zero")
+        };
+        assert_capacity_refusal(zero.event_capacity_usize(), "event_capacity");
+
+        let mesh_zero = MeshConfig {
+            event_capacity: 0,
+            ..MeshConfig::default()
+        };
+        assert_capacity_refusal(mesh_zero.event_capacity_usize(), "event_capacity");
+
+        let zero_trace = NetworkConfig {
+            connection_trace_capacity: 0,
+            ..NetworkConfig::from_network_id("zero-trace", "zero-trace")
+        };
+        assert_capacity_refusal(
+            zero_trace.connection_trace_capacity_usize(),
+            "connection_trace_capacity",
+        );
+
+        let exact_max = NetworkConfig {
+            event_capacity: MAX_NETWORK_BROADCAST_CAPACITY as u64,
+            ..NetworkConfig::from_network_id("exact-max", "exact-max")
+        };
+        assert_eq!(
+            exact_max
+                .event_capacity_usize()
+                .expect("exact event capacity maximum is valid"),
+            MAX_NETWORK_BROADCAST_CAPACITY
+        );
+
+        let above_max = NetworkConfig {
+            event_capacity: (MAX_NETWORK_BROADCAST_CAPACITY as u64) + 1,
+            ..NetworkConfig::from_network_id("above-max", "above-max")
+        };
+        assert_capacity_refusal(above_max.event_capacity_usize(), "event_capacity");
+
+        let mesh_exact_max = MeshConfig {
+            event_capacity: MAX_NETWORK_BROADCAST_CAPACITY as u64,
+            ..MeshConfig::default()
+        };
+        assert_eq!(
+            mesh_exact_max
+                .event_capacity_usize()
+                .expect("exact mesh event capacity maximum is valid"),
+            MAX_NETWORK_BROADCAST_CAPACITY
+        );
+
+        let mesh_above_max = MeshConfig {
+            event_capacity: (MAX_NETWORK_BROADCAST_CAPACITY as u64) + 1,
+            ..MeshConfig::default()
+        };
+        assert_capacity_refusal(mesh_above_max.event_capacity_usize(), "event_capacity");
+
+        let exact_trace_max = NetworkConfig {
+            connection_trace_capacity: MAX_NETWORK_BROADCAST_CAPACITY as u64,
+            ..NetworkConfig::from_network_id("exact-trace-max", "exact-trace-max")
+        };
+        assert_eq!(
+            exact_trace_max
+                .connection_trace_capacity_usize()
+                .expect("exact trace capacity maximum is valid"),
+            MAX_NETWORK_BROADCAST_CAPACITY
+        );
+
+        let above_trace_max = NetworkConfig {
+            connection_trace_capacity: (MAX_NETWORK_BROADCAST_CAPACITY as u64) + 1,
+            ..NetworkConfig::from_network_id("above-trace-max", "above-trace-max")
+        };
+        assert_capacity_refusal(
+            above_trace_max.connection_trace_capacity_usize(),
+            "connection_trace_capacity",
+        );
+
+        let overflow_trace = NetworkConfig {
+            connection_trace_capacity: u64::MAX,
+            ..NetworkConfig::from_network_id("overflow-trace", "overflow-trace")
+        };
+        assert_capacity_refusal(
+            overflow_trace.connection_trace_capacity_usize(),
+            "connection_trace_capacity",
+        );
     }
 
     #[test]
@@ -1621,16 +2073,15 @@ mod tests {
         assert_eq!(s.strategy, "nostr");
         assert_eq!(s.redundancy, DEFAULT_SIGNALING_REDUNDANCY);
         assert!(s.denylist.iter().any(|h| h == "relay.damus.io"));
-        assert!(s.mdns_policy.validate());
     }
 
     #[test]
-    fn mdns_policy_is_legacy_default_compatible_and_round_trips() {
-        let legacy: SignalingConfig = serde_json::from_str(
+    fn mdns_policy_omission_uses_current_defaults_and_round_trips() {
+        let omitted: SignalingConfig = serde_json::from_str(
             r#"{"strategy":"none","mdns":true,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false}"#,
         )
         .unwrap();
-        assert_eq!(legacy.mdns_policy, MdnsPolicyConfig::default());
+        assert_eq!(omitted.mdns_policy, MdnsPolicyConfig::default());
 
         let configured = MdnsPolicyConfig {
             max_active_connections: 3,
@@ -1696,18 +2147,19 @@ mod tests {
     }
 
     #[test]
-    fn closed_relay_policy_is_legacy_default_compatible_and_bounded() {
-        let legacy: NetworkConfig = serde_json::from_str(
-            r#"{"id":"legacy","network_id":"legacy-net","signaling":{"strategy":"none","mdns":false,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false},"stun_servers":[],"turn_servers":[],"pinned_peers":[],"auto_approve":false}"#,
+    fn closed_relay_policy_defaults_disabled_and_roundtrips_bounded_config() {
+        let defaults: NetworkConfig = serde_json::from_str(
+            r#"{"id":"omitted","network_id":"omitted-net","signaling":{"strategy":"none","mdns":false,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false},"stun_servers":[],"turn_servers":[],"pinned_peers":[],"auto_approve":false}"#,
         )
         .unwrap();
-        assert_eq!(legacy.closed_relay, ClosedRelayPolicyConfig::default());
+        assert_eq!(defaults.closed_relay, ClosedRelayPolicyConfig::default());
 
         let configured = ClosedRelayPolicyConfig {
             enabled: true,
             max_allocations: 3,
             max_allocations_per_member: 2,
             max_pending_handshakes: 5,
+            pending_handshake_timeout_ms: 47_000,
             replay_window: 11,
             max_frame_ciphertext_bytes: 8191,
             queue_items_per_direction: 7,
@@ -1727,6 +2179,19 @@ mod tests {
         let decoded: NetworkConfig = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded.closed_relay, configured);
         assert!(decoded.closed_relay.validate());
+        assert_eq!(
+            decoded
+                .closed_relay
+                .pending_handshake_timeout()
+                .expect("configured pending-handshake timeout is valid"),
+            Duration::from_millis(47_000)
+        );
+        assert!(ClosedRelayPolicyConfig {
+            pending_handshake_timeout_ms: 0,
+            ..configured.clone()
+        }
+        .pending_handshake_timeout()
+        .is_err());
 
         assert!(!ClosedRelayPolicyConfig {
             queue_items_per_direction: 0,
@@ -1735,50 +2200,14 @@ mod tests {
         .validate());
         assert!(!ClosedRelayPolicyConfig {
             max_frame_ciphertext_bytes: MAX_CLOSED_RELAY_PACKET_BYTES + 1,
+            ..configured.clone()
+        }
+        .validate());
+        assert!(!ClosedRelayPolicyConfig {
+            max_control_bytes: MAX_CLOSED_RELAY_CONTROL_BYTES + 1,
             ..configured
         }
         .validate());
-    }
-
-    #[test]
-    fn closed_relay_plaintext_ceiling_is_sctp_safe_and_checked() {
-        let exact = ClosedRelayPolicyConfig {
-            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
-            ..ClosedRelayPolicyConfig::default()
-        };
-        assert!(exact.validate());
-        assert!(!ClosedRelayPolicyConfig {
-            max_frame_ciphertext_bytes: crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
-                + 1,
-            ..exact
-        }
-        .validate());
-        let exact_formula = crate::protocol::relay::closed_relay_worst_case_json_bytes(
-            crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
-                + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES,
-        );
-        assert!(
-            exact_formula.expect("boundary arithmetic is representable")
-                <= crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
-        );
-        assert_eq!(exact_formula, Some(65_532));
-        assert!(
-            crate::protocol::relay::closed_relay_worst_case_json_bytes(
-                crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
-                    + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES
-                    + 1
-            )
-            .expect("next boundary arithmetic is representable")
-                > crate::protocol::relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
-        );
-        assert_eq!(
-            crate::protocol::relay::closed_relay_worst_case_json_bytes(
-                crate::protocol::relay::CLOSED_RELAY_MAX_PLAINTEXT_BYTES
-                    + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES
-                    + 1
-            ),
-            Some(65_536)
-        );
     }
 
     #[test]
@@ -1815,7 +2244,6 @@ mod tests {
 
     #[test]
     fn network_kind_silent_round_trips_and_defaults_open() {
-        use crate::network_state::NetworkKind;
         // Explicit `"kind": "silent"` decodes to Silent.
         let json = r#"{ "id": "n1", "network_id": "t", "kind": "silent" }"#;
         let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
@@ -1834,7 +2262,6 @@ mod tests {
 
     #[test]
     fn mesh_config_with_a_silent_network_round_trips() {
-        use crate::network_state::NetworkKind;
         let mut cfg = MeshConfig::default();
         let mut net = NetworkConfig::from_network_id("support", "cec-support");
         net.kind = NetworkKind::Silent;

@@ -70,15 +70,6 @@ pub enum Request {
     RosterList {
         network: String,
     },
-    RosterApprove {
-        network: String,
-        device_id: String,
-        label: Option<String>,
-    },
-    RosterRemove {
-        network: String,
-        device_id: String,
-    },
     TopologySet {
         network: String,
         topology: String,
@@ -239,15 +230,13 @@ pub enum Request {
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
-        role: myownmesh_core::network_state::Role,
-        #[serde(default)]
+        role: myownmesh_core::semantic::Role,
         mfa_code: Option<String>,
     },
     /// Float a role-revoke proposal.
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,
-        #[serde(default)]
         mfa_code: Option<String>,
     },
     /// Float an evict proposal — remove a peer from the closed network's
@@ -255,7 +244,6 @@ pub enum Request {
     GovernanceProposeEvict {
         network: String,
         target: String,
-        #[serde(default)]
         mfa_code: Option<String>,
     },
     /// Prepare a new enrollment and return its exact transaction identity.

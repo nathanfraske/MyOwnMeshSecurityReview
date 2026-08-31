@@ -48,7 +48,7 @@ use myownmesh_signaling::nostr::AdmissionSource;
 use myownmesh_signaling::SignalingMessage;
 
 use crate::resource::{
-    mailbox_retained_claim, strings_measure, LocalApplicationResourceScope, ResourceClaim,
+    strings_measure, LocalApplicationResourceScope, MailboxMeasurement, ResourceClaim,
     ResourceLease, ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxSendError,
     ResourceMailboxSender,
 };
@@ -1083,14 +1083,16 @@ impl EphemeralIngress {
     }
 }
 
-impl ResourceMailboxItem for EphemeralIngress {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for EphemeralIngress {
+    fn measured_claim(
+        &self,
+    ) -> std::result::Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         // Carrier, instance, signal and attribution are `Copy` and field-less or
         // a counter: they reach nothing, allocate nothing, and their inline bytes
         // are already inside `size_of::<Self>()`. So the measurement is the
         // inbound value's, priced against this type's own footprint.
         let measure = self.inbound.string_measure()?;
-        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+        MailboxMeasurement::from_parts(measure.0, measure.1, measure.2)
     }
 }
 
@@ -1879,6 +1881,7 @@ impl CarrierAttach {
     }
 
     /// Hand an observation to the runtime. `false` once the engine side is gone.
+    #[cfg(test)]
     pub(crate) fn deliver(&self, observation: CarrierObservation) -> bool {
         !matches!(self.admit(observation), Delivered::Closed)
     }

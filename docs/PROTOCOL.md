@@ -5,14 +5,18 @@ a JSON object tagged by a `kind` discriminator. The source of truth
 for these types is `crates/myownmesh-core/src/protocol/`.
 
 ```
-PROTOCOL_VERSION  = 1
+PROTOCOL_VERSION  = 2
 TRYSTERO_APP_ID   = "myownmesh-cloud-mesh-v1"
 ```
 
 This hard-alpha protocol has a closed frame set. An unknown `kind` is
 refused during decoding and reaches no protocol state. The `features`
 list on `hello` carries only the required endpoint-authentication profile;
-it is a compatibility precondition, not optional-frame negotiation.
+it is a compatibility precondition, not optional-frame negotiation. Version 2
+is a hard cutover from version 1: `ClosedRelayControl` and `ClosedRelayData`
+add an incompatible closed wire set, so a receiver refuses an older, newer,
+missing, or otherwise wrong core version before endpoint authentication. There
+is no mixed-version, optional-feature, or downgrade fallback.
 
 ## Frame envelope
 
@@ -75,7 +79,7 @@ verify independently before reduction.
 The semantic owner defines the canonical `FactContent` tuple:
 
 ```text
-domain = governance | participation | checkpoint | eviction_proof
+domain = governance | participation | eviction_proof
 mesh_context
 typed FactBody
 author
@@ -84,19 +88,36 @@ sorted causal parent FactIds
 
 The FactId is the semantic owner's 32-byte SHA-256 digest of its explicit
 length-delimited canonical encoding, domain-separated by `myownmesh-semantic-v4`
-and schema 4. The typed `FactBody` encoding includes governance changes,
-participation, checkpoints, eviction proofs, topology, and explicit conflict
-resolution. Parent ordering is canonicalized by the semantic owner. The
-signature covers the exact FactId, and verification recomputes the semantic
-content digest before checking the author's signature. Any change to context,
-author, body, domain, or causal parent set therefore produces a different
-FactId and cannot retain the old signature.
+and schema 4. The typed `FactBody` union is exactly `RoleGrant`, `RoleRevoke`,
+`Evict`, `MembershipAdmit`, `OpenParticipation`, `EvictionProof`,
+`SelfStandDown`, `Attestation`, ordinary cell-local `Resolution`, and typed
+cross-cell `AuthorityLineageResolution`. Ordinary `Resolution` selects only
+one exclusive cell; the AuthorityLineage variant is the only persistent
+cross-cell selector and must cite the complete current lineage set. Parent
+ordering is canonicalized by the semantic owner. The signature covers the
+exact FactId, and verification recomputes the semantic content digest before
+checking the author's signature. Any change to context, author, body, domain,
+or causal parent set therefore produces a different FactId and cannot retain
+the old signature.
 
-`roster_summary`, `roster_request`, and `roster_entries` remain discovery and
-dependency exchanges. `roster_entries` is unsigned exchange data and is never
-an authoritative fact bundle; membership or role changes must arrive as signed
-V4 facts. There are no unsigned transition/member-log fields in that exchange
-frame. Inventory/request traffic is not silently promoted into authority.
+There is no roster wire family in protocol version 2: `roster_summary`,
+`roster_request`, and `roster_entries` are retired and absent from
+`MeshMessage`. The roster is a local projection/cache only. Membership and
+role changes must arrive as signed V4 facts; `fact_inventory` and
+`fact_request` are non-authoritative exact-context dependency traffic and are
+never silently promoted into authority.
+
+### `fact_inventory` and `fact_request`
+
+These are non-authoritative exact-context anti-entropy frames. An inventory
+names canonical `FactId`s known to the sender; a request names IDs the receiver
+is missing. Both are canonicalized and split into pages by the exact compact
+JSON encoding of the complete `MeshMessage`, bounded by the receive-safe frame
+limit. There is no item-count or timer-based page policy. A signed fact bundle
+uses the same byte boundary. Missing or reordered pages are repaired by the
+next inventory pass, and a foreign context or stale logical route is refused
+before any graph or projection mutation. Only independently verified signed
+facts can change authority; LAN discovery, inventory, and requests never do.
 
 ---
 
@@ -107,7 +128,7 @@ First frame on a fresh data channel from each side.
 
 | Field | Type | Notes |
 |---|---|---|
-| `protocol` | u32 | Current closed wire-profile version; older profiles are not accepted. |
+| `protocol` | u32 | Exact current closed wire-profile version (`2`); older and newer profiles are not accepted. |
 | `device_id` | string | Bare-pubkey Device ID (base32-lowercase, 52 chars). |
 | `label` | string | Self-reported human label. Cosmetic. |
 | `nonce` | string | Random 32-byte challenge, base32-lowercase. |
@@ -152,6 +173,94 @@ key and returns the signature in `auth_response`. `nonce` is that
 endpoint's per-attempt contribution: a fresh 32-byte CSPRNG draw,
 base32-lowercase, accepted only in that exact canonical encoding. Both
 sides send one, and both are bound into the signed transcript.
+
+## Closed member relay
+
+Version 1 defines one typed, closed relay wire set. It is not negotiated as an
+optional frame extension: the exact core version gate above must succeed first,
+and the existing `endpoint_auth_v1` profile remains a separate hard
+precondition. The owner-selected `ClosedRelayPolicyConfig.enabled` is
+`false` by default; an invalid or disabled profile refuses allocation,
+handshake, control, and data admission before retaining relay state. The relay
+sees routing metadata and opaque endpoint ciphertext; it never sees endpoint
+keys, raw addresses, or authority-bearing capabilities.
+
+The control sequence is exact and directional:
+
+```text
+Open(requester -> relay) -> Offer(relay -> target) -> Accept(target -> relay)
+```
+
+The enclosing requester–relay and relay–target links must already be exact,
+authenticated sessions. `Open` is admitted at the relay only for the current
+requester owner; the relay validates and forwards `Offer` to the exact target.
+The target validates the complete route and requester share, derives its
+endpoint-side state, and returns `Accept` to the same relay. The relay forwards
+that accept to the requester. Endpoint-side key agreement then yields the two
+endpoint sessions; no endpoint key or pending secret is placed in
+relay state. This wire description does not assert that a native A–C WebRTC
+link is created by the relay protocol.
+
+Every control binds the complete route tuple (using the wire field names):
+
+```text
+(context_id, requester, relay, target, session_id)
+```
+
+The three Device IDs are canonical and pairwise distinct, and `session_id` is
+the non-zero 16-byte session identity. A pending control is consumed only when
+all five fields equal the pending route; matching only a device or a partial
+route cannot select an allocation. `Open` and `Offer` carry the requester's
+authenticated `RelayKeyShare`; `Accept` carries the target's corresponding
+share. `Close` repeats the same route tuple and closes only that exact session,
+with no free-form peer selector or recursive next hop. A duplicate that finds
+no current custody is harmless, but the wire route has no generation or
+persistent tombstone, so a delayed Close after session-id reuse is not
+distinguishable from a new close at this boundary.
+
+`ClosedRelayData` carries the same route tuple plus an opaque packet. The packet
+may travel only in one of two endpoint directions: `requester -> target` or
+`target -> requester`; the relay itself and unrelated devices are never valid
+endpoints. The packet's ciphertext is checked against the configured
+plaintext-plus-16-byte-AES-GCM-tag bound before forwarding, while the complete
+JSON wire representation is checked against the finite receive-safe budget.
+The configured plaintext ceiling is derived so worst-case JSON data stays at
+or below the 65,535-byte WebRTC callback budget (the SCTP user-message ceiling
+is 65,536 bytes); controls have their own finite encoded-byte ceiling. Overflow
+in any conversion or addition fails closed. These are validation bounds, not
+permission to infer a larger capacity from a default value.
+
+Endpoint key shares are signed over the complete mesh/session/from/to/share
+binding. The two endpoint ephemeral X25519 public keys and the exact endpoint
+route are fed into HKDF-SHA256 to derive direction-separated AES-256-GCM keys
+and nonce prefixes. Each packet nonce contains its direction's prefix and the
+monotonic sequence; AEAD additional authenticated data is the closed-relay
+packet domain tag plus length-delimited mesh/from/to fields and fixed-width
+session/sequence fields. The relay only queues and forwards the opaque packet.
+An endpoint accepts a packet only when route, nonce, opposite endpoint
+direction, and its bounded replay window all match; a duplicate or
+out-of-window sequence is refused before plaintext delivery.
+
+An admitted allocation owns bounded per-direction item/byte queues,
+bandwidth, pending-handshake, lifetime, and idle limits. Validation and
+admission refusal before insertion constructs no route state. A valid Accept
+that cannot obtain or retain an allocation terminalizes the consumed pending
+handshake. Expiry, stale-owner, queue-closed, and shutdown terminal paths
+release exact owner custody rather than authorize a successor or another
+route; validation or endpoint-crypto errors are surfaced at their boundary
+and are not themselves a generation or successor token. A normal close or
+terminal path settles exactly that live generation and releases its
+provider-backed claim once. Repeated settlement of the same
+terminal owner is harmless, but the wire Close itself has no generation
+tombstone and is not a successor-disambiguation token. The protocol
+description specifies this wire/runtime contract; the status of any native
+A–C WebRTC promotion choreography is outside this wire specification.
+
+LAN, mDNS, and other discovery signals are locator hints only. They can suggest
+where a peer may be reached, but they do not authenticate a Device ID, establish
+the route tuple, authorize a relay allocation, or provide capability
+provenance. Endpoint authentication, signed semantic facts, and the exact
+current session remain the authorities for those decisions.
 
 ### `auth_response`
 Proves possession of the secret key matching `hello.device_id`, over the

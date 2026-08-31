@@ -236,8 +236,11 @@ impl Drop for NativeCloseGateHandle {
 /// Single cleanup owner for one native peer connection.
 pub(super) struct ConnectorCloseOwner {
     pub(super) ownership: ConnectorOwnership,
-    resource_owner: MeshConnectorResourceScope,
+    resource_owner: SyncMutex<Option<MeshConnectorResourceScope>>,
     cleanup_capability: SyncMutex<Option<crate::runtime::attempt::ConnectorCleanupCapability>>,
+    /// The transport object observation ends when native cleanup succeeds,
+    /// independently of any worker `Arc` retained by a caller after close.
+    transport_observation: SyncMutex<Option<ObservationLease>>,
     native: SyncMutex<Option<Arc<dyn NativeConnectorClosePort>>>,
     remote_candidates: SyncMutex<Option<Arc<SyncMutex<RemoteCandidateState>>>>,
     realtime_flows: SyncMutex<Option<Arc<RealtimeFlowRegistry>>>,
@@ -286,12 +289,14 @@ impl ConnectorCloseOwner {
         ownership: ConnectorOwnership,
         resource_owner: MeshConnectorResourceScope,
         cleanup_capability: crate::runtime::attempt::ConnectorCleanupCapability,
+        transport_observation: Option<ObservationLease>,
     ) -> Arc<Self> {
         let (status, _receiver) = watch::channel(ConnectorCloseStatus::Open);
         Arc::new(Self {
             ownership,
-            resource_owner: resource_owner.clone(),
+            resource_owner: SyncMutex::new(Some(resource_owner)),
             cleanup_capability: SyncMutex::new(Some(cleanup_capability)),
+            transport_observation: SyncMutex::new(transport_observation),
             native: SyncMutex::new(None),
             remote_candidates: SyncMutex::new(None),
             realtime_flows: SyncMutex::new(None),
@@ -341,7 +346,9 @@ impl ConnectorCloseOwner {
         let mut current = self.native.lock();
         if current.is_some() {
             drop(current);
-            self.resource_owner.poison_accounting();
+            if let Some(resource_owner) = self.resource_owner.lock().as_ref() {
+                resource_owner.poison_accounting();
+            }
             self.fail_cleanup("duplicate native peer installation".to_string());
             return false;
         }
@@ -491,11 +498,15 @@ impl ConnectorCloseOwner {
             ));
             return;
         }
+        let Some(resource_owner) = self.resource_owner.lock().take() else {
+            self.fail_cleanup("connector resource owner is missing".to_string());
+            return;
+        };
+        self.ownership.relinquish_work_resource_scope();
         let owner = Arc::clone(self);
         let completion_owner = Arc::clone(self);
         let failure_owner = Arc::clone(self);
-        if self
-            .resource_owner
+        let refused = resource_owner
             .submit_cleanup(
                 cleanup_capability,
                 Box::pin(async move { owner.run().await }),
@@ -506,8 +517,9 @@ impl ConnectorCloseOwner {
                     failure_owner.fail_cleanup(reason);
                 }),
             )
-            .was_refused()
-        {
+            .was_refused();
+        drop(resource_owner);
+        if refused {
             self.fail_cleanup("process cleanup executor refused the close owner".to_string());
         }
     }
@@ -583,6 +595,12 @@ impl ConnectorCloseOwner {
     fn finish_closed(&self) {
         let _transition = self.status_transition.lock();
         let terminal_failure = matches!(*self.status.borrow(), ConnectorCloseStatus::Failed(_));
+        // Native close has completed, so end only this transport observation
+        // before publishing cleanup completion. On a prior terminal failure,
+        // the conservative failed-cleanup path retains it until the owner dies.
+        if !terminal_failure {
+            drop(self.transport_observation.lock().take());
+        }
         self.cleanup_complete.store(true, Ordering::Release);
         if terminal_failure {
             // A failure recorded before start remains authoritative, but a

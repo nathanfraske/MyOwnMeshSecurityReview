@@ -183,13 +183,11 @@ impl Drop for ConnectorCleanupCapability {
 /// The private field prevents public IDs, wire values, and serialized state
 /// from being treated as a permit. The permit is intentionally neither
 /// `Clone` nor serializable.
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 pub struct PreAuthAttemptPermit {
     pub(super) attempt: Arc<AttemptOwnership>,
     pub(super) resource_scope: MeshConnectorResourceScope,
 }
 
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 impl PreAuthAttemptPermit {
     // The attempt owner will call this only after the resource owner admits
     // the work. It stays private until that production port is migrated.
@@ -222,6 +220,7 @@ impl PreAuthAttemptPermit {
     /// The attempt permit remains alive and may issue more child reservations
     /// from the same aggregate. The closure is never called when admission
     /// fails.
+    #[cfg(test)]
     pub(super) fn allocate_connector_candidate<T>(
         &self,
         claim: ConnectorCandidateResourceClaim,
@@ -296,14 +295,12 @@ pub(crate) fn admit_single_connector_candidate(
 /// let public_peer_id = String::new();
 /// let _candidate = ConnectorCandidateCapability::from(public_peer_id);
 /// ```
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 pub struct ConnectorCandidateCapability {
     attempt: Arc<AttemptOwnership>,
     reservation: ConnectorCandidateReservation,
     connected_claim: crate::resource::ResourceClaim,
 }
 
-#[allow(dead_code, reason = "Arc 03 moves the production attempt caller")]
 impl ConnectorCandidateCapability {
     pub(crate) fn runtime(&self) -> &RuntimeIncarnation {
         &self.attempt.runtime
@@ -342,10 +339,6 @@ impl ConnectorCandidateCapability {
         &mut self,
     ) -> Result<ConnectorCleanupCapability, ConnectorCleanupCapabilityIssueError> {
         self.reservation.issue_cleanup_capability()
-    }
-
-    pub(crate) fn promote_if_live<T>(self, promote: impl FnOnce(Self) -> T) -> Option<T> {
-        self.try_promote_if_live(promote).ok()
     }
 
     /// Promote without losing cleanup ownership when retirement or a

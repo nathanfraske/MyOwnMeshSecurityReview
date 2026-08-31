@@ -14,10 +14,15 @@ use tracing::{debug, trace};
 
 use super::{
     DiscoveryConfig, DiscoveryEvent, DiscoveryEventAdmission, DiscoveryEventCoalescer,
-    MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES, MAX_TXT_KEY_BYTES,
-    MAX_TXT_VALUE_BYTES,
+    MAX_DNS_NAME_BYTES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
 };
 use crate::Error;
+
+/// A one-element edge-triggered wakeup channel. It carries no discovery
+/// payload: repeated notifications coalesce while the bounded handoff is
+/// being drained, so this implementation invariant is independent of the
+/// owner-selected event capacity.
+const PROGRESS_SIGNAL_CAPACITY: usize = 1;
 
 pub struct Discovery {
     daemon: ServiceDaemon,
@@ -34,8 +39,8 @@ impl Discovery {
     /// Browse starts before the first [`register`](Self::register) so we never
     /// miss a burst of resolves racing our own announce.
     pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
-        if !cfg.limits.validate() || !cfg.timing.validate() {
-            return Err(Error::Other("invalid discovery limits".into()));
+        if !cfg.validate() || !cfg.limits.validate() || !cfg.timing.validate() {
+            return Err(Error::Other("invalid discovery configuration".into()));
         }
         let daemon = ServiceDaemon::new().map_err(|e| Error::Other(format!("mdns daemon: {e}")))?;
 
@@ -59,7 +64,7 @@ impl Discovery {
 
         let (tx, rx) = mpsc::channel(cfg.limits.event_capacity);
         let (forward_tx, forward_rx) = mpsc::channel(cfg.limits.event_capacity);
-        let (progress_tx, progress_rx) = mpsc::channel(1);
+        let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_SIGNAL_CAPACITY);
         let (stop, stop_rx) = watch::channel(false);
         let discovery_limits = cfg.limits;
         let forwarder = tokio::spawn(async move {
@@ -168,7 +173,7 @@ async fn pump(
                 let Ok(event) = event else { break };
                 match event {
                     ServiceEvent::ServiceResolved(resolved) => {
-                        admit_resolved(&coalescer, &forward_tx, *resolved);
+                        admit_resolved(&coalescer, &forward_tx, *resolved, limits);
                     }
                     ServiceEvent::ServiceRemoved(_ty, fullname) => {
                         admit_removed(&coalescer, &forward_tx, fullname);
@@ -257,6 +262,7 @@ fn admit_resolved(
     coalescer: &DiscoveryEventCoalescer,
     forward_tx: &mpsc::Sender<DiscoveryEvent>,
     resolved: mdns_sd::ResolvedService,
+    limits: crate::mdns::discovery::DiscoveryLimits,
 ) {
     if !resolved.is_valid() {
         return;
@@ -266,17 +272,29 @@ fn admit_resolved(
         return;
     }
     let properties = resolved.get_properties();
-    if properties.len() > MAX_TXT_ENTRIES
-        || properties.iter().any(|property| {
-            property.key().len() > MAX_TXT_KEY_BYTES
+    let txt_bytes_valid = properties
+        .iter()
+        .try_fold(0usize, |total, property| {
+            if property.key().is_empty()
+                || property.key().len() > MAX_TXT_KEY_BYTES
                 || property.val_str().len() > MAX_TXT_VALUE_BYTES
+            {
+                return None;
+            }
+            let entry_bytes = property
+                .key()
+                .len()
+                .checked_add(1)
+                .and_then(|bytes| bytes.checked_add(property.val_str().len()))?;
+            if entry_bytes > u8::MAX as usize {
+                return None;
+            }
+            total
+                .checked_add(1)
+                .and_then(|total| total.checked_add(entry_bytes))
         })
-        || properties
-            .iter()
-            .map(|property| property.key().len() + property.val_str().len())
-            .sum::<usize>()
-            > MAX_TXT_BYTES
-    {
+        .is_some_and(|total| total <= limits.max_txt_bytes);
+    if properties.len() > limits.max_txt_entries || !txt_bytes_valid {
         return;
     }
     let address_count = resolved
@@ -284,7 +302,7 @@ fn admit_resolved(
         .iter()
         .filter(|address| matches!(**address, mdns_sd::ScopedIp::V4(_)))
         .count();
-    if address_count == 0 || address_count > MAX_RESOLVED_ADDRESSES {
+    if address_count == 0 || address_count > limits.max_resolved_addresses {
         return;
     }
     let Some(generation) = admit_key(coalescer, fullname) else {
@@ -467,6 +485,9 @@ mod tests {
             max_resolve_owners: 2,
             event_capacity: 3,
             max_event_epochs: 4,
+            max_txt_entries: 5,
+            max_txt_bytes: 512,
+            max_resolved_addresses: 6,
         };
         let (forward_tx, _forward_rx) = mpsc::channel(limits.event_capacity);
         for index in 0..limits.event_capacity {
@@ -477,7 +498,7 @@ mod tests {
                 })
                 .expect("fill bounded handoff");
         }
-        let (_progress_tx, progress_rx) = mpsc::channel(1);
+        let (_progress_tx, progress_rx) = mpsc::channel(PROGRESS_SIGNAL_CAPACITY);
         let (stop_tx, stop_rx) = watch::channel(false);
         let pump = tokio::spawn(pump(browse, forward_tx, progress_rx, stop_rx, limits));
 

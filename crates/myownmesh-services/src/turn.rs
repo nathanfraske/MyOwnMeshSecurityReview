@@ -14,12 +14,16 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use tokio::task::JoinHandle;
 use tracing::info;
 use turn::auth::{generate_auth_key, AuthHandler};
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
@@ -34,11 +38,6 @@ use myownmesh_core::config::{TurnCredential, TurnServiceConfig};
 
 use crate::{Error, Result};
 
-/// Smallest burst the per-connection bandwidth cap always allows, so a
-/// single full-size UDP datagram never deadlocks a tiny cap. The average
-/// throughput still converges on the configured rate.
-const MIN_BURST_BYTES: u64 = 65_536;
-
 /// Token bucket over bytes, for per-allocation bandwidth shaping. A cap
 /// of 0 is never wrapped (see [`ThrottledRelayGenerator`]), so `rate` is
 /// always > 0 here.
@@ -51,7 +50,10 @@ struct ByteBucket {
 
 impl ByteBucket {
     fn new(bps: u64) -> Self {
-        let capacity = bps.max(MIN_BURST_BYTES) as f64;
+        // The configured rate is also the initial burst. There is no hidden
+        // floor: workload capacity comes solely from the provider's explicit
+        // per-connection configuration.
+        let capacity = bps as f64;
         Self {
             tokens: capacity,
             capacity,
@@ -267,12 +269,41 @@ impl AuthHandler for StaticAuthHandler {
 /// A running TURN server. Constructed via [`TurnServer::start`].
 pub struct TurnServer;
 
+type TaskReaperSender = mpsc::Sender<ReapEntry>;
+
+struct ReapEntry {
+    task: JoinHandle<std::result::Result<(), String>>,
+    terminal: Arc<TaskTerminal>,
+}
+
+struct TaskTerminal {
+    finished: AtomicBool,
+    notify: Notify,
+}
+
+impl TaskTerminal {
+    fn new() -> Self {
+        Self {
+            finished: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn mark(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
 /// Handle to a running TURN server. Call [`TurnServerHandle::stop`] to
-/// shut it down cleanly (closing allocations and the listener); dropping
-/// it also tears the listener task down, but `stop` is preferred so
-/// in-flight allocations get a clean close.
+/// request the dependency's close protocol and join its close task; dropping
+/// it sends the same request and hands the exact task to a bounded reaper.
 pub struct TurnServerHandle {
-    server: Server,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<std::result::Result<(), String>>>,
+    terminal: Arc<TaskTerminal>,
+    task_reaper: Option<TaskReaperSender>,
+    task_reaper_handle: Option<JoinHandle<()>>,
     local_addr: SocketAddr,
     relay_ip: IpAddr,
 }
@@ -290,11 +321,122 @@ impl TurnServerHandle {
     }
 
     /// Stop the server, closing allocations and the listener.
-    pub async fn stop(self) -> Result<()> {
-        self.server
-            .close()
-            .await
-            .map_err(|e| Error::Turn(e.to_string()))
+    pub async fn stop(mut self) -> Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let task_result = if let Some(task) = self.task.take() {
+            task.await
+        } else {
+            Ok(Ok(()))
+        };
+        self.terminal.mark();
+        drop(self.task_reaper.take());
+        if let Some(reaper) = self.task_reaper_handle.take() {
+            reaper
+                .await
+                .map_err(|error| Error::TaskJoin(error.to_string()))?;
+        }
+        match task_result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::Turn(error)),
+            Err(error) => Err(Error::TaskJoin(error.to_string())),
+        }
+    }
+}
+
+impl Drop for TurnServerHandle {
+    fn drop(&mut self) {
+        let Some(shutdown) = self.shutdown.take() else {
+            return;
+        };
+        let _ = shutdown.send(());
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let entry = ReapEntry {
+            task,
+            terminal: Arc::clone(&self.terminal),
+        };
+        let Some(reaper) = self.task_reaper.take() else {
+            reap_without_runtime(entry);
+            return;
+        };
+        match reaper.try_send(entry) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(entry))
+            | Err(mpsc::error::TrySendError::Closed(entry)) => reap_without_runtime(entry),
+        }
+        drop(self.task_reaper_handle.take());
+    }
+}
+
+fn spawn_task_reaper() -> (TaskReaperSender, JoinHandle<()>) {
+    let (sender, mut receiver) = mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        while let Some(entry) = receiver.recv().await {
+            reap_entry(entry).await;
+        }
+    });
+    (sender, task)
+}
+
+async fn reap_entry(entry: ReapEntry) {
+    match entry.task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!("dropped TURN close task returned an error: {error}");
+        }
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => warn_join_error(error),
+    }
+    entry.terminal.mark();
+}
+
+fn warn_join_error(error: tokio::task::JoinError) {
+    tracing::warn!("dropped TURN close task did not join normally: {error}");
+}
+
+fn reap_without_runtime(entry: ReapEntry) {
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(reap_entry(entry));
+    } else {
+        let ReapEntry { task, terminal } = entry;
+        match join_without_runtime(task) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!("dropped TURN close task returned an error: {error}");
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => warn_join_error(error),
+        }
+        terminal.mark();
+    }
+}
+
+struct ThreadUnparker(thread::Thread);
+
+impl Wake for ThreadUnparker {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+fn join_without_runtime(
+    mut task: JoinHandle<std::result::Result<(), String>>,
+) -> std::result::Result<std::result::Result<(), String>, tokio::task::JoinError> {
+    let waker = Waker::from(Arc::new(ThreadUnparker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    let mut task = std::pin::Pin::new(&mut task);
+    loop {
+        match std::future::Future::poll(task.as_mut(), &mut context) {
+            Poll::Ready(result) => return result,
+            Poll::Pending => thread::park(),
+        }
     }
 }
 
@@ -360,6 +502,14 @@ impl TurnServer {
         .await
         .map_err(|e| Error::Turn(e.to_string()))?;
 
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            server.close().await.map_err(|error| error.to_string())
+        });
+        let terminal = Arc::new(TaskTerminal::new());
+        let (task_reaper, task_reaper_handle) = spawn_task_reaper();
+
         let relay_ports = if relay_port_min == 0 {
             "OS ephemeral range".to_string()
         } else {
@@ -375,7 +525,11 @@ impl TurnServer {
             config.port, relay_ports
         );
         Ok(TurnServerHandle {
-            server,
+            shutdown: Some(shutdown),
+            task: Some(task),
+            terminal,
+            task_reaper: Some(task_reaper),
+            task_reaper_handle: Some(task_reaper_handle),
             local_addr,
             relay_ip,
         })
@@ -467,6 +621,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_stop_observes_turn_close_terminal() {
+        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let terminal = Arc::clone(&server.terminal);
+
+        server.stop().await.unwrap();
+
+        assert!(terminal.finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn drop_outside_runtime_is_reaped_by_runtime_owner() {
+        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let terminal = Arc::clone(&server.terminal);
+        let notified = terminal.notify.notified();
+
+        std::thread::spawn(move || drop(server))
+            .join()
+            .expect("drop thread panicked");
+        notified.await;
+
+        assert!(terminal.finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn relay_allocations_land_in_configured_range() {
         // An allocation with no requested port must draw from the bounded
         // relay range, so operators can open one small UDP window.
@@ -534,7 +712,7 @@ mod tests {
 
     #[test]
     fn byte_bucket_shapes_to_rate() {
-        // rate 100_000 B/s → capacity max(100_000, 65_536) = 100_000.
+        // rate 100_000 B/s → the configured rate is the burst capacity.
         let mut b = ByteBucket::new(100_000);
         let t0 = Instant::now();
         // First 100KB fits in the burst — no wait.
@@ -553,7 +731,7 @@ mod tests {
     fn byte_bucket_oversized_datagram_never_deadlocks() {
         // A datagram larger than a tiny cap's per-second budget still
         // drains (clamped to capacity) rather than waiting forever.
-        let mut b = ByteBucket::new(1_000); // capacity floored to 65_536
+        let mut b = ByteBucket::new(1_000); // no hidden burst floor
         let t0 = Instant::now();
         // Drain the burst, then a full datagram is clamped to capacity.
         assert!(b.try_consume(65_536, t0).is_none());

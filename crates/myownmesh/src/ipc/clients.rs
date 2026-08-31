@@ -110,6 +110,7 @@ pub enum IpcAdmissionError {
 pub struct RegistryResidue {
     pub lifecycle: Lifecycle,
     pub live_tasks: u64,
+    pub watchdogs: u64,
     pub clients: u64,
     pub realtime_flows: u64,
     pub handler_claims: u64,
@@ -145,6 +146,7 @@ impl RegistryResidue {
         Self {
             lifecycle,
             live_tasks: 0,
+            watchdogs: 0,
             clients: 0,
             realtime_flows: 0,
             handler_claims: 0,
@@ -1586,6 +1588,10 @@ struct RegistryTables {
     /// for tasks. One lock over both means an admission either happens entirely
     /// before the transition or is refused by it.
     live_tasks: u64,
+    /// Inbound stream watchdogs retained until shutdown observes each result.
+    /// Keeping the handle here prevents bridge code from detaching a task and
+    /// makes its node allocation independently funded.
+    watchdogs: crate::ipc::LeasedList<tokio::task::JoinHandle<()>>,
     clients: LeasedMap<ClientId, FundedArc<ClientHandle>>,
     handler_claims: LeasedMap<ClaimKey, Funded<ClientId>>,
     /// Subscribers per (network, channel), as a funded set of funded members.
@@ -2189,12 +2195,96 @@ impl WeakClientRegistry {
     }
 }
 
+impl Drop for RegistryTables {
+    fn drop(&mut self) {
+        // A synchronous drop cannot await. Abort any handle that escaped an
+        // orderly control shutdown so the fallback is cancellation, never a
+        // live detached watchdog. The normal shutdown path observes JoinError
+        // through `drain_watchdogs` first.
+        while let Some(handle) = self.watchdogs.pop() {
+            handle.abort();
+        }
+    }
+}
+
 /// Every operation this registry performs on the tables declared above.
 ///
 /// A descendant, so it reaches every private field here without any of them
 /// being widened for it. What the state *is* stays with the claims that fund
 /// it; what is *done* with it lives there.
 mod registry;
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::{ClientRegistry, IpcAdmissionError};
+    use myownmesh_core::ResourceClaim;
+
+    #[tokio::test]
+    async fn watchdog_completion_panic_and_shutdown_are_joined_once() {
+        let registry = ClientRegistry::default();
+
+        let completion_admission = registry.lease_task().expect("completion is funded");
+        let completion = tokio::spawn(async move {
+            drop(completion_admission);
+        });
+        registry
+            .retain_watchdog(completion)
+            .expect("completion handle is retained");
+
+        let panic_admission = registry.lease_task().expect("panic is funded");
+        let panic_task = tokio::spawn(async move {
+            drop(panic_admission);
+            panic!("watchdog control panic");
+        });
+        registry
+            .retain_watchdog(panic_task)
+            .expect("panic handle is retained");
+
+        let shutdown_registry = registry.clone();
+        let shutdown_admission = registry.lease_task().expect("shutdown is funded");
+        let shutdown_task = tokio::spawn(async move {
+            shutdown_registry.closing().await;
+            drop(shutdown_admission);
+        });
+        registry
+            .retain_watchdog(shutdown_task)
+            .expect("shutdown handle is retained");
+
+        assert!(registry.begin_closing(), "the first close fences admission");
+        assert_eq!(
+            registry.drain_watchdogs().await,
+            1,
+            "completion and shutdown are observed, and only panic is abnormal"
+        );
+        assert_eq!(registry.residue().watchdogs, 0);
+        registry.wait_for_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_admission_refuses_full_and_closed_without_detaching() {
+        let full = ClientRegistry::over_grant(ResourceClaim::ZERO);
+        let full_task = tokio::spawn(async {});
+        let (full_task, refusal) = full
+            .retain_watchdog(full_task)
+            .expect_err("a zero grant cannot retain a watchdog node");
+        assert!(matches!(refusal, IpcAdmissionError::Resources(_)));
+        full_task.abort();
+        let _ = full_task.await;
+        assert_eq!(full.residue().watchdogs, 0);
+
+        let closed = ClientRegistry::default();
+        assert!(closed.begin_closing());
+        let closed_task = tokio::spawn(async {});
+        let (closed_task, refusal) = closed
+            .retain_watchdog(closed_task)
+            .expect_err("a closing registry cannot retain a watchdog");
+        assert!(matches!(refusal, IpcAdmissionError::Closing));
+        closed_task
+            .await
+            .expect("the refused handle remains owned by this control");
+        assert_eq!(closed.residue().watchdogs, 0);
+    }
+}
 
 #[cfg(test)]
 mod tests;

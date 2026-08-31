@@ -194,6 +194,7 @@ impl ClientRegistry {
                 tables: Mutex::new(RegistryTables {
                     lifecycle: Lifecycle::Running,
                     live_tasks: 0,
+                    watchdogs: crate::ipc::LeasedList::new(),
                     clients: LeasedMap::new(),
                     handler_claims: LeasedMap::new(),
                     channel_subs: LeasedMap::new(),
@@ -352,6 +353,7 @@ impl ClientRegistry {
         let mut residue = RegistryResidue {
             lifecycle: tables.lifecycle,
             live_tasks: tables.live_tasks,
+            watchdogs: tables.watchdogs.len() as u64,
             clients: 0,
             realtime_flows: 0,
             handler_claims: 0,
@@ -444,6 +446,46 @@ impl ClientRegistry {
             }
             idle.await;
         }
+    }
+
+    /// Retain an inbound-stream watchdog under the same lifecycle fence as
+    /// every other registry admission. The handle is returned on refusal so
+    /// its owner can abort and observe it exactly once rather than detaching
+    /// it on an error path.
+    pub(crate) fn retain_watchdog(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Result<(), (tokio::task::JoinHandle<()>, IpcAdmissionError)> {
+        let claim = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .map_err(|reason| (handle, IpcAdmissionError::Claim(reason)))?;
+        let mut tables = self.inner.tables.lock();
+        if let Err(reason) = admitting(&tables) {
+            return Err((handle, reason));
+        }
+        let node = self
+            .inner
+            .resources
+            .acquire(claim)
+            .map_err(IpcAdmissionError::Resources)
+            .map_err(|reason| (handle, reason))?;
+        tables.watchdogs.push(handle, node);
+        Ok(())
+    }
+
+    /// Remove and await every retained watchdog, observing each terminal
+    /// result exactly once. The table lock is released before awaiting, and
+    /// the node lease is released when the entry is popped.
+    pub(crate) async fn drain_watchdogs(&self) -> usize {
+        let mut abnormal = 0;
+        while let Some(handle) = {
+            let mut tables = self.inner.tables.lock();
+            tables.watchdogs.pop()
+        } {
+            if handle.await.is_err() {
+                abnormal += 1;
+            }
+        }
+        abnormal
     }
 
     /// Resolve when the runtime enters `Closing`, or immediately if it already

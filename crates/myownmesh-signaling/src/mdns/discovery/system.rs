@@ -36,11 +36,19 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 use super::{
-    DiscoveryConfig, DiscoveryEvent, ResolveCompletion, ResolveHint, ResolveLease,
-    ResolveOwnership, MAX_DNS_NAME_BYTES, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES,
-    MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
+    DiscoveryConfig, DiscoveryEvent, DiscoveryLimits, ResolveCompletion, ResolveHint, ResolveLease,
+    ResolveOwnership, MAX_DNS_NAME_BYTES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
 };
 use crate::Error;
+
+/// Poll cadence used only to re-check stop/deadline state around the
+/// dependency-owned DNSServiceRef socket. It is a liveness implementation
+/// bound, not a discovery workload or queue capacity; query duration remains
+/// owner-selected through `MdnsTimingProfile::query_deadline`.
+const DNS_SD_POLL_TIMEOUT_MS: i32 = 500;
+/// DNS-SD encodes each TXT string with one octet of length. Keep this wire
+/// fact separate from the application's value/parser guards in `super`.
+const DNS_SD_TXT_STRING_MAX_BYTES: usize = u8::MAX as usize;
 
 // ---- the dnssd C API (dns_sd.h) ----------------------------------------
 
@@ -178,7 +186,7 @@ fn encode_txt(entries: &[(String, String)]) -> Vec<u8> {
         // A TXT string caps at 255 bytes; our entries (version, room hash,
         // device pubkey) are all far below it. Oversize would be a programmer
         // error — truncate defensively rather than emit corrupt rdata.
-        let len = bytes.len().min(255);
+        let len = bytes.len().min(DNS_SD_TXT_STRING_MAX_BYTES);
         out.push(len as u8);
         out.extend_from_slice(&bytes[..len]);
     }
@@ -186,8 +194,8 @@ fn encode_txt(entries: &[(String, String)]) -> Vec<u8> {
 }
 
 /// Parse DNS TXT rdata into a key→value map (a flag entry maps to "").
-fn parse_txt(rdata: &[u8]) -> HashMap<String, String> {
-    if rdata.len() > MAX_TXT_BYTES {
+fn parse_txt(rdata: &[u8], max_bytes: usize, max_entries: usize) -> HashMap<String, String> {
+    if rdata.len() > max_bytes {
         return HashMap::new();
     }
     let mut out = HashMap::new();
@@ -195,7 +203,7 @@ fn parse_txt(rdata: &[u8]) -> HashMap<String, String> {
     let mut entries = 0usize;
     while p < rdata.len() {
         entries += 1;
-        if entries > MAX_TXT_ENTRIES {
+        if entries > max_entries {
             return HashMap::new();
         }
         let len = rdata[p] as usize;
@@ -254,15 +262,20 @@ unsafe fn process_ref(sd_ref: DNSServiceRef, until: impl Fn() -> bool, deadline:
             events: libc::POLLIN,
             revents: 0,
         };
-        let rc = libc::poll(&mut pfd, 1, 500);
+        let rc = libc::poll(&mut pfd, 1, DNS_SD_POLL_TIMEOUT_MS);
         if rc < 0 {
             return;
         }
         if rc == 0 {
             continue; // tick: re-check until()/deadline
         }
-        if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
-            return;
+        // `libc` exposes the error-bit constants on POSIX targets but not on
+        // Windows.  Any nonzero result is handed to the DNS-SD API, which
+        // reports readiness and terminal/error states through its return code;
+        // this keeps the same fail-closed behavior without target-specific
+        // constants.
+        if pfd.revents == 0 {
+            continue;
         }
         if DNSServiceProcessResult(sd_ref) != NO_ERROR {
             return;
@@ -298,6 +311,7 @@ struct Inner {
     /// and resolve ownership alive only for their owner.
     workers: WorkerRegistry,
     query_deadline: Duration,
+    discovery_limits: DiscoveryLimits,
 }
 
 /// A checked, non-wrapping epoch for each exact DNS-SD service-instance key.
@@ -444,14 +458,14 @@ impl Discovery {
     /// stream. Fails fast when the daemon is unreachable (no mDNSResponder /
     /// Avahi) — callers fall back to their other signaling transports.
     pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+        if !cfg.validate() || !cfg.limits.validate() || !cfg.timing.validate() {
+            return Err(Error::Other("invalid discovery configuration".into()));
+        }
         let regtype = CString::new(regtype_of(&cfg.service_type))
             .map_err(|e| Error::Other(format!("service type: {e}")))?;
         let instance = CString::new(cfg.instance.as_str())
             .map_err(|e| Error::Other(format!("instance name: {e}")))?;
 
-        if !cfg.limits.validate() || !cfg.timing.validate() {
-            return Err(Error::Other("invalid discovery limits".into()));
-        }
         let (tx, rx) = mpsc::channel(cfg.limits.event_capacity);
         let inner = Arc::new(Inner {
             regtype,
@@ -466,6 +480,7 @@ impl Discovery {
             tx,
             workers: WorkerRegistry::new(),
             query_deadline: cfg.timing.query_deadline,
+            discovery_limits: cfg.limits,
         });
 
         // Browse first (mirrors the embedded backend: never miss resolves
@@ -754,7 +769,6 @@ unsafe extern "C" fn browse_cb(
                     event_generation,
                 )
             });
-        drop(_resolution_fence);
         match spawn_result {
             Ok(worker) => {
                 let callback_inner = &*(ctx as *const Inner);
@@ -768,6 +782,10 @@ unsafe extern "C" fn browse_cb(
                     .remove_if_current(&epoch_key, event_generation);
             }
         }
+        // Keep publication under the same fence as admission. Shutdown takes
+        // this fence before draining workers, so it cannot observe the epoch
+        // cleared while the corresponding JoinHandle is still unpublished.
+        drop(_resolution_fence);
     } else {
         let generation = {
             let _resolution_fence = inner.resolution_fence.lock();
@@ -814,6 +832,8 @@ struct ResolveOut {
     port: u16,
     txt: HashMap<String, String>,
     interface_index: u32,
+    max_txt_bytes: usize,
+    max_txt_entries: usize,
 }
 
 unsafe extern "C" fn resolve_cb(
@@ -842,8 +862,12 @@ unsafe extern "C" fn resolve_cb(
     out.host = Some(host);
     out.port = u16::from_be(port_network_order);
     out.interface_index = interface_index;
-    if !txt_record.is_null() && txt_len > 0 && txt_len as usize <= MAX_TXT_BYTES {
-        out.txt = parse_txt(std::slice::from_raw_parts(txt_record, txt_len as usize));
+    if !txt_record.is_null() && txt_len > 0 && txt_len as usize <= out.max_txt_bytes {
+        out.txt = parse_txt(
+            std::slice::from_raw_parts(txt_record, txt_len as usize),
+            out.max_txt_bytes,
+            out.max_txt_entries,
+        );
     }
 }
 
@@ -852,6 +876,8 @@ unsafe extern "C" fn resolve_cb(
 struct AddrOut {
     done: bool,
     addrs: Vec<IpAddr>,
+    max_addresses: usize,
+    overflowed: bool,
 }
 
 unsafe extern "C" fn addr_cb(
@@ -876,8 +902,14 @@ unsafe extern "C" fn addr_cb(
     {
         let octets = std::slice::from_raw_parts(rdata as *const u8, 4);
         let ip = IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
-        if !out.addrs.contains(&ip) && out.addrs.len() < MAX_RESOLVED_ADDRESSES {
-            out.addrs.push(ip);
+        if !out.addrs.contains(&ip) {
+            if out.addrs.len() >= out.max_addresses {
+                // Do not retain a prefix: callback order must not decide
+                // which addresses become authoritative for this resolution.
+                out.overflowed = true;
+            } else {
+                out.addrs.push(ip);
+            }
         }
     }
     if flags & FLAG_MORE_COMING == 0 {
@@ -946,7 +978,11 @@ fn resolve_instance(
     };
 
     // SRV + TXT.
-    let mut out = ResolveOut::default();
+    let mut out = ResolveOut {
+        max_txt_bytes: inner.discovery_limits.max_txt_bytes,
+        max_txt_entries: inner.discovery_limits.max_txt_entries,
+        ..ResolveOut::default()
+    };
     let mut sd_ref: DNSServiceRef = std::ptr::null_mut();
     let resolve_deadline = checked_query_deadline(query_deadline)?;
     let err = unsafe {
@@ -978,7 +1014,10 @@ fn resolve_instance(
     // Address lookup — an A query (v4 only, matching the embedded backend:
     // the exchange dials IPv4 addresses; parity keeps the driver identical).
     let c_host = CString::new(host).ok()?;
-    let mut addrs = AddrOut::default();
+    let mut addrs = AddrOut {
+        max_addresses: inner.discovery_limits.max_resolved_addresses,
+        ..AddrOut::default()
+    };
     let mut sd_ref: DNSServiceRef = std::ptr::null_mut();
     let address_deadline = checked_query_deadline(query_deadline)?;
     let err = unsafe {
@@ -1006,7 +1045,16 @@ fn resolve_instance(
         DNSServiceRefDeallocate(sd_ref);
     }
 
-    Some((addrs.addrs, out.port, out.txt))
+    let addresses = accepted_addresses(addrs)?;
+    Some((addresses, out.port, out.txt))
+}
+
+fn accepted_addresses(out: AddrOut) -> Option<Vec<IpAddr>> {
+    if out.overflowed || out.addrs.is_empty() {
+        None
+    } else {
+        Some(out.addrs)
+    }
 }
 
 fn checked_query_deadline(query_deadline: Duration) -> Option<Instant> {
@@ -1028,24 +1076,83 @@ mod tests {
 
     #[test]
     fn txt_codec_round_trips() {
+        let limits = DiscoveryLimits::default();
         let entries = vec![
             ("v".to_string(), "1".to_string()),
             ("room".to_string(), "a".repeat(64)),
             ("peer".to_string(), "b".repeat(52)),
         ];
         let rdata = encode_txt(&entries);
-        let parsed = parse_txt(&rdata);
+        let parsed = parse_txt(&rdata, limits.max_txt_bytes, limits.max_txt_entries);
         assert_eq!(parsed.len(), 3);
         assert_eq!(parsed["v"], "1");
         assert_eq!(parsed["room"], "a".repeat(64));
         assert_eq!(parsed["peer"], "b".repeat(52));
 
         // Flag entries (no '=') parse as empty values; garbage is skipped.
-        let parsed = parse_txt(&[4, b'f', b'l', b'a', b'g']);
+        let parsed = parse_txt(
+            &[4, b'f', b'l', b'a', b'g'],
+            limits.max_txt_bytes,
+            limits.max_txt_entries,
+        );
         assert_eq!(parsed["flag"], "");
         // Truncated length prefixes never panic.
-        let parsed = parse_txt(&[200, b'x']);
+        let parsed = parse_txt(&[200, b'x'], limits.max_txt_bytes, limits.max_txt_entries);
         assert!(parsed.is_empty() || parsed.contains_key("x"));
+    }
+
+    fn emit_address(out: &mut AddrOut, octets: [u8; 4], more_coming: bool) {
+        let flags = FLAG_ADD | if more_coming { FLAG_MORE_COMING } else { 0 };
+        unsafe {
+            addr_cb(
+                std::ptr::null_mut(),
+                flags,
+                0,
+                NO_ERROR,
+                std::ptr::null(),
+                RR_TYPE_A,
+                RR_CLASS_IN,
+                4,
+                octets.as_ptr().cast(),
+                0,
+                out as *mut AddrOut as *mut c_void,
+            );
+        }
+    }
+
+    #[test]
+    fn address_overflow_refuses_the_whole_resolution_without_publication() {
+        let mut out = AddrOut {
+            max_addresses: 2,
+            ..AddrOut::default()
+        };
+        emit_address(&mut out, [192, 0, 2, 1], true);
+        emit_address(&mut out, [192, 0, 2, 2], true);
+        emit_address(&mut out, [192, 0, 2, 3], false);
+        assert!(out.overflowed);
+        assert_eq!(out.addrs.len(), 2);
+
+        let mut published = 0usize;
+        if let Some(addresses) = accepted_addresses(out) {
+            published += addresses.len();
+        }
+        assert_eq!(published, 0, "overflow must not publish a retained prefix");
+    }
+
+    #[test]
+    fn configured_address_capacity_publishes_all_unique_addresses_at_the_bound() {
+        let mut out = AddrOut {
+            max_addresses: 3,
+            ..AddrOut::default()
+        };
+        emit_address(&mut out, [192, 0, 2, 1], true);
+        emit_address(&mut out, [192, 0, 2, 2], true);
+        emit_address(&mut out, [192, 0, 2, 3], false);
+        assert!(!out.overflowed);
+        let addresses = accepted_addresses(out).expect("exact bound is publishable");
+        assert_eq!(addresses.len(), 3);
+        assert_eq!(addresses[0], IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(addresses[2], IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3)));
     }
 
     #[test]
@@ -1169,6 +1276,9 @@ mod tests {
             max_resolve_owners: 3,
             event_capacity: 5,
             max_event_epochs: 7,
+            max_txt_entries: 8,
+            max_txt_bytes: 512,
+            max_resolved_addresses: 4,
         };
         let cfg = DiscoveryConfig {
             service_type: "_momtest._tcp.local.".into(),

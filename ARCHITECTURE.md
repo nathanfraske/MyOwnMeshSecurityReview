@@ -450,44 +450,31 @@ Carrier choice changes latency, loss, cost, metadata exposure, and availability.
 
 ### 7.1 Closed member relay
 
-A Closed member B may offer an explicit bounded relay function for A and C. B remains visibly Device B. Anonymous attestation is neither required nor desirable.
+The supported Closed member relay is an explicit three-party path, not an automatic A-C transport upgrade. A and B independently discover, endpoint-authenticate, and promote their exact leg; B and C do the same for their exact leg. B remains visibly Device B and is the local canonical relay member. Anonymous attestation is neither required nor desirable.
 
-A basal Closed member-relay allocation requires:
+After both legs are live, the endpoints establish one opaque session through B with the exact control sequence:
 
-- current Closed authorization for the endpoints and B under the local accepted view;
-- a valid current relay offer or capability for B under the selected Closed profile;
-- local relay policy at A, B, and C;
-- one exact A-C allocation with bounded resources;
-- fixed endpoints and no arbitrary host, port, fanout, or recursive relay destination;
-- fresh A-C endpoint authentication through the resulting channel.
+```text
+A -> B: Open(context, requester=A, relay=B, target=C, session)
+B -> C: Offer(same route, requester share)
+C -> B: Accept(same route, target share)
+B <-> A/C: ClosedRelayData carrying opaque ciphertext
+A <-> C: endpoint-local seal/open over the opaque session
+```
 
-B may authenticate relay setup with its ordinary Device identity or through an already authenticated Device channel. A separate operational relay key is optional private-key custody hardening. It remains visible and explicitly delegated by B. It is not an anonymous credential or another authority root.
+The route is the complete `(context, requester, relay, target, session)` tuple. Every control and data message is validated against that route before state mutation or forwarding. The endpoint key agreement uses signed ephemeral X25519, HKDF-SHA256, and AES-256-GCM with directional nonce and replay fences. Only A and C hold endpoint session cryptographic state; B forwards `OpaqueRelayPacket` values and cannot read A-C application plaintext.
 
-B may drop, delay, reorder, meter, or correlate opaque traffic and observe carrier metadata. Under the endpoint cryptographic premises, B cannot authenticate as A or C, read A-C application plaintext, or forge accepted A-C application packets.
+B's allocation is a provider-backed, move-only resource lease covering two bounded directional relay queues and their retained custody. Admission requires current Closed authorization, exact promoted A-B and B-C session witnesses, the local relay policy, and the exact route. The runtime rejects arbitrary host or port selectors, fanout, recursive relays, and replacement or stale owner generations. A refusal constructs no relay state; expiry, stale ownership, endpoint retirement, queue closure, and shutdown settle the exact allocation and wake bounded waiters.
 
-A relay may be tried immediately, raced with direct and TURN candidates, retained as backup, or preferred by local policy. It need not be a last resort and no exhaustive candidate search is a security prerequisite.
+The relay may drop, delay, reorder, meter, or correlate opaque traffic and observe carrier metadata. Those are availability and metadata effects, not endpoint authority. This profile does not claim automatic candidate racing, relay-to-relay handoff, or a generic promoted A-C WebRTC channel: Open/Offer/Accept and the endpoint cryptographic session are required before application data is usable.
 
-## 8. Recovery and handoff
+## 8. Closed relay close and shutdown
 
-![Closed member relay and endpoint-driven handoff](diagrams/04-closed-member-relay-handoff.svg)
+![Closed member relay explicit setup and terminal close](diagrams/04-closed-member-relay-handoff.svg)
 
-Handoff is endpoint-driven and live. It does not require a durable `PathOffer`, `PathAccept`, `PathID`, `PathRetire`, a monotonic path generation, a globally current route, or relay-to-relay signaling.
+Close is also explicit and route-bound. An endpoint sends `Close` through its exact promoted leg; B validates the authenticated sender and exact allocation generation, marks the slot closing, and forwards the canonical close once to the opposite endpoint. The opposite endpoint closes its exact local session and returns the acknowledgement through B. B settles the exact allocation, and the initiator becomes terminal. Duplicate close messages are idempotent for the same terminal tombstone and cannot affect a successor allocation with a reused session identifier.
 
-If A and C are using B and the connector finds D:
-
-1. Keep B active.
-2. Attempt D under the speculative-work budget.
-3. Establish a working candidate channel through D.
-4. Perform fresh A-C endpoint authentication or current-session key confirmation bound to that exact channel.
-5. Add the authenticated D channel to the local usable-channel set.
-6. Select D according to local path policy.
-7. Close B when policy and in-flight work permit.
-
-An attacker may drop B and thereby trigger failover policy. That is availability influence. The attacker cannot make D application-usable without the endpoint authentication and promotion predicates.
-
-Old signaling or handoff messages may cause bounded duplicate candidate work. They cannot recreate a live channel capability, endpoint-authentication result, packet key, replay state, or session handle.
-
-No simultaneous global switch is required. A and C may temporarily send over different authenticated channels or keep more than one authenticated channel active.
+Shutdown uses the same exact-owner fence. It wakes pending Open/Offer/Accept waiters, checked-out receives, and relay queue operations; it then settles endpoint, accepted, pending, closing, and allocation custody before the driver join completes. No relay or endpoint handle remains usable after its exact owner, route, or generation is stale.
 
 ## 9. Reachability and freshness
 

@@ -4023,7 +4023,7 @@ struct ConnectorOwnership {
     incarnation: Arc<WebRtcConnectorIncarnation>,
     authority: Arc<SyncMutex<ConnectorAuthorityState>>,
     operation_fence: Arc<ConnectorOperationFence>,
-    work_resource_scope: ConnectorWorkResourceScope,
+    work_resource_scope: Arc<SyncMutex<Option<ConnectorWorkResourceScope>>>,
     candidate_promoted: Arc<AtomicBool>,
     cleanup_complete: Arc<AtomicBool>,
     cleanup_failed: Arc<AtomicBool>,
@@ -4045,7 +4045,7 @@ impl ConnectorOwnership {
                 liveness: attempt,
             })),
             operation_fence,
-            work_resource_scope,
+            work_resource_scope: Arc::new(SyncMutex::new(Some(work_resource_scope))),
             candidate_promoted,
             cleanup_complete: Arc::new(AtomicBool::new(false)),
             cleanup_failed: Arc::new(AtomicBool::new(false)),
@@ -4109,8 +4109,10 @@ impl ConnectorOwnership {
     }
 
     fn enter_operation(&self) -> Result<ConnectorOwnedOperationPermit> {
-        let resources = self
-            .work_resource_scope
+        let work_resource_scope = self
+            .work_resource_scope()
+            .ok_or_else(|| Error::Transport("connector work scope was relinquished".to_string()))?;
+        let resources = work_resource_scope
             .acquire(
                 crate::resource::ResourceAuthorityClass::Speculative,
                 crate::runtime::attempt::connector_operation_claim(),
@@ -4124,6 +4126,14 @@ impl ConnectorOwnership {
             _fence: fence,
             _resources: resources,
         })
+    }
+
+    fn relinquish_work_resource_scope(&self) {
+        self.work_resource_scope.lock().take();
+    }
+
+    fn work_resource_scope(&self) -> Option<ConnectorWorkResourceScope> {
+        self.work_resource_scope.lock().clone()
     }
 
     fn begin_close(&self) {
@@ -4596,7 +4606,6 @@ pub(crate) struct WebRtcConnectorWorker {
     /// disagree about which is authoritative during a close.
     realtime_flows: Arc<RealtimeFlowRegistry>,
     resource_scope: PeerConnectionResourceScope,
-    _transport_observation: ObservationLease,
     /// Which single binding component this connector withholds from its own
     /// supplier. **Controls only**, compiled out of production entirely.
     ///
@@ -4621,7 +4630,6 @@ struct AdmittedConnectorOwnership {
     close_owner: Arc<ConnectorCloseOwner>,
     resource_scope: PeerConnectionResourceScope,
     work_resource_scope: ConnectorWorkResourceScope,
-    transport_observation: ObservationLease,
 }
 
 /// The session side of the realtime flow binding.
@@ -4651,9 +4659,12 @@ impl WebRtcConnectorWorker {
         claim: crate::resource::ResourceClaim,
     ) -> std::result::Result<crate::resource::ResourceLease, crate::resource::ResourceUnavailable>
     {
-        self.ownership
-            .work_resource_scope
-            .acquire(crate::resource::ResourceAuthorityClass::Speculative, claim)
+        let Some(work_resource_scope) = self.ownership.work_resource_scope() else {
+            return Err(crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: crate::resource::ResourceClass::WorkerOrTask,
+            });
+        };
+        work_resource_scope.acquire(crate::resource::ResourceAuthorityClass::Speculative, claim)
     }
 
     /// Build the flow set one promoted session owns.
@@ -4978,7 +4989,6 @@ impl WebRtcConnectorWorker {
             close_owner,
             resource_scope,
             work_resource_scope,
-            transport_observation,
         } = admitted;
         let attempt_retirement = attempt_liveness.subscribe_retirement();
         let session = Arc::new(session);
@@ -5019,7 +5029,6 @@ impl WebRtcConnectorWorker {
                 remote_candidates,
                 close_owner,
                 resource_scope,
-                _transport_observation: transport_observation,
                 #[cfg(all(test, feature = "transport-lab"))]
                 withheld_binding_component: std::sync::atomic::AtomicU8::new(0),
                 #[cfg(test)]
@@ -6395,6 +6404,7 @@ impl Transport {
             ownership.clone(),
             resource_owner.clone(),
             cleanup_capability,
+            Some(transport_observation),
         );
         let mut outer_cleanup = StartConnectorCleanupOnDrop::new(Arc::clone(&close_owner));
         let construction_close_owner = Arc::clone(&close_owner);
@@ -6474,7 +6484,6 @@ impl Transport {
                 close_owner,
                 resource_scope,
                 work_resource_scope,
-                transport_observation,
             },
         );
         if admitted.is_ok() {
@@ -9210,6 +9219,20 @@ mod tests {
     fn close_owner_fixture(
         owner: &MeshConnectorResourceScope,
     ) -> (Arc<ConnectorCloseOwner>, AttemptLifetime) {
+        close_owner_fixture_with_observation(owner, None)
+    }
+
+    /// A close-owner fixture with an optional real transport observation.
+    ///
+    /// Production installs this observation before the native connector is
+    /// admitted and keeps it on the close owner until native close succeeds.
+    /// The transport terminal controls use an isolated observation scope so
+    /// they can inspect that exact family without depending on process-global
+    /// accounting from other tests.
+    fn close_owner_fixture_with_observation(
+        owner: &MeshConnectorResourceScope,
+        observation_scope: Option<&PeerConnectionResourceScope>,
+    ) -> (Arc<ConnectorCloseOwner>, AttemptLifetime) {
         let (permit, lifetime, claim) =
             admit_single_connector_candidate(crate::runtime::runtime_for_test(), owner.clone());
         let mut candidate = permit
@@ -9219,8 +9242,15 @@ mod tests {
             .issue_cleanup_capability()
             .expect("fixture candidate issues one cleanup capability");
         let ownership = admitted_ownership(candidate);
+        let transport_observation = observation_scope
+            .map(|scope| observe_inexact_item(scope, PreAuthResourceFamily::TransportObject, 1, 0));
         (
-            ConnectorCloseOwner::new(ownership, owner.clone(), cleanup_capability),
+            ConnectorCloseOwner::new(
+                ownership,
+                owner.clone(),
+                cleanup_capability,
+                transport_observation,
+            ),
             lifetime,
         )
     }
@@ -9360,6 +9390,24 @@ mod tests {
             .iter()
             .find(|report| report.family == PreAuthResourceFamily::CandidateObject)
             .expect("candidate family is present")
+    }
+
+    fn transport_object_report(
+        scope: &PeerConnectionResourceScope,
+    ) -> ResourceFamilyReport<PreAuthResourceFamily> {
+        *scope
+            .report()
+            .pre_authentication
+            .iter()
+            .find(|report| report.family == PreAuthResourceFamily::TransportObject)
+            .expect("transport-object family is present")
+    }
+
+    fn transport_observation_scope() -> PeerConnectionResourceScope {
+        ProcessResourceRoot::isolated()
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope()
     }
 
     fn observed_candidate() -> LocalIceCandidate {
@@ -11707,6 +11755,53 @@ mod tests {
         assert_eq!(owner.report().active_candidates, 0);
     }
 
+    #[test]
+    fn v4_arc03_cleanup_executor_is_joined_after_non_runtime_owner_drop() {
+        let grant = crate::runtime::attempt::explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let process_port = ResourceProviderPort::new(provider.clone())
+            .expect("fixture provider admits its process scope");
+        let process_owner = ConnectorResourceOwnerPort::new(process_port);
+        let mesh = process_owner
+            .issue_mesh_scope()
+            .expect("fixture process owner issues its Mesh scope");
+        let (close_owner, _lifetime) = close_owner_fixture(&mesh);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Success,
+                calls: Arc::clone(&calls),
+            }))
+        );
+
+        let caller_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture caller runtime");
+        caller_runtime.block_on(async { close_owner.start() });
+        drop(caller_runtime);
+
+        let verifier_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("fixture verifier runtime");
+        verifier_runtime
+            .block_on(close_owner.wait())
+            .expect("native close is observed by the executor");
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // These final drops happen on this ordinary thread, after the caller
+        // runtime is gone. The process root must be released synchronously,
+        // which requires observing the executor thread rather than detaching
+        // its JoinHandle.
+        drop(close_owner);
+        drop(mesh);
+        drop(process_owner);
+        assert_eq!(provider.active_scopes(), 0);
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.in_use(), crate::resource::ResourceClaim::ZERO);
+    }
+
     #[tokio::test]
     async fn v4_arc03_duplicate_connected_claims_remain_exact_and_local() {
         let owner = test_resource_owner(4, 1);
@@ -11828,7 +11923,17 @@ mod tests {
         reuse: Option<&str>,
         native_close: TestNativeCloseResult,
     ) -> AuthTaskFixture {
-        let (close_owner, lifetime) = close_owner_fixture(owner);
+        auth_task_fixture_with_scope(owner, None, reuse, native_close)
+    }
+
+    fn auth_task_fixture_with_scope(
+        owner: &MeshConnectorResourceScope,
+        observation_scope: Option<&PeerConnectionResourceScope>,
+        reuse: Option<&str>,
+        native_close: TestNativeCloseResult,
+    ) -> AuthTaskFixture {
+        let (close_owner, lifetime) =
+            close_owner_fixture_with_observation(owner, observation_scope);
         let calls = Arc::new(AtomicUsize::new(0));
         assert!(
             close_owner.attach_native_port(Arc::new(TestNativeClosePort {
@@ -12425,6 +12530,119 @@ mod tests {
             0,
             "and the claim is released only after close succeeded"
         );
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_transport_object_stays_charged_until_gated_native_close_succeeds() {
+        let owner = test_resource_owner(1, 1);
+        let observation_scope = transport_observation_scope();
+        let gate = TestNativeCloseGate::new();
+        let (close_owner, _lifetime) =
+            close_owner_fixture_with_observation(&owner, Some(&observation_scope));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Gate(Arc::clone(&gate)),
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = Arc::new(task_from_handoff(EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        )));
+
+        let before = transport_object_report(&observation_scope);
+        assert_eq!(before.active.items(), 1);
+        assert_eq!(before.active_lease_count, 1);
+        assert!(before.oldest_active_lifetime.is_some());
+        assert!(!before.oldest_active_lifetime_inexact);
+        assert!(Arc::strong_count(&task) >= 1, "worker Arc remains retained");
+
+        let closing = tokio::spawn({
+            let close_owner = Arc::clone(&close_owner);
+            async move { close_owner.wait().await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), gate.wait_for_entry())
+            .await
+            .expect("native close reaches the exact gate");
+        let during = transport_object_report(&observation_scope);
+        assert_eq!(during.active.items(), 1);
+        assert_eq!(during.active_lease_count, 1);
+        assert!(during.oldest_active_lifetime.is_some());
+        assert!(!during.oldest_active_lifetime_inexact);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        gate.open();
+        tokio::time::timeout(Duration::from_secs(1), closing)
+            .await
+            .expect("gated close completes")
+            .expect("close task joins")
+            .expect("native close succeeds");
+        let after = transport_object_report(&observation_scope);
+        assert_eq!(after.active, ResourceUse::ZERO);
+        assert_eq!(after.active_lease_count, 0);
+        assert!(after.oldest_active_lifetime.is_none());
+        assert!(!after.oldest_active_lifetime_inexact);
+        assert!(
+            Arc::strong_count(&task) >= 1,
+            "worker Arc remains after terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn v4_arc03_transport_object_fail_close_retains_charge_until_owner_drop() {
+        let owner = test_resource_owner(2, 1);
+        let observation_scope = transport_observation_scope();
+        let (close_owner, _lifetime) =
+            close_owner_fixture_with_observation(&owner, Some(&observation_scope));
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert!(
+            close_owner.attach_native_port(Arc::new(TestNativeClosePort {
+                result: TestNativeCloseResult::Error,
+                calls: Arc::clone(&calls),
+            }))
+        );
+        let connected = match close_owner.ownership.mark_data_channel_open() {
+            DataChannelOpenTransition::Connected(capability) => capability,
+            _ => panic!("fixture connector promotes"),
+        };
+        let task = Arc::new(task_from_handoff(EndpointAuthHandoff::new(
+            connected,
+            Arc::clone(&close_owner.ownership.incarnation),
+            Arc::clone(&close_owner),
+        )));
+
+        let error = close_owner
+            .wait()
+            .await
+            .expect_err("native close failure is fail closed");
+        assert!(error.to_string().contains("injected native close failure"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let failed = transport_object_report(&observation_scope);
+        assert_eq!(failed.active.items(), 1);
+        assert_eq!(failed.active_lease_count, 1);
+        assert!(failed.oldest_active_lifetime.is_some());
+        assert!(!failed.oldest_active_lifetime_inexact);
+        assert!(
+            Arc::strong_count(&task) >= 1,
+            "worker Arc remains on failure"
+        );
+
+        drop(task);
+        let retained = transport_object_report(&observation_scope);
+        assert_eq!(retained.active.items(), 1);
+        assert_eq!(retained.active_lease_count, 1);
+        drop(close_owner);
+        let released = transport_object_report(&observation_scope);
+        assert_eq!(released.active, ResourceUse::ZERO);
+        assert_eq!(released.active_lease_count, 0);
+        assert!(released.oldest_active_lifetime.is_none());
+        assert!(!released.oldest_active_lifetime_inexact);
     }
 
     #[tokio::test]
@@ -14626,9 +14844,11 @@ mod tests {
                 .pop_last_for_application(&resource_scope)
                 .expect("production candidate reaches application")
         };
-        let _held = worker
+        let work_scope = worker
             .ownership
-            .work_resource_scope
+            .work_resource_scope()
+            .expect("production worker retains its live work scope");
+        let _held = work_scope
             .acquire(
                 crate::resource::ResourceAuthorityClass::Speculative,
                 retained_claim,
@@ -15890,12 +16110,12 @@ mod tests {
             .issue_mesh_scope()
             .expect("fixture process owner issues one Mesh scope");
         let (close_owner, _lifetime) = close_owner_fixture(&mesh);
-        let credentials = sdp_ice_credentials_owned(
-            &sdp,
-            sdp.capacity(),
-            &close_owner.ownership.work_resource_scope,
-        )
-        .expect("the exact remote-description claim is admitted");
+        let work_scope = close_owner
+            .ownership
+            .work_resource_scope()
+            .expect("close-owner fixture retains its work scope before start");
+        let credentials = sdp_ice_credentials_owned(&sdp, sdp.capacity(), &work_scope)
+            .expect("the exact remote-description claim is admitted");
         close_owner.retain_remote_description_resources(
             credentials
                 .resource_owner()

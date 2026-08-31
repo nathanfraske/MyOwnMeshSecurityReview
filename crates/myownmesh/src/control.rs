@@ -920,6 +920,13 @@ async fn serve_with_hooks(
     // before its own funding is released, and the list is empty by the time this
     // returns.
     join_all(&mut accepted).await;
+    let abnormal_watchdogs = state.clients.drain_watchdogs().await;
+    if abnormal_watchdogs != 0 {
+        warn!(
+            abnormal_watchdogs,
+            "inbound-stream watchdogs ended abnormally during control shutdown"
+        );
+    }
     // And then the count, which covers what this list does not: the channel
     // pumps and inbound-stream watchdogs the registry admitted on connections'
     // behalf. It should already be zero -- retiring a route joins its pump --
@@ -1861,41 +1868,6 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     dispatch::governance::roster_list(&state, &json_lines, network).await?;
                 let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
                     .context("RosterList response exceeded its measured ceiling")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            // Twelve arms, not one arm that bound a whole `Request` and re-matched
-            // it. The grouped form needed a `_ => unreachable!()` underneath, so a
-            // thirteenth transition would have compiled into that panic instead of
-            // failing the build as a missing arm here.
-            Request::RosterApprove {
-                network,
-                device_id,
-                label,
-            } => {
-                let (reply, output) = dispatch::governance::roster_approve(
-                    &state,
-                    &json_lines,
-                    network,
-                    device_id,
-                    label,
-                )
-                .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
-                match write_admitted_line(&mut writer, &cancel, line).await? {
-                    Wrote::Sent => continue,
-                    Wrote::Ended => break,
-                }
-            }
-            Request::RosterRemove { network, device_id } => {
-                let (reply, output) =
-                    dispatch::governance::roster_remove(&state, &json_lines, network, device_id)
-                        .await?;
-                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
-                    .context("governance/network response changed after measurement")?;
                 match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
@@ -2963,6 +2935,21 @@ mod request_wire_tests {
         let back: Request = serde_json::from_value(value).expect("re-decode");
         assert!(matches!(back, Request::NetworkConnectPeer { .. }));
     }
+
+    #[test]
+    fn governance_requests_require_an_explicit_mfa_field() {
+        for (op, extra) in [
+            ("governance_propose_role_grant", r#","role":"member""#),
+            ("governance_propose_role_revoke", ""),
+            ("governance_propose_evict", ""),
+        ] {
+            let json = format!(r#"{{"op":"{op}","network":"n","target":"t"{extra}}}"#);
+            assert!(
+                serde_json::from_str::<Request>(&json).is_err(),
+                "{op} must not silently default its security-sensitive MFA field"
+            );
+        }
+    }
 }
 
 /// What `serve` does with the connection tasks it accepted.
@@ -3620,8 +3607,12 @@ mod terminal_shutdown_tests {
         myownmesh_core::NetworkConfig {
             id: id.to_string(),
             network_id: network_id.to_string(),
+            event_capacity: myownmesh_core::NetworkConfig::from_network_id("", "").event_capacity,
+            connection_trace_capacity: myownmesh_core::NetworkConfig::from_network_id("", "")
+                .connection_trace_capacity,
             label: id.to_string(),
             kind: Default::default(),
+            scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),
             closed_relay: Default::default(),

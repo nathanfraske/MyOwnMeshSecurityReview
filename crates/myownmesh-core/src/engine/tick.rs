@@ -14,7 +14,7 @@
 //!    a data channel that never opened, a restart that never carried traffic,
 //!    a reconnect that needs another nudge, a primary-IP that quietly moved.
 //!    No event can signal "nothing happened", so a single periodic pass (the
-//!    state-watch tick, [`super::scheduler::STATE_WATCH_INTERVAL_MS`]) confirms
+//!    state-watch tick, configured by `NetworkConfig::scheduler`) confirms
 //!    everything still looks right and repairs what doesn't.
 //!
 //! A [`Ticker`] is one such time-based subsystem. The driver builds a
@@ -127,9 +127,9 @@ impl Ticker for NetworkWatchTicker {
 }
 
 /// Canonical fact anti-entropy backstop. Event-driven advertisements remain
-/// the fast path; this bounded inventory pass repairs a fact lost while a
-/// peer's data channel was transiently unavailable. Governance snapshots
-/// exact current owners before each send and keeps the inventory context-bound.
+/// the fast path; this bounded, byte-paged inventory pass repairs a fact lost
+/// while a peer's data channel was transiently unavailable. It snapshots exact
+/// current owners before each page send and keeps every page context-bound.
 pub(crate) struct FactInventoryTicker;
 
 #[async_trait]

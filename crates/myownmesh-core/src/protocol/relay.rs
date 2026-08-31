@@ -13,6 +13,8 @@ pub const OPAQUE_RELAY_NONCE_BYTES: usize = 12;
 pub const OPAQUE_RELAY_SESSION_BYTES: usize = 16;
 pub const OPAQUE_RELAY_EPHEMERAL_KEY_BYTES: usize = 32;
 pub const CLOSED_RELAY_CONTROL_VERSION: u8 = 1;
+pub const OPAQUE_RELAY_MAX_MESH_BYTES: usize = 256;
+pub const OPAQUE_RELAY_MAX_SIGNATURE_BYTES: usize = 256;
 
 /// The current WebRTC/SCTP user-message budget accepted by the SCTP writer.
 pub const CLOSED_RELAY_SCTP_USER_MESSAGE_BYTES: u64 = 65_536;
@@ -78,7 +80,7 @@ impl RelayKeyShare {
         if self.version != OPAQUE_RELAY_VERSION {
             return Err("unsupported opaque relay key-share version".into());
         }
-        if self.mesh.is_empty() || self.mesh.len() > 256 {
+        if self.mesh.is_empty() || self.mesh.len() > OPAQUE_RELAY_MAX_MESH_BYTES {
             return Err("opaque relay mesh context is empty or oversized".into());
         }
         crate::semantic::DeviceId::from_canonical_str(&self.from)
@@ -91,8 +93,8 @@ impl RelayKeyShare {
         if self.ephemeral_public.iter().all(|byte| *byte == 0) {
             return Err("opaque relay ephemeral key is all zero".into());
         }
-        if self.signature.is_empty() {
-            return Err("opaque relay key-share signature is empty".into());
+        if self.signature.is_empty() || self.signature.len() > OPAQUE_RELAY_MAX_SIGNATURE_BYTES {
+            return Err("opaque relay key-share signature is empty or oversized".into());
         }
         Ok(())
     }
@@ -121,7 +123,7 @@ impl OpaqueRelayPacket {
         if self.version != OPAQUE_RELAY_VERSION {
             return Err("unsupported opaque relay packet version".into());
         }
-        if self.mesh.is_empty() || self.mesh.len() > 256 {
+        if self.mesh.is_empty() || self.mesh.len() > OPAQUE_RELAY_MAX_MESH_BYTES {
             return Err("opaque relay mesh context is empty or oversized".into());
         }
         crate::semantic::DeviceId::from_canonical_str(&self.from)
@@ -166,6 +168,7 @@ pub enum ClosedRelayControl {
         relay: DeviceId,
         target: DeviceId,
         session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+        allocation_epoch: u64,
         requester_share: RelayKeyShare,
     },
     /// The target accepts the exact route and returns its endpoint share.
@@ -176,6 +179,7 @@ pub enum ClosedRelayControl {
         relay: DeviceId,
         target: DeviceId,
         session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+        allocation_epoch: u64,
         target_share: RelayKeyShare,
     },
     /// Close the exact route and session.  There is no peer selector or
@@ -187,10 +191,168 @@ pub enum ClosedRelayControl {
         relay: DeviceId,
         target: DeviceId,
         session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+        allocation_epoch: u64,
     },
 }
 
+/// The complete, exact identity of one Closed relay route.
+///
+/// This is deliberately separate from any one control operation so pending
+/// consumption can compare every binding field without resolving a peer by
+/// device id or accepting a partial route match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosedRelayRoute {
+    pub context_id: MeshContextId,
+    pub requester: DeviceId,
+    pub relay: DeviceId,
+    pub target: DeviceId,
+    pub session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+    /// Checked epoch minted by the relay for this allocation. Open routes
+    /// use zero because admission has not happened yet.
+    pub allocation_epoch: u64,
+}
+
+impl ClosedRelayRoute {
+    pub fn new(
+        context_id: MeshContextId,
+        requester: DeviceId,
+        relay: DeviceId,
+        target: DeviceId,
+        session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+    ) -> Self {
+        Self::with_epoch(context_id, requester, relay, target, session_id, 0)
+    }
+
+    pub fn with_epoch(
+        context_id: MeshContextId,
+        requester: DeviceId,
+        relay: DeviceId,
+        target: DeviceId,
+        session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+        allocation_epoch: u64,
+    ) -> Self {
+        Self {
+            context_id,
+            requester,
+            relay,
+            target,
+            session_id,
+            allocation_epoch,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        validate_binding(
+            CLOSED_RELAY_CONTROL_VERSION,
+            &self.context_id,
+            &self.requester,
+            &self.relay,
+            &self.target,
+            &self.session_id,
+        )
+    }
+}
+
 impl ClosedRelayControl {
+    /// Return the complete route identity carried by this operation.
+    pub fn route(&self) -> ClosedRelayRoute {
+        match self {
+            Self::Open {
+                context_id,
+                requester,
+                relay,
+                target,
+                session_id,
+                ..
+            } => ClosedRelayRoute::new(
+                *context_id,
+                requester.clone(),
+                relay.clone(),
+                target.clone(),
+                *session_id,
+            ),
+            Self::Offer {
+                context_id,
+                requester,
+                relay,
+                target,
+                session_id,
+                allocation_epoch,
+                ..
+            } => ClosedRelayRoute::with_epoch(
+                *context_id,
+                requester.clone(),
+                relay.clone(),
+                target.clone(),
+                *session_id,
+                *allocation_epoch,
+            ),
+            Self::Accept {
+                context_id,
+                requester,
+                relay,
+                target,
+                session_id,
+                allocation_epoch,
+                ..
+            }
+            | Self::Close {
+                context_id,
+                requester,
+                relay,
+                target,
+                session_id,
+                allocation_epoch,
+                ..
+            } => ClosedRelayRoute::with_epoch(
+                *context_id,
+                requester.clone(),
+                relay.clone(),
+                target.clone(),
+                *session_id,
+                *allocation_epoch,
+            ),
+        }
+    }
+
+    /// Compare every route field exactly, suitable for pending-record
+    /// consumption before any operation-specific handling.
+    pub fn matches_route(&self, expected: &ClosedRelayRoute) -> bool {
+        self.route() == *expected
+    }
+
+    pub fn validate_against_route(&self, expected: &ClosedRelayRoute) -> Result<(), String> {
+        self.validate()?;
+        expected.validate()?;
+        if self.matches_route(expected) {
+            Ok(())
+        } else {
+            Err("closed relay control does not match the exact route".into())
+        }
+    }
+
+    /// Return the complete serialized MeshMessage size, including its kind
+    /// envelope, before a configured control-byte ceiling is applied.
+    pub fn encoded_len(&self) -> Result<usize, String> {
+        serde_json::to_vec(&crate::protocol::MeshMessage::ClosedRelayControl(
+            self.clone(),
+        ))
+        .map(|encoded| encoded.len())
+        .map_err(|error| format!("closed relay control serialization failed: {error}"))
+    }
+
+    /// Validate both semantic binding and the finite receive-safe wire size.
+    pub fn validate_for_wire(&self, max_control_bytes: u64) -> Result<(), String> {
+        self.validate()?;
+        let encoded_len = self.encoded_len()?;
+        let encoded_len = u64::try_from(encoded_len)
+            .map_err(|_| "closed relay control length exceeds u64".to_string())?;
+        if max_control_bytes == 0 || encoded_len > max_control_bytes {
+            return Err("closed relay control exceeds configured encoded-byte bound".into());
+        }
+        Ok(())
+    }
+
     /// Validate the complete semantic route before a relay handler uses it.
     /// The control contains no signature by itself: endpoint shares are
     /// independently authenticated by the endpoint session, while this check
@@ -198,15 +360,6 @@ impl ClosedRelayControl {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Open {
-                version,
-                context_id,
-                requester,
-                relay,
-                target,
-                session_id,
-                requester_share,
-            }
-            | Self::Offer {
                 version,
                 context_id,
                 requester,
@@ -225,6 +378,27 @@ impl ClosedRelayControl {
                     "requester",
                 )
             }
+            Self::Offer {
+                version,
+                context_id,
+                requester,
+                relay,
+                target,
+                session_id,
+                allocation_epoch,
+                requester_share,
+            } => {
+                validate_binding(*version, context_id, requester, relay, target, session_id)?;
+                validate_epoch(*allocation_epoch)?;
+                validate_share(
+                    requester_share,
+                    context_id,
+                    session_id,
+                    requester,
+                    target,
+                    "requester",
+                )
+            }
             Self::Accept {
                 version,
                 context_id,
@@ -232,9 +406,11 @@ impl ClosedRelayControl {
                 relay,
                 target,
                 session_id,
+                allocation_epoch,
                 target_share,
             } => {
                 validate_binding(*version, context_id, requester, relay, target, session_id)?;
+                validate_epoch(*allocation_epoch)?;
                 validate_share(
                     target_share,
                     context_id,
@@ -251,7 +427,11 @@ impl ClosedRelayControl {
                 relay,
                 target,
                 session_id,
-            } => validate_binding(*version, context_id, requester, relay, target, session_id),
+                allocation_epoch,
+            } => {
+                validate_binding(*version, context_id, requester, relay, target, session_id)?;
+                validate_epoch(*allocation_epoch)
+            }
         }
     }
 }
@@ -279,10 +459,36 @@ pub struct ClosedRelayData {
     pub relay: DeviceId,
     pub target: DeviceId,
     pub session_id: [u8; OPAQUE_RELAY_SESSION_BYTES],
+    pub allocation_epoch: u64,
     pub packet: OpaqueRelayPacket,
 }
 
 impl ClosedRelayData {
+    pub fn route(&self) -> ClosedRelayRoute {
+        ClosedRelayRoute::with_epoch(
+            self.context_id,
+            self.requester.clone(),
+            self.relay.clone(),
+            self.target.clone(),
+            self.session_id,
+            self.allocation_epoch,
+        )
+    }
+
+    pub fn matches_route(&self, expected: &ClosedRelayRoute) -> bool {
+        self.route() == *expected
+    }
+
+    pub fn validate_against_route(&self, expected: &ClosedRelayRoute) -> Result<(), String> {
+        self.validate(usize::MAX)?;
+        expected.validate()?;
+        if self.matches_route(expected) {
+            Ok(())
+        } else {
+            Err("closed relay data does not match the exact route".into())
+        }
+    }
+
     /// Return the exact endpoint direction after validating the route and
     /// packet. A relay may forward only one of these two directions; a packet
     /// naming the relay or any unrelated endpoint is refused.
@@ -298,6 +504,7 @@ impl ClosedRelayData {
             &self.target,
             &self.session_id,
         )?;
+        validate_epoch(self.allocation_epoch)?;
         self.packet.validate(max_ciphertext_bytes)?;
         if self.packet.mesh != self.context_id.to_string()
             || self.packet.session_id != self.session_id
@@ -341,6 +548,14 @@ fn validate_binding(
         return Err("closed relay context id must not be all zero".into());
     }
     Ok(())
+}
+
+fn validate_epoch(epoch: u64) -> Result<(), String> {
+    if epoch == 0 {
+        Err("closed relay allocation epoch must be nonzero after admission".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_share(
@@ -439,6 +654,21 @@ mod tests {
             requester_share: share(&context, session_id, &requester, &target, 4),
         };
         control.validate().expect("exact Closed route validates");
+        let expected_route = ClosedRelayRoute::new(
+            context,
+            requester.clone(),
+            relay.clone(),
+            target.clone(),
+            session_id,
+        );
+        expected_route.validate().expect("route validates");
+        control
+            .validate_against_route(&expected_route)
+            .expect("control matches exact route");
+        let mut wrong_route = expected_route.clone();
+        wrong_route.session_id[0] ^= 1;
+        assert!(!control.matches_route(&wrong_route));
+        assert!(control.validate_against_route(&wrong_route).is_err());
         let message = crate::protocol::MeshMessage::ClosedRelayControl(control.clone());
         let encoded = serde_json::to_string(&message).expect("relay control serializes");
         assert!(encoded.contains(r#""kind":"closed_relay_control""#));
@@ -461,6 +691,7 @@ mod tests {
             relay: relay.clone(),
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
         };
         close.validate().expect("close binding validates");
 
@@ -471,6 +702,7 @@ mod tests {
             relay: requester.clone(),
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
         };
         assert!(duplicate.validate().is_err());
 
@@ -481,6 +713,7 @@ mod tests {
             relay: relay.clone(),
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
             requester_share: share(&context, session_id, &requester, &relay, 5),
         };
         assert!(mismatched_share.validate().is_err());
@@ -493,6 +726,34 @@ mod tests {
 
         let open = serde_json::to_string(&requester).expect("requester serializes");
         assert!(serde_json::from_str::<DeviceId>(&open.to_uppercase()).is_err());
+
+        let oversized = RelayKeyShare {
+            signature: "x".repeat(OPAQUE_RELAY_MAX_SIGNATURE_BYTES + 1),
+            ..share(&context, session_id, &requester, &target, 6)
+        };
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn closed_relay_control_wire_bound_is_encoded_and_finite() {
+        let (context, requester, relay, target, session_id) = route();
+        let control = ClosedRelayControl::Open {
+            version: CLOSED_RELAY_CONTROL_VERSION,
+            context_id: context,
+            requester: requester.clone(),
+            relay,
+            target: target.clone(),
+            session_id,
+            requester_share: share(&context, session_id, &requester, &target, 8),
+        };
+        let encoded_len = control.encoded_len().expect("control encodes");
+        assert!(encoded_len > 0);
+        control
+            .validate_for_wire(u64::try_from(encoded_len).expect("length fits u64"))
+            .expect("exact encoded control bound accepts");
+        assert!(control
+            .validate_for_wire(u64::try_from(encoded_len - 1).expect("length fits u64"))
+            .is_err());
     }
 
     #[test]
@@ -505,6 +766,7 @@ mod tests {
             relay: relay.clone(),
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
             packet: OpaqueRelayPacket {
                 version: OPAQUE_RELAY_VERSION,
                 mesh: context.to_string(),
@@ -517,6 +779,26 @@ mod tests {
             },
         };
         data.validate(8).expect("exact relay data validates");
+        let expected_route = ClosedRelayRoute::with_epoch(
+            context,
+            requester.clone(),
+            relay.clone(),
+            target.clone(),
+            session_id,
+            1,
+        );
+        data.validate_against_route(&expected_route)
+            .expect("data matches exact route");
+        assert!(data
+            .validate_against_route(&ClosedRelayRoute::with_epoch(
+                context,
+                requester.clone(),
+                relay.clone(),
+                target.clone(),
+                session_id,
+                2,
+            ))
+            .is_err());
         assert_eq!(
             data.direction(8).expect("forward direction"),
             ClosedRelayDataDirection::RequesterToTarget
@@ -531,6 +813,14 @@ mod tests {
 
         data.packet.from = relay.base32();
         assert!(data.direction(8).is_err(), "relay is not an endpoint");
+        assert!(!data.matches_route(&ClosedRelayRoute::with_epoch(
+            context,
+            requester.clone(),
+            relay.clone(),
+            device(4),
+            session_id,
+            1,
+        )));
 
         data.packet.from = requester.base32();
         data.packet.to = target.base32();
@@ -562,8 +852,15 @@ mod tests {
         assert_no_address_keys(&value);
     }
 
-    fn worst_case_data(plaintext_len: usize) -> ClosedRelayData {
+    fn worst_case_data(
+        plaintext_len: usize,
+        direction: ClosedRelayDataDirection,
+    ) -> ClosedRelayData {
         let (context, requester, relay, target, session_id) = route();
+        let (from, to) = match direction {
+            ClosedRelayDataDirection::RequesterToTarget => (requester.base32(), target.base32()),
+            ClosedRelayDataDirection::TargetToRequester => (target.base32(), requester.base32()),
+        };
         ClosedRelayData {
             version: CLOSED_RELAY_CONTROL_VERSION,
             context_id: context,
@@ -571,12 +868,13 @@ mod tests {
             relay,
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
             packet: OpaqueRelayPacket {
                 version: OPAQUE_RELAY_VERSION,
                 mesh: context.to_string(),
                 session_id,
-                from: requester.base32(),
-                to: target.base32(),
+                from,
+                to,
                 sequence: u64::MAX,
                 nonce: [255; OPAQUE_RELAY_NONCE_BYTES],
                 ciphertext: vec![
@@ -596,20 +894,47 @@ mod tests {
         let ciphertext_len = max_plaintext
             .checked_add(usize::try_from(CLOSED_RELAY_AEAD_TAG_BYTES).expect("AEAD tag fits usize"))
             .expect("ciphertext length is representable");
-        let exact = crate::protocol::MeshMessage::ClosedRelayData(worst_case_data(max_plaintext));
-        let encoded_len = serde_json::to_vec(&exact)
-            .expect("worst-case ClosedRelayData serializes")
-            .len();
+        for direction in [
+            ClosedRelayDataDirection::RequesterToTarget,
+            ClosedRelayDataDirection::TargetToRequester,
+        ] {
+            let exact = crate::protocol::MeshMessage::ClosedRelayData(worst_case_data(
+                max_plaintext,
+                direction,
+            ));
+            let encoded_len = serde_json::to_vec(&exact)
+                .expect("worst-case ClosedRelayData serializes")
+                .len();
+            assert!(
+                u64::try_from(encoded_len).expect("encoded length fits u64")
+                    <= CLOSED_RELAY_WEBRTC_CALLBACK_BYTES,
+                "exact receive-safe payload fits in both directions: {direction:?}"
+            );
+            assert_eq!(
+                worst_case_data(max_plaintext, direction)
+                    .direction(ciphertext_len)
+                    .expect("exact payload direction validates"),
+                direction
+            );
+            let over = crate::protocol::MeshMessage::ClosedRelayData(worst_case_data(
+                max_plaintext + 1,
+                direction,
+            ));
+            let over_len = serde_json::to_vec(&over)
+                .expect("over-boundary ClosedRelayData serializes")
+                .len();
+            assert!(
+                u64::try_from(over_len).expect("over-boundary length fits u64")
+                    > CLOSED_RELAY_WEBRTC_CALLBACK_BYTES,
+                "plaintext + 1 exceeds the callback boundary in both directions: {direction:?}"
+            );
+        }
         assert!(
-            u64::try_from(encoded_len).expect("encoded length fits u64")
+            closed_relay_worst_case_json_bytes(
+                u64::try_from(ciphertext_len).expect("ciphertext length fits u64"),
+            )
+            .expect("boundary arithmetic is representable")
                 <= CLOSED_RELAY_WEBRTC_CALLBACK_BYTES
-        );
-        assert!(
-            u64::try_from(encoded_len).expect("encoded length fits u64")
-                <= closed_relay_worst_case_json_bytes(
-                    u64::try_from(ciphertext_len).expect("ciphertext length fits u64"),
-                )
-                .expect("boundary arithmetic is representable")
         );
         let exact_formula = closed_relay_worst_case_json_bytes(
             u64::try_from(ciphertext_len).expect("ciphertext length fits u64"),

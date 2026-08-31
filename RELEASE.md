@@ -3,22 +3,19 @@
 Cutting a release:
 
 ```
-just release 0.2.8
+just release X.Y.Z
 ```
 
 That recipe:
 
-1. Bumps the version in every manifest that pins it via
-   `scripts/bump-version.sh` — root `Cargo.toml`
-   (`[workspace.package].version` + the matching pins under
-   `[workspace.dependencies]`), `gui/src-tauri/Cargo.toml`,
-   `gui/src-tauri/Cargo.lock`, and `gui/package.json`.
+1. Bumps the root workspace version and the separate GUI version files via
+   `scripts/bump-version.sh`.
 2. Refreshes the root `Cargo.lock`.
-3. Commits the version bumps, pushes the branch, then triggers
-   `release.yml` via `gh workflow run` with `tag=v0.2.8`.
+3. Commits and pushes the version bump, then pushes the immutable `vX.Y.Z`
+   tag, which triggers `release.yml`.
 
-The release workflow runs on `push: tags: v*` and on
-`workflow_dispatch` (which is what step 3 uses), then for each of
+The release workflow runs on `push: tags: v*`; `workflow_dispatch` remains a
+manual rerun path. For each of
 `linux-x86_64`, `linux-aarch64`, `macos-aarch64`, `macos-x86_64`,
 `windows-x86_64`:
 
@@ -45,8 +42,12 @@ aarch64 appliance asset: the plain `myownmesh-linux-aarch64.tar.gz`
 is the dynamic-glibc **desktop** build, so the appliance name must
 not collide with it. See [`docs/NANOKVM.md`](docs/NANOKVM.md).
 
-The matrix mirrors MyOwnLLM's `release.yml` so behaviour is
-consistent across both apps.
+The root Cargo workspace builds the daemon and its library dependencies. The
+Tauri GUI is a separate workspace under `gui/src-tauri`; the release matrix
+does not turn the GUI into a daemon dependency. Shipped daemon builds use
+`--no-default-features`, and no release build enables `transport-lab`; that
+feature remains an explicit test-only surface in CI. The release scanner checks
+the daemon binary and portable archive members for the seam.
 
 ## What's published, what isn't
 
@@ -55,23 +56,32 @@ consistent across both apps.
 | `myownmesh-<platform>.{tar.gz,zip}` + `.sha256` | [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases) | End users running the headless daemon; the self-updater consumes the same artifacts. |
 | `myownmesh-gui-<platform>.{tar.gz,zip}` + `.sha256` | GitHub Releases | The shell installer drops this next to the daemon so a bare `myownmesh` opens the GUI. The self-updater keeps it in lockstep with the daemon (it swaps this binary too when one is installed beside `myownmesh`). Lightweight (relies on the system webview); the OS bundles below are the full desktop install. |
 | Tauri GUI bundles (`.deb` / `.AppImage` / `.dmg` / `.msi` / `.exe`) | GitHub Releases | End users who want the desktop app with full OS integration. |
-| `myownmesh-core`, `myownmesh-signaling`, `myownmesh-updater` source | Git tag `vX.Y.Z` | Embedders, via `git = …, tag = "vX.Y.Z"` in their `Cargo.toml`. |
+| Workspace source and manifests | Git tag `vX.Y.Z` | Embedders and source builders; registry publication is not implied by a tag. |
 
-The three library crates are **not on crates.io yet** — embedders
-pull them as git dependencies pinned to a release tag. The first
-crates.io publish is gated on a public-API freeze; until then the
-git-tag pin is the supported integration path (and gives downstream
-projects exact reproducibility because the tag content is
-immutable).
+Portable `.tar.gz` and `.zip` assets are raw executable archives with a
+known daemon or GUI member and a separately generated checksum sidecar; they
+are the assets consumed by the shell installer and updater. Tauri `.deb`,
+`.AppImage`, `.dmg`, `.msi`, and `.exe` outputs are opaque platform installers
+for the GUI and are not interchangeable with those portable archives.
 
-The order of operations to add crates.io later is straightforward —
-`cargo publish -p myownmesh-signaling` first, then `-p myownmesh-core`
-(which depends on signaling), then `-p myownmesh-updater` (depends on
-core), then `-p myownmesh` (depends on all three). The workspace
-dependency table already pins each inter-crate edge with `version =
-"X.Y.Z"` alongside the path entry, which is exactly the shape
-`cargo publish` requires. When the time comes, add `cargo publish`
-steps to `release.yml` after the GitHub-release upload.
+The release workflow publishes the GitHub binary artifacts above; it does not
+run `cargo publish`. Treat the tagged repository as the source distribution and
+check the selected release's package metadata before assuming a registry
+artifact exists.
+
+### Artifact evidence
+
+The packaging jobs write a SHA-256 sidecar for each portable daemon and GUI
+archive. `scripts/verify-release-artifact.py` checks the release workflow and
+manifest boundary, and scans the daemon binary and portable archive members for
+the `transport-lab` seam. That scanner does not attest the opaque Tauri
+platform installers; their build and publication are separate workflow steps.
+
+The optional `sign` job applies detached minisign signatures to portable
+archives only when `MINISIGN_SECRET_KEY` is configured. Without that secret,
+the workflow explicitly ships SHA-256 integrity sidecars without claiming
+signature provenance. A release is not considered closed by this document
+without the corresponding hosted build, artifact, and signature evidence.
 
 ## Versioning
 
@@ -79,17 +89,19 @@ Semver. `MAJOR.MINOR.PATCH`:
 
 - **PATCH**: bug fixes, no protocol changes, no API changes that
   break embedders.
-- **MINOR**: new optional protocol message kinds (added to the
-  `features` matrix so older peers ignore them), new public API
-  surface (additive), new config fields with defaults.
+- **MINOR**: additive public API surface and config fields with defaults when
+  the wire protocol remains unchanged.
 - **MAJOR**: incompatible protocol shape change (bumps
   `PROTOCOL_VERSION`), removed / renamed public API, removed
   config keys.
 
-`PROTOCOL_VERSION` is at the wire-protocol layer; embedders that
-pin a specific MyOwnMesh version don't need to track it. Bumping
-the workspace version doesn't automatically bump the protocol
-version.
+`PROTOCOL_VERSION` is currently `2`. It is an exact pre-authentication wire
+gate. The frame set is closed: an unknown `kind` is refused rather than
+ignored, so old peers do not silently ignore new closed variants. There is no
+mixed-version or optional-frame fallback. Adding or changing wire variants
+therefore requires an explicit protocol-version review and, when incompatible,
+a major release. Bumping the workspace version does not automatically bump the
+protocol version.
 
 ## Updater channels
 
@@ -136,11 +148,11 @@ rule as a package-manager install.
 myownmesh update
 ```
 
-Fetches the latest release and updates everything (daemon + GUI) in one
-shot — the equivalent of MyOwnLLM's `myownllm update`. It ignores the
-`auto_apply` policy and the check interval (you asked for it), but still
-defers to the OS package manager. Restart MyOwnMesh afterwards to run
-the new binaries.
+Fetches the latest release and updates every installed portable component
+(daemon plus the adjacent GUI binary when present). It ignores the
+`auto_apply` policy and check interval for this explicit command, but still
+defers to the OS package manager. Restart MyOwnMesh afterwards to run the new
+binaries.
 
 The granular subcommands remain for scripting and inspection:
 

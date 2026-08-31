@@ -19,6 +19,7 @@ use crate::semantic::{DeviceId, MeshContextId};
 fn profile() -> ClosedRelayPolicyConfig {
     ClosedRelayPolicyConfig {
         enabled: true,
+        pending_handshake_timeout_ms: 30_000,
         ..ClosedRelayPolicyConfig::default()
     }
 }
@@ -72,16 +73,13 @@ fn admitted_handle(
     profile: ClosedRelayPolicyConfig,
     requester: &SessionCapability,
     target: &SessionCapability,
-    mesh: MeshContextId,
-    requester_id: DeviceId,
-    target_id: DeviceId,
-    session_id: [u8; 16],
+    route: (MeshContextId, DeviceId, DeviceId, [u8; 16]),
     host_id: DeviceId,
 ) -> ClosedRelayHandle {
     let relay = ClosedRelayRuntime::new(profile.clone(), host_id).expect("relay runtime");
     let permit = RelayAllocationPermit::try_new(requester.validity_witness(), &profile)
         .expect("funded relay permit");
-    let endpoints = ClosedRelayEndpoints::new(mesh, requester_id, target_id, session_id)
+    let endpoints = ClosedRelayEndpoints::new(route.0, route.1, route.2, route.3, 1)
         .expect("exact relay endpoints");
     relay
         .admit_closed_relay(
@@ -131,10 +129,7 @@ async fn closed_relay_forwards_opaque_ciphertext_both_directions_and_settles() {
         profile,
         &requester_owner,
         &target_owner,
-        mesh,
-        requester_id.clone(),
-        target_id.clone(),
-        session_id,
+        (mesh, requester_id.clone(), target_id.clone(), session_id),
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
     );
 
@@ -142,7 +137,11 @@ async fn closed_relay_forwards_opaque_ciphertext_both_directions_and_settles() {
     relay
         .try_forward(outbound)
         .expect("forward requester ciphertext");
-    let delivered = relay.recv().await.expect("receive requester ciphertext");
+    let delivered = relay
+        .recv_checked()
+        .await
+        .expect("requester receive remains active")
+        .expect("receive requester ciphertext");
     assert_eq!(
         target_session.open(&delivered).expect("target open"),
         b"A-to-C"
@@ -152,7 +151,11 @@ async fn closed_relay_forwards_opaque_ciphertext_both_directions_and_settles() {
     relay
         .try_forward(reverse)
         .expect("forward target ciphertext");
-    let delivered = relay.recv().await.expect("receive target ciphertext");
+    let delivered = relay
+        .recv_checked()
+        .await
+        .expect("target receive remains active")
+        .expect("receive target ciphertext");
     assert_eq!(
         requester_session.open(&delivered).expect("requester open"),
         b"C-to-A"
@@ -184,10 +187,7 @@ async fn closed_relay_rejects_route_tamper_and_endpoint_tamper_but_not_opaque_pa
         profile,
         &requester_owner,
         &target_owner,
-        mesh,
-        requester_id.clone(),
-        target_id.clone(),
-        session_id,
+        (mesh, requester_id.clone(), target_id.clone(), session_id),
         host_id,
     );
 
@@ -205,7 +205,11 @@ async fn closed_relay_rejects_route_tamper_and_endpoint_tamper_but_not_opaque_pa
     relay
         .try_forward(ciphertext_tamper)
         .expect("relay forwards opaque ciphertext without endpoint keys");
-    let tampered = relay.recv().await.expect("receive tampered ciphertext");
+    let tampered = relay
+        .recv_checked()
+        .await
+        .expect("tampered receive remains active")
+        .expect("receive tampered ciphertext");
     assert!(
         target_session.open(&tampered).is_err(),
         "endpoint AEAD must reject ciphertext tamper"
@@ -215,7 +219,11 @@ async fn closed_relay_rejects_route_tamper_and_endpoint_tamper_but_not_opaque_pa
     relay
         .try_forward(packet.clone())
         .expect("forward first packet");
-    let first = relay.recv().await.expect("receive first packet");
+    let first = relay
+        .recv_checked()
+        .await
+        .expect("first receive remains active")
+        .expect("receive first packet");
     assert_eq!(
         target_session.open(&first).expect("open first packet"),
         b"once"
@@ -223,7 +231,11 @@ async fn closed_relay_rejects_route_tamper_and_endpoint_tamper_but_not_opaque_pa
     relay
         .try_forward(packet)
         .expect("relay can carry opaque duplicate");
-    let duplicate = relay.recv().await.expect("receive duplicate packet");
+    let duplicate = relay
+        .recv_checked()
+        .await
+        .expect("duplicate receive remains active")
+        .expect("receive duplicate packet");
     assert!(
         target_session.open(&duplicate).is_err(),
         "endpoint replay window must reject the duplicate"
@@ -257,10 +269,7 @@ async fn closed_relay_queue_item_and_byte_pressure_refuse_without_losing_termina
         item_profile,
         &requester_owner,
         &target_owner,
-        mesh,
-        requester_id.clone(),
-        target_id.clone(),
-        session_id,
+        (mesh, requester_id.clone(), target_id.clone(), session_id),
         host_id.clone(),
     );
     let control_packet = requester_session
@@ -277,7 +286,11 @@ async fn closed_relay_queue_item_and_byte_pressure_refuse_without_losing_termina
         item_relay.try_forward(second),
         Err(ClosedRelayRefusal::QueueFull)
     );
-    let _ = item_relay.recv().await.expect("queued first item");
+    let _ = item_relay
+        .recv_checked()
+        .await
+        .expect("item receive remains active")
+        .expect("queued first item");
     item_relay.settle();
 
     let mut byte_profile = profile();
@@ -290,10 +303,7 @@ async fn closed_relay_queue_item_and_byte_pressure_refuse_without_losing_termina
         byte_profile.clone(),
         &byte_owner,
         &byte_target,
-        mesh,
-        requester_id,
-        target_id,
-        [10; 16],
+        (mesh, requester_id, target_id, [10; 16]),
         host_id,
     );
     let mut byte_requester = endpoint_sessions(
@@ -321,54 +331,67 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
     let fields = [
         ClosedRelayPolicyConfig {
             max_allocations: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             max_allocations_per_member: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             max_pending_handshakes: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             replay_window: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             max_frame_ciphertext_bytes: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             queue_items_per_direction: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             queue_bytes_per_direction: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             bandwidth_rate_bytes_per_second: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             bandwidth_burst_bytes: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             idle_timeout_ms: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             max_lifetime_ms: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             max_control_bytes: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
         ClosedRelayPolicyConfig {
             shutdown_grace_ms: 0,
+            pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
             ..profile()
         },
     ];
@@ -396,6 +419,7 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
             .expect("the provider's permit reservation record is representable");
     for dimension in [
         ResourceClass::AccountedMemoryBytes,
+        ResourceClass::QueuedBytes,
         ResourceClass::OpaqueDependencyResidual,
     ] {
         assert_eq!(
@@ -417,11 +441,41 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
             permit,
             owner.validity_witness(),
             target.validity_witness(),
-            ClosedRelayEndpoints::new(mesh, requester_id, target_id, [11; 16])
+            ClosedRelayEndpoints::new(mesh, requester_id, target_id, [11; 16], 1)
                 .expect("relay endpoints"),
         )
         .expect("relay admission");
     assert_eq!(handle.settle(), ClosedRelayTerminal::Settled);
+    assert_ne!(provider.in_use(), baseline);
+    drop(relay);
+    assert_eq!(provider.in_use(), baseline);
+}
+
+#[tokio::test]
+async fn closed_relay_expiry_is_a_consumable_terminal_and_releases_exact_claim() {
+    let valid = profile();
+    let runtime = crate::runtime::runtime_for_test();
+    let (owner, provider) = session_and_provider_for_test(runtime.clone(), permit_claim(&valid));
+    let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
+    let baseline = provider.in_use();
+    let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
+    let mut relay = admitted_handle(
+        valid.clone(),
+        &owner,
+        &target,
+        (mesh, requester_id, target_id, [16; 16]),
+        DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
+    );
+    relay.last_activity = Instant::now()
+        .checked_sub(relay.idle_timeout)
+        .expect("test clock can represent the configured idle interval");
+    assert_eq!(
+        relay
+            .recv_direction_checked(RelayDirection::RequesterToTarget)
+            .await,
+        Err(ClosedRelayRefusal::Expired)
+    );
+    assert_eq!(relay.settle(), ClosedRelayTerminal::Settled);
     assert_eq!(provider.in_use(), baseline);
 }
 
@@ -462,7 +516,7 @@ fn closed_relay_pending_handshake_and_allocation_limits_release_exact_slots() {
             first_permit,
             first_owner.validity_witness(),
             target.validity_witness(),
-            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), [12; 16])
+            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), [12; 16], 1)
                 .expect("first endpoints"),
         )
         .expect("first allocation");
@@ -473,7 +527,7 @@ fn closed_relay_pending_handshake_and_allocation_limits_release_exact_slots() {
             second_permit,
             second_owner.validity_witness(),
             target.validity_witness(),
-            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), [13; 16])
+            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), [13; 16], 2)
                 .expect("second endpoints"),
         ),
         Err(ClosedRelayRefusal::QueueFull)
@@ -488,7 +542,7 @@ fn closed_relay_pending_handshake_and_allocation_limits_release_exact_slots() {
             replacement_permit,
             first_owner.validity_witness(),
             target.validity_witness(),
-            ClosedRelayEndpoints::new(mesh, requester_id, target_id, [14; 16])
+            ClosedRelayEndpoints::new(mesh, requester_id, target_id, [14; 16], 3)
                 .expect("replacement endpoints"),
         )
         .expect("released allocation slot");
@@ -513,10 +567,84 @@ fn closed_relay_refuses_stale_exact_session_witness() {
     .expect("relay runtime");
     assert!(!stale.is_live());
     let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
-    let endpoints = ClosedRelayEndpoints::new(mesh, requester_id, target_id, [15; 16])
+    let endpoints = ClosedRelayEndpoints::new(mesh, requester_id, target_id, [15; 16], 1)
         .expect("stale-session endpoints");
     assert!(matches!(
         relay.admit_closed_relay(permit, stale.clone(), target.validity_witness(), endpoints,),
         Err(ClosedRelayRefusal::OwnerNotLive)
     ));
+}
+
+#[test]
+fn closed_relay_epoch_allows_bounded_reuse_after_exact_settlement() {
+    let profile = ClosedRelayPolicyConfig {
+        max_allocations: 1,
+        max_allocations_per_member: 1,
+        pending_handshake_timeout_ms: profile().pending_handshake_timeout_ms,
+        ..profile()
+    };
+    let runtime = crate::runtime::runtime_for_test();
+    let (owner, provider) = session_and_provider_for_test(runtime.clone(), permit_claim(&profile));
+    let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
+    let baseline = provider.in_use();
+    let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
+    let host_id =
+        DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id");
+    let session_id = [17; 16];
+    let relay = ClosedRelayRuntime::new(profile.clone(), host_id).expect("relay runtime");
+    let permit = RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
+        .expect("provider-backed relay permit");
+    let handle = relay
+        .admit_closed_relay(
+            permit,
+            owner.validity_witness(),
+            target.validity_witness(),
+            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), session_id, 1)
+                .expect("relay endpoints"),
+        )
+        .expect("relay admission");
+    let duplicate_permit = RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
+        .expect("duplicate attempt is independently funded before admission");
+    assert!(matches!(
+        relay.admit_closed_relay(
+            duplicate_permit,
+            owner.validity_witness(),
+            target.validity_witness(),
+            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), session_id, 1)
+                .expect("duplicate relay endpoints"),
+        ),
+        Err(ClosedRelayRefusal::OwnerMismatch)
+    ));
+    assert_eq!(relay.terminal_tombstone_epoch(session_id), None);
+    assert_eq!(handle.settle(), ClosedRelayTerminal::Settled);
+    assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(1));
+    assert_eq!(provider.in_use(), baseline);
+    let replacement_permit = RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
+        .expect("replacement permit is independently funded before admission");
+    let replacement = relay
+        .admit_closed_relay(
+            replacement_permit,
+            owner.validity_witness(),
+            target.validity_witness(),
+            ClosedRelayEndpoints::new(mesh, requester_id.clone(), target_id.clone(), session_id, 2)
+                .expect("reused relay endpoints"),
+        )
+        .expect("same session id is reusable with a fresh epoch");
+    let delayed_duplicate_permit =
+        RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
+            .expect("delayed duplicate is independently funded before admission");
+    assert!(matches!(
+        relay.admit_closed_relay(
+            delayed_duplicate_permit,
+            owner.validity_witness(),
+            target.validity_witness(),
+            ClosedRelayEndpoints::new(mesh, requester_id, target_id, session_id, 1)
+                .expect("delayed duplicate relay endpoints"),
+        ),
+        Err(ClosedRelayRefusal::OwnerMismatch)
+    ));
+    assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(1));
+    assert_eq!(replacement.settle(), ClosedRelayTerminal::Settled);
+    drop(relay);
+    assert_eq!(provider.in_use(), baseline);
 }

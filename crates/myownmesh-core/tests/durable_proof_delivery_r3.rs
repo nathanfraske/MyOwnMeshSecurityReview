@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::transport_lab::{
     admit_durable_proof, durable_proof_records, install_capability_replay_park_for_lab,
@@ -23,7 +23,6 @@ use myownmesh_core::engine::transport_lab::{
     ingest_semantic_fact, spawn_network_in_instance_root,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::protocol::{ProofAckMessage, ProofDeliveryMessage};
 use myownmesh_core::semantic::{
     AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactGraph, ProofRecord,
@@ -40,8 +39,11 @@ fn closed_config(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: format!("{id}-wire"),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Closed,
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
@@ -1918,9 +1920,8 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         .expect("E0 remains durable across the regrant");
     assert_exact_delivery_metadata(&selected_before_resume, &e0);
     assert_eq!(selected_before_resume.state, ProofRecordState::Pending);
-    assert_eq!(
+    assert!(
         reopened.is_rostered(target.public_id()),
-        true,
         "G1 restores the target role before the parked replay begins"
     );
     assert!(

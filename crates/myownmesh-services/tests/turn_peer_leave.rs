@@ -6,8 +6,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer,
-    TurnServiceConfig,
+    NetworkConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode, TurnCredential,
+    TurnServer as IceTurnServer, TurnServiceConfig,
 };
 use myownmesh_core::engine::transport_lab::{
     attach_local, channel, depart_for_lab, join_open_participation, spawn_network,
@@ -129,8 +129,11 @@ fn config(id: &str, turn_url: String) -> NetworkConfig {
     NetworkConfig {
         id: id.into(),
         network_id: "turn-depart-observed".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.into(),
         kind: Default::default(),
+        scheduler: SchedulerPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),

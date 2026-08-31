@@ -5,8 +5,8 @@
 //! commit:
 //!
 //! - one `AuthenticatedChannelCapability` for the exact current connector;
-//! - the current policy answer, produced by the narrow temporary adapter in
-//!   [`policy`] over the engine's existing admission state;
+//! - the canonical typed current-policy answer in [`policy`], derived from the
+//!   engine's existing admission state;
 //! - one explicit local process principal;
 //! - exact post-authentication reservations for the promoted record and the
 //!   refcounted validity block its delayed witnesses share.
@@ -519,7 +519,7 @@ impl SessionBroker {
                     // alongside it.
                     Some(SessionPromotionError::ChannelNotCurrent)
                 } else if !policy.admits(authenticated_channel) {
-                    // Policy is read from the adapter's proof value rather than
+                    // Policy is read from the canonical proof value rather than
                     // re-derived here, so the broker cannot disagree with the
                     // fence that produced it.
                     Some(SessionPromotionError::PolicyRefused)
@@ -780,30 +780,15 @@ fn session_validity_reservation_charge_for_test() -> ResourceClaim {
     .expect("one validity claim plus the provider's reservation record is representable")
 }
 
-/// The exact reservation one promoted session takes out of a fixture's grant.
-///
-/// Public so an **external** integration-test fixture can leave room for the
-/// sessions it promotes. Promotion is part of the default connector rather
-/// than a transport-lab feature, so this planning claim is always available;
-/// raw lab constructors remain feature-gated separately.
-/// An integration test is a separate crate: it sees only `pub` items and links
-/// the library built *without* `cfg(test)`, so neither the `pub(crate)` helper
-/// above nor the provider's own charge is reachable from one. This is.
-///
-/// It is the **reservation** charge, not the bare claim. The provider charges
-/// the claim together with the record it keeps for the lease carrying it, so a
-/// fixture that budgets the claim alone is short by exactly one record per
-/// session — and short *silently*, binding or refusing on whatever slack some
-/// unrelated term happened to leave. Deriving it here is what stops a fixture
-/// from restating a number the broker owns.
-pub fn session_reservation_planning_claim() -> ResourceClaim {
-    session_reservation_planning_claim_for_correlation("aaaaaaaaaaaaa")
-}
-
 /// The exact reservation one promoted session takes for a supplied channel
 /// correlation. Production minting uses an eight-byte random value encoded as
 /// 13 base32 characters; accepting the actual string lets an external fixture
 /// derive the same owned allocation instead of guessing its capacity.
+///
+/// This is the one public planning entry point. The reservation charge, rather
+/// than the bare claim, includes the provider record held for that lease, so a
+/// fixture cannot silently substitute a synthetic workload or underfund the
+/// promotion by omitting that record.
 pub fn session_reservation_planning_claim_for_correlation(correlation: &str) -> ResourceClaim {
     session_reservation_charge_for_correlation(correlation)
 }
@@ -1084,6 +1069,47 @@ mod tests {
         assert!(
             joined.validity_witness().is_live(),
             "dropping the first channel must not revoke the additional channel"
+        );
+    }
+
+    #[test]
+    fn v4_arc05_additional_promotion_rejects_stale_successor_without_mutation() {
+        let runtime = crate::runtime::runtime_for_test();
+        let broker = broker_for_test(runtime.clone());
+
+        let established_channel = crate::endpoint_auth::authenticated_for_test(runtime.clone());
+        let established_connector = Arc::clone(established_channel.record().connector());
+        let established = broker
+            .promote(
+                &mut Some(established_channel),
+                &established_connector,
+                CurrentPolicyAdmission::admitted_for_test(),
+            )
+            .expect("the established session promotes");
+        let stale_witness = established.validity_witness();
+        established.validity.invalidate();
+        assert!(
+            !stale_witness.is_live(),
+            "the predecessor lineage is revoked"
+        );
+
+        let successor = crate::endpoint_auth::authenticated_for_test(runtime);
+        let successor_connector = Arc::clone(successor.record().connector());
+        let mut slot = Some(successor);
+        assert_eq!(
+            broker
+                .promote_additional(
+                    &mut slot,
+                    &successor_connector,
+                    CurrentPolicyAdmission::admitted_for_test(),
+                    &established,
+                )
+                .err(),
+            Some(SessionPromotionError::ResourcesUnavailable)
+        );
+        assert!(
+            slot.is_some(),
+            "a stale established lineage cannot consume the successor channel"
         );
     }
 

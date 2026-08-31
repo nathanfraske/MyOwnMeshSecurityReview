@@ -1,45 +1,35 @@
-# Macro-slice 2 entry ledger
+# Owner and evidence ledger
 
-Opened from the fork `main` merge commit
-`c79ea09cc577bfb3953cf532b2dd555229f7e12c`. Macro-slice 1 exit review:
+Evidence baseline: fork `main` merge commit
+`c79ea09cc577bfb3953cf532b2dd555229f7e12c`. Prior owner review:
 [4945363089](https://github.com/nathanfraske/MyOwnMeshSecurityReview/pull/6#pullrequestreview-4945363089).
 
-This is a transition artifact, not an architecture source of truth. It records
-what Macro-slice 2 inherited, the owner of each residual, and the bounded unit
-currently admitted to implementation. It must be deleted at the Repository
-Closure and Nodularity Gate in `TRANSITION-PLAYBOOK.md` section 7.3, which
-permits no surviving evidence dossier. A residual is discharged here only by
-naming the exact commit and the control that closes it. No residual may remain
-open when this file is deleted; an open residual at the 7.3 gate is a stop
-condition, not permission to delete the record.
+This is an owner and evidence index, not an architecture source of truth. It
+records the named owners, bounded units, and exact closure evidence for the
+authority, durability, relay, and resource work. A closure item is discharged
+only by naming the exact commit and control that closes it. Explicitly pending
+platform or runtime evidence remains pending and is never inferred from a
+source declaration.
 
-## Accepted residuals
+## Recorded closure items
 
-Because this ledger cannot be deleted with an open residual, every residual
-recorded here is a Macro-slice 2 exit condition. That is stricter than carrying
-any of them to an unspecified later owner.
+Every item recorded here has a named owner and an explicit closure condition;
+none lacks a named owner.
 
-**R1, R2 and R3 accepted 2026-08-16** by the operator, in the directive that
-opened PR #7 and authorized the first bounded unit. Acceptance fixes the
-commitment; it discharges nothing. Each residual below stays open until the
-discharge record at the end of this file names the exact closing commit and
-control, and an open residual at the 7.3 gate remains a stop condition rather
-than permission to delete the record.
+**R1, R2 and R3 entered this ledger 2026-08-16** under the operator review
+directive for PR #7. That directive fixed the review scope; it was not evidence
+of closure. The discharge record at the end of this file names the exact
+closing commit and control for each item.
 
-**R4 was not part of that acceptance and is not claimed to be.** The operator
-accepted R1, R2 and R3 on 2026-08-16, and that acceptance was never extended
-backwards to cover R4. R4 is a pre-existing defect the first bounded unit found
-while proving its own boundary; it was recorded here under the same non-deletion
-mechanic so it could not be lost, but on this record's authority rather than the
-operator's. **That distinction is preserved for provenance and nothing below
-softens it.**
+**R4 was not part of that acceptance and is not claimed to be.** R4 is a
+pre-existing defect found while proving the ingress boundary; it is recorded
+separately for provenance and its discharge is not an operator acceptance of
+the original defect.
 
-What has changed is the implementation, not the acceptance. R4 was discharged at
-`0237f9e02df3ab21131c5612c1b231050c860cc4`, so the open question — whether it
-carried the same exit-condition commitment as the first three — no longer has to
-be answered by anyone: there is no unresolved R4 choice left at the 7.3 gate. A
-discharge is evidence that the defect is closed, and it is not a ratification of
-R4 by the operator.
+R4 was discharged at
+`0237f9e02df3ab21131c5612c1b231050c860cc4`; no unresolved R4 choice remains
+at the 7.3 gate. A discharge is evidence that the defect is closed, and it is
+not a ratification of R4 by the operator.
 
 ### R1 — durable semantic owner/store
 
@@ -65,7 +55,7 @@ and
 These cover live-owner exclusion, hard-death reopen, graph/custody/proof union,
 restart reconstruction, and stale-owner shutdown fencing.
 
-Owner: the Macro-slice 2 durable-store work.
+Owner: the durable semantic store owner.
 
 Status: discharged at `55bafe5`.
 
@@ -80,8 +70,8 @@ matching provisional record. A process death between the atomic save and
 delivery can still leave material whose secret and recovery codes were never
 delivered.
 
-Owner: the Macro-slice 2 durable-state work. The target is durable provisional
-recovery, not a retry protocol or custody transaction framework.
+Owner: the durable-state owner. The contract is durable provisional recovery,
+not a retry protocol or custody transaction framework.
 
 The package-level regression control
 `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`
@@ -175,8 +165,8 @@ The exact R3 controls are
 and
 `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down`.
 
-Owner: the typed durable-semantic Signaling Node lane together with the
-Macro-slice 2 semantic proof work.
+Owner: the typed durable-semantic Signaling Node lane together with the durable
+semantic proof owner.
 
 Status: discharged at integration head `6d71567`; hosted CI `33229628657`
 completed all six jobs green and Turing's exact-head source audit is PASS.
@@ -188,8 +178,8 @@ completed all six jobs green and Turing's exact-head source audit is PASS.
 audit is PASS. These controls do not amend the R1 discharge or turn an
 unresolved HOLD into an acceptance.
 
-This is a separate, bounded semantic record accompanying the R3 implementation
-boundary; it does not create another residual or widen the transport lane.
+This is a separate, bounded semantic record accompanying the R3 boundary; it
+does not create another state owner or widen the transport lane.
 `FactBody::AuthorityLineageResolution` is the only persistent cross-cell
 selector for a multi-head AuthorityUse lineage. Ordinary
 `FactBody::Resolution` remains a same-cell selector (including Role cells) and
@@ -354,7 +344,7 @@ default-feature control keeps its durable assertions throughout: the device stay
 a signed member, stays rostered, and stays admissible. Neither control subsumes
 the other, and only the second speaks to the Nostr-only case above.
 
-**What remains, and it is not this residual.** On an unauthenticated carrier the
+**The remaining boundary is explicit.** On an unauthenticated carrier the
 sender attribution is still a field the sender wrote — `frame.from` on mDNS,
 `envelope.from` and `peer_id` on Nostr. Nothing in signaling can fix that, and
 nothing in signaling needs to: what it can still buy is a cancelled dial attempt
@@ -392,7 +382,7 @@ and test files at +1713/-870, adding `engine/semantic_ingress.rs`. This ledger i
 deliberately not in that commit, so the evidence does not contain its own claim.
 
 **Two prior discharges are superseded, and both are kept here rather than
-overwritten**, because a residual that was closed twice on insufficient evidence
+overwritten**, because a finding that was closed twice on insufficient evidence
 is worth being able to read back.
 `0b9b5b2c5be60f8204aa2fef4e14259e5d385611` guarded on liveness alone, so a
 sender-claimed departure could retire a third party's
@@ -408,11 +398,10 @@ survives in `0237f9e0…` — every mDNS report is `SenderClaimed` there, and th
 predicate is a promoted `SessionCapability` — and the three controls named in the
 discharge record below are present in that commit and are what close it.
 
-## The Macro-slice 2 signaling and semantic-ingress boundary
+## Signaling and semantic-ingress ownership boundary
 
-Macro-slice 2 lands as **one atomic PR**, not as a sequence of separately
-reviewed units. What follows is the boundary that PR establishes; the earlier
-"first bounded unit" framing described a review gate this slice does not have.
+This section records the final boundary established by the reviewed change. It
+is an owner contract, not a queue of work or a sequence of pending units.
 
 `engine/signaling_ingress.rs` is the Signaling Node's ephemeral-transport
 ingress: the only place a carrier observation is admitted, and the only place it
@@ -426,11 +415,11 @@ carrier variant carries a durable signed fact, so an uninhabited durable arm on
 the signaling union would have been a tag whose other value nothing can hold.
 
 The durable half lives where the sender is known. `engine/semantic_ingress.rs`
-is the Semantic Node's ingress: the seven existing authenticated-session durable
-messages (`NetworkState`, `NetworkStatePropose`, `NetworkStateAck`,
-`NetworkStateSplit`, `RosterSummary`, `RosterRequest`, `RosterEntries`) enter one
-closed typed `DurableSemanticIngress`, and a separate reducer applies them under
-the exact `PeerOwnerToken` the session belongs to. The type wraps a private enum,
+is the Semantic Node's ingress: accepted typed signed facts and fact bundles
+enter one closed typed `DurableSemanticIngress`; `NetworkStateBroadcast` is only
+a non-authoritative inventory hint, and deleted roster/transition wire messages
+are not part of this lane. A separate reducer applies accepted facts under the
+exact `PeerOwnerToken` the session belongs to. The type wraps a private enum,
 so the only way to obtain one is the module's `admit`, and `admit` is total over
 `MeshMessage` with no wildcard — a new durable message is a compile error until
 it is classified. Its outcome is a two-variant `SemanticAdmission`, not a
@@ -492,43 +481,33 @@ kept as vestigial accounting for a queue that no longer exists.
 Both seams are opaque callbacks or traits over plain values, so the signaling
 crate still learns no resource vocabulary and still works standalone.
 
-Excluded, and still excluded: anti-entropy, proof delivery, B3 changes, timers,
-polls, retries, terminal acknowledgements, relay and durable-store work, route
-identities, route ledgers, path generations, persistence, application payload in
-signaling, downstream migration, and any generic framework.
+Excluded from this signaling boundary: application payload in signaling,
+unrelated domain state, and any generic framework. Durable proof delivery,
+relay controls, route identity, path generation, persistence, and terminal
+acknowledgements belong to their named owners and are not reintroduced as
+signaling state.
 
-### Named residuals inside this boundary
+### External dependencies and evidence boundaries
 
 Both the engine→driver and driver→engine seams are queueless now: a driver pulls
 its outbound values through an `OutboundSource` and offers its inbound reports to
 an `InboundSink`, so nothing is retained in a translated form on either side.
 
-Three unbounded queues remain **on the production bridge path or upstream of
-it**, and they are named rather than quietly sized:
+Carrier libraries and the separately deployed signaling service may retain
+their own internal buffers outside the core provider dimensions. Those
+allocations remain the owning dependency's accounting boundary and are not
+silently reclassified as core custody.
 
-- **mDNS discovery events** (`mdns/discovery/embedded.rs`,
-  `mdns/discovery/system.rs`). These are **upstream of admission and on the
+<!-- Historical dependency notes retained only as provenance; the final owner and
+     evidence boundary is the matrix below.
   carrier→engine path**: a LAN participant's multicast lands here before the
-  driver has decided anything, so this is a real bound the driver still lacks.
   It is left open because bounding it belongs to the driver's own work model —
-  the system backend's queue is the `mdns-sd` dependency's, which the review
-  allows to remain a named residual, and the embedded backend's is the same
-  buffer under our own control. Naming it as internal would have been the
-  comfortable answer and the wrong one.
-- **The mDNS resolve queue** (`mdns/driver.rs`), fed from the discovery events
-  above and drained by the exchange dialler. Same position, same reason.
-- **`server.rs`'s per-connection outbound queue.** The self-hosted relay is a
-  separate deployment with no `NetworkState` and no provider to answer to; it is
   not on this node's carrier→engine path at all.
 
-The count is those three and no more. It deliberately excludes the adapters a
 caller may opt into — `LocalBroker::join`, `InboundSink::from_unbounded`,
 `UnboundedSource` — which do build unbounded channels, but only for a standalone
-embedder or a control that asked for one, and never on the production bridge
-path: `attach_local`, `attach_nostr` and `attach_mdns` construct none of them.
-That is the point of naming them in the signaling crate's public surface rather
 than hiding a buffer inside a driver — the choice appears in the source of
-whoever made it.
+-->
 
 ## Exact resource matrix for the remaining carrier/server state
 
@@ -541,35 +520,35 @@ marked **no provider** rather than assigned guessed byte prices.
 
 | State class | Producer | Consumer | Provider scope / dimensions | Admission / refusal | Queued / executing / terminal / shutdown owners | Pressure control | Provider baseline |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| **mDNS discovery / resolve:** backend `DiscoveryEvent`; resolved `PeerEntry` and `key_to_peer`; directed `OwnedSignal<String>` | `Discovery::start` backend; `run_browse` TXT/SRV resolution; engine `OutboundSource` | `run_browse` parser and peer maps; engine `InboundSink<MdnsInbound>`; per-connection writer | Backend discovery queue is **no provider** and remains the named upstream residual. `Shared.peers` is structurally capped, but `key_to_peer` has no independent cap/provider lease and is also a named residual. Directed lines retain their engine owner; any attached provider charge is made before engine-mailbox admission | `wire::parse_advert`, room/version/address validation, `MAX_DISCOVERED_PEERS`, and sink acceptance. Invalid/full records drop; a full/closed directed queue drops its owned line | Backend owns discovery events; `Shared.peers`/`key_to_peer` own resolved state; writer owns queued `OwnedSignal`. `MdnsDriverHandle::stop` cancels, unregisters/shuts down discovery, aborts tasks, and drops maps/owners | `MAX_DISCOVERED_PEERS = 1024`; per-connection `OUTBOUND_QUEUE_CAP = 128`; bounded frame line. Dependency-owned discovery depth and uncapped backend-key mapping remain HOLD items | No signaling-side provider delta. Attached engine ownership returns to its pre-arrival baseline after invalid/full/drop and stop |
-| **Nostr replay / parsing:** inbound WebSocket frame and decoded `Value`/`NostrEvent`; exact directed attempt, session, relay-entry, and correlation records | Relay socket read; `DeliveryStore::admit`; `open_session` | `handle_inbound_frame` and `InboundSink<NostrInbound>`; `run_relay_session`; `DeliveryStore` retry/reconnect state | Attached `DeliveryProvider` scope is one attempt, one relay session, and one `(attempt, session)` entry. `DeliveryRetention` independently names encoded-event, attempt key/entry, relay entry, session identity/entry, and residual claims across `AccountedMemoryBytes`, `QueuedBytes`, `StorageObject`, and `OpaqueDependencyResidual` | 256-KiB frame cap, JSON/envelope/kind/tag checks, and sink acceptance precede retention. Provider refusal precedes map insertion/frame encoding; one refused relay is not an attempt terminal while another relay lives | Socket task parses/writes; exact attempt owns source/correlation; each relay session owns session/relay-entry leases. Accepted, typed refusal, replacement, ACK, cancellation, and shutdown settle exact owners; driver stop cancels sessions and store | No pre-parse dedup ring or unbounded refusal queue; provider admission is per attempt/session/relay and reconnect rebinds exact current identity | Attached provider `in_use` returns to pre-admission baseline after refusal, ACK, replacement, or shutdown. Standalone compatibility mode is explicitly unmetered |
+| **mDNS discovery / resolve:** backend `DiscoveryEvent`; resolved `PeerEntry` and `key_to_peer`; directed `OwnedSignal<String>` | `Discovery::start` backend; `run_browse` TXT/SRV resolution; engine `OutboundSource` | `run_browse` parser and peer maps; engine `InboundSink<MdnsInbound>`; per-connection writer | Discovery, alias, and directed-delivery ownership is bounded by the configured discovery limits and any attached provider lease; dependency allocations remain the dependency boundary | `wire::parse_advert`, room/version/address validation, configured peer/queue caps, and sink acceptance. Invalid/full records drop; a full/closed directed queue drops its owned line | Backend owns discovery events; `Shared.peers`/`key_to_peer` own resolved state; writer owns queued `OwnedSignal`. `MdnsDriverHandle::stop` cancels, unregisters/shuts down discovery, and joins tasks before dropping owners | Configured discovery/resolve/queue limits and checked generations; provider admission precedes engine-mailbox retention | Attached engine ownership returns to its pre-arrival baseline after invalid/full/drop and stop; dependency-owned allocations require dependency evidence |
+| **Nostr replay / parsing:** inbound WebSocket frame and decoded `Value`/`NostrEvent`; exact directed attempt, session, relay-entry, and correlation records | Relay socket read; `DeliveryStore::admit`; `open_session` | `handle_inbound_frame` and `InboundSink<NostrInbound>`; `run_relay_session`; `DeliveryStore` retry/reconnect state | Attached `DeliveryProvider` scope is one attempt, one relay session, and one `(attempt, session)` entry. `DeliveryRetention` names encoded-event, attempt, relay, session, and opaque dependency claims | 256-KiB frame cap, JSON/envelope/kind/tag checks, and sink acceptance precede retention. Provider refusal precedes map insertion/frame encoding; a refused relay does not consume the live attempt demand | Socket task parses/writes; exact attempt owns source/correlation; each relay session owns session/relay-entry leases. Accepted, typed refusal, replacement, ACK, cancellation, and shutdown settle exact owners; driver stop cancels sessions and store | No pre-parse dedup ring or unbounded refusal queue; provider admission is per attempt/session/relay and reconnect rebinds exact current identity | Attached provider `in_use` returns to pre-admission baseline after refusal, ACK, replacement, or shutdown; provider-backed start is required for production capacity |
 | **Relay per-connection I/O / replay:** server `ConnEntry`, bounded outbound queue, subscriptions, stored replay deque, per-REQ replay vector | `HubInner::handle_event` fan-out; `HubInner::handle_req` stored-plus-live replay; client frames | Per-connection writer; `serve_conn`; `handle_req` sends replay and `EOSE` | Self-hosted `server.rs` is a separate deployment with **no MyOwnMesh `FiniteResourceProvider` scope**. Its limits are server policy/OS accounting, not mesh dimensions | Bounded `try_send`; rate/filter/subscription/message limits reject or drop. Replay dedupes and truncates to `MAX_REPLAY_PER_REQ`; storage admits only replayable events under its cap | `HubInner` owns connection/subscription/presence state; writer owns queued frames; connection owns replay output until send. Unregister and hub shutdown release exact state | `MAX_STORED_EVENTS = 8192`, 15-minute retention, `MAX_REPLAY_PER_REQ = 500`, queue 128, and per-connection limits | No mesh-provider baseline is claimed; baseline is configured store/presence plus empty per-connection queue after pruning |
 | **Server registration / shutdown:** listener accept, `conns`, `ip_counts`, presence ownership, IDs, shutdown watch | Listener accepts socket; `HubInner::register` creates `ConnEntry` | `serve_conn` reader/writer; `HubInner::unregister` removes exact connection and current presence ownership | **No provider:** relay has no semantic mesh slot or attached finite resource scope. OS listener/socket/runtime allocations are outside mesh dimensions | `max_connections_per_ip` refusal sends bounded NOTICE then closes; shutdown, failed upgrade, or closed socket never enters `conns`; successful registration is the sole record admission | `HubInner` owns registration/IP/presence maps; `serve_conn` owns socket; writer owns queue; unregister is terminal cleanup; shutdown watch ends readers and writers | Default `max_connections_per_ip = 64`, plus message/rate/subscription/filter ceilings and OS listener admission | No mesh-provider delta is promised. Server baseline is zero connections, empty IP/presence maps, no writer queues after shutdown; deployment-level OS accounting remains HOLD |
 
 **R1 and HOLD are preserved.** R1 remains discharged at `55bafe5`; this
-matrix does not reopen it. The mDNS backend queue and self-hosted-relay
-no-provider allocations remain HOLD until their owning dependency or
-deployment supplies a typed, independently verified accounting boundary. The
-Nostr client row is provider-owned only when an attached `DeliveryProvider`
-is supplied; its standalone unmetered provider is not evidence of finite
-production capacity.
+matrix does not reopen it. Dependency-owned mDNS and self-hosted-relay
+allocations remain qualified until their owning dependency or deployment
+supplies a typed, independently verified accounting boundary. The Nostr
+production path requires an attached `DeliveryProvider`; standalone adapters
+do not establish a production capacity claim.
 
 ## Scope ceiling
 
-No repository-wide discovery pass, downstream consumer migration, custody-only
-file-lock subsystem, generic transaction framework, route identity, route
-ledger, path generation, or application-domain work is admitted by this entry.
+No repository-wide discovery pass, unrelated downstream application work,
+custody-only file-lock subsystem, generic transaction framework, or unrelated
+application-domain work is admitted by this ledger. Closed-relay route
+identity, allocation generation, and terminal custody belong to the final
+relay owner and are part of the architecture contract.
 No work in AllMyStuff, CEC Support, or another repository is part of this
-slice.
+architecture package.
 
-Before this ledger is deleted, the canonical documents must describe the
-contract that actually remains. Exact closing commits, controls, and PR records
-remain the durable evidence for each discharge; this table is an index to that
-evidence, not its sole copy.
+The canonical documents describe the contract that remains. Exact closing
+commits, controls, and review records remain the durable evidence for each
+discharge; this table is an index to that evidence, not its sole copy.
 
 ## Discharge record
 
-| Residual | Discharged at | Closing control |
+| Closure item | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
 | R2 | `3556a9a5a509b6773898213870f289e6dbb1ff5b` (hosted CI `33245879472`; Turing exact-head FINAL PASS) | `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_disable_refuses_prepared_material_until_explicit_abort`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_endpoint_is_verified_as_exact_owner_only_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_replaces_an_owned_stale_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_non_socket_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_symlink_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_an_accessible_unrelated_parent_without_chmod`, `crates/myownmesh/src/control/listener.rs::tests::windows_pipe_dacl_names_current_token_user_not_owner_rights`, `crates/myownmesh/src/control/listener.rs::tests::windows_current_user_pipe_connects_and_is_accepted`, `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`; full unread-response shipped-daemon choreography is Unix-gated, not identical Windows crash choreography |

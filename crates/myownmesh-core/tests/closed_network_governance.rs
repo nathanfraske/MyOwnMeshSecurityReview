@@ -15,14 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::transport_lab::{
     attach_local, create_network_in_instance_root, import_network_in_instance_root, NetworkState,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
-use myownmesh_core::semantic::{ClosedProfileId, VerifiedProjectPolicy};
+use myownmesh_core::semantic::{ClosedProfileId, Role, VerifiedProjectPolicy};
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
@@ -32,8 +31,11 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: network_id.to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -183,12 +185,10 @@ async fn onboard_member(
     // Closed admission begins from the verified shared bootstrap. Alice's
     // root-signed RoleGrant is the only onboarding authority; no roster write
     // or Open-network bypass is allowed to stand in for the semantic grant.
-    myownmesh_core::engine::governance::propose(
+    myownmesh_core::engine::governance::propose_role_grant(
         alice,
-        TransitionVariant::RoleGrant {
-            target: bob_id.public_id().to_string(),
-            role: Role::Member,
-        },
+        bob_id.public_id(),
+        Role::Member,
         None,
     )
     .await
@@ -232,7 +232,7 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
     let bob_id = Arc::new(Identity::ephemeral());
 
     // Unique per-test network id so a parallel test that happens to
-    // collide on file paths doesn't reuse a stale state log.
+    // collide on file paths doesn't reuse stale semantic state.
     let network_id = "closed-net-test";
     let ((alice_state, alice_driver), (bob_state, bob_driver)) = spawn_shared_closed_pair(
         network_id,
@@ -273,7 +273,7 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
     ));
 
     // The verified bootstrap seats Alice as root Owner; the canonical RoleGrant
-    // admits Bob as Member without a synthetic KindChange transition.
+    // admits Bob as Member without a separate kind-change command.
     {
         assert_eq!(
             alice_state.verified_authority_root(),
@@ -327,14 +327,15 @@ async fn shared_closed_bootstrap_onboards_root_signed_member() {
 }
 
 #[tokio::test]
-async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
+async fn owner_signed_member_grant_converges_via_canonical_signed_facts() {
     // Closed-network membership is owner-**signed**: an owner admits a member
     // by authoring a ratified `RoleGrant`, and that membership converges to
-    // every other member through the verified signed log — NOT through unsigned
-    // roster gossip, and WITHOUT the new member needing to be present. This is
-    // the regression guard for the fleet bug where a member couldn't see its
-    // co-members until the owner re-gossiped: the signed log is complete and
-    // self-sufficient, so any member that has adopted it holds the full roster.
+    // every other member through the verified signed fact set — NOT through
+    // unsigned roster metadata, and WITHOUT the new member needing to be
+    // present. This is the regression guard for the fleet bug where a member
+    // could not see its co-members until the owner retransmitted facts: the
+    // canonical fact set is complete and self-sufficient, so any member that
+    // adopts it holds the full roster.
     let broker = LocalBroker::new();
     let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
@@ -375,12 +376,10 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     // Alice (Owner) admits Carol with a single signed `RoleGrant` — the quorum
     // for a Member grant is ≥1 owner/controller, so it ratifies on Alice at
     // once (no co-signer, and Carol need not be present).
-    myownmesh_core::engine::governance::propose(
+    myownmesh_core::engine::governance::propose_role_grant(
         &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_id.public_id().to_string(),
-            role: Role::Member,
-        },
+        carol_id.public_id(),
+        Role::Member,
         None,
     )
     .await
@@ -395,9 +394,10 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
     .await;
 
     // The whole point: Carol converges into BOB's roster too — derived from
-    // Alice's verified signed log — even though Carol is offline and only the
+    // Alice's verified signed facts — even though Carol is offline and only the
     // owner ever signed her in. Before signed membership, Bob could learn a
-    // co-member only from live owner gossip; now the log carries it, complete.
+    // co-member only from live owner metadata; now the canonical facts carry
+    // the complete membership.
     wait_for(
         "bob's roster carries carol",
         Duration::from_secs(10),
@@ -417,12 +417,13 @@ async fn owner_signed_member_grant_converges_to_a_member_via_the_log() {
 }
 
 #[tokio::test]
-async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
+async fn evict_converges_and_drops_the_member_on_a_fact_exchange_peer() {
     // The lost/stolen-device kick must propagate. When the owner evicts a
-    // member, every peer that learned that member *through gossip* (not by
-    // ratifying the evict locally) has to drop it from its roster too, so the
+    // member, every peer that learned that member through canonical fact
+    // exchange (not by ratifying the evict locally) has to drop it from its
+    // roster too, so the
     // device loses authorisation network-wide — not just on the owner. This is
-    // the regression guard for the bug where the gossip-adopt path re-projected
+    // the regression guard for the bug where the fact-adoption path re-projected
     // roles but never removed the evicted row, so evicted devices lingered
     // (still authorised) on every co-member.
     let broker = LocalBroker::new();
@@ -431,7 +432,7 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     let bob_id = Arc::new(Identity::ephemeral()); // co-member, online
     let carol_id = Arc::new(Identity::ephemeral()); // admitted then evicted, offline
 
-    let network_id = "evict-gossip-net";
+    let network_id = "evict-fact-exchange-net";
     let alice_root = node_root();
     let bob_root = node_root();
     let ((alice_state, alice_driver), (bob_state, bob_driver)) = spawn_shared_closed_pair(
@@ -461,20 +462,18 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     .await;
 
     // The shared bootstrap is already Closed; admit Carol into its signed
-    // member log (she never connects).
-    myownmesh_core::engine::governance::propose(
+    // canonical member facts (she never connects).
+    myownmesh_core::engine::governance::propose_role_grant(
         &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_id.public_id().to_string(),
-            role: Role::Member,
-        },
+        carol_id.public_id(),
+        Role::Member,
         None,
     )
     .await
     .expect("admit carol");
 
-    // Carol converges into Bob's roster via the signed log — Bob only ever
-    // learns her through gossip, never a direct connection.
+    // Carol converges into Bob's roster via the signed facts — Bob only ever
+    // learns her through fact exchange, never a direct connection.
     wait_for(
         "bob's roster carries carol",
         Duration::from_secs(10),
@@ -483,15 +482,9 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
     .await;
 
     // Alice evicts Carol (the propagating lost-device kick).
-    myownmesh_core::engine::governance::propose(
-        &alice_state,
-        TransitionVariant::Evict {
-            target: carol_id.public_id().to_string(),
-        },
-        None,
-    )
-    .await
-    .expect("evict carol");
+    myownmesh_core::engine::governance::propose_evict(&alice_state, carol_id.public_id(), None)
+        .await
+        .expect("evict carol");
 
     // Gone on the owner (local ratify path already removed her)...
     wait_for(
@@ -500,14 +493,15 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
         || !rostered(&alice_state, carol_id.public_id()),
     )
     .await;
-    // ...and — the fix — gone on Bob too, who learned the evict only via gossip.
+    // ...and — the fix — gone on Bob too, who learned the evict only through
+    // canonical fact exchange.
     wait_for("carol leaves bob's roster", Duration::from_secs(10), || {
         !rostered(&bob_state, carol_id.public_id())
     })
     .await;
     assert!(
         !rostered(&bob_state, carol_id.public_id()),
-        "an evicted member must be dropped from a gossip peer's roster"
+        "an evicted member must be dropped from a fact-exchange peer's roster"
     );
     // The owner is still authorised on Bob (the prune keeps genuine members).
     assert!(
@@ -522,20 +516,20 @@ async fn evict_converges_and_drops_the_member_on_a_gossip_peer() {
 }
 
 #[tokio::test]
-async fn manager_admits_a_member_which_converges_via_canonical_facts() {
-    // The two-key model end to end: an owner promotes a peer to **manager**
-    // (Controller), and that manager — not just the owner — admits a member.
-    // The admission rides a manager-authored canonical RoleGrant and converges
+async fn controller_admits_a_member_which_converges_via_canonical_facts() {
+    // The two-key model end to end: an owner promotes a peer to Controller,
+    // and that controller — not just the owner — admits a member.
+    // The admission rides a controller-authored canonical RoleGrant and converges
     // to the owner even though the owner never signed it. This is the cert
-    // chain in motion: the owner issues the manager, then the manager issues
+    // chain in motion: the owner issues the controller, then the controller issues
     // the member through the canonical fact graph.
     let broker = LocalBroker::new();
     let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral()); // owner
-    let bob_id = Arc::new(Identity::ephemeral()); // promoted to manager
-    let dave_id = Arc::new(Identity::ephemeral()); // admitted by the manager, offline
+    let bob_id = Arc::new(Identity::ephemeral()); // promoted to Controller
+    let dave_id = Arc::new(Identity::ephemeral()); // admitted by the controller, offline
 
-    let network_id = "manager-admit-net";
+    let network_id = "controller-admit-net";
     let alice_root = node_root();
     let bob_root = node_root();
     let ((alice_state, alice_driver), (bob_state, bob_driver)) = spawn_shared_closed_pair(
@@ -564,14 +558,12 @@ async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     )
     .await;
 
-    // Alice promotes Bob to manager (Controller) — owner-only authority. This
+    // Alice promotes Bob to Controller — owner-only authority. This
     // rides the canonical fact graph and converges to Bob.
-    myownmesh_core::engine::governance::propose(
+    myownmesh_core::engine::governance::propose_role_grant(
         &alice_state,
-        TransitionVariant::RoleGrant {
-            target: bob_id.public_id().to_string(),
-            role: Role::Controller,
-        },
+        bob_id.public_id(),
+        Role::Controller,
         None,
     )
     .await
@@ -583,34 +575,32 @@ async fn manager_admits_a_member_which_converges_via_canonical_facts() {
     )
     .await;
 
-    // Bob — now a manager — admits Dave. Authority for a member grant is ≥1
+    // Bob — now a controller — admits Dave. Authority for a member grant is ≥1
     // controller/owner; Bob qualifies, so it ratifies on Bob alone and lands in
     // the canonical graph (Dave need not be present).
-    myownmesh_core::engine::governance::propose(
+    myownmesh_core::engine::governance::propose_role_grant(
         &bob_state,
-        TransitionVariant::RoleGrant {
-            target: dave_id.public_id().to_string(),
-            role: Role::Member,
-        },
+        dave_id.public_id(),
+        Role::Member,
         None,
     )
     .await
-    .expect("manager admits dave");
+    .expect("controller admits dave");
     wait_for("bob's roster carries dave", Duration::from_secs(10), || {
         rostered(&bob_state, dave_id.public_id())
     })
     .await;
 
-    // The manager-authored admission is a canonical RoleGrant fact; no legacy
-    // legacy log representation is authoritative.
+    // The controller-authored admission is a canonical RoleGrant fact; no
+    // compatibility representation is authoritative.
     assert_eq!(
         canonical_role(&bob_state, dave_id.public_id()),
         Some(Role::Member),
-        "Dave's canonical member grant must project on the manager"
+        "Dave's canonical member grant must project on the controller"
     );
 
     // And it converges to the OWNER by union-merge: Alice never signed Dave, yet
-    // recognises Bob's manager-authored admission and surfaces Dave as a member.
+    // recognises Bob's controller-authored admission and surfaces Dave as a member.
     wait_for(
         "alice's roster carries dave",
         Duration::from_secs(10),
@@ -672,12 +662,10 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
 
     // Bob is a member and therefore cannot author this authority-bearing fact;
     // the canonical graph must refuse it before any pending state is created.
-    let refusal = myownmesh_core::engine::governance::propose(
+    let refusal = myownmesh_core::engine::governance::propose_role_grant(
         &bob_state,
-        TransitionVariant::RoleGrant {
-            target: carol_id.public_id().to_string(),
-            role: Role::Member,
-        },
+        carol_id.public_id(),
+        Role::Member,
         None,
     )
     .await;
@@ -711,7 +699,7 @@ async fn plain_member_role_grant_is_rejected_without_canonical_mutation() {
 async fn causally_re_admitting_an_evicted_member_restores_membership() {
     // The explicit Closed creator supplies the verified root. Each governance
     // mutation cites the current exclusive-cell head, so this is a causal
-    // replacement sequence rather than a legacy timestamp/arrival-order test.
+    // replacement sequence rather than an arrival-order test.
     // The assertions below read the canonical role and roster projections.
     let transport = support::test_transport();
     let alice_id = Arc::new(Identity::ephemeral());
@@ -730,31 +718,18 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
     .await
     .expect("alice engine");
 
-    use myownmesh_core::engine::governance::propose;
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_pk.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("admit");
+    use myownmesh_core::engine::governance::{propose_evict, propose_role_grant};
+    propose_role_grant(&alice_state, &carol_pk, Role::Member, None)
+        .await
+        .expect("admit");
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
         Some(Role::Member),
         "the root-authored member grant must be visible before eviction"
     );
-    propose(
-        &alice_state,
-        TransitionVariant::Evict {
-            target: carol_pk.clone(),
-        },
-        None,
-    )
-    .await
-    .expect("evict");
+    propose_evict(&alice_state, &carol_pk, None)
+        .await
+        .expect("evict");
     assert!(
         !canonical_has_role(&alice_state, carol_pk.as_str()),
         "an evicted member must be absent from the projected membership"
@@ -767,16 +742,9 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
         None,
         "membership admission alone must not grant a role"
     );
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_pk.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("re-admit");
+    propose_role_grant(&alice_state, &carol_pk, Role::Member, None)
+        .await
+        .expect("re-admit");
 
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
@@ -792,23 +760,24 @@ async fn causally_re_admitting_an_evicted_member_restores_membership() {
 
 #[tokio::test]
 async fn evicting_a_promoted_member_tombstones_its_member_admit() {
-    // Regression for "I removed an owner/manager, but it stays controllable and
+    // Regression for "I removed an owner/controller, but it stays controllable and
     // the other owners still see it in the fleet."
     //
     // A device promoted past plain member (admitted as Member, then granted
     // Controller/Owner) still carries its original member-tier admit in the
-    // member log. Evicting it extends the owner (governance) log — but any peer
-    // that re-derives membership straight from the signed logs, which is exactly
-    // what a co-owner does when it adopts the log via gossip (e.g. it was offline
+    // member facts. Evicting it extends the signed governance facts — but any
+    // peer that re-derives membership straight from those facts, which is
+    // exactly what a co-owner does when it adopts the fact set through peer
+    // exchange (e.g. it was offline
     // during the kick), folds that stale admit back in and resurrects the evicted
     // device as a plain member: it lingers in the roster, still authorised to
     // control the fleet, and every such owner keeps seeing it. The evict must
     // tombstone the admit so the projected membership drops the device and the
     // roster mirror prunes it — the same convergence a plain-member evict gets.
     //
-    // This drives the projection functions the gossip-adoption path
-    // (`project_roles` / the roster mirror in `adopt_transition_log`) is built
-    // on, so it fails deterministically without the fix — unlike an online peer,
+    // This drives the projection functions the fact-adoption path is built on
+    // (`project_roles` / the roster mirror), so it fails deterministically
+    // without the fix — unlike an online peer,
     // which ratifies the evict incrementally and never hits the resurrecting
     // re-projection.
     let transport = support::test_transport();
@@ -828,50 +797,29 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
     .await
     .expect("alice engine");
 
-    use myownmesh_core::engine::governance::propose;
-    // Admit Carol as a plain member (member log), then promote her to manager
-    // (governance log) — so her stale member-tier admit outlives the promotion.
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_pk.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("admit carol");
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_pk.clone(),
-            role: Role::Controller,
-        },
-        None,
-    )
-    .await
-    .expect("promote carol");
+    use myownmesh_core::engine::governance::{propose_evict, propose_role_grant};
+    // Admit Carol as a plain member (member facts), then promote her to
+    // Controller (governance facts) — so her stale member-tier admit outlives the
+    // promotion.
+    propose_role_grant(&alice_state, &carol_pk, Role::Member, None)
+        .await
+        .expect("admit carol");
+    propose_role_grant(&alice_state, &carol_pk, Role::Controller, None)
+        .await
+        .expect("promote carol");
     assert_eq!(
         canonical_role(&alice_state, &carol_pk),
         Some(Role::Controller),
-        "carol should be a manager after promotion"
+        "carol should be a Controller after promotion"
     );
 
-    // Evict the manager.
-    propose(
-        &alice_state,
-        TransitionVariant::Evict {
-            target: carol_pk.clone(),
-        },
-        None,
-    )
-    .await
-    .expect("evict carol");
+    // Evict the Controller.
+    propose_evict(&alice_state, &carol_pk, None)
+        .await
+        .expect("evict carol");
 
-    // Canonical role and roster projection are authoritative here; compatibility
-    // logs may remain evidence but cannot decide whether Carol is admitted.
-    // Canonical projection is authoritative here; compatibility logs are not
-    // used to decide whether Carol remains admitted.
+    // Canonical role and roster projection are authoritative here. Compatibility
+    // records may remain evidence but cannot decide whether Carol remains admitted.
     assert!(!canonical_has_role(&alice_state, &carol_pk));
     assert_eq!(
         canonical_role(&alice_state, alice_id.public_id()),
@@ -885,9 +833,9 @@ async fn evicting_a_promoted_member_tombstones_its_member_admit() {
 
 #[tokio::test]
 async fn withdrawing_a_role_updates_the_local_roster_tag() {
-    // Regression: withdrawing a peer's role (owner/manager → plain member) must
+    // Regression: withdrawing a peer's role (owner/controller → plain member) must
     // update the *authoring* device's cached roster tag, not just the projected
-    // `roles` map. The gossip-adoption path reprojects the whole role map onto
+    // `roles` map. The fact-adoption path reprojects the whole role map onto
     // the roster, but the local ratify path open-coded per-variant mirrors and
     // skipped RoleRevoke entirely — so on the device that authored the
     // withdrawal, the peer's row kept rendering the old authority and the
@@ -910,27 +858,13 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
     .await
     .expect("alice engine");
 
-    use myownmesh_core::engine::governance::propose;
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: bob_pk.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("admit bob");
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: bob_pk.clone(),
-            role: Role::Controller,
-        },
-        None,
-    )
-    .await
-    .expect("promote bob");
+    use myownmesh_core::engine::governance::propose_role_grant;
+    propose_role_grant(&alice_state, &bob_pk, Role::Member, None)
+        .await
+        .expect("admit bob");
+    propose_role_grant(&alice_state, &bob_pk, Role::Controller, None)
+        .await
+        .expect("promote bob");
     assert_eq!(
         canonical_role(&alice_state, &bob_pk),
         Some(Role::Controller),
@@ -946,16 +880,9 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
 
     // Demote Bob explicitly back to a plain member. RoleRevoke means no role;
     // a durable demotion is a canonical RoleGrant(Member).
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: bob_pk.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("withdraw bob");
+    propose_role_grant(&alice_state, &bob_pk, Role::Member, None)
+        .await
+        .expect("withdraw bob");
 
     // The cached roster tag must drop to member on the authoring device — the
     // withdrawal has to "take" right where the owner performed it.
@@ -989,12 +916,12 @@ async fn withdrawing_a_role_updates_the_local_roster_tag() {
 async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     // The "offline and lost devices just keep showing back up" loop, killed
     // end to end. Carol is admitted to the closed network and then evicted
-    // while OFFLINE — she never hears the evict. When she comes back she
+    // while OFFLINE — she never receives the eviction fact. When she comes back she
     // redials with a stale credential; before this fix, the handshake
     // treated her as a fresh face and (on an auto-approve network — every
     // fleet mesh) re-approved her, put her back in rosters on mutual
-    // ACTIVE, and gossiped the resurrection. Now: the members' handshake
-    // gate denies her WITH the signed log attached, she verifies her own
+    // ACTIVE, and exchanged the resurrection. Now: the members' handshake
+    // gate denies her WITH the signed facts attached, she verifies her own
     // eviction through the standard strict-extension adoption (the owner's
     // signatures are the authority, not the denier), flips to stood-down,
     // and nobody's roster ever re-admits her.
@@ -1049,32 +976,19 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     )
     .await;
 
-    use myownmesh_core::engine::governance::propose;
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_id.public_id().to_string(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("admit carol");
+    use myownmesh_core::engine::governance::{propose_evict, propose_role_grant};
+    propose_role_grant(&alice_state, carol_id.public_id(), Role::Member, None)
+        .await
+        .expect("admit carol");
     wait_for(
         "bob's roster carries carol",
         Duration::from_secs(10),
         || rostered(&bob_state, carol_id.public_id()),
     )
     .await;
-    propose(
-        &alice_state,
-        TransitionVariant::Evict {
-            target: carol_id.public_id().to_string(),
-        },
-        None,
-    )
-    .await
-    .expect("evict carol while she is offline");
+    propose_evict(&alice_state, carol_id.public_id(), None)
+        .await
+        .expect("evict carol while she is offline");
     wait_for(
         "carol leaves both members' rosters",
         Duration::from_secs(10),
@@ -1088,8 +1002,8 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     // Carol comes back online, clueless, and redials the mesh.
     attach_local(&carol_state, &broker);
 
-    // She learns: some member's handshake denies her with the signed log,
-    // she adopts it (strict extension over her empty log), and the
+    // She learns: some member's handshake denies her with the signed facts,
+    // she adopts them (strict extension over her empty fact set), and the
     // verified verdict stands her down.
     wait_for(
         "carol adopts the proof and stands down",
@@ -1109,7 +1023,7 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
     );
 
     // And the resurrection is dead: give the mesh a few more announce/
-    // gossip beats — nobody re-admits her, on either member.
+    // fact-exchange beats — nobody re-admits her, on either member.
     assert!(
         !rostered(&alice_state, carol_id.public_id()),
         "an evicted device redialing must not re-enter the owner's roster"
@@ -1119,7 +1033,7 @@ async fn evicted_offline_device_learns_on_reconnect_and_stands_down() {
         "an evicted device redialing must not re-enter a member's roster"
     );
     // Her own roster view keeps whatever she had; the flag is what stands
-    // her down — and the signed logs she adopted agree she is out.
+    // her down — and the signed facts she adopted agree she is out.
     let verdict = !canonical_has_role(&carol_state, carol_id.public_id());
     assert!(
         verdict,
@@ -1204,7 +1118,7 @@ async fn two_owners_converge_their_rosters() {
     // The reported symptom, inverted into a guarantee: a fleet with two owners
     // where the rosters never converge and only one behaves like the "real"
     // owner. With flat peer authority (any owner is a full owner), an
-    // order-independent governance log (both recognise the same shared prefix
+    // order-independent governance fact set (both recognise the same shared prefix
     // regardless of ack order), and the union-merged member tier, the two owners
     // must each recognise the other, and a member admitted by *either* must
     // appear on *both*.
@@ -1243,18 +1157,11 @@ async fn two_owners_converge_their_rosters() {
     )
     .await;
 
-    use myownmesh_core::engine::governance::propose;
+    use myownmesh_core::engine::governance::propose_role_grant;
     // Alice promotes Bob to a second Owner under the shared Closed policy.
-    propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: bob_id.public_id().to_string(),
-            role: Role::Owner,
-        },
-        None,
-    )
-    .await
-    .expect("grant bob owner");
+    propose_role_grant(&alice_state, bob_id.public_id(), Role::Owner, None)
+        .await
+        .expect("grant bob owner");
 
     // Both sides must agree Bob is a *full* owner — not just on Alice's view.
     // (This is the "only one acts like the real owner" half of the symptom.)
@@ -1269,26 +1176,13 @@ async fn two_owners_converge_their_rosters() {
     .await;
 
     // Each owner independently admits a different member (both offline).
-    let alice_carol_fact = propose(
-        &alice_state,
-        TransitionVariant::RoleGrant {
-            target: carol_id.public_id().to_string(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("alice admits carol");
-    let bob_dave_fact = propose(
-        &bob_state,
-        TransitionVariant::RoleGrant {
-            target: dave_id.public_id().to_string(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect("bob admits dave");
+    let alice_carol_fact =
+        propose_role_grant(&alice_state, carol_id.public_id(), Role::Member, None)
+            .await
+            .expect("alice admits carol");
+    let bob_dave_fact = propose_role_grant(&bob_state, dave_id.public_id(), Role::Member, None)
+        .await
+        .expect("bob admits dave");
     assert_ne!(
         alice_carol_fact, bob_dave_fact,
         "the two owners must author distinct content-derived canonical facts"
@@ -1405,7 +1299,7 @@ async fn local_topology_control_does_not_enter_canonical_governance() {
     .await;
 
     // The bootstrap root designates herself the network's infra hub. One signed
-    // transition carries the whole shape (mode + hub set + redundancy).
+    // local topology command carries the whole shape (mode + hub set + redundancy).
     let governed = TopologyMode::Hubs {
         hubs: vec![alice_id.public_id().to_string()],
         spoke_redundancy: Some(1),
@@ -1416,7 +1310,7 @@ async fn local_topology_control_does_not_enter_canonical_governance() {
     );
 
     // Both governance views AND both runtime selectors converge — Bob
-    // never signs anything; adopting the extended log reshapes him.
+    // never signs anything; a local topology selector cannot reshape him.
     wait_for(
         "alice's local selector takes the topology",
         Duration::from_secs(10),
@@ -1424,8 +1318,8 @@ async fn local_topology_control_does_not_enter_canonical_governance() {
     )
     .await;
 
-    // The governed log re-verifies from scratch — what a third node
-    // joining later replays to learn the shape with zero prior trust.
+    // Canonical governance remains unchanged; a third node joining later must
+    // not infer this local selector change as a governance fact.
     // Backstop: a manual local SetTopology on a governed network is
     // ignored — one device can't fork itself off the owner's shape.
     assert!(

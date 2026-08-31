@@ -37,10 +37,10 @@ use crate::engine::state::NetworkState;
 use crate::identity::DeviceId;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-    FundedArc, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
-    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxReceiver, ResourceUnavailable,
+    checked_measure_add, mailbox_measure_serialized, strings_measure, FundedArc, LeasedMap,
+    LocalApplicationResourceScope, MailboxMeasurement, ResourceClaim, ResourceClaimArithmeticError,
+    ResourceClass, ResourceLease, ResourceMailboxItem, ResourceMailboxItemError,
+    ResourceMailboxReceiver, ResourceUnavailable,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -210,14 +210,14 @@ pub enum RpcStreamItem {
     End(Result<(), String>),
 }
 
-impl ResourceMailboxItem for RpcStreamItem {
-    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for RpcStreamItem {
+    fn measured_claim(&self) -> Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         let (retained, queued, allocations) = match self {
             Self::Chunk(payload) => mailbox_measure_serialized(payload)?,
             Self::End(Ok(())) => (0, 0, 0),
             Self::End(Err(error)) => strings_measure([error.as_str()])?,
         };
-        mailbox_retained_claim::<Self>(retained, queued, allocations)
+        MailboxMeasurement::from_parts(retained, queued, allocations)
     }
 }
 
@@ -4536,5 +4536,43 @@ mod session_ownership_tests {
         drop(state);
         assert!(weak.upgrade().is_none());
         assert!(first.inner.network.upgrade().is_none());
+    }
+
+    #[test]
+    fn stale_registration_drop_cannot_remove_a_live_successor() {
+        let state = crate::engine::build_test_state("rpc-registration-successor");
+        let rpc = Rpc::attach(&state).expect("the fixture funds one dispatcher");
+
+        let first = rpc
+            .prepare_serve("successor", |_call| async {
+                Ok(RpcResponse::from_value(serde_json::json!("first")))
+            })
+            .expect("the predecessor registration is funded");
+        let first = first
+            .commit()
+            .into_result()
+            .expect("the predecessor registration commits");
+
+        let second = rpc
+            .prepare_serve("successor", |_call| async {
+                Ok(RpcResponse::from_value(serde_json::json!("second")))
+            })
+            .expect("the successor registration is funded");
+        let second = second
+            .commit()
+            .into_result()
+            .expect("the successor registration commits");
+
+        drop(first);
+        assert_eq!(
+            rpc.registered_methods(),
+            vec!["successor".to_string()],
+            "dropping a stale registration cannot remove its live successor"
+        );
+        drop(second);
+        assert!(
+            rpc.registered_methods().is_empty(),
+            "dropping the current registration removes exactly its own entry"
+        );
     }
 }

@@ -129,6 +129,16 @@ pub struct FactBundleMessage {
     pub facts: Vec<SignedFact>,
 }
 
+impl FactBundleMessage {
+    /// Count a bundle page against the exact complete-frame boundary without
+    /// constructing a second serialized buffer.
+    pub(crate) fn encoded_len_for_facts(facts: &[SignedFact]) -> Option<usize> {
+        super::encoded_json_len(&super::MeshMessage::FactBundle(Self {
+            facts: facts.to_vec(),
+        }))
+    }
+}
+
 /// A non-authoritative inventory of canonical facts known by one peer.
 ///
 /// The context is exact and the identifiers are canonicalized at construction
@@ -158,6 +168,20 @@ impl FactInventory {
 
     pub fn fact_ids(&self) -> &[FactId] {
         &self.fact_ids
+    }
+
+    /// Stream canonical inventory pages at the exact receive-safe wire
+    /// boundary. Pages retain the same context and canonical ordering; no
+    /// page is authority and a lost page is repaired by the next inventory
+    /// pass.
+    pub(crate) fn pages(&self) -> ExactFramePages<'_, FactId, impl Fn(&[FactId]) -> Option<usize>> {
+        let context_id = self.context_id;
+        exact_frame_pages(&self.fact_ids, move |fact_ids| {
+            super::encoded_json_len(&super::MeshMessage::FactInventory(Self {
+                context_id,
+                fact_ids: fact_ids.to_vec(),
+            }))
+        })
     }
 }
 
@@ -189,6 +213,93 @@ impl FactRequest {
 
     pub fn fact_ids(&self) -> &[FactId] {
         &self.fact_ids
+    }
+
+    /// Stream this exact-context request using the same encoded frame
+    /// boundary as inventory pages. A request page never changes the
+    /// requested IDs.
+    pub(crate) fn pages(&self) -> ExactFramePages<'_, FactId, impl Fn(&[FactId]) -> Option<usize>> {
+        let context_id = self.context_id;
+        exact_frame_pages(&self.fact_ids, move |fact_ids| {
+            super::encoded_json_len(&super::MeshMessage::FactRequest(Self {
+                context_id,
+                fact_ids: fact_ids.to_vec(),
+            }))
+        })
+    }
+}
+
+pub(crate) struct ExactFramePages<'a, T, F> {
+    values: std::slice::Iter<'a, T>,
+    pending: Option<T>,
+    encoded_len: F,
+    started: bool,
+    finished: bool,
+    invalid: bool,
+}
+
+impl<'a, T: Clone, F> ExactFramePages<'a, T, F>
+where
+    F: Fn(&[T]) -> Option<usize>,
+{
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.invalid
+    }
+}
+
+impl<'a, T: Clone, F> Iterator for ExactFramePages<'a, T, F>
+where
+    F: Fn(&[T]) -> Option<usize>,
+{
+    type Item = Vec<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.invalid {
+            return None;
+        }
+        let mut current = Vec::new();
+        let Some(mut value) = self.pending.take().or_else(|| self.values.next().cloned()) else {
+            self.finished = true;
+            return (!self.started).then(|| {
+                self.started = true;
+                current
+            });
+        };
+        self.started = true;
+        loop {
+            current.push(value.clone());
+            match (self.encoded_len)(&current) {
+                Some(length) if length <= super::RECEIVE_FRAME_BYTES => {}
+                Some(_) | None => {
+                    current.pop();
+                    if current.is_empty() {
+                        self.invalid = true;
+                        return None;
+                    }
+                    self.pending = Some(value);
+                    return Some(current);
+                }
+            }
+            let Some(next) = self.values.next() else {
+                self.finished = true;
+                return Some(current);
+            };
+            value = next.clone();
+        }
+    }
+}
+
+fn exact_frame_pages<'a, T: Clone, F>(values: &'a [T], encoded_len: F) -> ExactFramePages<'a, T, F>
+where
+    F: Fn(&[T]) -> Option<usize>,
+{
+    ExactFramePages {
+        values: values.iter(),
+        pending: None,
+        encoded_len,
+        started: false,
+        finished: false,
+        invalid: false,
     }
 }
 
@@ -248,10 +359,6 @@ impl<'de> Deserialize<'de> for FactRequest {
     }
 }
 
-/// Compatibility names matching the other protocol DTOs' `*Message` style.
-pub type FactInventoryMessage = FactInventory;
-pub type FactRequestMessage = FactRequest;
-
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
@@ -295,5 +402,74 @@ mod tests {
         let mut wire = serde_json::to_value(&delivery).unwrap();
         wire["context_id"] = serde_json::to_value(MeshContextId::from_bytes([9; 32])).unwrap();
         assert!(serde_json::from_value::<ProofDeliveryMessage>(wire).is_err());
+    }
+
+    #[test]
+    fn anti_entropy_pages_are_canonical_and_fit_the_exact_frame_boundary() {
+        let context_id = MeshContextId::from_bytes([0x42; 32]);
+        let ids = (0u64..2_000)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&index.to_be_bytes());
+                FactId::from_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let inventory = FactInventory::new(context_id, ids.clone());
+        let mut pages = inventory.pages();
+        let mut page_count = 0;
+        let mut flattened = Vec::new();
+        while let Some(fact_ids) = pages.next() {
+            page_count += 1;
+            assert!(fact_ids.windows(2).all(|pair| pair[0] < pair[1]));
+            let page = FactInventory::new(context_id, fact_ids);
+            let encoded =
+                serde_json::to_vec(&crate::protocol::MeshMessage::FactInventory(page.clone()))
+                    .unwrap();
+            assert!(encoded.len() <= super::super::RECEIVE_FRAME_BYTES);
+            assert_eq!(page.context_id(), context_id);
+            flattened.extend_from_slice(page.fact_ids());
+        }
+        assert!(pages.is_valid());
+        assert!(
+            page_count > 1,
+            "paging must be driven by bytes, not item count"
+        );
+        assert_eq!(flattened, inventory.fact_ids());
+    }
+
+    #[test]
+    fn inventory_strict_subset_incomparable_and_lost_page_controls() {
+        let context_id = MeshContextId::from_bytes([0x51; 32]);
+        let ids = (0u64..2_000)
+            .map(|index| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&index.to_be_bytes());
+                FactId::from_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let full = FactInventory::new(context_id, ids.clone());
+        let strict = FactInventory::new(context_id, ids[..2].iter().copied());
+        let left = FactInventory::new(context_id, [ids[0], ids[1]]);
+        let right = FactInventory::new(context_id, [ids[0], ids[2]]);
+        assert!(strict
+            .fact_ids()
+            .iter()
+            .all(|id| full.fact_ids().contains(id)));
+        assert!(!left
+            .fact_ids()
+            .iter()
+            .all(|id| right.fact_ids().contains(id)));
+        assert!(!right
+            .fact_ids()
+            .iter()
+            .all(|id| left.fact_ids().contains(id)));
+
+        let mut first_pass = full.pages();
+        let dropped = first_pass.next().expect("full inventory has a page");
+        assert!(first_pass.is_valid());
+        let mut recovery_pass = full.pages();
+        let recovered = recovery_pass.next().expect("ticker can repair a lost page");
+        assert_eq!(recovered, dropped);
+        assert!(recovery_pass.is_valid());
     }
 }

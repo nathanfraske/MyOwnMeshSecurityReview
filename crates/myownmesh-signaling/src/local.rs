@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use tracing::trace;
 
 use crate::{CarrierAttribution, InboundSink, OutboundSource, SignalingMessage};
@@ -72,40 +71,6 @@ impl LocalBroker {
         Self::default()
     }
 
-    /// Join a peer to the named room, holding the inbound queue here.
-    ///
-    /// The standalone convenience: the broker builds an unbounded queue and
-    /// hands back its receiver, which is what an embedder with no accountant
-    /// wants. A consumer that *has* one calls [`Self::join_with_sink`] and keeps
-    /// no queue at all.
-    pub fn join(
-        &self,
-        room: &str,
-        device_id: &str,
-    ) -> (
-        mpsc::UnboundedSender<LocalOutbound>,
-        mpsc::UnboundedReceiver<LocalInbound>,
-    ) {
-        let (in_tx, in_rx) = mpsc::unbounded_channel::<LocalInbound>();
-        let (out_tx, out_rx) = mpsc::unbounded_channel::<LocalOutbound>();
-        // `Owner = ()`, written out: this is the standalone path, where the
-        // embedder chose a buffer and there is no accountant to name. The other
-        // callers of `join_with_sink` name a real owner, and the difference
-        // being visible at the call site is the point.
-        let outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
-            Box::new(crate::UnboundedSource::new(out_rx));
-        // The convenience API deliberately detaches the broker task: callers
-        // that need lifecycle custody use `join_with_sink` and retain its
-        // returned handle instead.
-        drop(self.join_with_sink(
-            room,
-            device_id,
-            outbound,
-            InboundSink::from_unbounded(in_tx),
-        ));
-        (out_tx, in_rx)
-    }
-
     /// Join a peer to the named room, delivering into the caller's sink.
     ///
     /// The broker keeps no inbound queue: every report is offered to `inbound`
@@ -124,9 +89,8 @@ impl LocalBroker {
     /// alternative — copying the peer list out and offering afterwards — would
     /// let a peer that left in between be delivered to.
     ///
-    /// Returns the exact outbound forwarder task. Dropping the handle detaches
-    /// it, which is the behavior of [`Self::join`]; lifecycle owners should
-    /// retain and await it.
+    /// Returns the exact outbound forwarder task. Lifecycle owners must retain
+    /// and await it so room membership and the final leave are observed.
     pub fn join_with_sink<O: Send + 'static>(
         &self,
         room: &str,
@@ -247,6 +211,7 @@ mod tests {
     use super::*;
     use crate::{CarrierCommit, OwnedSignal};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::mpsc;
 
     /// An owner that records its own release — see the mDNS control of the same
     /// shape.
@@ -310,10 +275,10 @@ mod tests {
         let flag_for_sink = Arc::clone(&first_released);
         // Bob is a peer with no outbound of its own; the sender is held so the
         // broker does not treat him as having left.
-        let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        let (bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
         let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
             Box::new(crate::UnboundedSource::new(bob_rx));
-        drop(broker.join_with_sink(
+        let bob_task = broker.join_with_sink(
             "room1",
             "bob",
             bob_outbound,
@@ -323,7 +288,7 @@ mod tests {
                 }
                 true
             }),
-        ));
+        );
 
         let directed = |peer_id: &str| LocalOutbound::DirectedToPeer {
             to: "bob".to_string(),
@@ -360,20 +325,22 @@ mod tests {
         alice_task
             .await
             .expect("finite outbound source forwarder joined");
+        drop(bob_tx);
+        bob_task.await.expect("bob forwarder leaves explicitly");
     }
 
     #[tokio::test]
     async fn local_carrier_commits_after_route_admission() {
         let broker = LocalBroker::new();
-        let (_bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
+        let (bob_tx, bob_rx) = mpsc::unbounded_channel::<LocalOutbound>();
         let bob_outbound: Box<dyn OutboundSource<LocalOutbound, Owner = ()>> =
             Box::new(crate::UnboundedSource::new(bob_rx));
-        drop(broker.join_with_sink(
+        let bob_task = broker.join_with_sink(
             "commit-room",
             "bob",
             bob_outbound,
             InboundSink::new_typed(|_| crate::InboundOutcome::Accepted),
-        ));
+        );
 
         let accepted = Arc::new(AtomicUsize::new(0));
         let refused = Arc::new(AtomicUsize::new(0));
@@ -401,6 +368,8 @@ mod tests {
             )
             .await
             .expect("local carrier forwarder joined");
+        drop(bob_tx);
+        bob_task.await.expect("bob forwarder leaves explicitly");
 
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
         assert_eq!(refused.load(Ordering::SeqCst), 0);
@@ -443,12 +412,26 @@ mod tests {
     #[tokio::test]
     async fn join_announces_existing_peers() {
         let broker = LocalBroker::new();
-        let (_tx_a, mut rx_a) = broker.join("room1", "alice");
+        let (tx_a, out_a) = mpsc::unbounded_channel();
+        let (in_a, mut rx_a) = mpsc::unbounded_channel();
+        let alice_task = broker.join_with_sink(
+            "room1",
+            "alice",
+            Box::new(crate::UnboundedSource::new(out_a)),
+            InboundSink::from_unbounded(in_a),
+        );
         // No peers in the room yet — alice gets nothing.
         let none = tokio::time::timeout(std::time::Duration::from_millis(50), rx_a.recv()).await;
         assert!(none.is_err(), "alice received unexpected event");
 
-        let (_tx_b, mut rx_b) = broker.join("room1", "bob");
+        let (tx_b, out_b) = mpsc::unbounded_channel();
+        let (in_b, mut rx_b) = mpsc::unbounded_channel();
+        let bob_task = broker.join_with_sink(
+            "room1",
+            "bob",
+            Box::new(crate::UnboundedSource::new(out_b)),
+            InboundSink::from_unbounded(in_b),
+        );
         // alice learns about bob; bob learns about alice.
         match tokio::time::timeout(std::time::Duration::from_millis(100), rx_a.recv())
             .await
@@ -466,13 +449,31 @@ mod tests {
             LocalInbound::PeerAnnounced { device_id, .. } => assert_eq!(device_id, "alice"),
             other => panic!("bob expected PeerAnnounced(alice), got {other:?}"),
         }
+        drop(tx_a);
+        drop(tx_b);
+        alice_task.await.expect("alice forwarder leaves explicitly");
+        bob_task.await.expect("bob forwarder leaves explicitly");
     }
 
     #[tokio::test]
     async fn directed_messages_route_to_recipient() {
         let broker = LocalBroker::new();
-        let (tx_a, mut _rx_a) = broker.join("room1", "alice");
-        let (_tx_b, mut rx_b) = broker.join("room1", "bob");
+        let (tx_a, out_a) = mpsc::unbounded_channel();
+        let (in_a, mut _rx_a) = mpsc::unbounded_channel();
+        let alice_task = broker.join_with_sink(
+            "room1",
+            "alice",
+            Box::new(crate::UnboundedSource::new(out_a)),
+            InboundSink::from_unbounded(in_a),
+        );
+        let (tx_b, out_b) = mpsc::unbounded_channel();
+        let (in_b, mut rx_b) = mpsc::unbounded_channel();
+        let bob_task = broker.join_with_sink(
+            "room1",
+            "bob",
+            Box::new(crate::UnboundedSource::new(out_b)),
+            InboundSink::from_unbounded(in_b),
+        );
         // Drain announces
         let _ = tokio::time::timeout(std::time::Duration::from_millis(50), rx_b.recv()).await;
 
@@ -501,5 +502,9 @@ mod tests {
             }
             other => panic!("expected Message, got {other:?}"),
         }
+        drop(tx_a);
+        drop(tx_b);
+        alice_task.await.expect("alice forwarder leaves explicitly");
+        bob_task.await.expect("bob forwarder leaves explicitly");
     }
 }

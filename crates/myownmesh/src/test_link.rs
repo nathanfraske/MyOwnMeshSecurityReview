@@ -28,7 +28,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
+use myownmesh_core::config::{NetworkConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode};
 use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
 use myownmesh_core::events::{MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
@@ -74,8 +74,11 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: wire_id.to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: SchedulerPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),

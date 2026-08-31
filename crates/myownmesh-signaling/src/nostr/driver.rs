@@ -6,7 +6,7 @@
 //! Resilience features baked in (see `crate::upstream`):
 //!
 //! - The subscription REQ is re-sent on every fresh socket, and the
-//!   per-socket reconnect backoff (2 → 60 s, jittered) is the single
+//!   per-socket reconnect backoff (operator-configured, jittered) is the single
 //!   anti-flood pace for a flapping relay.
 //! - Transition-only logging — no per-event spam.
 //! - Directed negotiation (offer / answer / candidate) is tagged with
@@ -21,10 +21,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::OnceLock;
+
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::Value;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -59,6 +64,86 @@ impl AttemptOutcomeSink for UnmeteredAttemptOutcomeSink {
 
 const INBOUND_SINK_CLOSED: &str = "inbound sink closed";
 const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024;
+type TaskReaperSender = mpsc::Sender<tokio::task::JoinHandle<()>>;
+
+/// Operator-supplied timing for socket recovery and fallback.
+/// Presence cadence remains the dependency-owned schedule in `upstream.rs`;
+/// these values govern only this driver's cancellation and recovery loops.
+/// Every field is required in [`NostrDriverConfig`] and validated before the
+/// driver creates identity, provider state, sockets, or tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NostrTimingConfig {
+    pub reconnect_initial: Duration,
+    pub reconnect_max: Duration,
+    pub reconnect_max_attempts: u32,
+    pub jitter_percent: u64,
+    pub fallback_poll: Duration,
+    pub fallback_activation_grace: Duration,
+    pub session_close_timeout: Duration,
+    pub announcer_cancel_quantum: Duration,
+}
+
+impl NostrTimingConfig {
+    pub fn validate(&self) -> Result<(), crate::Error> {
+        let millisecond_fields = [
+            ("reconnect_initial", self.reconnect_initial),
+            ("reconnect_max", self.reconnect_max),
+            ("announcer_cancel_quantum", self.announcer_cancel_quantum),
+        ];
+        if millisecond_fields
+            .iter()
+            .any(|(_, duration)| duration.is_zero() || duration.as_millis() > u64::MAX as u128)
+        {
+            return Err(crate::Error::Other(
+                "Nostr timing millisecond field is zero or overflows u64".into(),
+            ));
+        }
+        if self.fallback_poll.is_zero()
+            || self.fallback_activation_grace.is_zero()
+            || self.session_close_timeout.is_zero()
+        {
+            return Err(crate::Error::Other(
+                "Nostr timing duration must be non-zero".into(),
+            ));
+        }
+        if self.reconnect_max < self.reconnect_initial {
+            return Err(crate::Error::Other(
+                "Nostr reconnect_max must be at least reconnect_initial".into(),
+            ));
+        }
+        if self.reconnect_max_attempts == 0 {
+            return Err(crate::Error::Other(
+                "Nostr reconnect_max_attempts must be non-zero".into(),
+            ));
+        }
+        if self.jitter_percent > 100 {
+            return Err(crate::Error::Other(
+                "Nostr jitter_percent must be at most 100".into(),
+            ));
+        }
+        if self.fallback_activation_grace < self.fallback_poll {
+            return Err(crate::Error::Other(
+                "Nostr fallback grace must cover one polling interval".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+static TEST_REAPED_TASKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FALLBACK_WAKE: OnceLock<Notify> = OnceLock::new();
+
+#[cfg(test)]
+fn record_reaped_fallback() {
+    TEST_REAPED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    TEST_REAPED_FALLBACK_WAKE
+        .get_or_init(Notify::new)
+        .notify_one();
+}
 
 fn websocket_config() -> WebSocketConfig {
     WebSocketConfig {
@@ -96,8 +181,13 @@ pub struct NostrDriverConfig {
     /// surfaced by the mesh layer).
     pub device_id: String,
     /// User-supplied relay URLs. Empty = use built-in defaults.
+    ///
+    /// This is trusted local configuration, not peer input. Its vector and
+    /// the derived relay-task set are bounded by the configured list; the
+    /// driver does not retain any peer-controlled relay names.
     pub servers: Vec<String>,
-    /// Hostnames excluded from the shuffle.
+    /// Hostnames excluded from the shuffle. This is also trusted local
+    /// configuration and is not a wire-grown collection.
     pub denylist: Vec<String>,
     /// Top-N relays to maintain.
     pub redundancy: usize,
@@ -105,6 +195,8 @@ pub struct NostrDriverConfig {
     /// unreachable. On by default; the fallback is reactive (only while
     /// the primary set is down) so steady state stays on your own relays.
     pub public_fallback: bool,
+    /// Explicit operator timing for recovery, fallback, and cancellation.
+    pub timing: NostrTimingConfig,
 }
 
 /// Inbound signaling events the driver pushes to the engine.
@@ -165,7 +257,7 @@ pub fn start_with_delivery_provider<S>(
     outbound: S,
     inbound_tx: InboundSink<NostrInbound>,
     provider: Arc<dyn DeliveryProvider>,
-) -> NostrDriverHandle
+) -> Result<NostrDriverHandle, crate::Error>
 where
     S: OutboundSource<NostrOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
@@ -188,7 +280,7 @@ pub fn start_with_delivery_provider_and_refusal_sink<S>(
     inbound_tx: InboundSink<NostrInbound>,
     provider: Arc<dyn DeliveryProvider>,
     refusal_sink: Arc<dyn AttemptRefusalSink>,
-) -> NostrDriverHandle
+) -> Result<NostrDriverHandle, crate::Error>
 where
     S: OutboundSource<NostrOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
@@ -214,11 +306,12 @@ pub fn start_with_delivery_provider_and_sinks<S>(
     provider: Arc<dyn DeliveryProvider>,
     refusal_sink: Arc<dyn AttemptRefusalSink>,
     outcome_sink: Arc<dyn AttemptOutcomeSink>,
-) -> NostrDriverHandle
+) -> Result<NostrDriverHandle, crate::Error>
 where
     S: OutboundSource<NostrOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
 {
+    config.timing.validate()?;
     let identity = NostrIdentity::generate();
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
     info!(
@@ -282,7 +375,7 @@ where
         identity,
         room_handle,
         device_id: config.device_id.clone(),
-        relays: Mutex::new(Vec::new()),
+        timing: config.timing,
         // Erased once, here, at the only place that knows the producer's owner
         // type. Everything downstream stays concrete, and the owner remains
         // paired with the value it funded.
@@ -295,16 +388,6 @@ where
         relay_connected: relay_connected.clone(),
         shutdown: shutdown.clone(),
     });
-    {
-        let mut relays = shared.relays.lock();
-        for url in &selected {
-            relays.push(RelayHandle {
-                url: url.clone(),
-                connected: false,
-            });
-        }
-    }
-
     let mut cancellers = Vec::new();
     let mut cancel_wakes = Vec::new();
     let mut tasks = Vec::new();
@@ -383,15 +466,18 @@ where
         run_announcer(shared_for_announce, cancel_token_for_task).await;
     }));
 
-    NostrDriverHandle {
+    let (task_reaper, task_reaper_handle) = spawn_task_reaper(tasks.len().max(1));
+    Ok(NostrDriverHandle {
         cancellers,
         cancel_wakes,
-        tasks: Arc::new(tokio::sync::Mutex::new(Some(tasks))),
+        tasks: Arc::new(Mutex::new(Some(tasks))),
+        task_reaper: Mutex::new(Some(task_reaper)),
+        task_reaper_handle: Mutex::new(Some(task_reaper_handle)),
         force_reconnect,
         relay_connected,
         delivery,
         shutdown,
-    }
+    })
 }
 
 /// Handle returned by [`start_with_delivery_provider`]. Drop or call
@@ -400,7 +486,9 @@ where
 pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
     cancel_wakes: Vec<Arc<Notify>>,
-    tasks: Arc<tokio::sync::Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
+    tasks: Arc<Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
+    task_reaper: Mutex<Option<TaskReaperSender>>,
+    task_reaper_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     force_reconnect: Arc<watch::Sender<u64>>,
     relay_connected: Arc<watch::Sender<u64>>,
     delivery: Arc<DeliveryStore>,
@@ -439,19 +527,22 @@ impl NostrDriverHandle {
 
     /// Signal shutdown and join every driver-owned task. This is the
     /// lifecycle boundary for callers that hold the shared driver handle;
-    /// dropping the handle remains a non-blocking signal-only compatibility
-    /// operation. The task list is consumed exactly once, so concurrent
-    /// shutdown callers cannot double-join or lose ownership of a task.
+    /// Dropping the handle remains a non-blocking signal operation; the
+    /// reaper still owns the transferred tasks and observes their terminals.
+    /// The task list is consumed exactly once, so concurrent shutdown callers
+    /// cannot double-join or lose ownership of a task.
     pub async fn stop_and_join(&self) {
         self.request_stop();
-        let tasks = self.tasks.lock().await.take().unwrap_or_default();
+        let tasks = self.tasks.lock().take().unwrap_or_default();
         for task in tasks {
             let _ = task.await;
         }
-    }
-
-    pub fn stop(&self) {
-        self.request_stop();
+        let reaper_sender = self.task_reaper.lock().take();
+        drop(reaper_sender);
+        let reaper = { self.task_reaper_handle.lock().take() };
+        if let Some(reaper) = reaper {
+            let _ = reaper.await;
+        }
     }
 
     /// Clone of the force-reconnect signal. The engine stashes this
@@ -475,6 +566,58 @@ impl NostrDriverHandle {
 impl Drop for NostrDriverHandle {
     fn drop(&mut self) {
         self.request_stop();
+        let tasks = self.tasks.lock().take().unwrap_or_default();
+        let reaper = self.task_reaper.lock().take();
+        for task in tasks {
+            if let Some(reaper) = reaper.as_ref() {
+                abort_and_join(reaper, task);
+            } else {
+                task.abort();
+                let _ = futures::executor::block_on(task);
+            }
+        }
+        drop(reaper);
+    }
+}
+
+fn spawn_task_reaper(capacity: usize) -> (TaskReaperSender, tokio::task::JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let task = tokio::spawn(async move {
+        reap_owned_tasks(receiver).await;
+    });
+    (sender, task)
+}
+
+fn abort_and_join(reaper: &TaskReaperSender, task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    match reaper.try_send(task) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(task))
+        | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = task.await;
+                    #[cfg(test)]
+                    record_reaped_fallback();
+                });
+            } else {
+                let _ = futures::executor::block_on(task);
+                #[cfg(test)]
+                record_reaped_fallback();
+            }
+        }
+    }
+}
+
+async fn reap_owned_tasks(mut receiver: mpsc::Receiver<tokio::task::JoinHandle<()>>) {
+    while let Some(task) = receiver.recv().await {
+        if let Err(error) = task.await {
+            if !error.is_cancelled() {
+                warn!("nostr task did not join normally: {error}");
+            }
+        }
+        #[cfg(test)]
+        TEST_REAPED_TASKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -482,7 +625,7 @@ struct DriverShared {
     identity: NostrIdentity,
     room_handle: String,
     device_id: String,
-    relays: Mutex<Vec<RelayHandle>>,
+    timing: NostrTimingConfig,
     outbound:
         tokio::sync::Mutex<Option<Box<dyn OutboundSource<NostrOutbound, Owner = ErasedOwner>>>>,
     delivery: Arc<DeliveryStore>,
@@ -508,6 +651,11 @@ struct DriverShared {
     // DeliveryStore owns live directed attempts and registers fresh custody
     // entries for each reconnecting relay session. The source owner remains in
     // the exact attempt record until its terminal outcome.
+    //
+    // `outbound` and the inbound sink are caller-owned queue boundaries. This
+    // driver does not add a second queue or an event-id cache: each received
+    // frame is parsed once and each outbound value is admitted into the
+    // provider-funded DeliveryStore before relay fan-out.
 }
 
 /// The NIP-01 filter set for our room subscription:
@@ -567,11 +715,11 @@ fn build_req(shared: &DriverShared, sub_id: &str) -> String {
     Value::Array(arr).to_string()
 }
 
-/// Deterministic ±15% jitter on a timer, seeded from the device id and a
+/// Deterministic configured-percentage jitter on a timer, seeded from the device id and a
 /// per-use salt, so co-restarted nodes (a site-wide power blip, a relay
 /// outage ending) don't fire their timers in lockstep forever. Pure —
 /// same inputs, same wait — which keeps tests exact.
-fn jittered_ms(base_ms: u64, seed: &str, salt: u64) -> u64 {
+fn jittered_ms(base_ms: u64, jitter_percent: u64, seed: &str, salt: u64) -> u64 {
     use sha2::{Digest, Sha256};
     if base_ms == 0 {
         return 0;
@@ -581,19 +729,33 @@ fn jittered_ms(base_ms: u64, seed: &str, salt: u64) -> u64 {
     hasher.update(salt.to_le_bytes());
     let digest = hasher.finalize();
     let raw = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
-    // Map to [-15%, +15%] of base.
-    let span = base_ms * 30 / 100;
+    // Map to [-jitter, +jitter] of base.
+    let span = base_ms.saturating_mul(jitter_percent.saturating_mul(2)) / 100;
     if span == 0 {
         return base_ms;
     }
     let offset = raw % (span + 1);
-    base_ms - (base_ms * 15 / 100) + offset
+    base_ms.saturating_sub(base_ms.saturating_mul(jitter_percent) / 100) + offset
 }
 
-#[allow(dead_code)]
-struct RelayHandle {
-    url: String,
-    connected: bool,
+fn reconnect_base_ms(attempt: u32, timing: &NostrTimingConfig) -> u64 {
+    if attempt == 0 {
+        return 0;
+    }
+    let max_ms: u64 = timing
+        .reconnect_max
+        .as_millis()
+        .try_into()
+        .expect("validated reconnect_max fits u64 milliseconds");
+    let initial_ms: u64 = timing
+        .reconnect_initial
+        .as_millis()
+        .try_into()
+        .expect("validated reconnect_initial fits u64 milliseconds");
+    initial_ms
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(max_ms)
+        .min(max_ms)
 }
 
 struct RelaySessionCancellation<'a> {
@@ -779,14 +941,19 @@ async fn run_relay(
         }
         // Reconnect backoff: 2 / 4 / 8 / 16 / 32 s capped at 60 s — the
         // increment precedes the shift, so a 1 s wait is unreachable —
-        // then jittered ±15% per node so a shared outage (relay restart,
+        // then jittered by the configured percentage per node so a shared outage (relay restart,
         // site-wide blip) doesn't recover as a synchronized redial herd.
         // A forced-reconnect bump cuts the wait short so resume-from-sleep
         // recovery doesn't sit through a backoff that accrued while the
         // host was suspended.
-        backoff_attempt = (backoff_attempt + 1).min(6);
-        let base_ms = (1u64 << backoff_attempt).min(60) * 1_000;
-        let wait_ms = jittered_ms(base_ms, &shared.device_id, backoff_attempt as u64);
+        backoff_attempt = (backoff_attempt + 1).min(shared.timing.reconnect_max_attempts);
+        let base_ms = reconnect_base_ms(backoff_attempt, &shared.timing);
+        let wait_ms = jittered_ms(
+            base_ms,
+            shared.timing.jitter_percent,
+            &shared.device_id,
+            backoff_attempt as u64,
+        );
         debug!(relay = %short(&url), wait_ms, "relay backoff before reconnect");
         tokio::select! {
             _ = sleep(Duration::from_millis(wait_ms)) => {}
@@ -799,15 +966,6 @@ async fn run_relay(
         }
     }
 }
-
-/// How often the fallback supervisor samples primary-relay health.
-const FALLBACK_POLL_MS: u64 = 3_000;
-
-/// How long *every* primary relay must be continuously unreachable before
-/// the public fallback is brought up. Long enough that a routine
-/// reconnect or a brief blip doesn't leak presence to public relays;
-/// short enough that a real outage recovers in seconds.
-const FALLBACK_ACTIVATION_GRACE_MS: u64 = 20_000;
 
 /// What the fallback supervisor should do on a given tick. A pure
 /// function of the inputs so the policy is unit-testable without spawning
@@ -822,14 +980,19 @@ enum FallbackAction {
     Hold,
 }
 
-fn fallback_action(primary_live: usize, fallback_active: bool, down_for_ms: u64) -> FallbackAction {
+fn fallback_action(
+    timing: &NostrTimingConfig,
+    primary_live: usize,
+    fallback_active: bool,
+    down_for: Duration,
+) -> FallbackAction {
     if primary_live > 0 {
         if fallback_active {
             FallbackAction::StandDown
         } else {
             FallbackAction::Hold
         }
-    } else if !fallback_active && down_for_ms >= FALLBACK_ACTIVATION_GRACE_MS {
+    } else if !fallback_active && down_for >= timing.fallback_activation_grace {
         FallbackAction::Activate
     } else {
         FallbackAction::Hold
@@ -838,7 +1001,7 @@ fn fallback_action(primary_live: usize, fallback_active: bool, down_for_ms: u64)
 
 /// Supervises the public-relay fallback. Steady state: idle, sampling
 /// `primary_live`. When every primary relay has been down for
-/// [`FALLBACK_ACTIVATION_GRACE_MS`] it spawns a `run_relay` task per
+/// `shared.timing.fallback_activation_grace` it spawns a `run_relay` task per
 /// fallback URL; when a primary returns it cancels them. So the public
 /// relays only ever carry traffic when the configured/primary set can't —
 /// presence stays off public infrastructure in normal operation.
@@ -882,11 +1045,9 @@ async fn run_fallback_supervisor(
         } else {
             down_since = None;
         }
-        let down_for_ms = down_since
-            .map(|t| t.elapsed().as_millis() as u64)
-            .unwrap_or(0);
+        let down_for = down_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
 
-        match fallback_action(live, !active.is_empty(), down_for_ms) {
+        match fallback_action(&shared.timing, live, !active.is_empty(), down_for) {
             FallbackAction::Activate => {
                 warn!(
                     count = urls.len(),
@@ -928,7 +1089,7 @@ async fn run_fallback_supervisor(
         }
 
         tokio::select! {
-            _ = sleep(Duration::from_millis(FALLBACK_POLL_MS)) => {}
+            _ = sleep(shared.timing.fallback_poll) => {}
             _ = shutdown_rx.changed() => {
                 for (c, wake, _) in &active {
                     c.store(true, SeqCst);
@@ -1074,7 +1235,9 @@ async fn run_relay_session(
     // Ephemeral events are never stored, so `since` governs presence
     // replay only — negotiation always arrives live (see
     // `event::SIGNALING_EPHEMERAL_KIND`). The shape is fixed for the life
-    // of the session: nothing a peer publishes can widen it.
+    // of the session: nothing a peer publishes can widen it. The relay owns
+    // the replay result; this task retains only the current socket stream and
+    // does not build a local replay queue.
     let sub_id = "mom-sig-1";
     let req_text = build_req(shared, sub_id);
 
@@ -1120,7 +1283,7 @@ async fn run_relay_session(
             // immediately (a Close frame, falling back to the TCP FIN
             // from dropping the stream). Bounded so a wedged socket
             // can't hang teardown.
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), write.close()).await;
+            let _ = tokio::time::timeout(shared.timing.session_close_timeout, write.close()).await;
             return RelaySessionOutcome::Cancelled;
         }
         let cancel_notified = cancellation.wake.notified();
@@ -1253,14 +1416,19 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
             .get(count)
             .copied()
             .unwrap_or(ANNOUNCE_STEADY_MS);
-        // Jitter the steady cadence (±15%) so nodes that came up together
+        // Jitter the steady cadence by the configured percentage so nodes that came up together
         // — a site restoring power, a fleet rebooting after an update —
         // don't publish their presence in the same instant every cycle
         // forever. The dense early schedule stays exact: it exists to make
         // a fresh joiner visible fast, and determinism there keeps tests
         // and traces legible.
         let wait_ms = if base_ms == ANNOUNCE_STEADY_MS {
-            jittered_ms(base_ms, &shared.device_id, count as u64)
+            jittered_ms(
+                base_ms,
+                shared.timing.jitter_percent,
+                &shared.device_id,
+                count as u64,
+            )
         } else {
             base_ms
         };
@@ -1270,12 +1438,11 @@ async fn run_announcer(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic:
         // call doesn't have to wait a full 60s tick to take
         // effect. Bounded by `chunk` since wait_ms can exceed it.
         let mut remaining = wait_ms;
-        const CHUNK_MS: u64 = 1_000;
         while remaining > 0 {
             if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
                 return;
             }
-            let step = remaining.min(CHUNK_MS);
+            let step = remaining.min(shared.timing.announcer_cancel_quantum.as_millis() as u64);
             tokio::select! {
                 _ = sleep(Duration::from_millis(step)) => {}
                 _ = shutdown_rx.changed() => return,
@@ -1301,14 +1468,27 @@ fn handle_inbound_frame(
             .reserve_inbound_frame(frame.len())
             .map_err(|error| format!("inbound frame refused before parse: {error:?}"))?,
     ));
-    let value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
-    let arr = value.as_array().ok_or_else(|| "not an array".to_string())?;
-    let tag = arr.first().and_then(|v| v.as_str()).unwrap_or("");
-    match tag {
+    // The provider lease above accounts the raw frame bytes before any JSON
+    // allocation. The decoded tree is transient and bounded by that same
+    // frame cap; move the EVENT body out of the tree instead of cloning it so
+    // the typed event does not create a second decoded subtree. The websocket
+    // library's bounded message/write buffers are accounted at its boundary.
+    let mut value: Value = serde_json::from_str(frame).map_err(|e| e.to_string())?;
+    let arr = value
+        .as_array_mut()
+        .ok_or_else(|| "not an array".to_string())?;
+    let tag = arr
+        .first()
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_owned();
+    match tag.as_str() {
         "EVENT" => {
-            let event_value = arr.get(2).ok_or_else(|| "missing event body".to_string())?;
+            let event_value = arr
+                .get_mut(2)
+                .ok_or_else(|| "missing event body".to_string())?;
             let event: NostrEvent =
-                serde_json::from_value(event_value.clone()).map_err(|e| e.to_string())?;
+                serde_json::from_value(std::mem::take(event_value)).map_err(|e| e.to_string())?;
             // Skip events we sent ourselves.
             if event.pubkey == shared.identity.pubkey_hex() {
                 return Ok(());
@@ -1624,6 +1804,22 @@ mod tests {
     // direction.
     use tokio::sync::mpsc;
 
+    fn panicking_task(
+        message: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx
+                .send(())
+                .expect("the panic child start barrier remains live");
+            panic!("{message}");
+        });
+        (task, started_rx)
+    }
+
     struct ParkedWriteGate {
         parked: tokio::sync::Notify,
         waker: Mutex<Option<std::task::Waker>>,
@@ -1683,39 +1879,106 @@ mod tests {
 
     #[test]
     fn fallback_holds_while_a_primary_is_up() {
+        let timing = test_timing();
         // Primary connected, fallback not running → leave it alone.
-        assert_eq!(fallback_action(2, false, 0), FallbackAction::Hold);
         assert_eq!(
-            fallback_action(1, false, FALLBACK_ACTIVATION_GRACE_MS * 10),
+            fallback_action(&timing, 2, false, Duration::ZERO),
+            FallbackAction::Hold
+        );
+        assert_eq!(
+            fallback_action(
+                &timing,
+                1,
+                false,
+                timing.fallback_activation_grace + Duration::from_secs(1),
+            ),
             FallbackAction::Hold
         );
     }
 
     #[test]
     fn fallback_waits_out_the_grace_then_activates() {
+        let timing = test_timing();
         // All primaries down, but not yet past the grace → hold…
-        assert_eq!(fallback_action(0, false, 0), FallbackAction::Hold);
         assert_eq!(
-            fallback_action(0, false, FALLBACK_ACTIVATION_GRACE_MS - 1),
+            fallback_action(&timing, 0, false, Duration::ZERO),
+            FallbackAction::Hold
+        );
+        assert_eq!(
+            fallback_action(
+                &timing,
+                0,
+                false,
+                timing.fallback_activation_grace - Duration::from_millis(1),
+            ),
             FallbackAction::Hold
         );
         // …then activate once the grace elapses.
         assert_eq!(
-            fallback_action(0, false, FALLBACK_ACTIVATION_GRACE_MS),
+            fallback_action(&timing, 0, false, timing.fallback_activation_grace),
             FallbackAction::Activate
         );
     }
 
     #[test]
     fn fallback_stands_down_when_a_primary_returns() {
+        let timing = test_timing();
         // Fallback running and a primary comes back → tear it down.
-        assert_eq!(fallback_action(1, true, 999_999), FallbackAction::StandDown);
+        assert_eq!(
+            fallback_action(&timing, 1, true, Duration::ZERO),
+            FallbackAction::StandDown
+        );
     }
 
     #[test]
     fn fallback_holds_while_active_and_primary_still_down() {
+        let timing = test_timing();
         // Already covering the outage; don't respawn every tick.
-        assert_eq!(fallback_action(0, true, 999_999), FallbackAction::Hold);
+        assert_eq!(
+            fallback_action(&timing, 0, true, Duration::ZERO),
+            FallbackAction::Hold
+        );
+    }
+
+    #[test]
+    fn recovery_timing_policy_is_checked_and_deterministic() {
+        let timing = test_timing();
+        assert!(timing.validate().is_ok());
+        assert_eq!(timing.reconnect_initial, Duration::from_secs(2));
+        assert_eq!(reconnect_base_ms(0, &timing), 0);
+        assert_eq!(reconnect_base_ms(1, &timing), 2_000);
+        assert_eq!(reconnect_base_ms(5, &timing), 32_000);
+        assert_eq!(reconnect_base_ms(6, &timing), 60_000);
+        assert_eq!(reconnect_base_ms(u32::MAX, &timing), 60_000);
+
+        let max_ms = timing.reconnect_max.as_millis() as u64;
+        let jittered = jittered_ms(max_ms, timing.jitter_percent, "policy", 7);
+        let lower = max_ms * (100 - timing.jitter_percent) / 100;
+        let upper = max_ms * (100 + timing.jitter_percent) / 100;
+        assert!((lower..=upper).contains(&jittered));
+        assert_eq!(
+            jittered,
+            jittered_ms(max_ms, timing.jitter_percent, "policy", 7)
+        );
+
+        let mut invalid = timing;
+        invalid.reconnect_max = Duration::from_secs(1);
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.jitter_percent = 101;
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.reconnect_initial = Duration::ZERO;
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.reconnect_max = Duration::MAX;
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.reconnect_max_attempts = 0;
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.fallback_activation_grace = Duration::from_secs(1);
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -1750,7 +2013,9 @@ mod tests {
     #[tokio::test]
     async fn prearmed_delivery_survives_open_announcement_scan_wait_gap() {
         let shared = fixture_shared();
-        let (session, _) = shared.delivery.open_session();
+        let (session, session_refusal, refusals) = shared.delivery.open_session_with_refusals();
+        assert!(session_refusal.is_none());
+        assert!(refusals.is_empty());
         let gate = Arc::new(ParkedWriteGate {
             parked: tokio::sync::Notify::new(),
             waker: Mutex::new(None),
@@ -1932,6 +2197,113 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outside_runtime_driver_drop_transfers_task_to_reaper() {
+        let before = TEST_REAPED_TASKS.load(Ordering::Acquire);
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            armed_tx
+                .send(())
+                .expect("reaper control task must arm before drop");
+            std::future::pending::<()>().await;
+        });
+        armed_rx.await.expect("reaper control task must be running");
+
+        std::thread::spawn(move || abort_and_join(&reaper_sender, task))
+            .join()
+            .expect("outside-runtime owner drop must return");
+
+        reaper_task
+            .await
+            .expect("runtime-owned reaper must terminate after its sender closes");
+        assert_eq!(
+            TEST_REAPED_TASKS.load(Ordering::Acquire),
+            before + 1,
+            "the exact aborted task must be awaited by the runtime reaper"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaper_full_and_closed_fallbacks_observe_panics_in_and_outside_runtime() {
+        let wake = TEST_REAPED_FALLBACK_WAKE.get_or_init(Notify::new);
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the first handle fills the bounded reaper channel");
+        let (task, started) = panicking_task("injected nostr panic through full fallback");
+        started
+            .await
+            .expect("the full fallback child starts before transfer");
+        abort_and_join(&full_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "a full active-runtime transfer joins the exact panicking child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the full-channel filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) = panicking_task("injected nostr panic through closed fallback");
+        started
+            .await
+            .expect("the closed fallback child starts before transfer");
+        abort_and_join(&closed_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 2,
+            "a closed active-runtime transfer joins the exact panicking child"
+        );
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the no-runtime full channel is deterministically occupied");
+        let (task, started) =
+            panicking_task("injected nostr panic through outside-runtime full fallback");
+        started
+            .await
+            .expect("the outside-runtime full child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&full_sender, task))
+            .join()
+            .expect("outside-runtime full fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 3,
+            "a full no-runtime transfer synchronously observes the child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the no-runtime full filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) =
+            panicking_task("injected nostr panic through outside-runtime closed fallback");
+        started
+            .await
+            .expect("the outside-runtime closed child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&closed_sender, task))
+            .join()
+            .expect("outside-runtime closed fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 4,
+            "a closed no-runtime transfer synchronously observes the child"
+        );
+    }
+
     fn fixture_shared() -> Arc<DriverShared> {
         let identity = NostrIdentity::generate();
         let (_out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
@@ -1945,7 +2317,7 @@ mod tests {
             identity,
             room_handle: "test-room".into(),
             device_id: "self-device".into(),
-            relays: Mutex::new(Vec::new()),
+            timing: test_timing(),
             outbound: tokio::sync::Mutex::new(Some(out_rx)),
             delivery: DeliveryStore::new(Arc::new(UnmeteredDeliveryProvider)),
             refusal_sink: Arc::new(UnmeteredAttemptRefusalSink),
@@ -1954,6 +2326,19 @@ mod tests {
             relay_connected: Arc::new(watch::channel(0u64).0),
             shutdown: watch::channel(false).0,
         })
+    }
+
+    fn test_timing() -> NostrTimingConfig {
+        NostrTimingConfig {
+            reconnect_initial: Duration::from_secs(2),
+            reconnect_max: Duration::from_secs(60),
+            reconnect_max_attempts: 6,
+            jitter_percent: 15,
+            fallback_poll: Duration::from_secs(3),
+            fallback_activation_grace: Duration::from_secs(20),
+            session_close_timeout: Duration::from_secs(1),
+            announcer_cancel_quantum: Duration::from_secs(1),
+        }
     }
 
     /// Build a Nostr `EVENT` frame carrying an Announce envelope
@@ -2310,22 +2695,22 @@ mod tests {
     #[test]
     fn jitter_stays_within_15_percent_and_is_deterministic() {
         for salt in 0..64u64 {
-            let w = jittered_ms(120_000, "some-device", salt);
+            let w = jittered_ms(120_000, 15, "some-device", salt);
             assert!((102_000..=138_000).contains(&w), "±15% bound, got {w}");
             assert_eq!(
                 w,
-                jittered_ms(120_000, "some-device", salt),
+                jittered_ms(120_000, 15, "some-device", salt),
                 "same inputs, same wait"
             );
         }
         // Different nodes land on different offsets (not all identical).
-        let a = jittered_ms(120_000, "device-a", 1);
-        let b = jittered_ms(120_000, "device-b", 1);
-        let c = jittered_ms(120_000, "device-c", 1);
+        let a = jittered_ms(120_000, 15, "device-a", 1);
+        let b = jittered_ms(120_000, 15, "device-b", 1);
+        let c = jittered_ms(120_000, 15, "device-c", 1);
         assert!(
             !(a == b && b == c),
             "three nodes shouldn't share one jitter offset"
         );
-        assert_eq!(jittered_ms(0, "x", 0), 0, "zero base stays zero");
+        assert_eq!(jittered_ms(0, 15, "x", 0), 0, "zero base stays zero");
     }
 }

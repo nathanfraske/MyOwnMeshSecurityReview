@@ -406,12 +406,12 @@ fn ensure_bootstrap_for_config(
     }
 
     let valid_shape = match config.kind {
-        crate::network_state::NetworkKind::Closed => matches!(
+        crate::config::NetworkKind::Closed => matches!(
             bootstrap.policy(),
             VerifiedProjectPolicy::Closed(policy)
                 if policy.profile() == ClosedProfileId::SingleRootSignedMemberLogV1
         ),
-        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
+        crate::config::NetworkKind::Open | crate::config::NetworkKind::Silent => {
             matches!(bootstrap.policy(), VerifiedProjectPolicy::Open)
         }
     };
@@ -432,11 +432,11 @@ fn bootstrap_for_spawn(
     instance_root: Option<&Path>,
 ) -> Result<VerifiedBootstrap> {
     let bootstrap = match config.kind {
-        crate::network_state::NetworkKind::Open | crate::network_state::NetworkKind::Silent => {
+        crate::config::NetworkKind::Open | crate::config::NetworkKind::Silent => {
             VerifiedBootstrap::open(config.network_id.clone())
                 .map_err(|error| bootstrap_error("creating founderless", error))?
         }
-        crate::network_state::NetworkKind::Closed => bootstrap_store(config, instance_root)?
+        crate::config::NetworkKind::Closed => bootstrap_store(config, instance_root)?
             .restore()
             .map_err(|error| bootstrap_error("restoring Closed", error))?,
     };
@@ -449,7 +449,7 @@ fn create_local_bootstrap(
     instance_root: Option<&Path>,
     creation_id: [u8; 32],
 ) -> Result<VerifiedBootstrap> {
-    if config.kind != crate::network_state::NetworkKind::Closed {
+    if config.kind != crate::config::NetworkKind::Closed {
         return Err(bootstrap_error(
             "creating",
             "explicit local creation requires Closed network kind",
@@ -474,7 +474,7 @@ fn import_local_bootstrap(
     expected_context_id: MeshContextId,
     record: BootstrapRecord,
 ) -> Result<VerifiedBootstrap> {
-    if config.kind != crate::network_state::NetworkKind::Closed {
+    if config.kind != crate::config::NetworkKind::Closed {
         return Err(bootstrap_error(
             "importing",
             "explicit bootstrap import requires Closed network kind",

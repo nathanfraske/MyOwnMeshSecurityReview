@@ -427,10 +427,10 @@ where
 
 /// A source whose owner type has been erased, so a driver's shared state can
 /// stay concrete while the producer keeps whatever owner it needs.
-pub struct ErasedSource<S>(S);
+pub(crate) struct ErasedSource<S>(S);
 
 impl<S> ErasedSource<S> {
-    pub fn new(source: S) -> Self {
+    pub(crate) fn new(source: S) -> Self {
         Self(source)
     }
 }
@@ -792,8 +792,8 @@ pub enum RelayHealth {
     Opening,
     /// Socket connecting / reconnecting.
     Reconnecting,
-    /// Backed off after repeated failures; will retry per the
-    /// per-socket schedule.
+    /// Backed off after repeated failures; the driver applies its explicit
+    /// per-socket recovery policy before attempting the next connection.
     BackedOff,
     /// Permanently denied (in the user-configured denylist).
     Denied,

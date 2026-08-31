@@ -3,7 +3,7 @@
 //! Integration test: the per-device custody MFA gate on governance authoring.
 //!
 //! Proves that once a device enrolls a custody lock for a network,
-//! `governance::propose` refuses to author a transition without a valid
+//! `governance::propose_role_grant` refuses to author a role grant without a valid
 //! second factor — and proceeds once one is supplied. (The same
 //! `custody::require` chokepoint guards `sign_proposal`; see the unit tests
 //! in `custody.rs` for the verify/enroll/disable mechanics.)
@@ -11,20 +11,22 @@
 use std::sync::Arc;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::create_network_in_instance_root;
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::{NetworkKind, Role, TransitionVariant};
-use myownmesh_core::semantic::VerifiedProjectPolicy;
+use myownmesh_core::semantic::{Role, VerifiedProjectPolicy};
 
 fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: network_id.to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -73,16 +75,9 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
 
     // Authoring with no second factor is refused *at the gate* — before any
     // signing happens.
-    let err = governance::propose(
-        &state,
-        TransitionVariant::RoleGrant {
-            target: target_id.clone(),
-            role: Role::Member,
-        },
-        None,
-    )
-    .await
-    .expect_err("propose without a code must be refused");
+    let err = governance::propose_role_grant(&state, &target_id, Role::Member, None)
+        .await
+        .expect_err("propose without a code must be refused");
     let msg = err.to_string();
     assert!(
         msg.contains("custody") || msg.contains("authenticator"),
@@ -91,12 +86,10 @@ async fn custody_gate_blocks_unauthenticated_governance_authoring() {
 
     // With a valid one-time recovery code, the root-authorized member grant
     // proceeds and projects into the canonical production roster.
-    let fact_id = governance::propose(
+    let fact_id = governance::propose_role_grant(
         &state,
-        TransitionVariant::RoleGrant {
-            target: target_id.clone(),
-            role: Role::Member,
-        },
+        &target_id,
+        Role::Member,
         Some(&enrolled.recovery_codes[0]),
     )
     .await

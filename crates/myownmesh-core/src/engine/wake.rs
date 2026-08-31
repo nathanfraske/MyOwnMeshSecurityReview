@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
+use crate::config::SchedulerPolicyConfig;
 use crate::protocol::{keepalive::PingMessage, MeshMessage};
 
 use super::connection::PeerStatus;
-use super::scheduler::{WAKE_COALESCE_MS, WAKE_DETECTION_THRESHOLD_MS, WAKE_PROBE_DELAY_MS};
 use super::state::{NetworkState, SignalingOutbound};
 
 /// Local detector — tracks the last observed tick instant and
@@ -37,16 +37,31 @@ impl WakeDetector {
     /// `interval_ms`. If the gap to the previous tick exceeds
     /// `WAKE_DETECTION_THRESHOLD_MS` the next call to
     /// [`Self::take_wake_event`] returns `true`.
+    #[cfg(test)]
     pub fn observe(&mut self, now: Instant, interval_ms: u64) {
+        self.observe_with_policy(now, interval_ms, &SchedulerPolicyConfig::default());
+    }
+
+    /// Observe with the checked per-network scheduler policy.
+    pub fn observe_with_policy(
+        &mut self,
+        now: Instant,
+        interval_ms: u64,
+        policy: &SchedulerPolicyConfig,
+    ) {
         if let Some(prev) = self.last_tick_at {
             let gap = now.saturating_duration_since(prev).as_millis() as u64;
-            let threshold = WAKE_DETECTION_THRESHOLD_MS.max(interval_ms * 2);
+            let threshold = policy
+                .heartbeat_interval_ms
+                .checked_mul(2)
+                .expect("validated scheduler heartbeat interval is representable")
+                .max(interval_ms.saturating_mul(2));
             if gap > threshold {
                 let stale_window = self
                     .last_wake_at
                     .map(|t| now.saturating_duration_since(t).as_millis() as u64)
                     .unwrap_or(u64::MAX);
-                if stale_window > WAKE_COALESCE_MS {
+                if stale_window > policy.wake_coalesce_ms {
                     self.pending = true;
                     self.last_wake_at = Some(now);
                 }
@@ -73,6 +88,11 @@ impl Default for WakeDetector {
 /// schedule a follow-up sweep after `WAKE_PROBE_DELAY_MS` to see
 /// who responded.
 pub async fn on_wake(state: &Arc<NetworkState>) {
+    let policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     debug!(network = %state.network_id, "tier 2 wake probe");
 
     // Re-advertise immediately on resume. While this node was paused
@@ -84,8 +104,9 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
     // (see `handle_signaling_inbound`) makes neighbors re-announce
     // within ~1 s, so the round-trip rebuild lands in seconds. One
     // send per wake event — wake events are coalesced upstream by
-    // WAKE_COALESCE_MS, and reflected announces are rate-limited by
-    // REACTIVE_ANNOUNCE_MIN_INTERVAL_MS, so this can't storm the relay.
+    // the configured wake-coalescing interval, and reflected announces are
+    // rate-limited by the configured reactive-announce interval, so this
+    // can't storm the relay.
     let _ = state.signaling_tx.send(SignalingOutbound::Announce);
 
     // The announce above is useless if it's written to a dead socket.
@@ -125,24 +146,41 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
     }
 
     // Wait the probe delay then check who responded. Anyone still
-    // silent is escalated.
-    let state_clone = state.clone();
-    let peers = active;
+    // silent is escalated. The delayed probe owns no state, peer, or worker
+    // while asleep: promotion or shutdown makes its weak witness fail closed.
+    let weak_state = Arc::downgrade(state);
+    let peers: Vec<_> = active
+        .into_iter()
+        .filter_map(|owner| {
+            let peer = state.peers.get_if_current(&owner)?;
+            let worker = peer.current_worker()?;
+            Some(owner.for_worker(worker).downgrade())
+        })
+        .collect();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(WAKE_PROBE_DELAY_MS)).await;
+        tokio::time::sleep(Duration::from_millis(policy.wake_probe_delay_ms)).await;
+        let Some(state) = weak_state.upgrade() else {
+            return;
+        };
+        if shutdown_requested_now(&state).await {
+            return;
+        }
         let now = Instant::now();
         let mut any_rebuilt = false;
-        for owner in peers {
+        for weak_owner in peers {
+            let Some(owner) = weak_owner.upgrade() else {
+                continue;
+            };
             let peer_id = owner.device_id().to_string();
             let stale = {
-                let Some(peer) = state_clone.peers.get_if_current(&owner) else {
+                let Some(peer) = state.peers.get_if_current(&owner) else {
                     continue;
                 };
                 let data = peer.state.read();
                 data.last_recv_at
                     .map(|t| now.saturating_duration_since(t).as_millis() as u64)
                     .unwrap_or(u64::MAX)
-                    > WAKE_PROBE_DELAY_MS
+                    > policy.wake_probe_delay_ms
             };
             if stale {
                 // The peer didn't answer the wake probe — its transport
@@ -151,7 +189,7 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 // re-establish it (same reasoning as the heartbeat path).
                 debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
                 super::drop_peer_if_current(
-                    &state_clone,
+                    &state,
                     &owner,
                     crate::events::DropReason::HeartbeatTimeout,
                 )
@@ -159,10 +197,18 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
                 any_rebuilt = true;
             }
         }
-        if any_rebuilt {
-            super::maybe_reactive_announce(&state_clone);
+        if any_rebuilt && !shutdown_requested_now(&state).await {
+            super::maybe_reactive_announce(&state);
         }
     });
+}
+
+async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
+    tokio::select! {
+        biased;
+        _ = state.wait_for_shutdown() => true,
+        _ = std::future::ready(()) => false,
+    }
 }
 
 fn monotonic_ms() -> i64 {

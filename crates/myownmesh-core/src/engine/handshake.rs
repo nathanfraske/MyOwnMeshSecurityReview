@@ -13,7 +13,7 @@
 //!     features }`. No application capability metadata: the Hello is
 //!     admitted before a session exists, and what this node offers is
 //!     sent after promotion over `CapabilitiesUpdate`.
-//!   - Watchdog scheduled at `HANDSHAKE_TIMEOUT_MS`; up to three
+//!   - Watchdog scheduled at the configured handshake timeout; up to three
 //!     hello retries on the [`HANDSHAKE_HELLO_RETRY_SCHEDULE_MS`].
 //!
 //! On inbound hello:
@@ -66,9 +66,9 @@ use crate::PROTOCOL_VERSION;
 use super::connection::PeerStatus;
 use super::ladder::ConnectionTier;
 use super::peer_registry::{PeerOwnerToken, WeakPeerOwnerToken};
-use super::scheduler::{HANDSHAKE_HELLO_RETRY_SCHEDULE_MS, HANDSHAKE_TIMEOUT_MS};
 use super::state::NetworkState;
 use super::{phase, send_to_peer_owner};
+use crate::config::SchedulerPolicyConfig;
 
 /// Send a proof through the witness that already passed the final canonical,
 /// owner, and pending-operation fence.  This must not call the generic
@@ -82,7 +82,7 @@ async fn send_admitted_eviction_proof(
         admission.into_parts();
     let send = worker.begin_send()?;
     let sent = tokio::time::timeout(
-        Duration::from_millis(super::scheduler::PEER_SEND_TIMEOUT_MS),
+        Duration::from_millis(super::scheduler_policy(state).peer_send_timeout_ms),
         send.send(bytes),
     )
     .await
@@ -142,6 +142,11 @@ pub(super) async fn initiate(
         return;
     }
     let device_id = owner.device_id();
+    let scheduler_policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
     // The contribution on the wire is the task's own single draw, read out
     // rather than generated here. The task signs and verifies against the value
     // it drew, so a second draw made at this boundary would put a contribution
@@ -188,8 +193,14 @@ pub(super) async fn initiate(
         owner.downgrade(),
         hello_msg,
         delayed_device_id.clone(),
+        scheduler_policy,
     );
-    schedule_watchdog(Arc::downgrade(state), owner.downgrade(), delayed_device_id);
+    schedule_watchdog(
+        Arc::downgrade(state),
+        owner.downgrade(),
+        delayed_device_id,
+        scheduler_policy,
+    );
 }
 
 /// Re-send the same hello at each tick of
@@ -213,9 +224,10 @@ fn schedule_hello_retries(
     owner: WeakPeerOwnerToken,
     hello: MeshMessage,
     device_id: String,
+    scheduler_policy: SchedulerPolicyConfig,
 ) {
     tokio::spawn(async move {
-        for &delay_ms in HANDSHAKE_HELLO_RETRY_SCHEDULE_MS {
+        for &delay_ms in &scheduler_policy.handshake_hello_retry_schedule_ms {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let Some(state) = state.upgrade() else {
                 return;
@@ -254,9 +266,17 @@ fn schedule_hello_retries(
     });
 }
 
-fn schedule_watchdog(state: Weak<NetworkState>, owner: WeakPeerOwnerToken, device_id: String) {
+fn schedule_watchdog(
+    state: Weak<NetworkState>,
+    owner: WeakPeerOwnerToken,
+    device_id: String,
+    scheduler_policy: SchedulerPolicyConfig,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(
+            scheduler_policy.handshake_timeout_ms,
+        ))
+        .await;
         let Some(state) = state.upgrade() else {
             return;
         };
@@ -275,7 +295,9 @@ fn schedule_watchdog(state: Weak<NetworkState>, owner: WeakPeerOwnerToken, devic
                 && matches!(data.status, PeerStatus::Handshaking)
                 && data
                     .handshake_started_at
-                    .map(|t| t.elapsed().as_millis() as u64 >= HANDSHAKE_TIMEOUT_MS)
+                    .map(|t| {
+                        t.elapsed().as_millis() as u64 >= scheduler_policy.handshake_timeout_ms
+                    })
                     .unwrap_or(false)
         };
         if should_fail && !shutdown_requested_now(&state).await {
@@ -660,7 +682,8 @@ pub async fn on_auth_response(
     // stand down. Without this gate an evicted device that missed the
     // news redialed forever and the flow below RESURRECTED it: pending-
     // approval nudges at best, and on an auto-approve network (every
-    // fleet mesh) auto-approve → mutual ACTIVE → `approve_roster` put it
+    // fleet mesh) auto-approve → mutual ACTIVE previously also populated the
+    // local roster cache; that cache is not an authority input.
     // straight back into the roster and gossiped it fleet-wide.
     // Mark the exact authenticated installation pending before the governance
     // gate. A denied peer may still receive the signed proof bundle over this
@@ -759,7 +782,7 @@ pub async fn on_auth_response(
     // this peer's state.
     let rostered = state.is_rostered(device_id);
     let policy_admits = canonical_policy_admits_both(state, device_id);
-    let auto_approve = policy_admits && (state.config.read().auto_approve || rostered);
+    let auto_approve = policy_admits && state.config.read().auto_approve;
     // The local lifecycle API owns the durable Open fact. Handshake may only
     // forward the already-admitted positive projection to this exact pending
     // owner; it never manufactures a join.
@@ -829,8 +852,7 @@ pub(super) async fn reevaluate_after_role_grant(state: &Arc<NetworkState>, owner
     if !should_reevaluate || !canonical_policy_admits_both(state, owner.device_id()) {
         return;
     }
-    let rostered = state.is_rostered(owner.device_id());
-    let auto_approve = state.config.read().auto_approve || rostered;
+    let auto_approve = state.config.read().auto_approve;
     if auto_approve {
         send_local_approve_owner(state, owner).await;
     } else {
@@ -920,7 +942,7 @@ async fn maybe_activate_after_check(
         // This file mutation has no await point and runs while registry
         // replacement is excluded. Replacement therefore linearizes before
         // this complete commit or after it.
-        let roster_result = state.approve_roster_now(device_id, &label);
+        let roster_result = state.refresh_roster_projection(device_id, &label);
         state.log_diag_with(
             crate::events::DiagLevel::Info,
             "peer",
@@ -979,13 +1001,7 @@ async fn maybe_activate_after_check(
         return;
     }
 
-    if super::governance::broadcast_roster_summary_for_owner(state, owner).await {
-        let _ = super::governance::broadcast_state_for_owner(state, owner).await;
-        if state.peers.get_if_current(owner).is_none() {
-            return;
-        }
-        let _ = super::governance::broadcast_fact_inventory_for_owner(state, owner).await;
-    }
+    let _ = super::governance::broadcast_fact_inventory_for_owner(state, owner).await;
 }
 
 pub async fn on_deny(state: &Arc<NetworkState>, owner: &PeerOwnerToken, deny: DenyMessage) {
@@ -1072,13 +1088,24 @@ mod tests {
             .expect("timer owner exists");
         let weak_owner = owner.downgrade();
         let hello = MeshMessage::Deny(DenyMessage { reason: None });
+        let scheduler_policy = state
+            .config
+            .read()
+            .scheduler_policy()
+            .expect("test state has a validated scheduler policy");
         schedule_hello_retries(
             Weak::new(),
             weak_owner.clone(),
             hello,
             "timer-owner".to_string(),
+            scheduler_policy.clone(),
         );
-        schedule_watchdog(Weak::new(), weak_owner.clone(), "timer-owner".to_string());
+        schedule_watchdog(
+            Weak::new(),
+            weak_owner.clone(),
+            "timer-owner".to_string(),
+            scheduler_policy,
+        );
 
         assert!(weak_owner.upgrade().is_some());
         let removed = state

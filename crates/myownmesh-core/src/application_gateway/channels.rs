@@ -1,6 +1,8 @@
 //! Named application channels: the subscriber queues and the gateway
 //! operations that install, retire, and deliver into them.
 
+#[cfg(test)]
+use crate::resource::measure_serialized_mailbox_item;
 use crate::resource::{
     FundedArc, FundedWeak, LeasedMap, LeasedQueue, ResourceClaim, ResourceClass, ResourceLease,
 };
@@ -102,6 +104,17 @@ impl Drop for GatewayChannel {
             }
         }
     }
+}
+
+/// Retire weak subscription nodes whose funded strong owner has already gone
+/// away, then return the exact number of candidates that can receive.  The
+/// count feeds the scratch reservation below, so stale nodes must not make a
+/// live route fail for capacity it cannot use.
+fn retain_live_subscriber_count(channel: &mut GatewayChannel) -> usize {
+    channel
+        .subscribers
+        .retain(|subscriber| subscriber.strong_count() != 0);
+    channel.subscribers.iter().count()
 }
 
 impl ApplicationGateway {
@@ -266,7 +279,7 @@ impl ApplicationGateway {
         let mut registry = self.channels.lock();
         let candidate_count = registry
             .get_mut(name)
-            .map_or(0, |channel| channel.subscribers.iter().count());
+            .map_or(0, retain_live_subscriber_count);
         if candidate_count == 0 {
             return Err(GatewayRefusal::NoReceiver);
         }
@@ -529,8 +542,9 @@ mod tests {
     #[test]
     fn v4_r5_core_f1_one_subscriber_cannot_retain_two_decoded_graphs_under_one_residual() {
         let payload = serde_json::Value::String("decoded-result".to_owned());
-        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
-            .expect("the payload claim is measurable");
+        let payload_claim = measure_serialized_mailbox_item::<serde_json::Value>(&payload)
+            .expect("the payload claim is measurable")
+            .into_claim();
         let retention = channel_delivery_claim(payload_claim, "")
             .expect("the per-delivery claim is representable");
         assert_eq!(
@@ -622,8 +636,9 @@ mod tests {
         .expect("an admitted subscriber allocation may be shared");
 
         let payload = serde_json::Value::String("held-a".to_owned());
-        let payload_claim = crate::resource::serialized_mailbox_item_claim(&payload)
-            .expect("the payload claim is measurable");
+        let payload_claim = measure_serialized_mailbox_item::<serde_json::Value>(&payload)
+            .expect("the payload claim is measurable")
+            .into_claim();
         let retention = channel_delivery_claim(payload_claim, "peer")
             .expect("the delivery claim is representable");
         let node = GatewayMailbox::<GatewayChannelFrame>::node_claim()
@@ -702,6 +717,39 @@ mod tests {
             provider.in_use(),
             baseline,
             "and everything it was charged for comes back when it leaves"
+        );
+    }
+
+    /// A dropped subscription can leave a weak node until the route is next
+    /// inspected.  That node has no receiver and must not consume scratch
+    /// reservation or make a live route report pressure for an unreachable
+    /// candidate.
+    #[test]
+    fn stale_subscription_nodes_are_pruned_before_candidate_counting() {
+        let (_provider, gateway) = gateway_fixture();
+        let subscriber = gateway
+            .subscribe_channel("stale")
+            .expect("the control grant funds one subscription");
+        drop(subscriber);
+
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("stale"),
+            1,
+            "the deliberately stale weak node is present before route inspection"
+        );
+        let candidates = {
+            let mut registry = gateway.channels.lock();
+            retain_live_subscriber_count(
+                registry
+                    .get_mut("stale")
+                    .expect("the channel remains while its stale node is queued"),
+            )
+        };
+        assert_eq!(candidates, 0);
+        assert_eq!(
+            gateway.channel_subscriber_count_for_test("stale"),
+            0,
+            "pruning removes the unreachable node before any scratch claim"
         );
     }
 

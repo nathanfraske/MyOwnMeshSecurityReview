@@ -12,11 +12,26 @@ import tarfile
 import zipfile
 
 
+REMOVED_V3_MARKERS = (
+    b"NetworkStateBroadcast",
+    b"RosterSummary",
+    b"RosterRequest",
+    b"RosterEntries",
+    b"GovernanceSnapshot",
+    b"GovernanceMfaEnroll",
+    b"SelfStandDownReference",
+    b"CanonicalDeviceId",
+    b"LegacyAuthority",
+    b"network_state::",
+    b"governance_state",
+)
+
 FORBIDDEN_MARKERS = (
     b"MYOWNMESH_TRANSPORT_LAB_MFA_BARRIER",
     b"TransportLab",
     b"transport_lab",
     b"transport-lab",
+    *REMOVED_V3_MARKERS,
 )
 SCAN_CHUNK_SIZE = 64 * 1024
 
@@ -40,7 +55,10 @@ def scan_stream(label: str, stream: object) -> None:
         window = overlap + chunk
         found = [marker.decode("ascii") for marker in FORBIDDEN_MARKERS if marker in window]
         if found:
-            fail(f"{label} contains transport-lab marker(s): {', '.join(found)}")
+            fail(
+                f"{label} contains transport-lab marker(s) or removed V3 marker(s): "
+                f"{', '.join(found)}"
+            )
         overlap = window[-overlap_size:]
 
 

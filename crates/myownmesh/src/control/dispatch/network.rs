@@ -37,6 +37,43 @@ async fn network_mutation_guard() -> MutexGuard<'static, ()> {
         .await
 }
 
+/// Preserve the operation's primary failure while still surfacing a failure
+/// from the mandatory joined-network teardown. The control reply API carries
+/// errors as text, so keep both causes unambiguously in that one response.
+fn preserve_shutdown_failure(primary: impl Into<String>, shutdown: Result<()>) -> String {
+    let primary = primary.into();
+    match shutdown {
+        Ok(()) => primary,
+        Err(error) => format!("{primary}; shutdown failed: {error:#}"),
+    }
+}
+
+/// Report purge, on-disk persistence, and runtime-teardown outcomes together.
+/// All operations have already completed when this is called, so no later
+/// failure hides an earlier one.
+fn combine_remove_failures(
+    config_id: String,
+    purge_error: Option<String>,
+    persistence_error: Option<String>,
+    teardown_error: Option<String>,
+) -> std::result::Result<String, String> {
+    let mut failures = Vec::new();
+    if let Some(error) = purge_error {
+        failures.push(error);
+    }
+    if let Some(error) = persistence_error {
+        failures.push(error);
+    }
+    if let Some(error) = teardown_error {
+        failures.push(error);
+    }
+    if failures.is_empty() {
+        Ok(config_id)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
 /// Join a fresh network through the live mesh, attach signaling,
 /// register the result, and persist the new config to disk. Each
 /// step that mutates daemon-visible state is reversible up to the
@@ -94,8 +131,11 @@ pub(in crate::control) async fn network_add(
         match joined.attach_signaling() {
             Ok(drivers) => drivers,
             Err(error) => {
-                let _ = joined.shutdown().await;
-                return owner.finish(Err(format!("signaling attach failed: {error}")));
+                let message = preserve_shutdown_failure(
+                    format!("signaling attach failed: {error}"),
+                    joined.shutdown().await,
+                );
+                return owner.finish(Err(message));
             }
         }
     };
@@ -110,10 +150,11 @@ pub(in crate::control) async fn network_add(
         if let Some(drivers) = refused.drivers {
             drivers.shutdown().await;
         }
-        let _ = refused.joined.shutdown().await;
-        return owner.finish(Err(format!(
-            "network id is held by a runtime in {refusal_state:?} state"
-        )));
+        let message = preserve_shutdown_failure(
+            format!("network id is held by a runtime in {refusal_state:?} state"),
+            refused.joined.shutdown().await,
+        );
+        return owner.finish(Err(message));
     }
 
     // Refresh the service-role advert so the new network advertises what
@@ -135,22 +176,38 @@ pub(in crate::control) async fn network_add(
     owner.finish(Ok(OperationReplyData::Added(summary)))
 }
 
+/// Complete the on-disk half of forgetting a network under its exact owner.
+///
+/// The generic owner and injected operations keep the production order and
+/// failure contract directly testable without constructing a live network: no
+/// owner or failed semantic purge can be turned into a successful removal.
+fn purge_owned_state<T>(
+    network_id: &str,
+    owner: Option<&T>,
+    purge_semantic: impl FnOnce(&T) -> Result<()>,
+    delete_roster: impl FnOnce(&str) -> Result<()>,
+) -> std::result::Result<(), String> {
+    let owner = owner.ok_or_else(|| {
+        format!("purge refused for {network_id}: canonical semantic snapshot owner unavailable")
+    })?;
+    purge_semantic(owner).map_err(|error| {
+        format!(
+            "purge refused for {network_id}: canonical semantic snapshot purge failed: {error:#}"
+        )
+    })?;
+    delete_roster(network_id).map_err(|error| {
+        format!("purge refused for {network_id}: roster delete failed: {error:#}")
+    })?;
+    Ok(())
+}
+
+fn purge_network_projection(network_id: &str) -> Result<()> {
+    myownmesh_core::roster::delete(network_id).map_err(|error| anyhow!("{error:#}"))
+}
+
 /// Leave a live network and remove it from the on-disk config. The registry
 /// owns signaling and engine teardown through completion and reports its exact
 /// outcome.
-/// Drop a network's persisted **governance state + roster** — the on-disk half
-/// of forgetting a network. Best-effort + logged: a leave that can't delete the
-/// files isn't worth failing the request over, but leaving them is precisely
-/// what made a rejoin reload a stale/forked genesis, so we try.
-fn purge_network_state(network_id: &str) {
-    if let Err(e) = myownmesh_core::network_state::delete(network_id) {
-        warn!(%network_id, "purge: network_state delete failed: {e:#}");
-    }
-    if let Err(e) = myownmesh_core::roster::delete(network_id) {
-        warn!(%network_id, "purge: roster delete failed: {e:#}");
-    }
-}
-
 pub(in crate::control) async fn network_remove(
     state: &Arc<ControlState>,
     key: &str,
@@ -169,7 +226,7 @@ async fn network_remove_result(
 ) -> std::result::Result<String, String> {
     let _mutation_guard = network_mutation_guard().await;
     let key_owned = key.to_string();
-    let (ids, removal) = if let Some(joined) = state.registry.get(key) {
+    let (ids, joined_for_purge, removal) = if let Some(joined) = state.registry.get(key) {
         let ids = (
             joined.config_id().to_string(),
             joined.network_id().to_string(),
@@ -180,9 +237,9 @@ async fn network_remove_result(
         let departure = joined.announce_leave();
         let removal = state.registry.remove(key);
         let (_, removal) = tokio::join!(departure, removal);
-        (Some(ids), Some(removal))
+        (Some(ids), Some(joined), Some(removal))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let removal = match removal {
         Some(removal) => removal,
@@ -193,29 +250,42 @@ async fn network_remove_result(
             let (config_id, network_id) =
                 ids.unwrap_or_else(|| (key_owned.clone(), key_owned.clone()));
             state.services.on_network_removed(&config_id).await;
-            if let Err(e) = persist_network_remove(&config_id, &network_id) {
-                return Err(format!("network left but config.json save failed: {e}"));
-            }
-            if purge {
-                purge_network_state(&network_id);
-            }
-            match outcome {
-                Ok(()) => Ok(config_id),
-                Err(error) => Err(format!(
-                    "network removed but runtime teardown reported failure: {error}"
-                )),
-            }
+            let purge_error = if purge {
+                purge_owned_state(
+                    &network_id,
+                    joined_for_purge.as_ref(),
+                    |joined| joined.purge_durable_semantic_state(),
+                    purge_network_projection,
+                )
+                .err()
+            } else {
+                None
+            };
+            let persistence_error = persist_network_remove(&config_id, &network_id)
+                .err()
+                .map(|error| format!("network left but config.json save failed: {error}"));
+            let teardown_error = outcome.err().map(|error| {
+                format!("network removed but runtime teardown reported failure: {error}")
+            });
+            combine_remove_failures(config_id, purge_error, persistence_error, teardown_error)
         }
-        RemoveResult::AlreadyClosing(runtime) => Err(format!(
-            "network teardown already in progress ({runtime:?})"
-        )),
+        RemoveResult::AlreadyClosing(observation) => match observation.outcome {
+            Ok(()) => Err(format!(
+                "network teardown already completed (state {:?}); purge was not attempted",
+                observation.state
+            )),
+            Err(error) => Err(format!(
+                "network teardown already in progress but reported failure: {error}"
+            )),
+        },
         RemoveResult::NotFound => Err(format!("unknown network: {key_owned}")),
     }
 }
 
 /// Forget every joined network at once — the bulk `NetworkRemove{purge:true}`.
-/// Each network is torn down live and its signed state + roster deleted from
-/// disk; the device identity is kept. Snapshots the set first so removing as we
+/// Each network is torn down live and its canonical semantic snapshot plus
+/// roster projection are deleted from disk; the device identity is kept.
+/// Snapshots the set first so removing as we
 /// go can't skip an entry.
 ///
 /// The runtime shutdown that drops every in-memory cache around the wipe is not
@@ -227,10 +297,24 @@ pub(in crate::control) async fn forget_all_networks(
     owner: ResponseOwner,
 ) -> FundedVariableReply {
     let mut forgotten = Vec::new();
+    let mut failures = Vec::new();
     for n in state.registry.summaries() {
         // `network_remove` resolves either alias; the config id is stable.
-        let _ = network_remove_result(state, &n.config_id, true, &owner).await;
-        forgotten.push(n.config_id);
+        match network_remove_result(state, &n.config_id, true, &owner).await {
+            Ok(config_id) => forgotten.push(config_id),
+            Err(error) => failures.push(format!("{}: {error}", n.config_id)),
+        }
+    }
+    if !failures.is_empty() {
+        let mut message = format!(
+            "forget all failed for {} network(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+        if !forgotten.is_empty() {
+            message.push_str(&format!("; completed: {}", forgotten.join(", ")));
+        }
+        return owner.finish(Err(message));
     }
     owner.finish(Ok(OperationReplyData::Forgotten(forgotten)))
 }
@@ -238,18 +322,22 @@ pub(in crate::control) async fn forget_all_networks(
 /// Factory reset — return this device to a brand-new state. First quiesce every
 /// network (tear it down + purge its files) so nothing re-persists mid-wipe,
 /// then remove the whole state directory (identity, config, and any leftovers),
-/// so a fresh runtime mints a new identity on empty state. Best-effort per step,
-/// and a partial failure is still a reset: the connection loop submits the one
-/// runtime shutdown request after this answer has been attempted either way,
-/// rather than leaving a half-wiped daemon re-persisting stale caches.
+/// so a fresh runtime mints a new identity on empty state. Every destructive
+/// step is reported: a partial wipe is not reported as a successful reset. The
+/// connection loop still submits the one runtime shutdown request after this
+/// answer has been attempted either way, rather than leaving a half-wiped
+/// daemon re-persisting stale caches.
 pub(in crate::control) async fn factory_reset(
     state: &Arc<ControlState>,
     owner: ResponseOwner,
 ) -> FundedVariableReply {
     // Quiesce writers first: tearing each network down stops its engine driver
     // from writing a roster/state file back out while we're deleting the tree.
+    let mut failures = Vec::new();
     for n in state.registry.summaries() {
-        let _ = network_remove_result(state, &n.config_id, true, &owner).await;
+        if let Err(error) = network_remove_result(state, &n.config_id, true, &owner).await {
+            failures.push(format!("{}: {error}", n.config_id));
+        }
     }
     let dir = match myownmesh_core::dirs::data_dir() {
         Ok(d) => d,
@@ -261,11 +349,18 @@ pub(in crate::control) async fn factory_reset(
         }
     };
     if let Err(e) = std::fs::remove_dir_all(&dir) {
-        // A missing dir already reads as reset; anything else is worth logging,
-        // but we still exit so caches can't resurrect what did get deleted.
+        // A missing dir already reads as reset. Any other failure means the
+        // requested wipe did not happen and must not be acknowledged as one.
         if e.kind() != std::io::ErrorKind::NotFound {
             warn!(dir = %dir.display(), "factory reset: remove_dir_all: {e:#}");
+            failures.push(format!("remove state directory: {e}"));
         }
+    }
+    if !failures.is_empty() {
+        return owner.finish(Err(format!(
+            "factory reset failed: {}",
+            failures.join("; ")
+        )));
     }
     owner.finish(Ok(OperationReplyData::Reset))
 }
@@ -355,11 +450,10 @@ async fn connect_peer_funded(
         return owner.finish(Err(format!("unknown network: {key}")));
     };
     let result = if pin || wait_ms > 0 {
-        // Waited/pinned dial: resolves on ACTIVE (or the deadline). A
-        // pin with no wait still uses the waiting path with a minimal
-        // deadline so the sticky flag is recorded engine-side; the
-        // dial itself keeps going either way.
-        let deadline = std::time::Duration::from_millis(wait_ms.max(1));
+        // Waited/pinned dial: resolves on ACTIVE (or the caller's exact
+        // deadline). A zero wait is intentionally zero; this layer must not
+        // invent a timing policy for a caller that supplied none.
+        let deadline = std::time::Duration::from_millis(wait_ms);
         match joined.connect_peer_wait(peer, pin, deadline).await {
             Ok(()) => Ok(true),
             Err(e) if wait_ms == 0 => {
@@ -404,8 +498,10 @@ async fn rollback_old_network(state: &Arc<ControlState>, old_config: &NetworkCon
     let drivers = match attached {
         Ok(drivers) => drivers,
         Err(error) => {
-            let _ = restored.shutdown().await;
-            return format!(" — AND the rollback join could not attach signaling: {error}");
+            return preserve_shutdown_failure(
+                format!(" — AND the rollback join could not attach signaling: {error}"),
+                restored.shutdown().await,
+            );
         }
     };
     if let Some(refused) = state.registry.insert(restored, drivers).into_refusal() {
@@ -413,9 +509,11 @@ async fn rollback_old_network(state: &Arc<ControlState>, old_config: &NetworkCon
         if let Some(drivers) = refused.drivers {
             drivers.shutdown().await;
         }
-        let _ = refused.joined.shutdown().await;
-        return format!(
-            " — rollback join was refused by a {refusal_state:?} runtime; config was not overwritten"
+        return preserve_shutdown_failure(
+            format!(
+                " — rollback join was refused by a {refusal_state:?} runtime; config was not overwritten"
+            ),
+            refused.joined.shutdown().await,
         );
     }
 
@@ -587,10 +685,17 @@ pub(in crate::control) async fn network_update(
                 "old runtime teardown failed: {error}{rollback}"
             )));
         }
-        RemoveResult::AlreadyClosing(runtime) => {
-            return owner.finish(Err(format!(
-                "network update refused while teardown is already in progress ({runtime:?})"
-            )));
+        RemoveResult::AlreadyClosing(observation) => {
+            let error = match observation.outcome {
+                Ok(()) => format!(
+                    "network update refused after teardown completed (state {:?})",
+                    observation.state
+                ),
+                Err(error) => format!(
+                    "network update refused because prior teardown reported failure: {error}"
+                ),
+            };
+            return owner.finish(Err(error));
         }
         RemoveResult::NotFound => {
             if let Some(runtime) = state.registry.state(&old_config.id) {
@@ -627,11 +732,12 @@ pub(in crate::control) async fn network_update(
         match joined.attach_signaling() {
             Ok(drivers) => drivers,
             Err(error) => {
-                let _ = joined.shutdown().await;
+                let attach_error = preserve_shutdown_failure(
+                    format!("signaling attach failed after update: {error}"),
+                    joined.shutdown().await,
+                );
                 let rollback = rollback_old_network(state, &old_config).await;
-                return owner.finish(Err(format!(
-                    "signaling attach failed after update: {error}{rollback}"
-                )));
+                return owner.finish(Err(format!("{attach_error}{rollback}")));
             }
         }
     };
@@ -647,11 +753,12 @@ pub(in crate::control) async fn network_update(
         if let Some(drivers) = refused.drivers {
             drivers.shutdown().await;
         }
-        let _ = refused.joined.shutdown().await;
+        let replacement_error = preserve_shutdown_failure(
+            format!("replacement runtime refused while predecessor is {refusal_state:?}"),
+            refused.joined.shutdown().await,
+        );
         let rollback = rollback_old_network(state, &old_config).await;
-        return owner.finish(Err(format!(
-            "replacement runtime refused while predecessor is {refusal_state:?}{rollback}"
-        )));
+        return owner.finish(Err(format!("{replacement_error}{rollback}")));
     }
 
     // The insert is the replacement's ownership boundary. Resolve the exact
@@ -875,5 +982,157 @@ pub(in crate::control) async fn capabilities_set(
                 admission,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::combine_remove_failures;
+    use super::preserve_shutdown_failure;
+    use super::purge_owned_state;
+
+    #[test]
+    fn mandatory_shutdown_failure_preserves_each_primary_response_cause() {
+        for primary in [
+            "signaling attach failed: attach refused",
+            "network id is held by a runtime in Closing state",
+            "rollback join was refused by a Closing runtime; config was not overwritten",
+            "replacement runtime refused while predecessor is Closing",
+        ] {
+            let combined =
+                preserve_shutdown_failure(primary, Err(anyhow::anyhow!("driver teardown failed")));
+            assert_eq!(
+                combined,
+                format!("{primary}; shutdown failed: driver teardown failed")
+            );
+            assert_eq!(combined.matches("shutdown failed").count(), 1);
+        }
+
+        let primary = "signaling attach failed: attach refused";
+        assert_eq!(preserve_shutdown_failure(primary, Ok(())), primary);
+    }
+
+    #[test]
+    fn remove_failures_preserve_exact_single_and_combined_order() {
+        let purge = "purge refused for network-a: semantic state is busy".to_string();
+        let persistence = "network left but config.json save failed: disk full".to_string();
+        let teardown =
+            "network removed but runtime teardown reported failure: driver stopped with error"
+                .to_string();
+
+        assert_eq!(
+            combine_remove_failures("network-a".into(), None, Some(persistence.clone()), None),
+            Err(persistence.clone())
+        );
+        assert_eq!(
+            combine_remove_failures("network-a".into(), None, None, Some(teardown.clone())),
+            Err(teardown.clone())
+        );
+        assert_eq!(
+            combine_remove_failures(
+                "network-a".into(),
+                None,
+                Some(persistence.clone()),
+                Some(teardown.clone())
+            ),
+            Err(format!("{persistence}; {teardown}"))
+        );
+        assert_eq!(
+            combine_remove_failures("network-a".into(), Some(purge.clone()), None, None),
+            Err(purge.clone())
+        );
+        assert_eq!(
+            combine_remove_failures(
+                "network-a".into(),
+                Some(purge.clone()),
+                Some(persistence.clone()),
+                None
+            ),
+            Err(format!("{purge}; {persistence}"))
+        );
+        assert_eq!(
+            combine_remove_failures(
+                "network-a".into(),
+                Some(purge.clone()),
+                None,
+                Some(teardown.clone())
+            ),
+            Err(format!("{purge}; {teardown}"))
+        );
+        assert_eq!(
+            combine_remove_failures(
+                "network-a".into(),
+                Some(purge.clone()),
+                Some(persistence.clone()),
+                Some(teardown.clone())
+            ),
+            Err(format!("{purge}; {persistence}; {teardown}"))
+        );
+        assert_eq!(
+            combine_remove_failures("network-a".into(), None, None, None),
+            Ok("network-a".to_string())
+        );
+    }
+
+    #[test]
+    fn purge_without_the_joined_owner_is_refused() {
+        let error = purge_owned_state(
+            "network-a",
+            None::<&()>,
+            |_| panic!("semantic purge must not run without its owner"),
+            |_| panic!("roster purge must not run without its owner"),
+        )
+        .expect_err("missing owner must not report a successful purge");
+        assert!(error.contains("canonical semantic snapshot owner unavailable"));
+    }
+
+    #[test]
+    fn semantic_writer_refusal_is_not_reported_as_removed() {
+        let owner = ();
+        let error = purge_owned_state(
+            "network-a",
+            Some(&owner),
+            |_| Err(anyhow::anyhow!("WriterBusy: semantic writer is busy")),
+            |_| panic!("roster purge must wait for semantic success"),
+        )
+        .expect_err("a semantic writer refusal must fail the purge");
+        assert!(error.contains("WriterBusy"));
+        assert!(error.contains("purge refused"));
+    }
+
+    #[test]
+    fn roster_io_failure_is_not_reported_as_forgotten() {
+        let owner = ();
+        let error = purge_owned_state(
+            "network-a",
+            Some(&owner),
+            |_| Ok(()),
+            |_| Err(anyhow::anyhow!("I/O error removing roster")),
+        )
+        .expect_err("a roster I/O refusal must fail the purge");
+        assert!(error.contains("roster delete failed"));
+        assert!(error.contains("I/O error"));
+    }
+
+    #[test]
+    fn successful_purge_requires_both_owned_steps() {
+        let owner = ();
+        let mut semantic_called = false;
+        let mut roster_called = false;
+        purge_owned_state(
+            "network-a",
+            Some(&owner),
+            |_| {
+                semantic_called = true;
+                Ok(())
+            },
+            |_| {
+                roster_called = true;
+                Ok(())
+            },
+        )
+        .expect("both owned purge steps succeeded");
+        assert!(semantic_called);
+        assert!(roster_called);
     }
 }

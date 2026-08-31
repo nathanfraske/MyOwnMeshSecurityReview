@@ -7,9 +7,8 @@ use crate::error::Result;
 use crate::events::DropReason;
 use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceMailboxItem,
-    ResourceMailboxItemError,
+    checked_measure_add, mailbox_measure_serialized, strings_measure, MailboxMeasurement,
+    ResourceClaimArithmeticError, ResourceClass, ResourceMailboxItem, ResourceMailboxItemError,
 };
 
 use super::peer_registry::PeerOwnerToken;
@@ -22,15 +21,6 @@ pub enum NetworkCmd {
         owner: PeerOwnerToken,
     },
     SetTopology(TopologyMode),
-    ApproveRoster {
-        device_id: String,
-        label: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    RemoveRoster {
-        device_id: String,
-        reply: oneshot::Sender<Result<()>>,
-    },
     DropPeer {
         device_id: String,
         reason: DropReason,
@@ -81,24 +71,32 @@ pub enum NetworkCmd {
     FanoutCapabilities {
         caps: CapabilityAdvert,
     },
-    ProposeTransition {
-        variant: crate::network_state::TransitionVariant,
+    ProposeRoleGrant {
+        target: String,
+        role: crate::semantic::Role,
+        mfa_code: Option<String>,
+        reply: oneshot::Sender<Result<crate::semantic::FactId>>,
+    },
+    ProposeRoleRevoke {
+        target: String,
+        mfa_code: Option<String>,
+        reply: oneshot::Sender<Result<crate::semantic::FactId>>,
+    },
+    ProposeEvict {
+        target: String,
         mfa_code: Option<String>,
         reply: oneshot::Sender<Result<crate::semantic::FactId>>,
     },
 }
 
-impl ResourceMailboxItem for NetworkCmd {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for NetworkCmd {
+    fn measured_claim(
+        &self,
+    ) -> std::result::Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         let measure = match self {
             Self::ReplayCapabilities { .. } => (0, 0, 0),
             Self::SetTopology(mode) => mailbox_measure_serialized(mode)?,
-            Self::ApproveRoster {
-                device_id, label, ..
-            } => strings_measure([device_id.as_str(), label.as_str()])?,
-            Self::RemoveRoster { device_id, .. } | Self::ConnectPeer { device_id, .. } => {
-                strings_measure([device_id.as_str()])?
-            }
+            Self::ConnectPeer { device_id, .. } => strings_measure([device_id.as_str()])?,
             Self::DropPeer { device_id, reason } => {
                 let reason = match reason {
                     DropReason::TransportError { message } => Some(message.as_str()),
@@ -186,11 +184,18 @@ impl ResourceMailboxItem for NetworkCmd {
                 mailbox_measure_serialized(request)?,
             )?,
             Self::FanoutCapabilities { caps } => mailbox_measure_serialized(caps)?,
-            Self::ProposeTransition {
-                variant, mfa_code, ..
-            } => checked_measure_add(
-                mailbox_measure_serialized(variant)?,
-                strings_measure(mfa_code.iter().map(String::as_str))?,
+            Self::ProposeRoleGrant {
+                target, mfa_code, ..
+            }
+            | Self::ProposeRoleRevoke {
+                target, mfa_code, ..
+            }
+            | Self::ProposeEvict {
+                target, mfa_code, ..
+            } => strings_measure(
+                [Some(target.as_str()), mfa_code.as_deref()]
+                    .into_iter()
+                    .flatten(),
             )?,
         };
         let effect_allocations = match self {
@@ -201,19 +206,19 @@ impl ResourceMailboxItem for NetworkCmd {
             | Self::Reconnect { .. } => 0,
             Self::AttemptRefused { .. } | Self::AttemptOutcome { .. } => 1,
             Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
-            Self::ApproveRoster { .. }
-            | Self::RemoveRoster { .. }
-            | Self::SendChannelReliable { .. }
+            Self::SendChannelReliable { .. }
             | Self::SendChannelFrame { .. }
             | Self::BroadcastChannelFrame { .. }
             | Self::SendRpcRequest { .. }
-            | Self::ProposeTransition { .. } => 1,
+            | Self::ProposeRoleGrant { .. }
+            | Self::ProposeRoleRevoke { .. }
+            | Self::ProposeEvict { .. } => 1,
         };
         let allocations = measure.2.checked_add(effect_allocations).ok_or(
             ResourceClaimArithmeticError::Overflow {
                 dimension: ResourceClass::OpaqueDependencyResidual,
             },
         )?;
-        mailbox_retained_claim::<Self>(measure.0, measure.1, allocations)
+        MailboxMeasurement::from_parts(measure.0, measure.1, allocations)
     }
 }

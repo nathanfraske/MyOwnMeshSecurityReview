@@ -37,11 +37,10 @@ pub struct AuthorizedPeer {
     /// Authority tier within this network's governance. Current-profile roster
     /// entries always state it explicitly; open networks use `Member`.
     ///
-    /// Source of truth for *enforced* authority on a closed network
-    /// is the `roles` map on [`crate::NetworkState`] — this field is
-    /// the locally-cached projection for fast peer-row rendering.
-    /// They are kept in sync by the engine on every signed transition.
-    pub role: crate::network_state::Role,
+    /// This role is a non-authoritative projection/UI cache derived from the
+    /// canonical semantic `FactGraph`; admission and authorization must use
+    /// the verified facts rather than this locally stored field.
+    pub role: crate::semantic::Role,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -105,9 +104,9 @@ fn with_persistence_root(mut roster: Roster, root: Option<&Path>) -> Roster {
 /// Add or refresh a peer in the roster. Idempotent — re-approving an
 /// existing peer updates their label but doesn't bump `approved_at`,
 /// so the user-facing "approved on …" reflects the original moment
-/// of trust. The existing peer's `role` is preserved through a
-/// re-approval (use [`set_role_in`] or
-/// [`crate::network_state::apply_transition`] to change it).
+/// of trust. The existing role projection is preserved through a
+/// re-approval; canonical role changes arrive through the semantic
+/// `FactGraph`, while [`set_role_in`] only updates this local UI cache.
 pub fn add_peer_in(roster: &mut Roster, device_id: &str, label: &str) {
     let pubkey = crate::signing::pubkey_part(device_id).to_string();
     if let Some(existing) = roster
@@ -121,7 +120,7 @@ pub fn add_peer_in(roster: &mut Roster, device_id: &str, label: &str) {
             device_id: pubkey,
             label: label.to_string(),
             approved_at: now_unix(),
-            role: crate::network_state::Role::default(),
+            role: crate::semantic::Role::Member,
         });
     }
 }
@@ -129,7 +128,11 @@ pub fn add_peer_in(roster: &mut Roster, device_id: &str, label: &str) {
 /// Update a roster entry's role tag. No-op if the peer isn't in the
 /// roster (callers should add first). Returns whether a row was
 /// changed so the caller can short-circuit a no-op disk write.
-pub fn set_role_in(roster: &mut Roster, device_id: &str, role: crate::network_state::Role) -> bool {
+pub fn set_role_in<R>(roster: &mut Roster, device_id: &str, role: R) -> bool
+where
+    R: Into<crate::semantic::Role>,
+{
+    let role = role.into();
     let pubkey = crate::signing::pubkey_part(device_id);
     if let Some(existing) = roster
         .authorized_devices
@@ -158,132 +161,6 @@ pub fn is_authorized(roster: &Roster, device_id: &str) -> bool {
         .authorized_devices
         .iter()
         .any(|p| p.device_id == pubkey)
-}
-
-/// Legacy diagnostic only. It is not an ordering or convergence authority;
-/// roster summaries carry a fixed zero for the old wire field.
-pub fn last_edit_ts(roster: &Roster) -> u64 {
-    roster
-        .authorized_devices
-        .iter()
-        .map(|p| p.approved_at)
-        .max()
-        .unwrap_or(0)
-}
-
-// ---- merkle root for gossip ----------------------------------------
-//
-// The root is the deterministic hash of every entry in the roster.
-// Two peers with the same set of authorised devices (regardless of
-// insertion order or label whitespace) produce the same root; any
-// add/remove/role-change flips it. Used by `RosterSummaryMessage`
-// for cheap "are we in sync?" detection on every ACTIVE transition.
-//
-// v1 layout (subject to upgrade — bump `ROSTER_MERKLE_V` to break
-// compat):
-//   - Entries sorted by `device_id` (the canonical pubkey).
-//   - Each entry hashes to `sha256("v1|" || device_id || "|" || label ||
-//     "|" || approved_at || "|" || role)`. Field separators ensure no
-//     concatenation collision between adjacent entries.
-//   - Root = `sha256(v1_tag || concat(leaf_hashes))`, base32-lowercase.
-//
-// Role is part of the leaf so a role grant flips the root — every
-// peer's gossip will trigger a roster_request next round, which is
-// exactly the behaviour we want. Labels are hashed because relabels
-// should propagate even though they're cosmetic; a future
-// optimisation can exclude them if relabel-induced churn becomes
-// load-bearing.
-
-const ROSTER_MERKLE_V: &str = "v1";
-
-fn role_tag(r: crate::network_state::Role) -> &'static str {
-    match r {
-        crate::network_state::Role::Member => "member",
-        crate::network_state::Role::Controller => "controller",
-        crate::network_state::Role::Owner => "owner",
-    }
-}
-
-fn leaf_hash(entry: &AuthorizedPeer) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(ROSTER_MERKLE_V.as_bytes());
-    h.update(b"|");
-    h.update(entry.device_id.as_bytes());
-    h.update(b"|");
-    h.update(entry.label.as_bytes());
-    h.update(b"|");
-    h.update(role_tag(entry.role).as_bytes());
-    h.finalize().into()
-}
-
-/// Deterministic Merkle root over the roster's entries. Returns
-/// base32-lowercase 52 chars (52 == ceil(32 bytes / 5 bits/char)).
-/// Empty rosters produce a sentinel root distinct from any non-empty
-/// roster (just `sha256(version_tag)`) so a fresh peer's broadcast
-/// is comparable cleanly.
-pub fn merkle_root(roster: &Roster) -> String {
-    use sha2::{Digest, Sha256};
-    let mut entries: Vec<&AuthorizedPeer> = roster.authorized_devices.iter().collect();
-    entries.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-
-    let mut h = Sha256::new();
-    h.update(ROSTER_MERKLE_V.as_bytes());
-    for e in entries {
-        h.update(leaf_hash(e));
-    }
-    let digest = h.finalize();
-    data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
-}
-
-/// Deterministic root over just the *membership* of the roster — the
-/// sorted set of canonical device ids, ignoring labels, approval
-/// timestamps, and roles. Two peers with the same set of authorised
-/// devices produce the same membership root even if they each labelled
-/// those devices differently or approved them at different moments.
-///
-/// This — not [`merkle_root`] — is the root roster gossip converges on.
-/// Cosmetic, inherently per-node fields (a label, the local
-/// `approved_at`) must NOT drive anti-entropy: if they did, two peers
-/// holding the *same* members under different labels would see mismatched
-/// roots forever and request each other's rosters on every exchange
-/// without ever agreeing. Membership is the thing we actually want every
-/// member to converge on ("who is in this network"). Base32-lowercase,
-/// 52 chars.
-pub fn membership_root(roster: &Roster) -> String {
-    use sha2::{Digest, Sha256};
-    let mut ids: Vec<&str> = roster
-        .authorized_devices
-        .iter()
-        .map(|p| p.device_id.as_str())
-        .collect();
-    ids.sort_unstable();
-
-    let mut h = Sha256::new();
-    h.update(ROSTER_MERKLE_V.as_bytes());
-    h.update(b"|membership");
-    for id in ids {
-        h.update(id.as_bytes());
-        h.update(b"|");
-    }
-    let digest = h.finalize();
-    data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
-}
-
-/// Build a wire-shape summary for this roster, ready to drop into a
-/// `MeshMessage::RosterSummary` frame. Convenience over the
-/// individual helpers for the common "summarise + emit" path. The
-/// advertised root is the [`membership_root`] (not [`merkle_root`]) so
-/// peers converge on membership without thrashing over per-node label /
-/// timestamp differences — see that function's note.
-pub fn summary(roster: &Roster) -> crate::protocol::RosterSummaryMessage {
-    crate::protocol::RosterSummaryMessage {
-        root: membership_root(roster),
-        count: roster.authorized_devices.len() as u32,
-        // Preserve the current wire field without allowing a local clock to
-        // order or authorize roster state.
-        last_edit_ts: 0,
-    }
 }
 
 // ---- filesystem wrappers ------------------------------------------------
@@ -460,10 +337,7 @@ mod tests {
     fn default_role_is_member() {
         let mut r = empty_for("net-a");
         add_peer_in(&mut r, "peer1", "Laptop");
-        assert_eq!(
-            r.authorized_devices[0].role,
-            crate::network_state::Role::Member
-        );
+        assert_eq!(r.authorized_devices[0].role, crate::semantic::Role::Member);
     }
 
     #[test]
@@ -485,28 +359,24 @@ mod tests {
         assert!(set_role_in(
             &mut r,
             "peer1",
-            crate::network_state::Role::Controller
+            crate::semantic::Role::Controller
         ));
         assert_eq!(
             r.authorized_devices[0].role,
-            crate::network_state::Role::Controller
+            crate::semantic::Role::Controller
         );
         // Idempotent — same role is a no-op.
         assert!(!set_role_in(
             &mut r,
             "peer1",
-            crate::network_state::Role::Controller
+            crate::semantic::Role::Controller
         ));
     }
 
     #[test]
     fn set_role_is_noop_on_missing_peer() {
         let mut r = empty_for("net-a");
-        assert!(!set_role_in(
-            &mut r,
-            "ghost",
-            crate::network_state::Role::Owner
-        ));
+        assert!(!set_role_in(&mut r, "ghost", crate::semantic::Role::Owner));
         assert!(r.authorized_devices.is_empty());
     }
 
@@ -514,158 +384,10 @@ mod tests {
     fn add_peer_preserves_existing_role() {
         let mut r = empty_for("net-a");
         add_peer_in(&mut r, "peer1", "Laptop");
-        set_role_in(&mut r, "peer1", crate::network_state::Role::Owner);
+        set_role_in(&mut r, "peer1", crate::semantic::Role::Owner);
         // Re-add with a new label — role stays.
         add_peer_in(&mut r, "peer1", "Laptop-renamed");
         assert_eq!(r.authorized_devices[0].label, "Laptop-renamed");
-        assert_eq!(
-            r.authorized_devices[0].role,
-            crate::network_state::Role::Owner
-        );
-    }
-
-    // ---- merkle root + summary ----------------------------------------
-
-    #[test]
-    fn merkle_root_is_stable_across_insertion_order() {
-        let mut a = empty_for("net-a");
-        add_peer_in(&mut a, "peer1", "Laptop");
-        // Stamp a known approved_at so the hash is reproducible
-        // across `now_unix()` drift between adds.
-        a.authorized_devices[0].approved_at = 100;
-        add_peer_in(&mut a, "peer2", "Phone");
-        a.authorized_devices[1].approved_at = 200;
-
-        let mut b = empty_for("net-a");
-        add_peer_in(&mut b, "peer2", "Phone");
-        b.authorized_devices[0].approved_at = 200;
-        add_peer_in(&mut b, "peer1", "Laptop");
-        b.authorized_devices[1].approved_at = 100;
-
-        assert_eq!(merkle_root(&a), merkle_root(&b));
-    }
-
-    #[test]
-    fn merkle_root_changes_on_role_grant() {
-        let mut a = empty_for("net-a");
-        add_peer_in(&mut a, "peer1", "Laptop");
-        a.authorized_devices[0].approved_at = 100;
-        let before = merkle_root(&a);
-        set_role_in(&mut a, "peer1", crate::network_state::Role::Controller);
-        assert_ne!(merkle_root(&a), before);
-    }
-
-    #[test]
-    fn merkle_root_changes_on_label_edit() {
-        let mut a = empty_for("net-a");
-        add_peer_in(&mut a, "peer1", "Laptop");
-        a.authorized_devices[0].approved_at = 100;
-        let before = merkle_root(&a);
-        a.authorized_devices[0].label = "Renamed".into();
-        assert_ne!(merkle_root(&a), before);
-    }
-
-    #[test]
-    fn empty_root_is_distinct_from_one_entry_root() {
-        let empty = empty_for("net-a");
-        let mut one = empty_for("net-a");
-        add_peer_in(&mut one, "peer1", "Laptop");
-        one.authorized_devices[0].approved_at = 100;
-        assert_ne!(merkle_root(&empty), merkle_root(&one));
-    }
-
-    #[test]
-    fn membership_root_ignores_label_and_timestamp_and_role() {
-        // The whole point of the membership root: two peers holding the
-        // SAME set of devices agree even when they each labelled them
-        // differently, approved them at different moments, or tagged
-        // different roles. If this regressed, roster gossip would request
-        // forever without converging.
-        let mut a = empty_for("net-a");
-        add_peer_in(&mut a, "peer1", "Alice's laptop");
-        a.authorized_devices[0].approved_at = 100;
-        add_peer_in(&mut a, "peer2", "Alice's phone");
-        a.authorized_devices[1].approved_at = 200;
-        set_role_in(&mut a, "peer1", crate::network_state::Role::Owner);
-
-        let mut b = empty_for("net-a");
-        add_peer_in(&mut b, "peer2", "laptop-2"); // different label, order, role
-        b.authorized_devices[0].approved_at = 999;
-        add_peer_in(&mut b, "peer1", "");
-        b.authorized_devices[1].approved_at = 1;
-
-        assert_eq!(membership_root(&a), membership_root(&b));
-        // ...while the full merkle root, which hashes display/role fields,
-        // diverges — confirming the two roots capture different things.
-        assert_ne!(merkle_root(&a), merkle_root(&b));
-    }
-
-    #[test]
-    fn membership_root_changes_on_add_and_remove() {
-        let mut r = empty_for("net-a");
-        let empty = membership_root(&r);
-        add_peer_in(&mut r, "peer1", "X");
-        let one = membership_root(&r);
-        assert_ne!(empty, one);
-        add_peer_in(&mut r, "peer2", "Y");
-        let two = membership_root(&r);
-        assert_ne!(one, two);
-        remove_peer_in(&mut r, "peer2");
-        // Back to the same membership ⇒ back to the same root.
-        assert_eq!(membership_root(&r), one);
-    }
-
-    #[test]
-    fn membership_root_is_base32_lowercase() {
-        let mut r = empty_for("net-a");
-        add_peer_in(&mut r, "peer1", "Laptop");
-        let root = membership_root(&r);
-        assert_eq!(root.len(), 52);
-        assert!(root
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn root_is_base32_lowercase() {
-        let mut r = empty_for("net-a");
-        add_peer_in(&mut r, "peer1", "Laptop");
-        let root = merkle_root(&r);
-        // base32-lowercase with no padding — sha256 → 52 chars.
-        assert_eq!(root.len(), 52);
-        assert!(root
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
-    }
-
-    #[test]
-    fn last_edit_ts_takes_the_max() {
-        let mut r = empty_for("net-a");
-        add_peer_in(&mut r, "peer1", "Laptop");
-        r.authorized_devices[0].approved_at = 100;
-        add_peer_in(&mut r, "peer2", "Phone");
-        r.authorized_devices[1].approved_at = 250;
-        add_peer_in(&mut r, "peer3", "Tablet");
-        r.authorized_devices[2].approved_at = 50;
-        assert_eq!(last_edit_ts(&r), 250);
-    }
-
-    #[test]
-    fn summary_round_trips_through_wire() {
-        let mut r = empty_for("net-a");
-        add_peer_in(&mut r, "peer1", "Laptop");
-        r.authorized_devices[0].approved_at = 100;
-        let s = summary(&r);
-        let json =
-            serde_json::to_string(&crate::protocol::MeshMessage::RosterSummary(s.clone())).unwrap();
-        let back: crate::protocol::MeshMessage = serde_json::from_str(&json).unwrap();
-        match back {
-            crate::protocol::MeshMessage::RosterSummary(b) => {
-                assert_eq!(b.root, s.root);
-                assert_eq!(b.count, 1);
-                assert_eq!(b.last_edit_ts, 0);
-            }
-            _ => panic!("did not round-trip as RosterSummary"),
-        }
+        assert_eq!(r.authorized_devices[0].role, crate::semantic::Role::Owner);
     }
 }

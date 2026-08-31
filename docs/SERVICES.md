@@ -8,6 +8,10 @@ service, which is what makes a
 Cloudflare TURN, no public Nostr relay required: one always-on device
 (or a few) can supply every piece of plumbing a closed fleet needs.
 
+This page describes device-wide hosted services. A network-scoped Closed
+opaque member relay is a separate capability described below; it is not a
+hosted service endpoint and is not exposed as a public infrastructure URL.
+
 A device is **any combination** of a mesh node and these hosted
 services. A dedicated box can be pure infrastructure (signaling +
 STUN + TURN, not itself a member). The hosted services are **off by
@@ -36,17 +40,32 @@ joins no networks itself.
 Toggling `node` live joins or leaves every configured network in place;
 no restart needed.
 
-### There is no member payload relay
+### Network-scoped Closed opaque member relay
 
-A device never forwards another member's application payload. Application
-data goes endpoint to endpoint over that pair's own authenticated session,
-and a mesh member is not a hop on that path — TURN relays packets at the ICE
-layer without ever holding an application frame, which is a different thing
-entirely.
+The network-scoped relay is not a hosted service: it is configured in that
+network's `NetworkConfig.closed_relay`, not in the device-wide `services`
+block. It is not a public URL or a hosted-service toggle in the Services GUI
+or CLI.
 
-There is no `services.relay` key to set, no `relay` name the CLI or GUI will
-toggle, no relay field in the status report, and no relay role in the
-capability advert. A peer has nothing to point at.
+The two legs are independently discovered, endpoint-authenticated, and
+promoted. The endpoints then use exact route-bound `Open`, `Offer`, and
+`Accept` controls before sending opaque ciphertext through B. Every control
+and data message is checked against the complete context/requester/relay/
+target/session route before mutation or forwarding, and the profile bounds
+allocation, handshake, replay, frame, control, queue, bandwidth, lifetime,
+and shutdown work. B owns a provider-backed bounded two-direction queue and
+forwards ciphertext only; endpoint keys remain at A and C.
+
+Admission refusal constructs no relay state and preserves the pending
+handshake custody. Exact live allocation generations reject stale owners.
+`Close` marks the exact generation closing, forwards the canonical close once,
+and settles only after the opposite endpoint acknowledges. Persistent
+generation tombstones make duplicate terminal closes idempotent and prevent a
+delayed predecessor close from affecting a successor that reuses a session
+identifier. Shutdown wakes bounded waiters, settles endpoint, accepted,
+pending, closing, and allocation custody, and joins the owned tasks before
+completion. See [the V4 architecture](../ARCHITECTURE.md) for the complete
+route, cryptographic, and terminal-custody contract.
 
 ### Signaling
 
@@ -200,6 +219,23 @@ Services live under `services` in `~/.myownmesh/config.json`:
 > defaults, so neither needs to appear in a hand-written config. They are
 > shown here for completeness.
 
+Closed relay policy is selected per network rather than under `services`:
+
+```json
+{
+  "networks": [{
+    "id": "home",
+    "network_id": "my-cool-mesh",
+    "closed_relay": { "enabled": true }
+  }]
+}
+```
+
+The remaining `closed_relay` bounds are owner-selected finite values. A
+member is admitted as a relay only after the Closed projection and both
+endpoint session witnesses pass; this setting does not make an arbitrary
+device a relay.
+
 > Because TURN also serves STUN, the example above would try to bind both
 > on `3478` and the second would fail. Run one of them on `3478`, or give
 > the standalone STUN service a different port.
@@ -261,9 +297,10 @@ endpoint URLs in a structured `services` blob inside its capability
 } }
 ```
 
-There is no relay field or `service:relay` tag. Those named the ordinary-member
-application relay, not TURN — a device that hosts TURN advertises `turn_url`
-and the `service:turn` tag, which is a separate thing.
+Hosted service adverts describe signaling, STUN, and TURN only. TURN
+advertises `turn_url` and `service:turn`; the network-scoped Closed member
+relay is negotiated from the Closed network policy and exact member/session
+witnesses instead of from a device-wide service advert.
 
 A peer reads this with `ServiceAdvert::from_extra(...)` and can drop the
 URLs straight into its own network config.
@@ -283,6 +320,10 @@ instead of (or alongside) the public defaults:
 - **TURN** → add
   `{ "urls": ["turn:your-host:3478"], "username": "alice", "credential": "s3cret" }`
   to `turn_servers`.
+
+- **Closed member relay** → enable and bound `closed_relay` in the relevant
+  network configuration. It uses no public relay URL and is available only
+  to the exact authorized Closed members and promoted endpoint legs.
 
 In the GUI these live under a network's gear icon → **Settings**
 (signaling relays / STUN / TURN editors). Once every member points at one
@@ -391,6 +432,7 @@ WebSockets?), then **firewall** (is the port open?).
 | Piece | Location |
 |---|---|
 | Service config schema | `crates/myownmesh-core/src/config.rs` (`ServicesConfig`, `NodeServiceConfig`) |
+| Closed member relay policy/facade | `crates/myownmesh-core/src/{config.rs,engine/closed_relay.rs,handle.rs}` |
 | Service roles and advert | `crates/myownmesh-core/src/services/` |
 | STUN / TURN servers (+ bandwidth throttle) | `crates/myownmesh-services/` |
 | Intelligent signaling relay (presence / leave / limits) | `crates/myownmesh-signaling/src/server.rs` |

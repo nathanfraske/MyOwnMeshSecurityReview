@@ -32,6 +32,19 @@ pub enum EmbeddedStartError {
     CustodyRecovery(myownmesh_core::Error),
 }
 
+/// Ordered terminal failures observed while draining the daemon.
+#[derive(Debug, thiserror::Error)]
+#[error("daemon shutdown failed: {failures:?}")]
+pub struct EmbeddedShutdownError {
+    pub failures: Vec<EmbeddedShutdownFailure>,
+}
+
+#[derive(Debug)]
+pub struct EmbeddedShutdownFailure {
+    pub stage: &'static str,
+    pub error: String,
+}
+
 /// A daemon running inside this process. Keep it alive for the daemon's
 /// lifetime; call [`shutdown`](Self::shutdown) for the same graceful teardown
 /// `myownmesh serve` performs on SIGTERM (stop services, announce departures,
@@ -87,9 +100,9 @@ impl EmbeddedDaemon {
     /// no second drain to run, rather than a flag saying there is not. Nothing
     /// here is timed and nothing ends the host process; this returns and the
     /// application carries on.
-    pub async fn run_until_shutdown(self) {
+    pub async fn run_until_shutdown(self) -> std::result::Result<(), EmbeddedShutdownError> {
         self.supervisor.wait_requested().await;
-        self.shutdown().await;
+        self.shutdown().await
     }
 
     /// Graceful teardown, exactly like the serve binary's signal path.
@@ -106,7 +119,7 @@ impl EmbeddedDaemon {
     /// Nothing here is timed. `serve`'s own drain is what ends the accepted
     /// tasks, and it ends them by signalling rather than by aborting, so a
     /// request already in flight is finished rather than dropped half-applied.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(self) -> std::result::Result<(), EmbeddedShutdownError> {
         // The same request a reset submits, through the same object: idempotent,
         // so a daemon already draining because its state was reset is not
         // signalled twice, and an embedder is never told to wait on a second
@@ -116,11 +129,22 @@ impl EmbeddedDaemon {
         // taken away. A panic in the control task is reported rather than
         // swallowed: it means the drain did not complete, and the teardown below
         // is then running against state the control surface may still hold.
+        let mut failures = Vec::new();
         if let Err(e) = self.control.await {
             warn!("control task did not end cleanly: {e}");
+            failures.push(EmbeddedShutdownFailure {
+                stage: "control",
+                error: e.to_string(),
+            });
         }
         // Stop hosted services before tearing down networks.
-        self.service_manager.shutdown().await;
+        if let Err(error) = self.service_manager.shutdown().await {
+            warn!("hosted service shutdown failed: {error}");
+            failures.push(EmbeddedShutdownFailure {
+                stage: "services",
+                error: error.to_string(),
+            });
+        }
         // Supervise authenticated departures with teardown. A silent peer can
         // otherwise hold departure forever before shutdown gets to cancel its
         // waiter; the carrier hint remains in the departure future. Nothing is
@@ -128,7 +152,16 @@ impl EmbeddedDaemon {
         for outcome in self.registry.shutdown_all_with_departures().await {
             if let Err(e) = outcome {
                 warn!("network shutdown failed: {e}");
+                failures.push(EmbeddedShutdownFailure {
+                    stage: "network",
+                    error: e,
+                });
             }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(EmbeddedShutdownError { failures })
         }
     }
 }
@@ -396,7 +429,9 @@ mod tests {
             "non-vacuity: this connection is parked in the stream loop: {ack}"
         );
 
-        guarded("embedded shutdown returns", daemon.shutdown()).await;
+        guarded("embedded shutdown returns", daemon.shutdown())
+            .await
+            .expect("embedded daemon shutdown succeeds");
 
         // The claim, read from outside the daemon: this client's connection was
         // parked in the stream loop above, so a shutdown that returned while
@@ -499,7 +534,8 @@ mod tests {
         // request that had been a notification would have nothing left to
         // deliver, and this would never return.
         match tokio::time::timeout(HANG_GUARD, daemon.run_until_shutdown()).await {
-            Ok(()) => {}
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("daemon shutdown failed: {error}"),
             Err(_) => panic!("hang guard: a waiter built after the request resolves and drains"),
         }
 
@@ -558,6 +594,9 @@ mod tests {
         .await
         .expect("the connector-capable daemon starts from the policy alone");
         assert!(daemon.mesh().connector_resource_report().is_some());
-        daemon.shutdown().await;
+        daemon
+            .shutdown()
+            .await
+            .expect("connector-capable daemon shutdown succeeds");
     }
 }

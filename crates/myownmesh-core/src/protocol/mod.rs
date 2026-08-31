@@ -36,13 +36,12 @@
 //! does not implement refuses it — the frame fails to deserialize and
 //! reaches no handler — so there is no revision-tolerance to rely on.
 //! There is no optional feature negotiation or mixed-version mode in this
-//! alpha. `hello.features` carries only the closed endpoint-authentication
+//! protocol. `hello.features` carries only the closed endpoint-authentication
 //! profile required before any post-active frame is admitted.
 
 pub mod departure;
 pub mod facts;
 pub mod features;
-pub mod governance;
 pub mod handshake;
 pub mod keepalive;
 pub mod relay;
@@ -51,17 +50,13 @@ pub mod topology;
 
 pub use departure::{
     DepartureCorrelation, DepartureCorrelationError, DEPARTURE_CORRELATION_BYTES,
-    DEPARTURE_CORRELATION_WIRE_CHARS, MAX_DEPARTURE_CORRELATION_BYTES,
+    DEPARTURE_CORRELATION_WIRE_CHARS,
 };
 pub use facts::{
-    CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactInventoryMessage,
-    FactRequest, FactRequestMessage, ProofAckMessage, ProofDeliveryMessage, SignedFact,
+    CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactRequest,
+    ProofAckMessage, ProofDeliveryMessage, SignedFact,
 };
 pub use features::{Feature, ADVERTISED_FEATURES};
-pub use governance::{
-    NetworkStateBroadcast, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
-    RosterSummaryMessage,
-};
 pub use handshake::{
     ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage, DENY_REASON_EVICTED,
 };
@@ -76,6 +71,10 @@ pub use rpc::{
 pub use topology::{ShelveMessage, UnshelveMessage};
 
 use serde::{Deserialize, Serialize};
+
+/// The exact largest frame the WebRTC receive callback can deliver. Semantic
+/// anti-entropy uses this existing protocol boundary, not an item count.
+pub(crate) const RECEIVE_FRAME_BYTES: usize = relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES as usize;
 
 /// Exactly how many bytes `value`'s compact JSON encoding occupies, counted
 /// without building it.
@@ -254,7 +253,7 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
         },
         // Facts and exact proof delivery/receipt are the only non-handshake
         // frames with a durable semantic identity. Keep this exact set distinct from every
-        // inventory/request/roster/application kind; those remain Application
+        // inventory/request/application kind; those remain Application
         // and retain their existing failure policies below.
         "fact" | "fact_bundle" | "proof_delivery" | "proof_ack" => ClassifiedFrame {
             admission: FrameAdmission::DurableFact,
@@ -382,11 +381,7 @@ pub enum MeshMessage {
     RpcStreamChunk(RpcStreamChunkMessage),
     RpcStreamEnd(RpcStreamEndMessage),
 
-    // -- closed-network governance --
-    /// Sender's snapshot of the network's governance state.
-    /// Broadcast on ACTIVE; receivers compare against their own to
-    /// detect drift.
-    NetworkState(NetworkStateBroadcast),
+    // -- closed-network semantic facts --
     /// One independently verifiable canonical V4 authority fact.
     Fact(SignedFact),
     /// A set of canonical V4 authority facts. Each element is verified and
@@ -401,17 +396,6 @@ pub enum MeshMessage {
     ProofDelivery(ProofDeliveryMessage),
     /// Verified receipt for one exact proof delivery identity.
     ProofAck(ProofAckMessage),
-
-    // -- roster gossip --
-    /// Merkle-root summary of the sender's roster. Triggers a
-    /// `RosterRequest` from receivers whose root disagrees.
-    RosterSummary(RosterSummaryMessage),
-    /// "Send me the entries I'm missing." Carried alone on a
-    /// targeted reply to a `RosterSummary`.
-    RosterRequest(RosterRequestMessage),
-    /// Unsigned roster discovery data. It is never reduced as governance
-    /// authority; signed facts are carried by `Fact`/`FactBundle`.
-    RosterEntries(RosterEntriesMessage),
 
     /// Application payload on a user-defined typed channel. The
     /// `channel` name is the embedder's identifier; `payload` is the
@@ -624,10 +608,6 @@ mod tests {
         for kind in [
             "fact_inventory",
             "fact_request",
-            "network_state",
-            "roster_summary",
-            "roster_request",
-            "roster_entries",
             "rpc_request",
             "rpc_response",
             "rpc_stream_chunk",
@@ -723,41 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn network_state_broadcast_round_trips() {
-        use crate::network_state::NetworkKind;
-        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-            kind: NetworkKind::Closed,
-            fact_heads_count: 4,
-            roster_root: "abcdefghij".into(),
-        });
-        let s = serde_json::to_string(&msg).unwrap();
-        let back: MeshMessage = serde_json::from_str(&s).unwrap();
-        match back {
-            MeshMessage::NetworkState(b) => {
-                assert_eq!(b.kind, NetworkKind::Closed);
-                assert_eq!(b.fact_heads_count, 4);
-                assert_eq!(b.roster_root, "abcdefghij");
-            }
-            _ => panic!("did not round-trip as NetworkState"),
-        }
-    }
-
-    #[test]
-    fn network_state_kind_discriminator_is_snake_case() {
-        // Wire-level kind tag must be snake_case so the JS GUI's
-        // existing dispatch tables don't need a special case for
-        // these. Pinning here so a future #[serde(rename_all)]
-        // tweak doesn't silently break interop.
-        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-            kind: crate::network_state::NetworkKind::Open,
-            fact_heads_count: 0,
-            roster_root: "x".into(),
-        });
-        let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""kind":"network_state""#));
-    }
-
-    #[test]
     fn canonical_fact_bundle_round_trips() {
         let msg = MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() });
         let s = serde_json::to_string(&msg).unwrap();
@@ -823,33 +768,6 @@ mod tests {
     }
 
     #[test]
-    fn roster_summary_round_trips() {
-        let msg = MeshMessage::RosterSummary(RosterSummaryMessage {
-            root: "merkle_root".into(),
-            count: 3,
-            last_edit_ts: 1700000000,
-        });
-        let s = serde_json::to_string(&msg).unwrap();
-        let back: MeshMessage = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, MeshMessage::RosterSummary(_)));
-    }
-
-    #[test]
-    fn roster_request_defaults_clean() {
-        // include_all + subtree_hashes are #[serde(default)] so an
-        // empty request frame parses without per-field nulls.
-        let raw = r#"{"kind":"roster_request"}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        match msg {
-            MeshMessage::RosterRequest(r) => {
-                assert!(!r.include_all);
-                assert!(r.subtree_hashes.is_empty());
-            }
-            _ => panic!("did not parse as RosterRequest"),
-        }
-    }
-
-    #[test]
     fn authenticated_departure_control_round_trips_with_bounded_correlation() {
         let correlation = DepartureCorrelation::from_bytes([0x11; DEPARTURE_CORRELATION_BYTES]);
         let message = MeshMessage::SessionControl(SessionControl::Depart {
@@ -890,7 +808,7 @@ mod tests {
             MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
                 if value == correlation
         ));
-        let too_long = "a".repeat(MAX_DEPARTURE_CORRELATION_BYTES + 1);
+        let too_long = "a".repeat(DEPARTURE_CORRELATION_WIRE_CHARS + 1);
         assert!(serde_json::from_str::<MeshMessage>(&format!(
             r#"{{"kind":"session_control","op":"depart","correlation":"{too_long}"}}"#
         ))

@@ -16,10 +16,6 @@ pub const DEPARTURE_CORRELATION_BYTES: usize = 32;
 /// The exact lowercase base32-without-padding width of one correlation.
 pub const DEPARTURE_CORRELATION_WIRE_CHARS: usize = 52;
 
-/// Compatibility name for consumers that size a wire field. This is an exact
-/// fixed width, not a maximum accepted UTF-8 bound.
-pub const MAX_DEPARTURE_CORRELATION_BYTES: usize = DEPARTURE_CORRELATION_WIRE_CHARS;
-
 /// Opaque correlation for one authenticated `Depart`/`DepartObserved` pair.
 ///
 /// The stored form is already the one canonical wire form: 32 cryptographic
@@ -30,7 +26,7 @@ pub struct DepartureCorrelation(String);
 impl DepartureCorrelation {
     /// Construct directly from the already-selected 32-byte cryptographic
     /// premise. Arbitrary UTF-8 or caller-chosen wire text cannot enter this
-    /// type through a compatibility normalization path.
+    /// type; the wire parser accepts only the exact canonical representation.
     pub fn from_bytes(bytes: [u8; DEPARTURE_CORRELATION_BYTES]) -> Self {
         Self(BASE32_NOPAD.encode(&bytes).to_lowercase())
     }

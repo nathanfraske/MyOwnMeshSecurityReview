@@ -76,7 +76,6 @@
 
   /** When the import was an approval bundle, hold the approver's
    *  identity so we can pre-authorise them on the local roster
-   *  after the network is added. The actual `rosterApprove` call
    *  runs inside `save()` after `networkAdd` returns. */
   let pendingApprover = $state<IdentityExport | null>(null);
 
@@ -135,7 +134,7 @@
         //      clear "you also need the network" message rather
         //      than silently accepting and producing an empty
         //      network row.
-        //   3. .network-settings.json — the legacy path.
+        //   3. .network-settings.json — the settings-only profile.
         const portable = tryParsePortable(text);
         if (portable?.kind === "approval") {
           error = "";
@@ -230,21 +229,6 @@
       // connection auto-approves here too. Non-fatal: a failure
       // doesn't roll back the add; the user can still add them
       // through the normal Approve flow when they appear.
-      if (pendingApprover) {
-        try {
-          await meshClient.rosterApprove(
-            config.id,
-            pendingApprover.pubkey,
-            pendingApprover.label ?? "",
-          );
-        } catch (approveErr) {
-          console.warn(
-            "Failed to pre-approve approver from imported bundle:",
-            approveErr,
-          );
-        }
-      }
-
       onAdded(config.id);
     } catch (e) {
       error = String(e);
@@ -523,9 +507,9 @@
                     {pendingApprover.pubkey.slice(0, 12)}…
                   </code>
                   <div class="approver-hint">
-                    Will be added to this network's roster automatically
+                    The daemon will use this identity only as an imported
                     after save — their first connection skips the
-                    verification-code dance.
+                    bootstrap hint; authenticated admission remains authoritative.
                   </div>
                 </dd>
               {/if}
@@ -540,8 +524,7 @@
             Accepted shapes:
             <code>"myownmesh.network-settings"</code> (settings only) or
             <code>"myownmesh.approval"</code> (settings + the approver's
-            identity, which lands on this network's roster pre-approved
-            after save).
+            identity for authenticated bootstrap).
           </p>
           <div class="import-actions">
             <button class="btn-small" onclick={() => fileInput?.click()}>

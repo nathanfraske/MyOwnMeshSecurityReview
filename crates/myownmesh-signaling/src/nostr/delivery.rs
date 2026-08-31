@@ -181,7 +181,7 @@ pub trait DeliveryProvider: Send + Sync {
             content: String::new(),
             sig: String::new(),
         };
-        let mut retention = DeliveryRetention::for_event(&event);
+        let mut retention = DeliveryRetention::for_attempt("<inbound-frame>", &event);
         retention.encoded_event_bytes = frame_bytes;
         self.reserve_attempt_map_growth("<inbound-frame>", &event, retention)
     }
@@ -442,10 +442,6 @@ struct RelayEntry {
 }
 
 impl DeliveryRetention {
-    pub fn for_event(event: &NostrEvent) -> Self {
-        Self::for_attempt("", event)
-    }
-
     /// Compute the frame and owned-record shape before any frame or map node
     /// is allocated. The map-node sizes are the exact boxed allocation types
     /// used by this module, and their provider leases are acquired before
@@ -536,14 +532,6 @@ impl AdmissionSource {
     /// absence rather than an ABA-prone wrapped value.
     pub fn try_fresh() -> Option<Self> {
         try_fresh_from(&NEXT_ADMISSION_SOURCE)
-    }
-
-    /// Compatibility constructor for test/control callers that need a value
-    /// directly. Exhaustion is represented by the non-live sentinel rather
-    /// than a process-wide panic; admission code must use [`Self::try_fresh`]
-    /// when it requires a live source.
-    pub fn fresh() -> Self {
-        Self::try_fresh().unwrap_or(Self::Unavailable)
     }
 }
 
@@ -932,6 +920,11 @@ impl Drop for RetainedDeliveryLease {
 }
 
 /// The live attempt owner and its per-relay delivery entries.
+///
+/// This map is the sole local owner of outbound negotiation retention. Each
+/// node and owned value is inserted only after its provider lease succeeds;
+/// the provider therefore remains the source of truth for aggregate count and
+/// byte pressure. No elapsed-time retry or event-id cache is kept here.
 pub struct DeliveryStore {
     provider: Arc<dyn DeliveryProvider>,
     outcome_sink: Arc<dyn AttemptOutcomeSink>,
@@ -996,7 +989,7 @@ impl DeliveryStore {
                 "delivery store is closed".to_string(),
             ));
         }
-        let retention = DeliveryRetention::for_event(&event);
+        let retention = DeliveryRetention::for_attempt("<presence>", &event);
         let lease = self
             .provider
             .reserve_admission_source("<presence>", &event, retention)?;
@@ -1005,26 +998,6 @@ impl DeliveryStore {
             event,
             Box::new(RetainedDeliveryLease(Some(lease))) as ErasedOwner,
         ))
-    }
-
-    /// Register a fresh relay connection and fund one entry for each live
-    /// attempt before any frame is encoded for that connection.
-    pub fn open_session(&self) -> (RelaySessionId, Vec<(String, DeliveryRefusal)>) {
-        let (session, session_refusal, refused) = self.open_session_with_refusals();
-        let mut legacy = Vec::new();
-        if let Some(error) = session_refusal {
-            legacy.push(("<session>".to_string(), error));
-        }
-        legacy.extend(refused.into_iter().map(|refusal| {
-            (
-                refusal.event_id,
-                DeliveryRefusal::Provider(match refusal.refusal {
-                    NegotiationRefusal::Provider(reason) => reason,
-                    NegotiationRefusal::DuplicateLiveEvent => "duplicate live event".to_string(),
-                }),
-            )
-        }));
-        (session, legacy)
     }
 
     /// Register a session and return only refusals that left the exact
@@ -1343,26 +1316,11 @@ impl DeliveryStore {
         }
     }
 
-    /// Mark all pending entries for a session in flight and return event ids.
-    pub fn pending(&self, session: &RelaySessionId) -> Vec<String> {
-        let mut state = self.state.lock();
-        let mut ids = Vec::new();
-        for (event_id, entry) in state.attempts.iter_mut() {
-            if let Some(relay) = entry.relays.get_mut(session) {
-                if !relay.in_flight {
-                    relay.in_flight = true;
-                    ids.push(event_id.clone());
-                }
-            }
-        }
-        ids
-    }
-
     /// Mark and return one pending entry for a session.
     ///
-    /// The compatibility [`Self::pending`] method remains available to callers
-    /// that need a snapshot, but the live driver uses this one-at-a-time seam so
-    /// a relay cannot create an additional unbounded pending-ID collection.
+    /// The one-at-a-time seam keeps the relay task from creating a second
+    /// collection proportional to the number of live attempts. The delivery
+    /// map remains the sole owner of pending event identities.
     pub fn next_pending(&self, session: &RelaySessionId) -> Option<String> {
         let mut state = self.state.lock();
         for (event_id, entry) in state.attempts.iter_mut() {
@@ -1672,6 +1630,15 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{OnceLock, Weak};
 
+    fn open_test_session(store: &DeliveryStore) -> (RelaySessionId, Vec<AttemptRefusal>) {
+        let (session, session_refusal, refused) = store.open_session_with_refusals();
+        assert!(
+            session_refusal.is_none(),
+            "test session admission must succeed"
+        );
+        (session, refused)
+    }
+
     struct CountingProvider {
         live: Arc<AtomicUsize>,
     }
@@ -1884,7 +1851,7 @@ mod tests {
                 .expect("store weak reference is initialized")
                 .upgrade()
                 .expect("delivery store remains live during settlement");
-            let (session, _) = store.open_session();
+            let (session, _) = open_test_session(&store);
             *self.fresh.lock() = Some(session);
         }
     }
@@ -2106,7 +2073,10 @@ mod tests {
             .expect("the final nonzero identity is still usable");
         assert_eq!(exhausted, 0, "zero is the permanent exhausted sentinel");
         assert!(AdmissionSource::checked_value(0).is_none());
-        assert_ne!(AdmissionSource::fresh(), AdmissionSource::fresh());
+        assert_ne!(
+            AdmissionSource::try_fresh().expect("first test source exists"),
+            AdmissionSource::try_fresh().expect("second test source exists"),
+        );
     }
 
     #[test]
@@ -2118,7 +2088,10 @@ mod tests {
         );
         assert_eq!(try_fresh_from(&counter), None);
         assert_eq!(try_fresh_from(&counter), None);
-        assert_ne!(AdmissionSource::fresh(), AdmissionSource::fresh());
+        assert_ne!(
+            AdmissionSource::try_fresh().expect("first test source exists"),
+            AdmissionSource::try_fresh().expect("second test source exists"),
+        );
     }
 
     #[test]
@@ -2127,7 +2100,7 @@ mod tests {
         let store = DeliveryStore::new(Arc::new(SourceResidueProvider {
             live: Arc::clone(&live),
         }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = exhausted_admission_report(owned);
@@ -2150,7 +2123,7 @@ mod tests {
     fn outcome_sink_records_exact_accepted_relay_custody() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = store.admit("accepted-attempt".into(), owned);
@@ -2174,8 +2147,8 @@ mod tests {
     fn outcome_sink_aggregates_carrier_unavailable_after_all_relays_close() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (first, _) = store.open_session();
-        let (second, _) = store.open_session();
+        let (first, _) = open_test_session(&store);
+        let (second, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = store.admit("carrier-attempt".into(), owned);
@@ -2195,7 +2168,7 @@ mod tests {
     fn outcome_sink_records_typed_refusal_for_exact_attempt() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = store.admit("refused-attempt".into(), owned);
@@ -2221,7 +2194,7 @@ mod tests {
     fn outcome_sink_records_replaced_and_cancelled_attempt_terminals() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let replaced = event();
         let replaced_id = replaced.id.clone();
         let replaced_report = store.admit(
@@ -2257,7 +2230,7 @@ mod tests {
     fn stale_session_terminal_cannot_settle_fresh_attempt_outcome() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (stale, _) = store.open_session();
+        let (stale, _) = open_test_session(&store);
         let old = event();
         store.admit(
             "old-attempt".into(),
@@ -2265,7 +2238,7 @@ mod tests {
         );
         store.close_session(stale.clone(), DeliveryTerminal::Cancelled);
 
-        let (fresh, _) = store.open_session();
+        let (fresh, _) = open_test_session(&store);
         let current = event();
         let current_id = current.id.clone();
         store.admit(
@@ -2290,8 +2263,8 @@ mod tests {
     fn relay_entries_settle_independently_and_reconnect_is_fresh() {
         let live = Arc::new(AtomicUsize::new(0));
         let store = DeliveryStore::new(Arc::new(CountingProvider { live: live.clone() }));
-        let (a, _) = store.open_session();
-        let (b, _) = store.open_session();
+        let (a, _) = open_test_session(&store);
+        let (b, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let id = owned.value().id.clone();
         let report = store.admit("attempt-1".into(), owned);
@@ -2308,15 +2281,15 @@ mod tests {
         );
         store.close_session(a, DeliveryTerminal::Cancelled);
         store.close_session(b, DeliveryTerminal::Cancelled);
-        let (c, _) = store.open_session();
+        let (c, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let id = owned.value().id.clone();
         let report = store.admit("attempt-2".into(), owned);
         assert_eq!(report.accepted_sessions, 1);
-        assert_eq!(store.pending(&c), vec![id.clone()]);
+        assert_eq!(store.next_pending(&c), Some(id.clone()));
         store.close_session(c.clone(), DeliveryTerminal::Cancelled);
-        let (d, _) = store.open_session();
-        assert_eq!(store.pending(&d), vec![id.clone()]);
+        let (d, _) = open_test_session(&store);
+        assert_eq!(store.next_pending(&d), Some(id.clone()));
         assert!(!store.settle(&c, &id, DeliveryTerminal::Accepted));
         store.close_session(d, DeliveryTerminal::Cancelled);
         assert_eq!(live.load(Ordering::SeqCst), 0);
@@ -2332,7 +2305,7 @@ mod tests {
         }));
         assert!(store_ref.set(Arc::downgrade(&store)).is_ok());
 
-        let (old_session, _) = store.open_session();
+        let (old_session, _) = open_test_session(&store);
         let owner_dropped = Arc::new(AtomicBool::new(false));
         let event = event();
         let event_id = event.id.clone();
@@ -2351,7 +2324,7 @@ mod tests {
             .lock()
             .clone()
             .expect("lease finish opens a fresh session");
-        assert!(store.pending(&fresh).is_empty());
+        assert!(store.next_pending(&fresh).is_none());
         assert!(!store.settle(&fresh, &event_id, DeliveryTerminal::Accepted));
     }
 
@@ -2359,7 +2332,7 @@ mod tests {
     fn duplicate_live_event_refusal_preserves_original_custody() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live: live.clone() }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let event = event();
         let event_id = event.id.clone();
         let original_dropped = Arc::new(AtomicBool::new(false));
@@ -2391,7 +2364,7 @@ mod tests {
         assert_ne!(first.source, duplicate.source);
         assert!(duplicate_dropped.load(Ordering::SeqCst));
         assert!(!original_dropped.load(Ordering::SeqCst));
-        assert_eq!(store.pending(&session), vec![event_id.clone()]);
+        assert_eq!(store.next_pending(&session), Some(event_id.clone()));
         assert_eq!(live.load(Ordering::SeqCst), 1);
 
         assert!(!store.settle_source(
@@ -2421,7 +2394,7 @@ mod tests {
         let store = DeliveryStore::new(Arc::new(SourceResidueProvider {
             live: Arc::clone(&live),
         }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let event = event();
         let event_id = event.id.clone();
         let first = store.admit(
@@ -2466,15 +2439,15 @@ mod tests {
             live: live.clone(),
             refused: Arc::new(AtomicUsize::new(0)),
         }));
-        let (a, _) = store.open_session();
-        let (b, _) = store.open_session();
+        let (a, _) = open_test_session(&store);
+        let (b, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let report = store.admit("partial".into(), owned);
         assert_eq!(report.accepted_sessions, 1);
         assert_eq!(report.refused.len(), 1);
         assert_eq!(live.load(Ordering::SeqCst), 1);
         let id = report.event_id;
-        assert!(store.pending(&a).is_empty() || store.pending(&b).is_empty());
+        assert!(store.next_pending(&a).is_none() || store.next_pending(&b).is_none());
         assert_eq!(
             store.finish_attempt("partial", DeliveryTerminal::AttemptReplaced),
             1
@@ -2492,8 +2465,8 @@ mod tests {
                 target: Arc::clone(&target),
                 live: Arc::clone(&live),
             }));
-            let (first, _) = store.open_session();
-            let (second, _) = store.open_session();
+            let (first, _) = open_test_session(&store);
+            let (second, _) = open_test_session(&store);
             let refused = if refuse_first {
                 first.clone()
             } else {
@@ -2508,7 +2481,7 @@ mod tests {
             assert_eq!(report.accepted_sessions, 1);
             assert_eq!(report.refused.len(), 1);
             assert!(report.attempt_refusal.is_none());
-            assert_eq!(store.pending(&healthy), vec![id.clone()]);
+            assert_eq!(store.next_pending(&healthy), Some(id.clone()));
             assert_eq!(live.load(Ordering::SeqCst), 1);
             assert_eq!(
                 store.finish_attempt("admission-permutation", DeliveryTerminal::Accepted),
@@ -2528,8 +2501,8 @@ mod tests {
             let (store, outcomes) = recording_store(Arc::new(CountingProvider {
                 live: Arc::clone(&live),
             }));
-            let (first_session, _) = store.open_session();
-            let (second_session, _) = store.open_session();
+            let (first_session, _) = open_test_session(&store);
+            let (second_session, _) = open_test_session(&store);
             let (first, second) = if reverse {
                 (second_session, first_session)
             } else {
@@ -2546,7 +2519,7 @@ mod tests {
                 DeliveryTerminal::TypedRefused("first relay refused".into()),
             ));
             assert!(outcomes.lock().is_empty());
-            assert_eq!(store.pending(&second), vec![id.clone()]);
+            assert_eq!(store.next_pending(&second), Some(id.clone()));
             assert_eq!(live.load(Ordering::SeqCst), 1);
 
             assert!(store.settle(&second, &id, DeliveryTerminal::Accepted));
@@ -2567,8 +2540,8 @@ mod tests {
     fn carrier_aggregate_is_deterministic_and_reconnect_scoped() {
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (first, _) = store.open_session();
-        let (second, _) = store.open_session();
+        let (first, _) = open_test_session(&store);
+        let (second, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = store.admit("aggregate-accepted".into(), owned);
@@ -2580,8 +2553,8 @@ mod tests {
         fn refusal_order(reverse: bool) -> String {
             let live = Arc::new(AtomicUsize::new(0));
             let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-            let (first, _) = store.open_session();
-            let (second, _) = store.open_session();
+            let (first, _) = open_test_session(&store);
+            let (second, _) = open_test_session(&store);
             let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
             let event_id = owned.value().id.clone();
             let report = store.admit("aggregate-refusal".into(), owned);
@@ -2615,16 +2588,16 @@ mod tests {
 
         let live = Arc::new(AtomicUsize::new(0));
         let (store, outcomes) = recording_store(Arc::new(CountingProvider { live }));
-        let (first, _) = store.open_session();
-        let (second, _) = store.open_session();
+        let (first, _) = open_test_session(&store);
+        let (second, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         store.admit("aggregate-reconnect".into(), owned);
         store.close_session(first, DeliveryTerminal::Cancelled);
         assert!(outcomes.lock().is_empty());
         store.close_session(second, DeliveryTerminal::Cancelled);
         assert_eq!(outcomes.lock().len(), 1);
-        let (fresh, _) = store.open_session();
-        assert_eq!(store.pending(&fresh).len(), 1);
+        let (fresh, _) = open_test_session(&store);
+        assert!(store.next_pending(&fresh).is_some());
         store.close_session(fresh, DeliveryTerminal::Cancelled);
         assert_eq!(outcomes.lock().len(), 2);
     }
@@ -2638,7 +2611,7 @@ mod tests {
             live: Arc::clone(&live),
         });
         let store = DeliveryStore::new(provider);
-        let (initial, _) = store.open_session();
+        let (initial, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let report = store.admit("all-carrier-once".into(), owned);
@@ -2660,7 +2633,7 @@ mod tests {
         let (fresh, fresh_session_refusal, fresh_refusals) = store.open_session_with_refusals();
         assert!(fresh_session_refusal.is_none());
         assert!(fresh_refusals.is_empty());
-        assert_eq!(store.pending(&fresh), vec![event_id.clone()]);
+        assert_eq!(store.next_pending(&fresh), Some(event_id.clone()));
         assert!(store.settle(&fresh, &event_id, DeliveryTerminal::Cancelled));
         assert_eq!(live.load(Ordering::SeqCst), 0);
 
@@ -2715,7 +2688,7 @@ mod tests {
             bytes: Arc::clone(&bytes),
             calls: Arc::clone(&calls),
         }));
-        let (session, _) = store.open_session();
+        let (session, _) = open_test_session(&store);
         let owned = OwnedSignal::new(event(), Box::new(()) as ErasedOwner);
         let event_id = owned.value().id.clone();
         let expected_retained_bytes = retention.attempt_key_bytes

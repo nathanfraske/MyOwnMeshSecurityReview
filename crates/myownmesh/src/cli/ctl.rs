@@ -68,6 +68,13 @@ pub enum GovernanceCmd {
         #[arg(long)]
         mfa_code: Option<String>,
     },
+    /// Propose evicting `target` from the closed network entirely.
+    Evict {
+        network: String,
+        target: String,
+        #[arg(long)]
+        mfa_code: Option<String>,
+    },
     /// Per-device custody MFA (TOTP) that gates governance authoring.
     #[command(subcommand)]
     Mfa(MfaCmd),
@@ -183,19 +190,7 @@ pub enum NetworksCmd {
 
 #[derive(Subcommand, Debug)]
 pub enum RosterCmd {
-    List {
-        network: String,
-    },
-    Approve {
-        network: String,
-        device_id: String,
-        #[arg(long)]
-        label: Option<String>,
-    },
-    Remove {
-        network: String,
-        device_id: String,
-    },
+    List { network: String },
 }
 
 pub async fn run(cmd: CtlCmd) -> Result<()> {
@@ -252,18 +247,6 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         },
         CtlCmd::Peers { network } => Request::PeersList { network },
         CtlCmd::Roster(RosterCmd::List { network }) => Request::RosterList { network },
-        CtlCmd::Roster(RosterCmd::Approve {
-            network,
-            device_id,
-            label,
-        }) => Request::RosterApprove {
-            network,
-            device_id,
-            label,
-        },
-        CtlCmd::Roster(RosterCmd::Remove { network, device_id }) => {
-            Request::RosterRemove { network, device_id }
-        }
         CtlCmd::Governance(GovernanceCmd::GrantRole {
             network,
             target,
@@ -280,6 +263,15 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
             target,
             mfa_code,
         }) => Request::GovernanceProposeRoleRevoke {
+            network,
+            target,
+            mfa_code,
+        },
+        CtlCmd::Governance(GovernanceCmd::Evict {
+            network,
+            target,
+            mfa_code,
+        }) => Request::GovernanceProposeEvict {
             network,
             target,
             mfa_code,
@@ -345,11 +337,11 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
 }
 
 /// Parse a CLI role argument.
-fn parse_role(s: &str) -> Result<myownmesh_core::network_state::Role> {
+fn parse_role(s: &str) -> Result<myownmesh_core::semantic::Role> {
     match s.to_ascii_lowercase().as_str() {
-        "member" => Ok(myownmesh_core::network_state::Role::Member),
-        "controller" => Ok(myownmesh_core::network_state::Role::Controller),
-        "owner" => Ok(myownmesh_core::network_state::Role::Owner),
+        "member" => Ok(myownmesh_core::semantic::Role::Member),
+        "controller" => Ok(myownmesh_core::semantic::Role::Controller),
+        "owner" => Ok(myownmesh_core::semantic::Role::Owner),
         other => bail!("invalid role '{other}' — expected member | controller | owner"),
     }
 }

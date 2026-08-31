@@ -12,7 +12,7 @@
 //! or recursively create another relay.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use super::peer_registry::PeerOwnerToken;
@@ -20,6 +20,7 @@ use super::NetworkState;
 use crate::config::ClosedRelayPolicyConfig;
 use crate::protocol::relay::{ClosedRelayControl, ClosedRelayData, RelayKeyShare};
 use crate::protocol::OpaqueRelayPacket;
+use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 use crate::runtime::relay::{
     ClosedRelayEndpoints, ClosedRelayHandle, ClosedRelayHandshakeGuard, ClosedRelayRuntime,
     ClosedRelayTerminal, OpaqueRelaySession, PendingEndpointKeyAgreement, RelayAllocationPermit,
@@ -42,22 +43,82 @@ enum EndpointCrypto {
 pub(crate) struct EndpointSessionInner {
     state: Weak<NetworkState>,
     relay_owner: PeerOwnerToken,
+    relay_witness: SessionValidityWitness,
     context: MeshContextId,
     requester: DeviceId,
     relay: DeviceId,
     target: DeviceId,
     session_id: [u8; 16],
+    allocation_epoch: AtomicU64,
     crypto: Mutex<EndpointCrypto>,
     inbound: Mutex<VecDeque<OpaqueRelayPacket>>,
     inbound_capacity: usize,
+    _lease: ResourceLease,
     wake: Notify,
     closed: AtomicBool,
+    consumer_state: AtomicU8,
+    public_refs: std::sync::atomic::AtomicUsize,
 }
+
+/// A bounded, synchronous handoff from a dropped public endpoint to the
+/// network owner. The owner performs the asynchronous Close and exact relay
+/// settlement at the next engine boundary; Drop never spawns or awaits.
+pub(crate) struct ClosedRelayAbandonment {
+    pub(crate) route: crate::protocol::relay::ClosedRelayRoute,
+    pub(crate) relay_owner: PeerOwnerToken,
+    pub(crate) relay_witness: SessionValidityWitness,
+    pub(crate) allocation_generation: Option<ClosedRelayGeneration>,
+}
+
+const ENDPOINT_CONSUMER_UNCLAIMED: u8 = 0;
+const ENDPOINT_CONSUMER_CLAIMED: u8 = 1;
+const ENDPOINT_CONSUMER_CANCELLED: u8 = 2;
 
 /// Endpoint-owned opaque session handle. The relay only sees the bounded
 /// ciphertext queues; this handle retains endpoint AEAD state at A or C.
-#[derive(Clone)]
-pub(crate) struct EndpointSession(Arc<EndpointSessionInner>);
+pub(crate) struct EndpointSession(Arc<EndpointSessionInner>, EndpointSessionRole);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndpointSessionRole {
+    Public,
+    Registry,
+    Borrowed,
+}
+
+impl Drop for EndpointSession {
+    fn drop(&mut self) {
+        if self.1 != EndpointSessionRole::Public
+            || self.0.public_refs.fetch_sub(1, Ordering::AcqRel) != 1
+        {
+            return;
+        }
+        // A public endpoint handle may be abandoned without an explicit
+        // Close. The explicit public-owner counter is separate from Arc
+        // registry custody, so this retires even while registries retain an
+        // Arc to the same endpoint.
+        self.cancel_consumer();
+    }
+}
+
+impl Clone for EndpointSession {
+    fn clone(&self) -> Self {
+        if self.1 == EndpointSessionRole::Public {
+            self.0.public_refs.fetch_add(1, Ordering::AcqRel);
+        }
+        Self(Arc::clone(&self.0), self.1)
+    }
+}
+
+struct EndpointSessionRoute {
+    relay_owner: PeerOwnerToken,
+    relay_witness: SessionValidityWitness,
+    context: MeshContextId,
+    requester: DeviceId,
+    relay: DeviceId,
+    target: DeviceId,
+    session_id: [u8; 16],
+    allocation_epoch: u64,
+}
 
 #[derive(Clone)]
 pub(crate) struct EndpointSessionMetadata {
@@ -66,9 +127,71 @@ pub(crate) struct EndpointSessionMetadata {
     pub(crate) relay: DeviceId,
     pub(crate) target: DeviceId,
     pub(crate) session_id: [u8; 16],
+    pub(crate) allocation_epoch: u64,
 }
 
 impl EndpointSession {
+    fn into_registry(mut self) -> Self {
+        self.disarm_public();
+        self.1 = EndpointSessionRole::Registry;
+        self
+    }
+
+    fn into_public(mut self) -> Self {
+        if self.1 == EndpointSessionRole::Registry {
+            self.0
+                .consumer_state
+                .store(ENDPOINT_CONSUMER_CLAIMED, Ordering::Release);
+            self.0.public_refs.fetch_add(1, Ordering::AcqRel);
+        }
+        self.1 = EndpointSessionRole::Public;
+        self
+    }
+
+    fn borrowed_clone(&self) -> Self {
+        Self(Arc::clone(&self.0), EndpointSessionRole::Borrowed)
+    }
+
+    fn disarm_public(&mut self) {
+        if self.1 == EndpointSessionRole::Public {
+            let _ = self.0.public_refs.fetch_sub(1, Ordering::AcqRel);
+            self.1 = EndpointSessionRole::Borrowed;
+        }
+    }
+
+    pub(crate) fn cancel_consumer(&self) {
+        if self
+            .0
+            .consumer_state
+            .swap(ENDPOINT_CONSUMER_CANCELLED, Ordering::AcqRel)
+            == ENDPOINT_CONSUMER_CANCELLED
+        {
+            return;
+        }
+        self.mark_closed();
+        if let Some(state) = self.0.state.upgrade() {
+            state.enqueue_closed_relay_abandonment(self.abandonment(&state));
+            state.remove_closed_relay_endpoint(self);
+        }
+    }
+
+    fn abandonment(&self, state: &NetworkState) -> ClosedRelayAbandonment {
+        let metadata = self.metadata();
+        ClosedRelayAbandonment {
+            route: crate::protocol::relay::ClosedRelayRoute::with_epoch(
+                metadata.context,
+                metadata.requester,
+                metadata.relay,
+                metadata.target,
+                metadata.session_id,
+                metadata.allocation_epoch,
+            ),
+            relay_owner: self.0.relay_owner.clone(),
+            relay_witness: self.0.relay_witness.clone(),
+            allocation_generation: state.closed_relay_generation(metadata.session_id),
+        }
+    }
+
     pub(crate) fn metadata(&self) -> EndpointSessionMetadata {
         EndpointSessionMetadata {
             context: self.0.context,
@@ -76,61 +199,90 @@ impl EndpointSession {
             relay: self.0.relay.clone(),
             target: self.0.target.clone(),
             session_id: self.0.session_id,
+            allocation_epoch: self.0.allocation_epoch.load(Ordering::Acquire),
         }
+    }
+
+    pub(crate) fn set_allocation_epoch(&self, allocation_epoch: u64) {
+        let _ = self.0.allocation_epoch.compare_exchange(
+            0,
+            allocation_epoch,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn relay_owner_is_current(&self, state: &NetworkState) -> bool {
+        self.0.relay_witness.is_live()
+            && state
+                .peers
+                .with_current(&self.0.relay_owner, |peer| {
+                    peer.with_live_session(|session| self.0.relay_witness.witnesses(session))
+                })
+                .flatten()
+                .unwrap_or(false)
     }
 
     fn pending(
         state: &Arc<NetworkState>,
-        relay_owner: PeerOwnerToken,
-        context: MeshContextId,
-        requester: DeviceId,
-        relay: DeviceId,
-        target: DeviceId,
-        session_id: [u8; 16],
+        route: EndpointSessionRoute,
         pending: PendingEndpointKeyAgreement,
         capacity: usize,
+        lease: ResourceLease,
     ) -> Self {
-        Self(Arc::new(EndpointSessionInner {
-            state: Arc::downgrade(state),
-            relay_owner,
-            context,
-            requester,
-            relay,
-            target,
-            session_id,
-            crypto: Mutex::new(EndpointCrypto::Pending(pending)),
-            inbound: Mutex::new(VecDeque::with_capacity(capacity)),
-            inbound_capacity: capacity,
-            wake: Notify::new(),
-            closed: AtomicBool::new(false),
-        }))
+        Self(
+            Arc::new(EndpointSessionInner {
+                state: Arc::downgrade(state),
+                relay_owner: route.relay_owner,
+                relay_witness: route.relay_witness,
+                context: route.context,
+                requester: route.requester,
+                relay: route.relay,
+                target: route.target,
+                session_id: route.session_id,
+                allocation_epoch: AtomicU64::new(route.allocation_epoch),
+                crypto: Mutex::new(EndpointCrypto::Pending(pending)),
+                inbound: Mutex::new(VecDeque::with_capacity(capacity)),
+                inbound_capacity: capacity,
+                _lease: lease,
+                wake: Notify::new(),
+                closed: AtomicBool::new(false),
+                consumer_state: AtomicU8::new(ENDPOINT_CONSUMER_CLAIMED),
+                public_refs: std::sync::atomic::AtomicUsize::new(1),
+            }),
+            EndpointSessionRole::Public,
+        )
     }
 
     fn ready(
         state: &Arc<NetworkState>,
-        relay_owner: PeerOwnerToken,
-        context: MeshContextId,
-        requester: DeviceId,
-        relay: DeviceId,
-        target: DeviceId,
-        session_id: [u8; 16],
+        route: EndpointSessionRoute,
         session: OpaqueRelaySession,
         capacity: usize,
+        lease: ResourceLease,
     ) -> Self {
-        Self(Arc::new(EndpointSessionInner {
-            state: Arc::downgrade(state),
-            relay_owner,
-            context,
-            requester,
-            relay,
-            target,
-            session_id,
-            crypto: Mutex::new(EndpointCrypto::Ready(session)),
-            inbound: Mutex::new(VecDeque::with_capacity(capacity)),
-            inbound_capacity: capacity,
-            wake: Notify::new(),
-            closed: AtomicBool::new(false),
-        }))
+        Self(
+            Arc::new(EndpointSessionInner {
+                state: Arc::downgrade(state),
+                relay_owner: route.relay_owner,
+                relay_witness: route.relay_witness,
+                context: route.context,
+                requester: route.requester,
+                relay: route.relay,
+                target: route.target,
+                session_id: route.session_id,
+                allocation_epoch: AtomicU64::new(route.allocation_epoch),
+                crypto: Mutex::new(EndpointCrypto::Ready(session)),
+                inbound: Mutex::new(VecDeque::with_capacity(capacity)),
+                inbound_capacity: capacity,
+                _lease: lease,
+                wake: Notify::new(),
+                closed: AtomicBool::new(false),
+                consumer_state: AtomicU8::new(ENDPOINT_CONSUMER_UNCLAIMED),
+                public_refs: std::sync::atomic::AtomicUsize::new(1),
+            }),
+            EndpointSessionRole::Public,
+        )
     }
 
     pub(crate) async fn send(&self, plaintext: &[u8]) -> Result<(), ClosedRelayRefusal> {
@@ -152,12 +304,13 @@ impl EndpointSession {
             .upgrade()
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
         let data = ClosedRelayData {
-            version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
+            version: crate::protocol::relay::CLOSED_RELAY_CONTROL_VERSION,
             context_id: self.0.context,
             requester: self.0.requester.clone(),
             relay: self.0.relay.clone(),
             target: self.0.target.clone(),
             session_id: self.0.session_id,
+            allocation_epoch: self.0.allocation_epoch.load(Ordering::Acquire),
             packet,
         };
         super::send_to_peer_owner(
@@ -239,20 +392,23 @@ impl EndpointSession {
             self.mark_closed();
             return Err(ClosedRelayRefusal::OwnerNotLive);
         };
+        if self.0.allocation_epoch.load(Ordering::Acquire) == 0 {
+            state.remove_closed_relay_endpoint(&self);
+            self.mark_closed();
+            return Ok(());
+        }
+        let control = ClosedRelayControl::Close {
+            version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
+            context_id: self.0.context,
+            requester: self.0.requester.clone(),
+            relay: self.0.relay.clone(),
+            target: self.0.target.clone(),
+            session_id: self.0.session_id,
+            allocation_epoch: self.0.allocation_epoch.load(Ordering::Acquire),
+        };
+        validate_outbound_control(&state, &control)?;
         if self.begin_closing() {
-            let result = send_control_to_owner(
-                &state,
-                &self.0.relay_owner,
-                ClosedRelayControl::Close {
-                    version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
-                    context_id: self.0.context,
-                    requester: self.0.requester.clone(),
-                    relay: self.0.relay.clone(),
-                    target: self.0.target.clone(),
-                    session_id: self.0.session_id,
-                },
-            )
-            .await;
+            let result = send_control_to_owner(&state, &self.0.relay_owner, control).await;
             if let Err(error) = result {
                 state.remove_closed_relay_endpoint(&self);
                 self.mark_closed();
@@ -261,6 +417,7 @@ impl EndpointSession {
         }
         match self.wait_terminal().await {
             Ok(()) => {
+                self.mark_closed();
                 state.remove_closed_relay_endpoint(&self);
                 Ok(())
             }
@@ -316,6 +473,9 @@ impl EndpointSession {
     }
 
     pub(crate) fn mark_closed(&self) {
+        self.0
+            .consumer_state
+            .store(ENDPOINT_CONSUMER_CANCELLED, Ordering::Release);
         self.0.closed.store(true, Ordering::Release);
         *self.0.crypto.lock() = EndpointCrypto::Closed;
         self.0.wake.notify_waiters();
@@ -365,6 +525,14 @@ pub(crate) struct ClosedRelayEndpointRegistry {
     capacity: usize,
 }
 
+impl Drop for ClosedRelayEndpointRegistry {
+    fn drop(&mut self) {
+        for session in self.sessions.drain(..) {
+            session.mark_closed();
+        }
+    }
+}
+
 impl ClosedRelayEndpointRegistry {
     pub(crate) fn new(profile: &ClosedRelayPolicyConfig) -> Result<Self, ClosedRelayRefusal> {
         if !profile.enabled || !profile.validate() {
@@ -387,7 +555,7 @@ impl ClosedRelayEndpointRegistry {
         {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.sessions.push(session);
+        self.sessions.push(session.into_registry());
         Ok(())
     }
 
@@ -395,7 +563,14 @@ impl ClosedRelayEndpointRegistry {
         self.sessions
             .iter()
             .find(|session| session.0.session_id == session_id)
-            .cloned()
+            .map(EndpointSession::borrowed_clone)
+    }
+
+    /// Move every retained endpoint out for synchronous cancellation by the
+    /// network owner. Moving the registry nodes first keeps cancellation free
+    /// of a registry lock while it records the exact Close handoff.
+    pub(crate) fn take_all_for_cancel(&mut self) -> Vec<EndpointSession> {
+        std::mem::take(&mut self.sessions)
     }
 
     pub(crate) fn remove(&mut self, session: &EndpointSession) {
@@ -404,8 +579,24 @@ impl ClosedRelayEndpointRegistry {
             .iter()
             .position(|existing| Arc::ptr_eq(&existing.0, &session.0))
         {
-            self.sessions.swap_remove(index);
+            let removed = self.sessions.swap_remove(index);
+            removed.mark_closed();
         }
+    }
+
+    pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.sessions.len() {
+            if self.sessions[index].relay_owner_is_current(state) {
+                index += 1;
+                continue;
+            }
+            let session = self.sessions.swap_remove(index);
+            session.mark_closed();
+            removed += 1;
+        }
+        removed
     }
 }
 
@@ -416,6 +607,19 @@ pub(crate) struct ClosedRelayTargetAcceptedRegistry {
     ready: VecDeque<EndpointSession>,
     capacity: usize,
     wake: Arc<Notify>,
+}
+
+impl Drop for ClosedRelayTargetAcceptedRegistry {
+    fn drop(&mut self) {
+        // A target Accept may be waiting for its one consumer when shutdown
+        // takes the registry.  Wake and close every retained endpoint before
+        // the queue's last Arc is released; otherwise a dropped receiver can
+        // retain its endpoint lease past engine shutdown.
+        for session in self.ready.drain(..) {
+            session.mark_closed();
+        }
+        self.wake.notify_waiters();
+    }
 }
 
 impl ClosedRelayTargetAcceptedRegistry {
@@ -441,21 +645,42 @@ impl ClosedRelayTargetAcceptedRegistry {
         {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.ready.push_back(session);
+        self.ready.push_back(session.into_registry());
         self.wake.notify_one();
         Ok(())
     }
 
-    pub(crate) fn take(&mut self, session_id: [u8; 16]) -> Option<EndpointSession> {
-        let index = self
-            .ready
-            .iter()
-            .position(|session| session.0.session_id == session_id)?;
+    pub(crate) fn take_next(&mut self) -> Option<EndpointSession> {
+        self.ready.pop_front().map(EndpointSession::into_public)
+    }
+
+    /// Remove an accepted session that has not yet been claimed by a
+    /// consumer. The caller must invoke `EndpointSession::cancel_consumer`
+    /// after releasing its registry lock; returning the exact node keeps the
+    /// cancellation path from guessing at Arc counts or a timer.
+    pub(crate) fn take_unpulled_for_cancel(
+        &mut self,
+        session_id: [u8; 16],
+    ) -> Option<EndpointSession> {
+        let index = self.ready.iter().position(|session| {
+            session.0.session_id == session_id
+                && session.0.consumer_state.load(Ordering::Acquire) == ENDPOINT_CONSUMER_UNCLAIMED
+        })?;
         self.ready.remove(index)
     }
 
-    pub(crate) fn take_next(&mut self) -> Option<EndpointSession> {
-        self.ready.pop_front()
+    pub(crate) fn take_all_unpulled_for_cancel(&mut self) -> Vec<EndpointSession> {
+        let mut unpulled = Vec::with_capacity(self.ready.len());
+        let mut remaining = VecDeque::with_capacity(self.ready.len());
+        while let Some(session) = self.ready.pop_front() {
+            if session.0.consumer_state.load(Ordering::Acquire) == ENDPOINT_CONSUMER_UNCLAIMED {
+                unpulled.push(session);
+            } else {
+                remaining.push_back(session);
+            }
+        }
+        self.ready = remaining;
+        unpulled
     }
 
     pub(crate) fn wake(&self) -> Arc<Notify> {
@@ -468,9 +693,26 @@ impl ClosedRelayTargetAcceptedRegistry {
             .iter()
             .position(|existing| Arc::ptr_eq(&existing.0, &session.0))
         {
-            self.ready.remove(index);
+            if let Some(removed) = self.ready.remove(index) {
+                removed.mark_closed();
+            }
             self.wake.notify_waiters();
         }
+    }
+
+    pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.ready.len() {
+            if self.ready[index].relay_owner_is_current(state) {
+                index += 1;
+                continue;
+            }
+            let session = self.ready.remove(index).expect("accepted index is present");
+            session.mark_closed();
+            removed += 1;
+        }
+        removed
     }
 }
 
@@ -493,14 +735,6 @@ impl ClosedRelayEndpoint {
     pub(crate) fn device(&self) -> &DeviceId {
         &self.device
     }
-
-    pub(crate) fn owner(&self) -> &PeerOwnerToken {
-        &self.owner
-    }
-
-    pub(crate) fn session(&self) -> &SessionValidityWitness {
-        &self.session
-    }
 }
 
 /// The engine authorization handed to the concrete `runtime::relay` adapter.
@@ -509,6 +743,7 @@ impl ClosedRelayEndpoint {
 /// the runtime consumes it together with its provider-backed
 /// `RelayAllocationPermit`.  It contains no IP address, key, payload, queue,
 /// destination selector, or recursive forwarding capability.
+#[derive(Clone)]
 pub(crate) struct ClosedRelayAuthorization {
     state: Arc<NetworkState>,
     context: MeshContextId,
@@ -518,13 +753,24 @@ pub(crate) struct ClosedRelayAuthorization {
 }
 
 /// A successfully admitted runtime handle paired with the exact engine
-/// witness that must remain alive until terminal settlement.
-pub(crate) type ClosedRelayAdmission = (ClosedRelayHandle, ClosedRelayTerminalWitness);
+/// witness and one provider lease for its engine-side registry custody.
+pub(crate) struct ClosedRelayAdmission {
+    pub(super) handle: ClosedRelayHandle,
+    pub(super) terminal: ClosedRelayTerminalWitness,
+    pub(super) lease: ResourceLease,
+}
+
+pub(crate) struct ClosedRelayResponse {
+    control: ClosedRelayControl,
+    owner: PeerOwnerToken,
+}
 pub(crate) type ClosedRelayGeneration = Arc<()>;
 
 pub(crate) struct ClosedRelayCheckoutControl {
     closing: AtomicBool,
+    finished: AtomicBool,
     wake: Notify,
+    finished_wake: Notify,
 }
 
 impl ClosedRelayCheckoutControl {
@@ -536,20 +782,42 @@ impl ClosedRelayCheckoutControl {
     pub(crate) fn closing_notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.wake.notified()
     }
+
+    pub(crate) fn finish(&self) {
+        self.finished.store(true, Ordering::Release);
+        self.finished_wake.notify_waiters();
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn finished_notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.finished_wake.notified()
+    }
 }
 
 pub(crate) struct ClosedRelayCheckout {
     state: Weak<NetworkState>,
     session_id: [u8; 16],
     generation: ClosedRelayGeneration,
+    route: (MeshContextId, DeviceId, DeviceId, DeviceId, u64),
     handle: Option<ClosedRelayHandle>,
     terminal: Option<ClosedRelayTerminalWitness>,
+    lease: Option<ResourceLease>,
     control: Arc<ClosedRelayCheckoutControl>,
 }
 
 impl ClosedRelayCheckout {
-    pub(crate) async fn recv(&mut self, direction: RelayDirection) -> Option<OpaqueRelayPacket> {
-        self.handle.as_mut()?.recv_direction(direction).await
+    pub(crate) async fn recv(
+        &mut self,
+        direction: RelayDirection,
+    ) -> Result<Option<OpaqueRelayPacket>, ClosedRelayRefusal> {
+        self.handle
+            .as_mut()
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?
+            .recv_direction_checked(direction)
+            .await
     }
 
     pub(crate) fn control(&self) -> &Arc<ClosedRelayCheckoutControl> {
@@ -559,15 +827,33 @@ impl ClosedRelayCheckout {
     pub(crate) fn is_closing(&self) -> bool {
         self.control.closing.load(Ordering::Acquire)
     }
+
+    pub(crate) fn route_and_generation(
+        &self,
+    ) -> (
+        (MeshContextId, DeviceId, DeviceId, DeviceId, u64),
+        ClosedRelayGeneration,
+    ) {
+        (self.route.clone(), self.generation.clone())
+    }
 }
 
 impl Drop for ClosedRelayCheckout {
     fn drop(&mut self) {
+        let control = Arc::clone(&self.control);
         let Some(handle) = self.handle.take() else {
+            control.finish();
             return;
         };
         let Some(terminal) = self.terminal.take() else {
             drop(handle);
+            control.finish();
+            return;
+        };
+        let Some(lease) = self.lease.take() else {
+            drop(handle);
+            drop(terminal);
+            control.finish();
             return;
         };
         if let Some(state) = self.state.upgrade() {
@@ -576,12 +862,15 @@ impl Drop for ClosedRelayCheckout {
                 self.generation.clone(),
                 handle,
                 terminal,
+                lease,
                 Arc::clone(&self.control),
             );
         } else {
             drop(handle);
             drop(terminal);
+            drop(lease);
         }
+        control.finish();
     }
 }
 
@@ -600,6 +889,7 @@ struct ClosedRelaySlot {
     generation: ClosedRelayGeneration,
     handle: Option<ClosedRelayHandle>,
     terminal: ClosedRelayTerminalWitness,
+    lease: Option<ResourceLease>,
     checkout: Option<Arc<ClosedRelayCheckoutControl>>,
     closing: bool,
 }
@@ -628,13 +918,18 @@ impl ClosedRelayRegistry {
             drop(admission);
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        let (handle, terminal) = admission;
+        let ClosedRelayAdmission {
+            handle,
+            terminal,
+            lease,
+        } = admission;
         let generation = Arc::new(());
         self.slots.push(ClosedRelaySlot {
             session_id,
             generation: generation.clone(),
             handle: Some(handle),
             terminal,
+            lease: Some(lease),
             checkout: None,
             closing: false,
         });
@@ -651,17 +946,28 @@ impl ClosedRelayRegistry {
             .iter_mut()
             .find(|slot| slot.session_id == session_id && slot.handle.is_some())?;
         let handle = slot.handle.take()?;
+        let lease = slot.lease.take()?;
         let control = Arc::new(ClosedRelayCheckoutControl {
             closing: AtomicBool::new(slot.closing),
+            finished: AtomicBool::new(false),
             wake: Notify::new(),
+            finished_wake: Notify::new(),
         });
         slot.checkout = Some(Arc::clone(&control));
         Some(ClosedRelayCheckout {
             state: Arc::downgrade(state),
             session_id,
             generation: slot.generation.clone(),
+            route: (
+                slot.terminal.context,
+                slot.terminal.requester.device.clone(),
+                slot.terminal.relay.clone(),
+                slot.terminal.target.device.clone(),
+                slot.terminal.allocation_epoch,
+            ),
             handle: Some(handle),
             terminal: Some(slot.terminal.clone()),
+            lease: Some(lease),
             control,
         })
     }
@@ -687,6 +993,13 @@ impl ClosedRelayRegistry {
         self.slots.iter().any(|slot| slot.session_id == session_id)
     }
 
+    pub(crate) fn epoch(&self, session_id: [u8; 16]) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|slot| slot.session_id == session_id)
+            .map(|slot| slot.terminal.allocation_epoch)
+    }
+
     pub(crate) fn generation(&self, session_id: [u8; 16]) -> Option<ClosedRelayGeneration> {
         self.slots
             .iter()
@@ -709,6 +1022,7 @@ impl ClosedRelayRegistry {
         generation: ClosedRelayGeneration,
         handle: ClosedRelayHandle,
         terminal: ClosedRelayTerminalWitness,
+        lease: ResourceLease,
         control: Arc<ClosedRelayCheckoutControl>,
     ) -> Option<ClosedRelayAdmission> {
         let Some(index) = self.slots.iter().position(|slot| {
@@ -719,15 +1033,24 @@ impl ClosedRelayRegistry {
                     .as_ref()
                     .is_some_and(|existing| Arc::ptr_eq(existing, &control))
         }) else {
-            return Some((handle, terminal));
+            return Some(ClosedRelayAdmission {
+                handle,
+                terminal,
+                lease,
+            });
         };
         let slot = &mut self.slots[index];
         slot.checkout = None;
         if slot.closing || control.closing.load(Ordering::Acquire) {
             let _ = self.slots.swap_remove(index);
-            Some((handle, terminal))
+            Some(ClosedRelayAdmission {
+                handle,
+                terminal,
+                lease,
+            })
         } else {
             slot.handle = Some(handle);
+            slot.lease = Some(lease);
             None
         }
     }
@@ -767,26 +1090,77 @@ impl ClosedRelayRegistry {
         settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)
     }
 
+    pub(crate) fn retire_exact(
+        &mut self,
+        session_id: [u8; 16],
+        generation: &ClosedRelayGeneration,
+    ) -> Result<ClosedRelayTerminal, ClosedRelayRefusal> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.session_id == session_id && Arc::ptr_eq(&slot.generation, generation)
+            })
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+        let slot = self.slots.swap_remove(index);
+        let handle = slot.handle.ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+        settle_closed_relay(handle, slot.terminal)
+    }
+
     pub(crate) fn settle_all(&mut self) -> usize {
         let mut settled = 0;
-        while let Some(slot) = self.slots.pop() {
-            if let Some(handle) = slot.handle {
-                if settle_closed_relay(handle, slot.terminal).is_ok() {
-                    settled += 1;
-                }
+        let mut index = 0;
+        while index < self.slots.len() {
+            if self.slots[index].handle.is_none() {
+                // A checked-out handle is finalized by its owner Drop. Keep
+                // the slot until that Drop returns the exact custody.
+                index += 1;
+                continue;
+            }
+            let slot = self.slots.swap_remove(index);
+            if settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)
+                .is_ok()
+            {
+                settled += 1;
             }
         }
         settled
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
+    pub(crate) fn retire_stale(&mut self) -> usize {
+        let mut retired = 0;
+        let mut index = 0;
+        while index < self.slots.len() {
+            if self.slots[index].terminal.is_current() {
+                index += 1;
+                continue;
+            }
+            let checkout_control = self.slots[index].checkout.as_ref().map(Arc::clone);
+            if let Some(control) = checkout_control {
+                self.slots[index].closing = true;
+                control.request_close();
+                index += 1;
+                continue;
+            }
+            let slot = self.slots.swap_remove(index);
+            if let Some(handle) = slot.handle {
+                let _ = settle_closed_relay(handle, slot.terminal);
+            }
+            retired += 1;
+        }
+        retired
+    }
+
+    pub(crate) fn checkout_control(&self) -> Option<Arc<ClosedRelayCheckoutControl>> {
+        self.slots
+            .iter()
+            .find_map(|slot| slot.checkout.as_ref().map(Arc::clone))
     }
 
     pub(crate) fn route(
         &self,
         session_id: [u8; 16],
-    ) -> Option<(MeshContextId, DeviceId, DeviceId, DeviceId)> {
+    ) -> Option<(MeshContextId, DeviceId, DeviceId, DeviceId, u64)> {
         let slot = self
             .slots
             .iter()
@@ -796,6 +1170,26 @@ impl ClosedRelayRegistry {
             slot.terminal.requester.device.clone(),
             slot.terminal.relay.clone(),
             slot.terminal.target.device.clone(),
+            slot.terminal.allocation_epoch,
+        ))
+    }
+
+    pub(crate) fn route_if_generation(
+        &self,
+        session_id: [u8; 16],
+        generation: &ClosedRelayGeneration,
+    ) -> Option<(MeshContextId, DeviceId, DeviceId, DeviceId, u64)> {
+        let slot = self.slots.iter().find(|slot| {
+            slot.session_id == session_id
+                && Arc::ptr_eq(&slot.generation, generation)
+                && slot.terminal.is_current()
+        })?;
+        Some((
+            slot.terminal.context,
+            slot.terminal.requester.device.clone(),
+            slot.terminal.relay.clone(),
+            slot.terminal.target.device.clone(),
+            slot.terminal.allocation_epoch,
         ))
     }
 }
@@ -809,9 +1203,59 @@ pub(crate) struct ClosedRelayPendingRegistry {
 
 pub(crate) struct ClosedRelayPending {
     pub(crate) session_id: [u8; 16],
+    pub(crate) allocation_epoch: u64,
     pub(crate) authorization: ClosedRelayAuthorization,
-    pub(crate) requester_share: RelayKeyShare,
+    pub(crate) _requester_share: RelayKeyShare,
     pub(crate) _guard: ClosedRelayHandshakeGuard,
+    pub(crate) _expiry: ClosedRelayPendingExpiry,
+    pub(crate) _lease: ResourceLease,
+}
+
+/// Owns the pending-expiry signal and cancels its waiter when the pending
+/// record leaves the registry. Keeping this drop behavior in a field rather
+/// than on `ClosedRelayPending` permits the authorization to be moved into
+/// the admitted allocation while all remaining custody still drops normally.
+pub(crate) struct ClosedRelayPendingExpiry {
+    control: Arc<ClosedRelayPendingExpiryControl>,
+}
+
+impl ClosedRelayPendingExpiry {
+    pub(crate) fn new(control: Arc<ClosedRelayPendingExpiryControl>) -> Self {
+        Self { control }
+    }
+}
+
+impl Drop for ClosedRelayPendingExpiry {
+    fn drop(&mut self) {
+        self.control.cancel();
+    }
+}
+
+pub(crate) struct ClosedRelayPendingExpiryControl {
+    wake: Notify,
+    cancelled: AtomicBool,
+}
+
+impl ClosedRelayPendingExpiryControl {
+    pub(crate) fn new() -> Self {
+        Self {
+            wake: Notify::new(),
+            cancelled: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) fn cancelled(&self) -> tokio::sync::futures::Notified<'_> {
+        self.wake.notified()
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 impl ClosedRelayPendingRegistry {
@@ -849,12 +1293,88 @@ impl ClosedRelayPendingRegistry {
         Some(self.slots.swap_remove(index))
     }
 
+    pub(crate) fn take_matching(
+        &mut self,
+        session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
+        target_witness: &SessionValidityWitness,
+    ) -> Result<ClosedRelayPending, ClosedRelayRefusal> {
+        let index = self.matching_index(session_id, route, target_witness)?;
+        Ok(self.slots.swap_remove(index))
+    }
+
+    pub(crate) fn matching_authorization(
+        &self,
+        session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
+        target_witness: &SessionValidityWitness,
+    ) -> Result<ClosedRelayAuthorization, ClosedRelayRefusal> {
+        let index = self.matching_index(session_id, route, target_witness)?;
+        Ok(self.slots[index].authorization.clone())
+    }
+
+    fn matching_index(
+        &self,
+        session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
+        target_witness: &SessionValidityWitness,
+    ) -> Result<usize, ClosedRelayRefusal> {
+        let index = self
+            .slots
+            .iter()
+            .position(|pending| pending.session_id == session_id)
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+        let pending = &self.slots[index];
+        let pending_route = crate::protocol::relay::ClosedRelayRoute::new(
+            pending.authorization.context,
+            pending.authorization.requester.device().clone(),
+            pending.authorization.relay.clone(),
+            pending.authorization.target.device().clone(),
+            session_id,
+        );
+        let pending_route = crate::protocol::relay::ClosedRelayRoute::with_epoch(
+            pending_route.context_id,
+            pending_route.requester,
+            pending_route.relay,
+            pending_route.target,
+            pending_route.session_id,
+            pending.allocation_epoch,
+        );
+        if pending_route != *route
+            || !pending
+                .authorization
+                .target
+                .session
+                .same_validity(target_witness)
+        {
+            return Err(ClosedRelayRefusal::OwnerMismatch);
+        }
+        Ok(index)
+    }
+
     pub(crate) fn contains(&self, session_id: [u8; 16]) -> bool {
         self.slots.iter().any(|slot| slot.session_id == session_id)
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
+    pub(crate) fn epoch(&self, session_id: [u8; 16]) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|slot| slot.session_id == session_id)
+            .map(|slot| slot.allocation_epoch)
+    }
+
+    pub(crate) fn remove_stale(&mut self) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.slots.len() {
+            if self.slots[index].authorization.is_current() {
+                index += 1;
+                continue;
+            }
+            self.slots.swap_remove(index);
+            removed += 1;
+        }
+        removed
     }
 
     pub(crate) fn clear(&mut self) -> usize {
@@ -865,13 +1385,47 @@ impl ClosedRelayPendingRegistry {
 }
 
 pub(crate) struct ClosedRelayCloseRecord {
+    // A close record is only a route-bound coordination record. The exact
+    // allocation/pending registry retains its single lease until terminal
+    // settlement, so this record deliberately does not double-charge it.
     pub(crate) session_id: [u8; 16],
+    pub(crate) allocation_epoch: u64,
     pub(crate) allocation_generation: Option<ClosedRelayGeneration>,
     pub(crate) initiator: DeviceId,
     pub(crate) opposite: DeviceId,
     pub(crate) initiator_owner: PeerOwnerToken,
+    pub(crate) opposite_owner: PeerOwnerToken,
     pub(crate) initiator_witness: SessionValidityWitness,
     pub(crate) opposite_witness: SessionValidityWitness,
+}
+
+impl ClosedRelayCloseRecord {
+    fn is_current(&self, state: &NetworkState) -> bool {
+        let owners_current = owner_witness_is_current(
+            state,
+            &self.initiator_owner,
+            &self.initiator,
+            &self.initiator_witness,
+        ) && owner_witness_is_current(
+            state,
+            &self.opposite_owner,
+            &self.opposite,
+            &self.opposite_witness,
+        );
+        owners_current
+            && self.allocation_epoch != 0
+            && state
+                .closed_relay_route(self.session_id)
+                .is_some_and(|(_, _, _, _, epoch)| epoch == self.allocation_epoch)
+            && self
+                .allocation_generation
+                .as_ref()
+                .is_none_or(|generation| {
+                    state
+                        .closed_relay_generation(self.session_id)
+                        .is_some_and(|current| Arc::ptr_eq(&current, generation))
+                })
+    }
 }
 
 pub(crate) struct ClosedRelayClosingRegistry {
@@ -896,13 +1450,11 @@ impl ClosedRelayClosingRegistry {
         &mut self,
         record: ClosedRelayCloseRecord,
     ) -> Result<bool, ClosedRelayRefusal> {
-        if self.records.iter().any(|existing| {
-            if existing.session_id == record.session_id {
-                true
-            } else {
-                false
-            }
-        }) {
+        if self
+            .records
+            .iter()
+            .any(|existing| existing.session_id == record.session_id)
+        {
             return Ok(false);
         }
         if self.records.len() >= self.capacity {
@@ -917,11 +1469,13 @@ impl ClosedRelayClosingRegistry {
         session_id: [u8; 16],
         opposite: &DeviceId,
         witness: &SessionValidityWitness,
+        allocation_epoch: u64,
     ) -> Option<ClosedRelayCloseRecord> {
         let index = self.records.iter().position(|record| {
             record.session_id == session_id
                 && &record.opposite == opposite
                 && record.opposite_witness.same_validity(witness)
+                && record.allocation_epoch == allocation_epoch
         })?;
         Some(self.records.swap_remove(index))
     }
@@ -934,57 +1488,62 @@ impl ClosedRelayClosingRegistry {
         Some(self.records.swap_remove(index))
     }
 
+    pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
+        let mut removed = 0;
+        let mut index = 0;
+        while index < self.records.len() {
+            if self.records[index].is_current(state) {
+                index += 1;
+                continue;
+            }
+            let record = self.records.swap_remove(index);
+            if let Some(generation) = record.allocation_generation.as_ref() {
+                // Stale Close custody is terminal, not merely forgotten. The
+                // exact generation fence prevents a successor from being
+                // touched, while runtime settlement installs its provider-
+                // funded non-expiring session tombstone.
+                let _ = state.settle_closed_relay_exact(record.session_id, generation);
+            }
+            removed += 1;
+        }
+        removed
+    }
+
     pub(crate) fn contains(&self, session_id: [u8; 16]) -> bool {
         self.records
             .iter()
             .any(|record| record.session_id == session_id)
     }
-
-    pub(crate) fn clear(&mut self) {
-        self.records.clear();
-    }
 }
 
 impl ClosedRelayAuthorization {
-    /// The exact semantic context selected by the verified bootstrap.
-    pub(crate) fn context(&self) -> MeshContextId {
-        self.context
-    }
-
-    /// The local canonical member performing the relay operation.
-    pub(crate) fn relay(&self) -> &DeviceId {
-        &self.relay
-    }
-
-    pub(crate) fn requester(&self) -> &ClosedRelayEndpoint {
-        &self.requester
-    }
-
-    pub(crate) fn target(&self) -> &ClosedRelayEndpoint {
-        &self.target
-    }
-
     /// Admit this already-bound route through the concrete provider-backed
     /// runtime. Permit issuance deliberately occurs after `bind_closed_relay`
     /// and its currentness fence; a failed semantic or owner check therefore
     /// cannot reserve a relay allocation.
     pub(crate) fn admit_to_runtime(
-        self,
+        &self,
         runtime: &ClosedRelayRuntime,
         profile: &ClosedRelayPolicyConfig,
         session_id: [u8; 16],
+        allocation_epoch: u64,
     ) -> Result<ClosedRelayAdmission, ClosedRelayRefusal> {
         if !self.is_current() {
             return Err(ClosedRelayRefusal::OwnerNotLive);
         }
+        let lease = self
+            .state
+            .acquire_closed_relay_lease(allocation_lease_claim(&self)?)
+            .map_err(|_| ClosedRelayRefusal::QueueFull)?;
         let permit = RelayAllocationPermit::try_new(self.requester.session.clone(), profile)?;
         let endpoints = ClosedRelayEndpoints::new(
             self.context,
             self.requester.device.clone(),
             self.target.device.clone(),
             session_id,
+            allocation_epoch,
         )?;
-        let terminal = self.into_terminal();
+        let terminal = self.into_terminal(session_id, allocation_epoch);
         runtime
             .admit_closed_relay(
                 permit,
@@ -992,7 +1551,11 @@ impl ClosedRelayAuthorization {
                 terminal.target.session.clone(),
                 endpoints,
             )
-            .map(|handle| (handle, terminal))
+            .map(|handle| ClosedRelayAdmission {
+                handle,
+                terminal,
+                lease,
+            })
     }
 
     /// Re-prove the immutable policy and both exact session lineages before a
@@ -1024,31 +1587,21 @@ impl ClosedRelayAuthorization {
     /// exact terminal state.  No new authority is minted here; the returned
     /// state is only the engine-side witness needed by a runtime settlement
     /// hook.
-    pub(crate) fn into_terminal(self) -> ClosedRelayTerminalWitness {
+    pub(crate) fn into_terminal(
+        &self,
+        session_id: [u8; 16],
+        allocation_epoch: u64,
+    ) -> ClosedRelayTerminalWitness {
         ClosedRelayTerminalWitness {
-            state: self.state,
+            state: Arc::clone(&self.state),
             context: self.context,
-            relay: self.relay,
-            requester: self.requester,
-            target: self.target,
+            relay: self.relay.clone(),
+            requester: self.requester.clone(),
+            target: self.target.clone(),
+            session_id,
+            allocation_epoch,
         }
     }
-}
-
-/// Bind and admit one Closed relay through the concrete runtime. The returned
-/// handle remains keyless and the paired terminal witness must be supplied to
-/// [`settle_closed_relay`].
-pub(crate) fn admit_closed_relay(
-    state: &Arc<NetworkState>,
-    runtime: &ClosedRelayRuntime,
-    profile: &ClosedRelayPolicyConfig,
-    requester: DeviceId,
-    relay: DeviceId,
-    target: DeviceId,
-    session_id: [u8; 16],
-) -> Result<ClosedRelayAdmission, ClosedRelayRefusal> {
-    bind_closed_relay(state, requester, relay, target)?
-        .admit_to_runtime(runtime, profile, session_id)
 }
 
 /// Recheck the exact engine witness before consuming the runtime handle. A
@@ -1059,7 +1612,7 @@ pub(crate) fn settle_closed_relay(
     terminal: ClosedRelayTerminalWitness,
 ) -> Result<ClosedRelayTerminal, ClosedRelayRefusal> {
     if !terminal.is_current() {
-        drop(handle);
+        handle.settle_stale();
         return Err(ClosedRelayRefusal::OwnerNotLive);
     }
     Ok(handle.settle())
@@ -1075,10 +1628,17 @@ pub(crate) struct ClosedRelayTerminalWitness {
     relay: DeviceId,
     requester: ClosedRelayEndpoint,
     target: ClosedRelayEndpoint,
+    session_id: [u8; 16],
+    allocation_epoch: u64,
 }
 
 impl ClosedRelayTerminalWitness {
     pub(crate) fn is_current(&self) -> bool {
+        if let Some((_, _, _, _, epoch)) = self.state.closed_relay_route(self.session_id) {
+            if epoch != self.allocation_epoch {
+                return false;
+            }
+        }
         ClosedRelayAuthorization {
             state: Arc::clone(&self.state),
             context: self.context,
@@ -1200,6 +1760,23 @@ fn endpoint_is_current(state: &Arc<NetworkState>, endpoint: &ClosedRelayEndpoint
             .peers
             .with_current(&endpoint.owner, |peer| {
                 peer.with_live_session(|session| endpoint.session.witnesses(session))
+            })
+            .flatten()
+            .unwrap_or(false)
+}
+
+fn owner_witness_is_current(
+    state: &NetworkState,
+    owner: &PeerOwnerToken,
+    device: &DeviceId,
+    witness: &SessionValidityWitness,
+) -> bool {
+    witness.is_live()
+        && owner.device_id() == device.base32().as_str()
+        && state
+            .peers
+            .with_current(owner, |peer| {
+                peer.with_live_session(|session| witness.witnesses(session))
             })
             .flatten()
             .unwrap_or(false)
@@ -1338,12 +1915,28 @@ async fn handle_close(
     control
         .validate()
         .map_err(|error| invalid(format!("invalid Closed relay Close: {error}")))?;
+    validate_outbound_control(state, &control)?;
     let (context, requester, relay, target, session_id) = control_fields(&control);
+    let allocation_epoch = match &control {
+        ClosedRelayControl::Close {
+            allocation_epoch, ..
+        } => *allocation_epoch,
+        _ => unreachable!("handle_close only receives Close"),
+    };
     let local = DeviceId::from_canonical_str(state.identity.public_id())
         .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
 
     if *relay == local {
         canonical_route_admitted(state, requester, relay, target)?;
+        if state.has_closed_relay_custody(*session_id) {
+            let current_epoch = state
+                .closed_relay_route(*session_id)
+                .map(|(_, _, _, _, epoch)| epoch)
+                .or_else(|| state.closed_relay_pending_epoch(*session_id));
+            if current_epoch != Some(allocation_epoch) {
+                return Err(ClosedRelayRefusal::OwnerNotLive);
+            }
+        }
         let (sender_device, opposite, sender_witness) =
             if owner.device_id() == requester.base32().as_str() {
                 (
@@ -1360,11 +1953,22 @@ async fn handle_close(
             } else {
                 return Err(ClosedRelayRefusal::OwnerMismatch);
             };
-        if let Some(record) =
-            state.take_closed_relay_close(*session_id, sender_device, &sender_witness)
-        {
+        if let Some(record) = state.take_closed_relay_close(
+            *session_id,
+            sender_device,
+            &sender_witness,
+            allocation_epoch,
+        ) {
+            let record_current = record.is_current(state);
             if let Some(generation) = record.allocation_generation.as_ref() {
                 let _ = state.settle_closed_relay_exact(*session_id, generation);
+            }
+            if !record_current {
+                // A delayed Close may still match the opposite endpoint's
+                // witness after the initiator or allocation was replaced.
+                // Consume only this close record; never acknowledge it or
+                // touch the successor allocation.
+                return Err(ClosedRelayRefusal::OwnerNotLive);
             }
             send_control_to_owner(state, &record.initiator_owner, control).await?;
             return Ok(());
@@ -1381,10 +1985,12 @@ async fn handle_close(
         let allocation_generation = state.closed_relay_generation(*session_id);
         let record = ClosedRelayCloseRecord {
             session_id: *session_id,
+            allocation_epoch,
             allocation_generation: allocation_generation.clone(),
             initiator: sender_device.clone(),
             opposite: opposite.clone(),
             initiator_owner: owner.clone(),
+            opposite_owner: opposite_owner.clone(),
             initiator_witness: sender_witness,
             opposite_witness,
         };
@@ -1420,6 +2026,7 @@ async fn handle_close(
             || metadata.relay != *relay
             || metadata.target != *target
             || metadata.session_id != *session_id
+            || metadata.allocation_epoch != allocation_epoch
             || (local != metadata.requester && local != metadata.target)
         {
             return Err(ClosedRelayRefusal::OwnerMismatch);
@@ -1439,6 +2046,7 @@ async fn send_control_to_owner(
     owner: &PeerOwnerToken,
     control: ClosedRelayControl,
 ) -> Result<(), ClosedRelayRefusal> {
+    validate_outbound_control(state, &control)?;
     super::send_to_peer_owner(
         state,
         owner,
@@ -1448,9 +2056,231 @@ async fn send_control_to_owner(
     .map_err(|_| ClosedRelayRefusal::CarrierUnavailable)
 }
 
+/// Execute one network-owned abandonment handoff. This is deliberately
+/// awaited by state-owned engine boundaries; `EndpointSession::Drop` only
+/// enqueues the bounded record and never creates a detached task.
+pub(crate) async fn settle_closed_relay_abandonment(
+    state: &Arc<NetworkState>,
+    abandonment: ClosedRelayAbandonment,
+) -> Result<(), ClosedRelayAbandonment> {
+    if abandonment.route.allocation_epoch == 0 {
+        let _ = state.take_closed_relay_pending(abandonment.route.session_id);
+        return Ok(());
+    }
+    let control = ClosedRelayControl::Close {
+        version: crate::protocol::relay::CLOSED_RELAY_CONTROL_VERSION,
+        context_id: abandonment.route.context_id,
+        requester: abandonment.route.requester.clone(),
+        relay: abandonment.route.relay.clone(),
+        target: abandonment.route.target.clone(),
+        session_id: abandonment.route.session_id,
+        allocation_epoch: abandonment.route.allocation_epoch,
+    };
+    let mut settled = false;
+    if owner_witness_is_current(
+        state,
+        &abandonment.relay_owner,
+        &abandonment.route.relay,
+        &abandonment.relay_witness,
+    ) {
+        settled = send_control_to_owner(state, &abandonment.relay_owner, control)
+            .await
+            .is_ok();
+    }
+    if let Some(generation) = abandonment.allocation_generation.as_ref() {
+        settled |= state
+            .settle_closed_relay_exact(abandonment.route.session_id, generation)
+            .is_ok();
+    }
+    if settled {
+        Ok(())
+    } else {
+        Err(abandonment)
+    }
+}
+
+fn validate_outbound_control(
+    state: &NetworkState,
+    control: &ClosedRelayControl,
+) -> Result<(), ClosedRelayRefusal> {
+    let profile = state.config.read().closed_relay.clone();
+    if !profile.validate() {
+        return Err(ClosedRelayRefusal::InvalidProfile);
+    }
+    if !profile.validate_closed_relay_control(control) {
+        return Err(ClosedRelayRefusal::InvalidPacket(
+            "closed relay control exceeds configured encoded-byte bound".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn endpoint_capacity(state: &NetworkState) -> Result<usize, ClosedRelayRefusal> {
     usize::try_from(state.config.read().closed_relay.queue_items_per_direction)
         .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+}
+
+fn checked_claim_bytes(value: usize) -> Result<u64, ClosedRelayRefusal> {
+    u64::try_from(value).map_err(|_| ClosedRelayRefusal::InvalidProfile)
+}
+
+fn endpoint_lease_claim(
+    profile: &ClosedRelayPolicyConfig,
+    capacity: usize,
+    context: &MeshContextId,
+    requester: &DeviceId,
+    relay: &DeviceId,
+    target: &DeviceId,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    let max_ciphertext =
+        crate::runtime::relay::checked_ciphertext_ceiling(profile.max_frame_ciphertext_bytes)?;
+    let queued_bytes = capacity
+        .checked_mul(max_ciphertext)
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    // Measure the allocator's actual VecDeque capacity, rather than assuming
+    // the requested logical length is the backing allocation.
+    let queue_capacity = VecDeque::<OpaqueRelayPacket>::with_capacity(capacity).capacity();
+    let packet_slots = queue_capacity
+        .checked_mul(std::mem::size_of::<OpaqueRelayPacket>())
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let replay_slots = usize::try_from(profile.replay_window)
+        .map_err(|_| ClosedRelayRefusal::InvalidProfile)?
+        .checked_mul(std::mem::size_of::<bool>())
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let mesh = context.base32();
+    let requester_wire = requester.base32();
+    let relay_wire = relay.base32();
+    let target_wire = target.base32();
+    let route_bytes = requester_wire
+        .capacity()
+        .checked_add(relay_wire.capacity())
+        .and_then(|bytes| bytes.checked_add(target_wire.capacity()))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let key_session_bytes = requester_wire
+        .capacity()
+        .checked_add(target_wire.capacity())
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let packet_string_bytes = capacity
+        .checked_mul(
+            mesh.capacity()
+                .checked_add(requester_wire.capacity())
+                .and_then(|bytes| bytes.checked_add(target_wire.capacity()))
+                .ok_or(ClosedRelayRefusal::InvalidProfile)?,
+        )
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let accounted = std::mem::size_of::<EndpointSessionInner>()
+        .checked_add(packet_slots)
+        .and_then(|bytes| bytes.checked_add(replay_slots))
+        .and_then(|bytes| bytes.checked_add(route_bytes))
+        .and_then(|bytes| bytes.checked_add(key_session_bytes))
+        .and_then(|bytes| bytes.checked_add(packet_string_bytes))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let retained_allocations = 1usize
+        .checked_add(3) // the endpoint's canonical requester/relay/target Strings
+        .and_then(|count| count.checked_add(1)) // endpoint inbound VecDeque
+        .and_then(|count| count.checked_add(1)) // endpoint replay-window Vec
+        .and_then(|count| count.checked_add(capacity.checked_mul(4)?)) // packet Strings + ciphertext
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            checked_claim_bytes(accounted)?,
+        ),
+        (
+            ResourceClass::QueuedBytes,
+            checked_claim_bytes(queued_bytes)?,
+        ),
+        (ResourceClass::RelayOrProviderAllocation, 1),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            checked_claim_bytes(retained_allocations)?,
+        ),
+    ])
+    .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+}
+
+fn pending_lease_claim(
+    authorization: &ClosedRelayAuthorization,
+    requester_share: &RelayKeyShare,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    let route_bytes = retained_route_bytes(authorization)?
+        .checked_add(requester_share.mesh.capacity())
+        // These fields are retained String buffers; charge their capacities,
+        // not only their visible lengths.
+        .and_then(|bytes| bytes.checked_add(requester_share.mesh.capacity()))
+        .and_then(|bytes| bytes.checked_add(requester_share.from.capacity()))
+        .and_then(|bytes| bytes.checked_add(requester_share.to.capacity()))
+        .and_then(|bytes| bytes.checked_add(requester_share.signature.capacity()))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let accounted = std::mem::size_of::<ClosedRelayPending>()
+        .checked_add(route_bytes)
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let retained_allocations = 3usize
+        .checked_add(4) // requester-share mesh/from/to/signature Strings
+        .and_then(|count| count.checked_add(1)) // pending-expiry control Arc
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            checked_claim_bytes(accounted)?,
+        ),
+        (ResourceClass::RelayOrProviderAllocation, 1),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            checked_claim_bytes(retained_allocations)?,
+        ),
+    ])
+    .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+}
+
+fn allocation_lease_claim(
+    authorization: &ClosedRelayAuthorization,
+) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    let route_bytes = retained_route_bytes(authorization)?;
+    let checkout_route_bytes = authorization
+        .requester
+        .device
+        .base32()
+        .capacity()
+        .checked_add(authorization.relay.base32().capacity())
+        .and_then(|bytes| bytes.checked_add(authorization.target.device.base32().capacity()))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let accounted = std::mem::size_of::<ClosedRelaySlot>()
+        .checked_add(route_bytes)
+        .and_then(|bytes| bytes.checked_add(checkout_route_bytes))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let retained_allocations = 3usize
+        .checked_add(1) // the generation token's Arc allocation
+        .and_then(|count| count.checked_add(6)) // checkout route and terminal clones
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    ResourceClaim::try_from_entries([
+        (
+            ResourceClass::AccountedMemoryBytes,
+            checked_claim_bytes(accounted)?,
+        ),
+        (ResourceClass::RelayOrProviderAllocation, 1),
+        (
+            ResourceClass::OpaqueDependencyResidual,
+            checked_claim_bytes(retained_allocations)?,
+        ),
+    ])
+    .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+}
+
+fn retained_route_bytes(
+    authorization: &ClosedRelayAuthorization,
+) -> Result<usize, ClosedRelayRefusal> {
+    let context = authorization.context.base32();
+    let requester = authorization.requester.device.base32();
+    let relay = authorization.relay.base32();
+    let target = authorization.target.device.base32();
+    context
+        .capacity()
+        .checked_add(requester.capacity())
+        .and_then(|bytes| bytes.checked_add(relay.capacity()))
+        .and_then(|bytes| bytes.checked_add(target.capacity()))
+        .ok_or(ClosedRelayRefusal::InvalidProfile)
 }
 
 fn max_frame_ciphertext(state: &NetworkState) -> Result<usize, ClosedRelayRefusal> {
@@ -1485,18 +2315,17 @@ pub(crate) fn begin_closed_relay_open(
         session_id,
         &profile,
     )?;
-    Ok((
-        pending,
-        ClosedRelayControl::Open {
-            version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
-            context_id: state.mesh_context_id(),
-            requester,
-            relay,
-            target,
-            session_id,
-            requester_share,
-        },
-    ))
+    let control = ClosedRelayControl::Open {
+        version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
+        context_id: state.mesh_context_id(),
+        requester,
+        relay,
+        target,
+        session_id,
+        requester_share,
+    };
+    validate_outbound_control(state, &control)?;
+    Ok((pending, control))
 }
 
 /// Begin and send an endpoint Open through the exact current relay owner.
@@ -1508,28 +2337,64 @@ pub(crate) async fn open_endpoint(
     target: DeviceId,
     session_id: [u8; 16],
 ) -> Result<EndpointSession, ClosedRelayRefusal> {
+    state.drain_closed_relay_abandonments().await;
+    let requester = DeviceId::from_canonical_str(state.identity.public_id())
+        .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
+    canonical_route_admitted(state, &requester, &relay, &target)?;
+    let capacity = endpoint_capacity(state)?;
+    let profile = state.config.read().closed_relay.clone();
+    let _runtime = state
+        .closed_relay_runtime()
+        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let lease = state
+        .acquire_closed_relay_lease(endpoint_lease_claim(
+            &profile,
+            capacity,
+            &state.mesh_context_id(),
+            &requester,
+            &relay,
+            &target,
+        )?)
+        .map_err(|_| ClosedRelayRefusal::QueueFull)?;
     let (pending, control) =
-        begin_closed_relay_open(state, relay.clone(), target.clone(), session_id)?;
+        match begin_closed_relay_open(state, relay.clone(), target.clone(), session_id) {
+            Ok(value) => value,
+            Err(error) => {
+                drop(lease);
+                return Err(error);
+            }
+        };
     let owner = match current_owner_for_device(state, &relay) {
         Ok(owner) => owner,
         Err(error) => {
             drop(pending);
+            drop(lease);
             return Err(error);
         }
     };
-    let requester = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
-    let capacity = endpoint_capacity(state)?;
+    let relay_witness = match current_owner_witness(state, &owner, &relay) {
+        Ok(witness) => witness,
+        Err(error) => {
+            drop(pending);
+            drop(lease);
+            return Err(error);
+        }
+    };
     let session = EndpointSession::pending(
         state,
-        owner,
-        state.mesh_context_id(),
-        requester,
-        relay,
-        target,
-        session_id,
+        EndpointSessionRoute {
+            relay_owner: owner,
+            relay_witness,
+            context: state.mesh_context_id(),
+            requester,
+            relay,
+            target,
+            session_id,
+            allocation_epoch: 0,
+        },
         pending,
         capacity,
+        lease,
     );
     if let Err(error) = state.insert_closed_relay_endpoint(session.clone()) {
         drop(session);
@@ -1548,20 +2413,6 @@ pub(crate) async fn open_endpoint(
     Ok(session)
 }
 
-/// Finish the requester endpoint agreement from the exact target Accept.
-pub(crate) fn finish_closed_relay_open(
-    pending: PendingEndpointKeyAgreement,
-    control: &ClosedRelayControl,
-) -> Result<OpaqueRelaySession, ClosedRelayRefusal> {
-    control
-        .validate()
-        .map_err(|error| invalid(format!("invalid Closed relay Accept: {error}")))?;
-    let ClosedRelayControl::Accept { target_share, .. } = control else {
-        return Err(invalid("requester expected a Closed relay Accept"));
-    };
-    pending.finish(target_share)
-}
-
 /// Handle the relay member's Open/Accept/Close controls. A response is
 /// returned for the caller to send only over the exact owner selected by its
 /// route; this function never resolves a peer by a string or sends under a
@@ -1570,7 +2421,7 @@ pub(crate) fn on_control(
     state: &Arc<NetworkState>,
     owner: &PeerOwnerToken,
     control: ClosedRelayControl,
-) -> Result<Option<ClosedRelayControl>, ClosedRelayRefusal> {
+) -> Result<Option<ClosedRelayResponse>, ClosedRelayRefusal> {
     match control {
         ClosedRelayControl::Open {
             version,
@@ -1601,24 +2452,43 @@ pub(crate) fn on_control(
             {
                 return Err(ClosedRelayRefusal::OwnerMismatch);
             }
+            let allocation_epoch = state
+                .closed_relay_runtime()
+                .ok_or(ClosedRelayRefusal::InvalidProfile)?
+                .mint_allocation_epoch()?;
+            let offer = ClosedRelayControl::Offer {
+                version,
+                context_id,
+                requester: requester.clone(),
+                relay: relay.clone(),
+                target: target.clone(),
+                session_id,
+                allocation_epoch,
+                requester_share: requester_share.clone(),
+            };
+            validate_outbound_control(state, &offer)?;
             let runtime = state
                 .closed_relay_runtime()
                 .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+            let lease = state
+                .acquire_closed_relay_lease(pending_lease_claim(&authorization, &requester_share)?)
+                .map_err(|_| ClosedRelayRefusal::QueueFull)?;
             let guard = runtime.try_begin_handshake()?;
+            let expiry = Arc::new(ClosedRelayPendingExpiryControl::new());
+            let target_owner = authorization.target.owner.clone();
             state.insert_closed_relay_pending(ClosedRelayPending {
                 session_id,
+                allocation_epoch,
                 authorization,
-                requester_share: requester_share.clone(),
+                _requester_share: requester_share.clone(),
                 _guard: guard,
+                _expiry: ClosedRelayPendingExpiry::new(Arc::clone(&expiry)),
+                _lease: lease,
             })?;
-            Ok(Some(ClosedRelayControl::Offer {
-                version,
-                context_id,
-                requester,
-                relay,
-                target,
-                session_id,
-                requester_share,
+            state.arm_closed_relay_pending_expiry(session_id, expiry)?;
+            Ok(Some(ClosedRelayResponse {
+                control: offer,
+                owner: target_owner,
             }))
         }
         ClosedRelayControl::Offer { .. } => Err(invalid(
@@ -1631,6 +2501,7 @@ pub(crate) fn on_control(
             relay,
             target,
             session_id,
+            allocation_epoch,
             target_share,
         } => {
             let control = ClosedRelayControl::Accept {
@@ -1640,30 +2511,62 @@ pub(crate) fn on_control(
                 relay: relay.clone(),
                 target: target.clone(),
                 session_id,
+                allocation_epoch,
                 target_share: target_share.clone(),
             };
             validate_control_for_relay(state, &control)?;
+            validate_outbound_control(state, &control)?;
             let target_witness = current_owner_witness(state, owner, &target)?;
-            let pending = state
-                .take_closed_relay_pending(session_id)
-                .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-            if !pending
-                .authorization
-                .target
-                .session
-                .same_validity(&target_witness)
-            {
-                return Err(ClosedRelayRefusal::OwnerMismatch);
-            }
+            let route = control.route();
+            // Clone only the immutable authorization first.  Runtime/provider
+            // refusal must leave the pending handshake, guard, expiry, and
+            // lease untouched in the pending registry.
+            let authorization =
+                state.closed_relay_pending_authorization(session_id, &route, &target_witness)?;
             let runtime = state
                 .closed_relay_runtime()
                 .ok_or(ClosedRelayRefusal::InvalidProfile)?;
             let profile = state.config.read().closed_relay.clone();
-            let (handle, terminal) = pending
-                .authorization
-                .admit_to_runtime(runtime, &profile, session_id)?;
-            let _ = state.insert_closed_relay_admission(session_id, (handle, terminal))?;
-            Ok(Some(control))
+            let admission =
+                authorization.admit_to_runtime(runtime, &profile, session_id, allocation_epoch)?;
+            // Admission is synchronous, but the owner/session may still be
+            // replaced before the pending record is consumed. Recheck the
+            // exact captured witnesses before any registry mutation or Accept
+            // emission; dropping the admission releases W1 on refusal.
+            if !authorization.is_current()
+                || !owner_witness_is_current(
+                    state,
+                    &authorization.target.owner,
+                    &target,
+                    &target_witness,
+                )
+            {
+                drop(admission);
+                return Err(ClosedRelayRefusal::OwnerNotLive);
+            }
+            // Consume the pending record only after the complete runtime
+            // allocation has been admitted.  A concurrent owner replacement
+            // makes this exact take fail and dropping `admission` releases
+            // its runtime and engine custody without losing the pending slot.
+            let pending =
+                state.take_closed_relay_pending_matching(session_id, &route, &target_witness)?;
+            match state.insert_closed_relay_admission(session_id, admission) {
+                Ok(_) => {
+                    drop(pending);
+                    Ok(Some(ClosedRelayResponse {
+                        control,
+                        owner: authorization.requester.owner.clone(),
+                    }))
+                }
+                Err(error) => {
+                    // The allocation registry may reject after runtime
+                    // admission (for example, a concurrent same-session
+                    // insert). Restore the still-valid pending custody
+                    // before returning the refusal.
+                    state.insert_closed_relay_pending(pending)?;
+                    Err(error)
+                }
+            }
         }
         ClosedRelayControl::Close { .. } => Err(invalid(
             "Close requires the asynchronous exact-owner dispatch path",
@@ -1680,6 +2583,7 @@ pub(crate) async fn handle_control(
     owner: &PeerOwnerToken,
     control: ClosedRelayControl,
 ) -> Result<Option<EndpointSession>, ClosedRelayRefusal> {
+    state.drain_closed_relay_abandonments().await;
     match &control {
         ClosedRelayControl::Offer { .. } => {
             let (accept, session) = accept_offer(state, owner, &control)?;
@@ -1693,23 +2597,15 @@ pub(crate) async fn handle_control(
             drop(session);
             Ok(None)
         }
-        ClosedRelayControl::Open {
-            target, session_id, ..
-        } => {
-            let target = target.clone();
+        ClosedRelayControl::Open { session_id, .. } => {
             let session_id = *session_id;
             let response = on_control(state, owner, control)?;
             let Some(response) = response else {
                 return Ok(None);
             };
-            let target_owner = match current_owner_for_device(state, &target) {
-                Ok(target_owner) => target_owner,
-                Err(error) => {
-                    let _ = state.take_closed_relay_pending(session_id);
-                    return Err(error);
-                }
-            };
-            if let Err(error) = send_control_to_owner(state, &target_owner, response).await {
+            if let Err(error) =
+                send_control_to_owner(state, &response.owner, response.control).await
+            {
                 let _ = state.take_closed_relay_pending(session_id);
                 return Err(error);
             }
@@ -1720,11 +2616,10 @@ pub(crate) async fn handle_control(
             session_id,
             ..
         } => {
-            let requester = requester.clone();
             let session_id = *session_id;
             let local = DeviceId::from_canonical_str(state.identity.public_id())
                 .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
-            if requester == local {
+            if *requester == local {
                 control
                     .validate()
                     .map_err(|error| invalid(format!("invalid Closed relay Accept: {error}")))?;
@@ -1732,6 +2627,7 @@ pub(crate) async fn handle_control(
                     context_id,
                     relay,
                     target,
+                    allocation_epoch,
                     target_share,
                     ..
                 } = &control
@@ -1743,7 +2639,25 @@ pub(crate) async fn handle_control(
                 }
                 canonical_route_admitted(state, &requester, relay, target)?;
                 let _ = current_owner_witness(state, owner, relay)?;
-                let session = state.complete_closed_relay_endpoint(session_id, target_share)?;
+                let session = state
+                    .closed_relay_endpoint(session_id)
+                    .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+                if !endpoint_matches_route(
+                    &session,
+                    context_id,
+                    &requester,
+                    relay,
+                    target,
+                    &session_id,
+                    *allocation_epoch,
+                ) {
+                    return Err(ClosedRelayRefusal::OwnerMismatch);
+                }
+                let session = state.complete_closed_relay_endpoint(
+                    session_id,
+                    &control.route(),
+                    target_share,
+                )?;
                 return Ok(Some(session));
             }
             let response = on_control(state, owner, control)?;
@@ -1751,16 +2665,9 @@ pub(crate) async fn handle_control(
                 return Ok(None);
             };
             let generation = state.closed_relay_generation(session_id);
-            let requester_owner = match current_owner_for_device(state, &requester) {
-                Ok(requester_owner) => requester_owner,
-                Err(error) => {
-                    if let Some(generation) = generation.as_ref() {
-                        let _ = state.settle_closed_relay_exact(session_id, generation);
-                    }
-                    return Err(error);
-                }
-            };
-            if let Err(error) = send_control_to_owner(state, &requester_owner, response).await {
+            if let Err(error) =
+                send_control_to_owner(state, &response.owner, response.control).await
+            {
                 if let Some(generation) = generation.as_ref() {
                     let _ = state.settle_closed_relay_exact(session_id, generation);
                 }
@@ -1792,6 +2699,7 @@ pub(crate) fn accept_offer(
         relay,
         target,
         session_id,
+        allocation_epoch,
         requester_share,
     } = control
     else {
@@ -1803,11 +2711,17 @@ pub(crate) fn accept_offer(
         return Err(invalid("Offer is not addressed to this target"));
     }
     canonical_route_admitted(state, requester, relay, target)?;
-    let _relay_witness = current_owner_witness(state, owner, relay)?;
+    let relay_witness = current_owner_witness(state, owner, relay)?;
     let profile = state.config.read().closed_relay.clone();
     let runtime = state
         .closed_relay_runtime()
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let capacity = endpoint_capacity(state)?;
+    let lease = state
+        .acquire_closed_relay_lease(endpoint_lease_claim(
+            &profile, capacity, context_id, requester, relay, target,
+        )?)
+        .map_err(|_| ClosedRelayRefusal::QueueFull)?;
     let (pending, target_share) = PendingEndpointKeyAgreement::begin_with_runtime(
         runtime,
         &state.identity,
@@ -1817,16 +2731,32 @@ pub(crate) fn accept_offer(
         &profile,
     )?;
     let session = pending.finish(requester_share)?;
+    let accept = ClosedRelayControl::Accept {
+        version: *version,
+        context_id: *context_id,
+        requester: requester.clone(),
+        relay: relay.clone(),
+        target: target.clone(),
+        session_id: *session_id,
+        allocation_epoch: *allocation_epoch,
+        target_share,
+    };
+    validate_outbound_control(state, &accept)?;
     let session = EndpointSession::ready(
         state,
-        owner.clone(),
-        *context_id,
-        requester.clone(),
-        relay.clone(),
-        target.clone(),
-        *session_id,
+        EndpointSessionRoute {
+            relay_owner: owner.clone(),
+            relay_witness,
+            context: *context_id,
+            requester: requester.clone(),
+            relay: relay.clone(),
+            target: target.clone(),
+            session_id: *session_id,
+            allocation_epoch: *allocation_epoch,
+        },
         session,
-        endpoint_capacity(state)?,
+        capacity,
+        lease,
     );
     state.insert_closed_relay_endpoint(session.clone())?;
     if let Err(error) = state.publish_closed_relay_target_accept(session.clone()) {
@@ -1834,18 +2764,12 @@ pub(crate) fn accept_offer(
         session.mark_closed();
         return Err(error);
     }
-    Ok((
-        ClosedRelayControl::Accept {
-            version: *version,
-            context_id: *context_id,
-            requester: requester.clone(),
-            relay: relay.clone(),
-            target: target.clone(),
-            session_id: *session_id,
-            target_share,
-        },
-        session,
-    ))
+    // The accepted session is now owned only by the two registries until a
+    // consumer takes it; this constructor-local wrapper is not public
+    // custody and must not cancel the queued handoff when it drops.
+    let mut session = session;
+    session.disarm_public();
+    Ok((accept, session))
 }
 
 fn validate_data_for_direction(
@@ -1864,6 +2788,7 @@ fn validate_data_for_direction(
         relay: data.relay.clone(),
         target: data.target.clone(),
         session_id: data.session_id,
+        allocation_epoch: data.allocation_epoch,
     }
     .validate()
     .map_err(|error| invalid(format!("invalid Closed relay data: {error}")))?;
@@ -1886,6 +2811,24 @@ fn validate_data_for_direction(
     Ok(())
 }
 
+fn endpoint_matches_route(
+    session: &EndpointSession,
+    context: &MeshContextId,
+    requester: &DeviceId,
+    relay: &DeviceId,
+    target: &DeviceId,
+    session_id: &[u8; 16],
+    allocation_epoch: u64,
+) -> bool {
+    let metadata = session.metadata();
+    metadata.context == *context
+        && metadata.requester == *requester
+        && metadata.relay == *relay
+        && metadata.target == *target
+        && metadata.session_id == *session_id
+        && metadata.allocation_epoch == allocation_epoch
+}
+
 /// Validate and enqueue one opaque data frame from the exact requester or
 /// target owner. The runtime performs the final packet/queue/bandwidth checks.
 pub(crate) fn on_data(
@@ -1899,6 +2842,19 @@ pub(crate) fn on_data(
     if data.context_id != state.mesh_context_id() || data.relay != local {
         return Err(invalid("data is not bound to this local relay"));
     }
+    let (context_id, requester, relay, target, allocation_epoch) = state
+        .closed_relay_route(data.session_id)
+        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+    let expected_route = crate::protocol::relay::ClosedRelayRoute::with_epoch(
+        context_id,
+        requester,
+        relay,
+        target,
+        data.session_id,
+        allocation_epoch,
+    );
+    data.validate_against_route(&expected_route)
+        .map_err(|error| invalid(format!("closed relay data route mismatch: {error}")))?;
     let direction = if owner.device_id() == data.requester.base32().as_str() {
         RelayDirection::RequesterToTarget
     } else if owner.device_id() == data.target.base32().as_str() {
@@ -1942,7 +2898,22 @@ pub(crate) async fn handle_data(
     validate_data_for_direction(&data, max_frame_ciphertext(state)?, direction)?;
     canonical_route_admitted(state, &data.requester, &data.relay, &data.target)?;
     let _ = current_owner_witness(state, owner, &data.relay)?;
-    state.deliver_closed_relay_endpoint(data.session_id, data.packet)
+    let session = state
+        .closed_relay_endpoint(data.session_id)
+        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+    if !endpoint_matches_route(
+        &session,
+        &data.context_id,
+        &data.requester,
+        &data.relay,
+        &data.target,
+        &data.session_id,
+        data.allocation_epoch,
+    ) {
+        return Err(ClosedRelayRefusal::OwnerMismatch);
+    }
+    let route = data.route();
+    state.deliver_closed_relay_endpoint(data.session_id, &route, data.packet)
 }
 
 /// Drain one packet from the exact B-side allocation and emit it to the
@@ -1955,17 +2926,64 @@ pub(crate) async fn forward_closed_relay_data(
     session_id: [u8; 16],
     direction: RelayDirection,
 ) -> Result<bool, ClosedRelayRefusal> {
-    let Some(packet) = state.recv_closed_relay(session_id, direction).await else {
-        return Ok(false);
-    };
-    let Some((context_id, requester, relay, target)) = state.closed_relay_route(session_id) else {
-        return Err(ClosedRelayRefusal::OwnerNotLive);
-    };
+    // Capture the destination owner before the receive await.  A lookup after
+    // that await could silently substitute a successor installation for the
+    // owner that authenticated this allocation.
+    let (captured_context, captured_requester, captured_relay, captured_target, captured_epoch) =
+        state
+            .closed_relay_route(session_id)
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
     let destination = match direction {
-        RelayDirection::RequesterToTarget => target.clone(),
-        RelayDirection::TargetToRequester => requester.clone(),
+        RelayDirection::RequesterToTarget => captured_target.clone(),
+        RelayDirection::TargetToRequester => captured_requester.clone(),
     };
     let destination_owner = current_owner_for_device(state, &destination)?;
+    let Some((
+        packet,
+        received_context,
+        received_requester,
+        received_relay,
+        received_target,
+        received_epoch,
+        generation,
+    )) = state.recv_closed_relay(session_id, direction).await
+    else {
+        return Ok(false);
+    };
+    let Some((context_id, requester, relay, target, allocation_epoch)) =
+        state.closed_relay_route_if_generation(session_id, &generation)
+    else {
+        let _ = state.retire_closed_relay_exact(session_id, &generation);
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    };
+    if (
+        context_id,
+        requester.clone(),
+        relay.clone(),
+        target.clone(),
+        allocation_epoch,
+    ) != (
+        captured_context,
+        captured_requester,
+        captured_relay,
+        captured_target,
+        captured_epoch,
+    ) || (
+        context_id,
+        requester.clone(),
+        relay.clone(),
+        target.clone(),
+        allocation_epoch,
+    ) != (
+        received_context,
+        received_requester,
+        received_relay,
+        received_target,
+        received_epoch,
+    ) {
+        let _ = state.retire_closed_relay_exact(session_id, &generation);
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    }
     let data = ClosedRelayData {
         version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
         context_id,
@@ -1973,15 +2991,20 @@ pub(crate) async fn forward_closed_relay_data(
         relay,
         target,
         session_id,
+        allocation_epoch,
         packet,
     };
-    super::send_to_peer_owner(
+    if super::send_to_peer_owner(
         state,
         &destination_owner,
         &crate::protocol::MeshMessage::ClosedRelayData(data),
     )
     .await
-    .map_err(|_| ClosedRelayRefusal::CarrierUnavailable)?;
+    .is_err()
+    {
+        let _ = state.settle_closed_relay_exact(session_id, &generation);
+        return Err(ClosedRelayRefusal::CarrierUnavailable);
+    }
     Ok(true)
 }
 
@@ -2040,6 +3063,7 @@ mod tests {
             relay,
             target: target.clone(),
             session_id,
+            allocation_epoch: 1,
             packet: OpaqueRelayPacket {
                 version: crate::protocol::relay::OPAQUE_RELAY_VERSION,
                 mesh: context.to_string(),
@@ -2056,5 +3080,75 @@ mod tests {
             validate_data_for_direction(&data, 32, RelayDirection::RequesterToTarget),
             Err(ClosedRelayRefusal::InvalidPacket(_))
         ));
+    }
+
+    #[test]
+    fn outbound_control_accepts_exact_encoded_bound_and_refuses_one_byte_less() {
+        let context = MeshContextId::from_bytes([8; 32]);
+        let control = ClosedRelayControl::Close {
+            version: crate::protocol::relay::CLOSED_RELAY_CONTROL_VERSION,
+            context_id: context,
+            requester: device(1),
+            relay: device(2),
+            target: device(3),
+            session_id: [10; 16],
+            allocation_epoch: 1,
+        };
+        let encoded = control.encoded_len().expect("close control encodes");
+        let exact = ClosedRelayPolicyConfig {
+            enabled: true,
+            max_control_bytes: u64::try_from(encoded).expect("encoded length fits u64"),
+            pending_handshake_timeout_ms: ClosedRelayPolicyConfig::default()
+                .pending_handshake_timeout_ms,
+            ..ClosedRelayPolicyConfig::default()
+        };
+        assert!(exact.validate_closed_relay_control(&control));
+        let below = ClosedRelayPolicyConfig {
+            max_control_bytes: u64::try_from(encoded - 1).expect("encoded length fits u64"),
+            pending_handshake_timeout_ms: exact.pending_handshake_timeout_ms,
+            ..exact
+        };
+        assert!(!below.validate_closed_relay_control(&control));
+    }
+
+    #[test]
+    fn endpoint_claim_covers_replay_queue_and_retained_route_storage() {
+        let context = MeshContextId::from_bytes([11; 32]);
+        let requester = device(11);
+        let relay = device(12);
+        let target = device(13);
+        let profile = ClosedRelayPolicyConfig {
+            enabled: true,
+            replay_window: 5,
+            max_frame_ciphertext_bytes: 31,
+            pending_handshake_timeout_ms: ClosedRelayPolicyConfig::default()
+                .pending_handshake_timeout_ms,
+            ..ClosedRelayPolicyConfig::default()
+        };
+        let one = endpoint_lease_claim(&profile, 1, &context, &requester, &relay, &target)
+            .expect("one endpoint claim");
+        let two = endpoint_lease_claim(&profile, 2, &context, &requester, &relay, &target)
+            .expect("two endpoint claim");
+        assert_eq!(
+            two.amount(ResourceClass::QueuedBytes),
+            one.amount(ResourceClass::QueuedBytes)
+                + u64::try_from(
+                    crate::runtime::relay::checked_ciphertext_ceiling(
+                        profile.max_frame_ciphertext_bytes,
+                    )
+                    .expect("ciphertext ceiling"),
+                )
+                .expect("ciphertext ceiling fits the claim amount")
+        );
+        assert!(
+            two.amount(ResourceClass::AccountedMemoryBytes)
+                > one.amount(ResourceClass::AccountedMemoryBytes),
+            "each retained packet must charge its metadata and queue slot"
+        );
+        assert!(
+            two.amount(ResourceClass::OpaqueDependencyResidual)
+                > one.amount(ResourceClass::OpaqueDependencyResidual),
+            "each retained packet allocation must be observed"
+        );
     }
 }

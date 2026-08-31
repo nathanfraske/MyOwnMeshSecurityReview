@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::transport_lab::NetworkState;
@@ -41,7 +41,6 @@ use myownmesh_core::engine::transport_lab::{
     attach_local, channel, join_open_participation, spawn_network,
 };
 use myownmesh_core::identity::Identity;
-use myownmesh_core::network_state::NetworkKind;
 use myownmesh_core::transport::Transport;
 use myownmesh_signaling::local::LocalBroker;
 use tokio::time::Instant;
@@ -56,8 +55,11 @@ fn silent_cfg(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: NETWORK_ID.into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),

@@ -36,7 +36,7 @@
 //! thing in one shot — check, download, verify, apply both binaries —
 //! mirroring MyOwnLLM's single `myownllm update` command.
 
-pub mod policy;
+mod policy;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -72,6 +72,8 @@ pub fn default_release_api_beta() -> &'static str {
 }
 
 const USER_AGENT: &str = concat!("myownmesh-self-update/", env!("CARGO_PKG_VERSION"));
+
+const SECONDS_PER_HOUR: u64 = 60 * 60;
 
 /// The minisign public key releases are signed with, baked in at build time.
 /// `None` until release signing is configured (set `MYOWNMESH_RELEASE_PUBKEY`
@@ -203,6 +205,8 @@ pub struct UpdateStatus {
     pub channel: String,
     pub auto_apply: String,
     pub check_interval_hours: u32,
+    pub feed_request_timeout_ms: u64,
+    pub artifact_download_timeout_ms: u64,
     /// Unix seconds of the last successful feed check, if any.
     pub last_check_at: Option<i64>,
     /// Version staged at `~/.myownmesh/updates/<version>/` waiting to be
@@ -413,7 +417,7 @@ fn resolve_apply_target(kind: ArtifactKind) -> Result<Option<PathBuf>> {
 /// disabled-via-config short-circuit still applies. Stages a permitted
 /// update; never applies (that happens on next launch).
 pub async fn check_now(force: bool) -> Result<CheckOutcome> {
-    let au = load_auto_update().unwrap_or_default();
+    let au = load_valid_auto_update()?;
     if !au.enabled || env_disabled() {
         return Ok(CheckOutcome::Disabled);
     }
@@ -452,7 +456,7 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
     if gui_needs_update(&latest) {
         want.push(ArtifactKind::Gui);
     }
-    stage_release(&release, &latest, &want).await?;
+    stage_release(&release, &latest, &want, &au).await?;
     Ok(CheckOutcome::Staged { version: latest })
 }
 
@@ -469,12 +473,12 @@ pub async fn check_now(force: bool) -> Result<CheckOutcome> {
 /// disk immediately and reports what changed; the running processes keep
 /// their old code until restarted.
 pub async fn update_now() -> Result<UpdateNowOutcome> {
+    let au = load_valid_auto_update()?;
     if detect_install_kind() == InstallKind::PackageManager {
         mark_pm_detected();
         return Ok(UpdateNowOutcome::PackageManager);
     }
 
-    let au = load_auto_update().unwrap_or_default();
     let release = fetch_release(&au).await?;
     let latest = release["tag_name"]
         .as_str()
@@ -495,7 +499,7 @@ pub async fn update_now() -> Result<UpdateNowOutcome> {
     }
 
     stamp_check_now()?;
-    let kinds = stage_release(&release, &latest, &want).await?;
+    let kinds = stage_release(&release, &latest, &want, &au).await?;
     // Apply right now rather than waiting for the next launch.
     apply_now()?;
 
@@ -521,6 +525,8 @@ pub fn status() -> Result<UpdateStatus> {
         channel: au.channel.clone(),
         auto_apply: au.auto_apply.clone(),
         check_interval_hours: au.check_interval_hours,
+        feed_request_timeout_ms: au.feed_request_timeout_ms,
+        artifact_download_timeout_ms: au.artifact_download_timeout_ms,
         last_check_at: last_check_at(),
         staged_version: staged_version(),
         release_url: resolve_release_url(&au),
@@ -552,6 +558,8 @@ pub struct UpdatePrefs {
     pub channel: Option<String>,
     pub auto_apply: Option<String>,
     pub check_interval_hours: Option<u32>,
+    pub feed_request_timeout_ms: Option<u64>,
+    pub artifact_download_timeout_ms: Option<u64>,
     pub stable_url: Option<String>,
     pub beta_url: Option<String>,
 }
@@ -567,6 +575,8 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
         channel,
         auto_apply,
         check_interval_hours,
+        feed_request_timeout_ms,
+        artifact_download_timeout_ms,
         stable_url,
         beta_url,
     } = prefs;
@@ -585,6 +595,21 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
             )));
         }
     }
+    if matches!(check_interval_hours, Some(0)) {
+        return Err(Error::msg(
+            "auto_update.check_interval_hours must be non-zero",
+        ));
+    }
+    if matches!(feed_request_timeout_ms, Some(0)) {
+        return Err(Error::msg(
+            "auto_update.feed_request_timeout_ms must be non-zero",
+        ));
+    }
+    if matches!(artifact_download_timeout_ms, Some(0)) {
+        return Err(Error::msg(
+            "auto_update.artifact_download_timeout_ms must be non-zero",
+        ));
+    }
 
     MeshConfig::transaction(|cfg| {
         let au = &mut cfg.auto_update;
@@ -598,9 +623,13 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
             au.auto_apply = v;
         }
         if let Some(v) = check_interval_hours {
-            // Clamp to a sane floor so a fat-fingered 0 doesn't spin the
-            // background ticker hot.
-            au.check_interval_hours = v.max(1);
+            au.check_interval_hours = v;
+        }
+        if let Some(v) = feed_request_timeout_ms {
+            au.feed_request_timeout_ms = v;
+        }
+        if let Some(v) = artifact_download_timeout_ms {
+            au.artifact_download_timeout_ms = v;
         }
         if let Some(v) = stable_url {
             au.stable_url = normalise_url_override(v);
@@ -608,6 +637,7 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
         if let Some(v) = beta_url {
             au.beta_url = normalise_url_override(v);
         }
+        au.validate()?;
         Ok(())
     })?;
     status()
@@ -626,11 +656,9 @@ fn normalise_url_override(v: String) -> Option<String> {
 
 /// Background ticker. Runs forever; checks the feed at the configured
 /// interval (re-read each loop so a config edit takes effect without a
-/// restart). The first check fires shortly after launch.
+/// restart). The first check runs immediately; the configured cadence is the
+/// only background scheduling policy.
 pub async fn tick_forever() {
-    // Let a fresh daemon finish binding its sockets before we hit the
-    // network.
-    tokio::time::sleep(Duration::from_secs(30)).await;
     loop {
         match check_now(false).await {
             Ok(CheckOutcome::Staged { version }) => {
@@ -639,11 +667,21 @@ pub async fn tick_forever() {
             Ok(_) => {}
             Err(e) => tracing::warn!("self-update check failed: {e}"),
         }
-        let hours = load_auto_update()
-            .map(|a| a.check_interval_hours)
-            .unwrap_or(6)
-            .max(1);
-        tokio::time::sleep(Duration::from_secs(hours as u64 * 3600)).await;
+        let hours = match load_valid_auto_update() {
+            Ok(a) => a.check_interval_hours,
+            Err(e) => {
+                tracing::error!("self-update ticker stopped: invalid config: {e}");
+                break;
+            }
+        };
+        let delay = match check_interval_duration(hours) {
+            Ok(delay) => delay,
+            Err(e) => {
+                tracing::error!("self-update ticker stopped: invalid check interval: {e}");
+                break;
+            }
+        };
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -653,6 +691,23 @@ pub async fn tick_forever() {
 
 fn load_auto_update() -> Result<AutoUpdateConfig> {
     Ok(MeshConfig::load()?.auto_update)
+}
+
+/// Load the owner policy for a side-effecting updater operation. The core
+/// config loader deliberately quarantines malformed files for daemon startup;
+/// an updater mutation must fail closed instead, before package markers,
+/// check markers, clients, or staging directories can be touched. Reparse the
+/// existing source as a read-only preflight, then use the canonical loader for
+/// the actual transaction and validate its timing policy.
+fn load_valid_auto_update() -> Result<AutoUpdateConfig> {
+    let path = myownmesh_core::dirs::config_path()?;
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path)?;
+        let _: MeshConfig = serde_json::from_str(&raw)?;
+    }
+    let au = load_auto_update()?;
+    au.validate()?;
+    Ok(au)
 }
 
 /// `MYOWNMESH_AUTOUPDATE=0` (or `false`) hard-disables self-update,
@@ -746,7 +801,7 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
 
 async fn fetch_release(au: &AutoUpdateConfig) -> Result<Value> {
     let url = resolve_release_url(au);
-    let client = http_client(Duration::from_secs(15))?;
+    let client = http_client(au.feed_request_timeout()?)?;
     let resp = client.get(&url).send().await?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
@@ -1080,14 +1135,16 @@ async fn stage_release(
     release: &Value,
     version: &str,
     want: &[ArtifactKind],
+    au: &AutoUpdateConfig,
 ) -> Result<Vec<ArtifactKind>> {
     let assets = release["assets"]
         .as_array()
         .ok_or_else(|| Error::msg("release missing assets"))?;
 
+    let artifact_timeout = au.artifact_download_timeout()?;
     let updates_dir = myownmesh_core::dirs::updates_dir()?.join(version);
     std::fs::create_dir_all(&updates_dir)?;
-    let client = http_client(Duration::from_secs(300))?;
+    let client = http_client(artifact_timeout)?;
 
     let mut staged: Vec<StagedArtifact> = Vec::new();
 
@@ -1500,6 +1557,19 @@ fn check_marker_path() -> Result<PathBuf> {
     Ok(myownmesh_core::dirs::updates_dir()?.join("last-check"))
 }
 
+fn check_interval_duration(interval_hours: u32) -> Result<Duration> {
+    if interval_hours == 0 {
+        return Err(Error::msg(
+            "auto_update.check_interval_hours must be non-zero",
+        ));
+    }
+    let hours = u64::from(interval_hours);
+    let seconds = hours
+        .checked_mul(SECONDS_PER_HOUR)
+        .ok_or_else(|| Error::msg("update check interval overflows duration"))?;
+    Ok(Duration::from_secs(seconds))
+}
+
 fn is_due(interval_hours: u32) -> Result<bool> {
     let path = check_marker_path()?;
     if !path.exists() {
@@ -1507,8 +1577,12 @@ fn is_due(interval_hours: u32) -> Result<bool> {
     }
     let s = std::fs::read_to_string(&path).unwrap_or_default();
     let prev = s.trim().parse::<i64>().unwrap_or(0);
-    let elapsed_h = (unix_secs() - prev) as f64 / 3600.0;
-    Ok(elapsed_h >= interval_hours as f64)
+    let now = unix_secs();
+    if prev > now {
+        return Ok(false);
+    }
+    let elapsed = u64::try_from(now.saturating_sub(prev)).unwrap_or(0);
+    Ok(elapsed >= check_interval_duration(interval_hours)?.as_secs())
 }
 
 fn stamp_check_now() -> Result<()> {
@@ -1615,6 +1689,33 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static UPDATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn request_counter_server() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the local request observer binds");
+        let url = format!("http://{}/releases", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                observed.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (url, requests, task)
+    }
+
+    fn assert_no_update_effects(updates: &std::path::Path) {
+        assert!(!updates.exists(), "the updates root must remain absent");
+        assert!(!updates.join("pm-detected.flag").exists());
+        assert!(!updates.join("last-check").exists());
+        assert!(!updates.join("pending.json").exists());
+    }
 
     #[test]
     fn signature_verification_fails_closed_on_garbage() {
@@ -1730,6 +1831,38 @@ mod tests {
     }
 
     #[test]
+    fn updater_timing_policy_and_interval_are_explicit_and_checked() {
+        let config = AutoUpdateConfig::default();
+        config.validate().expect("default updater policy is valid");
+        assert_eq!(
+            config.feed_request_timeout().unwrap(),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            config.artifact_download_timeout().unwrap(),
+            Duration::from_millis(300_000)
+        );
+        assert_eq!(
+            check_interval_duration(0)
+                .expect_err("zero interval must be refused")
+                .to_string(),
+            "auto_update.check_interval_hours must be non-zero"
+        );
+        assert_eq!(
+            check_interval_duration(u32::MAX)
+                .expect("u32 hours fit in the checked duration conversion")
+                .as_secs(),
+            u64::from(u32::MAX) * SECONDS_PER_HOUR
+        );
+        assert!(AutoUpdateConfig {
+            feed_request_timeout_ms: 0,
+            ..config
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
     fn sidecars_are_rejected() {
         assert!(is_sidecar_asset("myownmesh-linux-x86_64.tar.gz.sha256"));
         assert!(is_sidecar_asset("thing.sig"));
@@ -1773,6 +1906,7 @@ mod tests {
     fn set_prefs_validates_and_persists() {
         // One tempdir, one sequential test: MYOWNMESH_HOME is process
         // global, so we don't want two of these racing.
+        let _guard = UPDATE_TEST_LOCK.lock().expect("updater test lock");
         let tmp = tempfile::tempdir().expect("tempdir");
         std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
@@ -1787,12 +1921,43 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+        assert!(set_prefs(UpdatePrefs {
+            check_interval_hours: Some(0),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(set_prefs(UpdatePrefs {
+            feed_request_timeout_ms: Some(0),
+            ..Default::default()
+        })
+        .is_err());
+
+        // Mutation paths preflight malformed source bytes before the core
+        // loader's startup quarantine policy can substitute defaults. No
+        // package marker or staging root may be created on this refusal.
+        let config_path = myownmesh_core::dirs::config_path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("config parent")).unwrap();
+        std::fs::write(&config_path, b"{").unwrap();
+        assert!(load_valid_auto_update().is_err());
+        let updates = myownmesh_core::dirs::updates_dir().expect("updates path");
+        assert!(!updates.exists());
+
+        let mut invalid = myownmesh_core::MeshConfig::default();
+        invalid.auto_update.feed_request_timeout_ms = 0;
+        std::fs::write(&config_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(load_valid_auto_update().is_err());
+        assert!(!updates.exists());
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&myownmesh_core::MeshConfig::default()).unwrap(),
+        )
+        .unwrap();
 
         // A valid partial edit persists and is reflected in status.
         let st = set_prefs(UpdatePrefs {
             channel: Some("beta".into()),
             auto_apply: Some("minor".into()),
-            check_interval_hours: Some(0), // clamps up to 1
+            check_interval_hours: Some(1),
             beta_url: Some("https://vendor.example/releases".into()),
             ..Default::default()
         })
@@ -1812,6 +1977,66 @@ mod tests {
         assert!(!st.release_url_overridden);
         assert_eq!(st.release_url, default_release_api_beta());
 
+        std::env::remove_var("MYOWNMESH_HOME");
+    }
+
+    #[tokio::test]
+    async fn public_mutations_refuse_malformed_config_before_any_effect() {
+        let _guard = UPDATE_TEST_LOCK.lock().expect("updater test lock");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("MYOWNMESH_HOME", tmp.path());
+        let (_url, requests, server) = request_counter_server().await;
+        let config_path = myownmesh_core::dirs::config_path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("config parent")).unwrap();
+        std::fs::write(&config_path, b"{").unwrap();
+        let updates = myownmesh_core::dirs::updates_dir().expect("updates path");
+
+        assert!(check_now(true).await.is_err());
+        assert!(update_now().await.is_err());
+        assert_no_update_effects(&updates);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "malformed config is refused before any network request"
+        );
+
+        server.abort();
+        assert!(server
+            .await
+            .expect_err("the observer was cancelled")
+            .is_cancelled());
+        std::env::remove_var("MYOWNMESH_HOME");
+    }
+
+    #[tokio::test]
+    async fn public_mutations_refuse_zero_feed_timeout_before_any_effect() {
+        let _guard = UPDATE_TEST_LOCK.lock().expect("updater test lock");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("MYOWNMESH_HOME", tmp.path());
+        let (url, requests, server) = request_counter_server().await;
+        let config_path = myownmesh_core::dirs::config_path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("config parent")).unwrap();
+        let mut config = myownmesh_core::MeshConfig::default();
+        config.auto_update.enabled = true;
+        config.auto_update.stable_url = Some(url);
+        config.auto_update.feed_request_timeout_ms = 0;
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let updates = myownmesh_core::dirs::updates_dir().expect("updates path");
+
+        assert!(check_now(true).await.is_err());
+        assert!(update_now().await.is_err());
+        assert_no_update_effects(&updates);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "zero feed timeout is refused before constructing the network client"
+        );
+
+        server.abort();
+        assert!(server
+            .await
+            .expect_err("the observer was cancelled")
+            .is_cancelled());
         std::env::remove_var("MYOWNMESH_HOME");
     }
 

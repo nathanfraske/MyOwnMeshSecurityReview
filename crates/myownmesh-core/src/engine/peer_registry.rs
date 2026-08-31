@@ -558,9 +558,36 @@ impl PeerRegistry {
         broker: &SessionBroker,
         mesh_context: &str,
     ) -> bool {
+        // Every production caller currently enters through the mutation
+        // fence, but keep the install boundary self-enforcing as well.  A
+        // delayed W0 owner must not promote against the W1 installation that
+        // reused its device id, even if a future caller forgets to repeat this
+        // check before reaching the common promotion funnel.  The map entry,
+        // installation marker, binding coordinate and optional worker are one
+        // exact identity; no device-only lookup can substitute a successor.
+        let Some(current) = self.peers.get(owner.device_id()) else {
+            return false;
+        };
+        let exact_owner = Arc::ptr_eq(&current.value().peer, peer)
+            && Arc::ptr_eq(&current.value().installation, &owner.installation)
+            && current.value().binding_epoch == owner.binding_epoch
+            && self.binding_namespace == owner.binding_namespace
+            && owner.worker_matches(&current.value().peer);
+        drop(current);
+        if !exact_owner {
+            return false;
+        }
         let durable_policy = self.policy_admits(owner.device_id());
-        let policy_admits =
-            durable_policy && (peer.holds_promoted_session() || peer.state.read().is_admitted());
+        let phase_admits = {
+            let data = peer.state.read();
+            matches!(
+                data.status,
+                super::connection::PeerStatus::Active | super::connection::PeerStatus::Shelved
+            )
+        };
+        let policy_admits = durable_policy
+            && (peer.holds_promoted_session()
+                || (peer.has_authenticated_channel() && phase_admits));
         // The exact peer fence receives the canonical verdict even for an
         // already-promoted slot. A false verdict is intentionally not merely
         // a refusal hint: `promote_session_if_needed` clears retained session
@@ -792,8 +819,14 @@ impl PeerRegistry {
             }
             Arc::clone(&current.value().peer)
         };
-        let admitted = peer.state.read().is_admitted();
-        admitted
+        let phase_admits = {
+            let data = peer.state.read();
+            matches!(
+                data.status,
+                super::connection::PeerStatus::Active | super::connection::PeerStatus::Shelved
+            )
+        };
+        phase_admits
             && peer.holds_promoted_session()
             && peer.has_usable_session_for_recovery()
             && self.policy_admits(owner.device_id())

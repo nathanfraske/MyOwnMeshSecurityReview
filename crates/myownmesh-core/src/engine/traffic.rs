@@ -23,7 +23,7 @@ pub enum FrameClass {
     /// Handshake + topology negotiation (`hello`, `auth_response`,
     /// `approve`, `deny`, `shelve`, `unshelve`, capabilities).
     Control,
-    /// Roster + governance anti-entropy.
+    /// Governance anti-entropy.
     Gossip,
     /// Application frames: typed channels (plain and acked) + RPC.
     App,
@@ -44,16 +44,12 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::SessionControl(_)
         | MeshMessage::CapabilitiesUpdate(_)
         | MeshMessage::ClosedRelayControl(_) => FrameClass::Control,
-        MeshMessage::NetworkState(_)
-        | MeshMessage::Fact(_)
+        MeshMessage::Fact(_)
         | MeshMessage::FactBundle(_)
         | MeshMessage::FactInventory(_)
         | MeshMessage::FactRequest(_)
         | MeshMessage::ProofDelivery(_)
-        | MeshMessage::ProofAck(_)
-        | MeshMessage::RosterSummary(_)
-        | MeshMessage::RosterRequest(_)
-        | MeshMessage::RosterEntries(_) => FrameClass::Gossip,
+        | MeshMessage::ProofAck(_) => FrameClass::Gossip,
         MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }

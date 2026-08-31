@@ -29,22 +29,26 @@
 use std::sync::Arc;
 
 use crate::config::NetworkConfig;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::state::NetworkState;
 
 /// Returns `true` when the new config differs from the current one in a
 /// way that can't be applied to a running network — `network_id`
 /// (a different network), `signaling` (the relay set the Nostr driver
-/// is bound to), or `closed_relay` (the provider-backed runtime profile).
-/// STUN/TURN, topology, label, roster, and auto-approve are all applied in
-/// place by [`apply_hot`] without dropping peers.
+/// is bound to), `closed_relay` (the provider-backed runtime profile), or
+/// any construction-time scheduler/broadcast capacity. STUN/TURN, topology,
+/// label, roster, and auto-approve are all applied in place by [`apply_hot`]
+/// without dropping peers.
 /// Changes to `closed_relay` require restart because its provider-backed
 /// runtime profile is fixed when `NetworkState` is constructed.
 pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
     current.network_id != next.network_id
         || current.signaling != next.signaling
         || current.closed_relay != next.closed_relay
+        || current.scheduler != next.scheduler
+        || current.event_capacity != next.event_capacity
+        || current.connection_trace_capacity != next.connection_trace_capacity
 }
 
 /// Apply the hot-reloadable subset of config without tearing down
@@ -54,6 +58,11 @@ pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
 pub fn apply_hot(state: &Arc<NetworkState>, next: NetworkConfig) -> Result<()> {
     {
         let mut cfg = state.config.write();
+        if requires_restart(&cfg, &next) {
+            return Err(Error::Config(
+                "network config change requires an exact runtime replacement".into(),
+            ));
+        }
         cfg.label = next.label;
         cfg.topology = next.topology.clone();
         cfg.auto_approve = next.auto_approve;
@@ -127,9 +136,54 @@ mod tests {
     }
 
     #[test]
+    fn construction_time_runtime_resources_require_exact_replacement() {
+        let current = base_config();
+
+        let mut scheduler = current.clone();
+        scheduler.scheduler.heartbeat_interval_ms += 1;
+        assert!(requires_restart(&current, &scheduler));
+
+        let mut events = current.clone();
+        events.event_capacity += 1;
+        assert!(requires_restart(&current, &events));
+
+        let mut traces = current.clone();
+        traces.connection_trace_capacity += 1;
+        assert!(requires_restart(&current, &traces));
+    }
+
+    #[test]
+    fn label_only_hot_update_keeps_runtime_identity() {
+        let state = super::super::build_test_state("reconcile-label");
+        let current = state.config.read().clone();
+        let mut next = current.clone();
+        next.label = "updated-label".into();
+        assert!(!requires_restart(&current, &next));
+        let state_identity = Arc::as_ptr(&state);
+
+        apply_hot(&state, next).expect("label-only apply_hot");
+
+        assert_eq!(Arc::as_ptr(&state), state_identity);
+        assert_eq!(state.config.read().label, "updated-label");
+    }
+
+    #[test]
+    fn construction_time_change_is_refused_by_hot_path() {
+        let state = super::super::build_test_state("reconcile-capacity");
+        let current = state.config.read().clone();
+        let mut next = current.clone();
+        next.event_capacity += 1;
+
+        assert!(apply_hot(&state, next).is_err());
+        assert_eq!(state.config.read().event_capacity, current.event_capacity);
+    }
+
+    #[test]
     fn apply_hot_updates_ice_servers_in_place() {
         let state = super::super::build_test_state("reconcile-hot");
+        let state_identity = Arc::as_ptr(&state);
         let mut next = state.config.read().clone();
+        next.label = "updated-label".into();
         next.turn_servers = vec![TurnServer {
             urls: vec!["turn:fresh.example.com:3478".into()],
             username: Some("user".into()),
@@ -140,6 +194,12 @@ mod tests {
         }];
 
         apply_hot(&state, next).expect("apply_hot");
+
+        assert_eq!(
+            Arc::as_ptr(&state),
+            state_identity,
+            "label-only hot updates preserve the existing runtime Arc"
+        );
 
         let cfg = state.config.read();
         assert_eq!(cfg.turn_servers.len(), 1);

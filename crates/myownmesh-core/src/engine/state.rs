@@ -3,7 +3,8 @@
 //! engine; all per-peer state mutation is funneled through the
 //! command queue so the driver loop owns serial access.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -62,15 +63,13 @@ fn next_non_wrapping(counter: &AtomicU64) -> Option<u64> {
 
 use crate::config::{NetworkConfig, TopologyMode};
 use crate::error::{Error, Result};
-use crate::events::{DiagEntry, DiagLevel, DropReason, MeshEvent, MeshPhase, PhaseEvent};
+use crate::events::{DiagEntry, DiagLevel, MeshEvent, MeshPhase, PhaseEvent};
 use crate::identity::Identity;
-use crate::protocol::{rpc::RpcRequestMessage, CapabilityAdvert};
 use crate::resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-    LocalApplicationResourceScope, MeshRuntimeResourceScope, NetworkInstanceResourceScope,
-    ResourceClaim, ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxReceiver, ResourceMailboxSender, ResourceReport,
-    ResourceUnavailable,
+    strings_measure, LocalApplicationResourceScope, MailboxMeasurement, MeshRuntimeResourceScope,
+    NetworkInstanceResourceScope, ResourceClaim, ResourceClaimArithmeticError, ResourceClass,
+    ResourceLease, ResourceMailboxItem, ResourceMailboxItemError, ResourceMailboxReceiver,
+    ResourceMailboxSender, ResourceReport, ResourceUnavailable,
 };
 use crate::roster::Roster;
 use crate::runtime::session_broker::SessionBroker;
@@ -82,14 +81,15 @@ use crate::transport::webrtc::{
 };
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{broadcast, oneshot, watch};
-#[cfg(feature = "transport-lab")]
+use tokio::sync::{broadcast, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+use super::carrier_state::CarrierAttemptList;
 use super::carrier_state::{
-    CarrierAttemptCarrier, CarrierAttemptList, CarrierAttemptNode, CarrierInstanceList,
-    CarrierInstanceNode, CarrierState, RecoveryCohort, RecoveryCohortCause,
-    RecoveryCohortCauseList, RecoveryCohortGeneration, RecoveryPublication,
+    CarrierAttemptCarrier, CarrierAttemptNode, CarrierInstanceList, CarrierInstanceNode,
+    CarrierState, RecoveryCohort, RecoveryCohortCause, RecoveryCohortCauseList,
+    RecoveryCohortGeneration, RecoveryPublication,
 };
 pub(crate) use super::carrier_state::{
     CarrierEmissionAdmission, CarrierEmissionRecord, CarrierEmissionSettlement,
@@ -104,6 +104,22 @@ use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
 pub(crate) type AttemptSettlement = Arc<
     dyn Fn(&str, myownmesh_signaling::nostr::delivery::DeliveryTerminal) -> usize + Send + Sync,
 >;
+
+struct PeerEventPumpRegistry {
+    handles: Vec<JoinHandle<()>>,
+    pending_registrations: usize,
+    closed: bool,
+}
+
+impl PeerEventPumpRegistry {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+            pending_registrations: 0,
+            closed: false,
+        }
+    }
+}
 
 /// A synchronous, funded witness for sending one exact Pending proof.  The
 /// witness owns the provider claim and exact endpoint/worker identity; it is
@@ -219,10 +235,12 @@ pub(super) struct SpeculativePromotionCmd {
     pub(super) correlation: String,
 }
 
-impl ResourceMailboxItem for SpeculativePromotionCmd {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for SpeculativePromotionCmd {
+    fn measured_claim(
+        &self,
+    ) -> std::result::Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         let measure = strings_measure([self.correlation.as_str()])?;
-        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+        MailboxMeasurement::from_parts(measure.0, measure.1, measure.2)
     }
 }
 
@@ -230,10 +248,17 @@ impl ResourceMailboxItem for SpeculativePromotionCmd {
 pub(super) fn speculative_promotion_item_charge_for_test(correlation: &str) -> ResourceClaim {
     struct PlanningItem<'a>(&'a str);
 
-    impl crate::resource::ResourceMailboxItemBuilder<SpeculativePromotionCmd> for PlanningItem<'_> {
-        fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+    unsafe impl crate::resource::ResourceMailboxItemBuilder<SpeculativePromotionCmd>
+        for PlanningItem<'_>
+    {
+        fn measured_claim(
+            &self,
+        ) -> std::result::Result<
+            MailboxMeasurement<SpeculativePromotionCmd>,
+            ResourceMailboxItemError,
+        > {
             let measure = strings_measure([self.0])?;
-            mailbox_retained_claim::<SpeculativePromotionCmd>(measure.0, measure.1, measure.2)
+            MailboxMeasurement::from_parts(measure.0, measure.1, measure.2)
         }
 
         fn build(self) -> SpeculativePromotionCmd {
@@ -292,10 +317,6 @@ async fn retire_realtime_remains(
 }
 
 use super::conn_trace::ConnTrace;
-use super::scheduler::{
-    RECONNECTING_GRACE_MS, RECONNECT_RETRY_BACKOFF_MS, RELAY_RESCUE_MIN_INTERVAL_MS,
-};
-
 /// Bookkeeping for an offerer-side reconnect intent. When we drop a peer we
 /// were the *offerer* for (a recoverable `IceFailed`), we keep one of these
 /// in [`NetworkState::reconnect_intents`] and event paths re-offer on a
@@ -308,13 +329,15 @@ use super::scheduler::{
 /// backoff step, never cadence traffic.
 #[derive(Debug, Clone, Copy)]
 pub struct ReconnectIntent {
-    /// Stop retrying after this instant (drop time + `RECONNECTING_GRACE_MS`).
+    /// Stop retrying after this instant (drop time plus the configured
+    /// reconnecting grace).
     /// A sticky intent ignores this — see [`ReconnectIntent::sticky`].
     pub give_up_at: std::time::Instant,
     /// Earliest instant for the next re-offer; advanced by the backoff each
     /// time an event services this intent.
     pub next_retry_at: std::time::Instant,
-    /// Number of re-offers issued so far — indexes `RECONNECT_RETRY_BACKOFF_MS`.
+    /// Number of re-offers issued so far — indexes the configured reconnect
+    /// retry schedule.
     pub attempt: usize,
     /// A pinned peer's intent: never expires, and once the active backoff
     /// schedule is spent it parks (no more event-driven re-offers) and waits
@@ -327,14 +350,21 @@ pub struct ReconnectIntent {
 /// Bump a reconnect intent's backoff after a re-offer: advance the attempt
 /// and push `next_retry_at` out by the next step (saturating at the last
 /// one). One offer per backoff window — never a per-tick publish.
-fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
-    let step = RECONNECT_RETRY_BACKOFF_MS
+fn advance_backoff(
+    intent: &mut ReconnectIntent,
+    now: std::time::Instant,
+    retry_schedule_ms: &[u64; 4],
+) -> bool {
+    let step = retry_schedule_ms
         .get(intent.attempt)
         .copied()
-        .or_else(|| RECONNECT_RETRY_BACKOFF_MS.last().copied())
-        .unwrap_or(15_000);
+        .unwrap_or_else(|| retry_schedule_ms[retry_schedule_ms.len() - 1]);
+    let Some(next_retry_at) = now.checked_add(std::time::Duration::from_millis(step)) else {
+        return false;
+    };
     intent.attempt = intent.attempt.saturating_add(1);
-    intent.next_retry_at = now + std::time::Duration::from_millis(step);
+    intent.next_retry_at = next_retry_at;
+    true
 }
 
 /// Emitted once per session, on the call that minted it — never on reuse and
@@ -342,7 +372,6 @@ fn advance_backoff(intent: &mut ReconnectIntent, now: std::time::Instant) {
 /// announced, so peers keep their sessions and app-level state — this is
 /// answering an inbound offer. Idempotent — a no-op if a live session
 /// how many peers the push reached — so the reply channel was charged for on
-
 pub struct ConnectWaiterRegistration {
     pub(super) id: u64,
     pub(super) reply: oneshot::Sender<Result<()>>,
@@ -564,8 +593,10 @@ impl std::fmt::Debug for SignalingOutbound {
     }
 }
 
-impl ResourceMailboxItem for SignalingOutbound {
-    fn retained_claim(&self) -> std::result::Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for SignalingOutbound {
+    fn measured_claim(
+        &self,
+    ) -> std::result::Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         let measure = match self {
             Self::Announce | Self::RecoveryAnnounce { .. } | Self::Leave => (0, 0, 0),
             Self::Offer {
@@ -597,7 +628,7 @@ impl ResourceMailboxItem for SignalingOutbound {
                 .flatten(),
             )?,
         };
-        mailbox_retained_claim::<Self>(measure.0, measure.1, measure.2)
+        MailboxMeasurement::from_parts(measure.0, measure.1, measure.2)
     }
 }
 
@@ -657,12 +688,32 @@ pub struct NetworkState {
     /// Bounded Open/Offer/Accept custody. Runtime handshake guards remain
     /// owned here until the exact control reaches Accept or is refused.
     closed_relay_pending: Mutex<Option<super::closed_relay::ClosedRelayPendingRegistry>>,
+    /// Every pending-handshake expiry task is retained until it observes the
+    /// matching pending value's cancellation or expires it. Shutdown takes
+    /// this registry before awaiting, so no expiry task is detached.
+    closed_relay_pending_expiries: Mutex<Option<Vec<JoinHandle<()>>>>,
+    /// Finished handles remain owned until their result or panic is observed.
+    closed_relay_pending_expiry_observations: Mutex<Option<Vec<JoinHandle<()>>>>,
+    /// Serializes expiry registration with shutdown's handle extraction.
+    closed_relay_pending_expiry_lifecycle: Mutex<()>,
+    /// Production per-peer event pumps are retained by the network owner until
+    /// their exact worker retirement path has completed.  Keeping the handles
+    /// here prevents a pump's worker `Arc` (and its transport observation)
+    /// from outliving `NetworkState::shutdown`.
+    peer_event_pumps: Mutex<PeerEventPumpRegistry>,
+    peer_event_pump_ready: Notify,
+    peer_event_pump_shutdown_waiting: Notify,
+    peer_event_pump_shutdown_started: AtomicBool,
     /// Bounded endpoint-owned opaque sessions. Endpoint crypto remains here,
     /// never in the relay allocation registry or on the wire.
     closed_relay_endpoints: Mutex<Option<super::closed_relay::ClosedRelayEndpointRegistry>>,
     /// One-consumer handoff for target-side accepted endpoint sessions.
     closed_relay_target_accepts:
         Mutex<Option<super::closed_relay::ClosedRelayTargetAcceptedRegistry>>,
+    /// Public endpoint abandonment is handed here synchronously and drained
+    /// by async engine boundaries. The vector is bounded by the owner-selected
+    /// allocation ceiling; no Drop path spawns an unobserved task.
+    closed_relay_abandonments: Mutex<Option<Vec<super::closed_relay::ClosedRelayAbandonment>>>,
     /// The one durable owner for this instance's canonical graph, projection
     /// commitment, and provisional semantic custody.  Its slot is local
     /// (`config.id`) while the snapshot itself is bound to the immutable
@@ -724,6 +775,10 @@ pub struct NetworkState {
     #[cfg(test)]
     parked_command_receiver: Mutex<Option<ResourceMailboxReceiver<NetworkCmd>>>,
     shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Set only after the shutdown path has released the durable writer
+    /// owner. This is stronger than `shutdown_requested`: callers must not
+    /// purge while teardown is still draining live state.
+    shutdown_complete: std::sync::atomic::AtomicBool,
     shutdown_ready: tokio::sync::Notify,
 
     /// Offerer-side reconnect intents (see [`ReconnectIntent`]). Keyed by
@@ -913,7 +968,7 @@ pub struct NetworkState {
     /// `ice_watchdog::on_checking_timeout`) so a peer that keeps timing
     /// out every `ICE_CHECKING_TIMEOUT_MS` can't redial the relays on
     /// every cycle — one redial per
-    /// [`RELAY_RESCUE_MIN_INTERVAL_MS`] window is enough to recover a
+    /// configured rescue interval is enough to recover a
     /// genuinely-wedged signaling socket without churning healthy ones.
     last_relay_rescue_at: Mutex<Option<std::time::Instant>>,
 
@@ -940,6 +995,16 @@ pub struct NetworkState {
     /// from `MYOWNMESH_CONN_TRACE` at construction (any non-empty value
     /// other than `0` enables it).
     conn_trace_force_on: bool,
+}
+
+/// A linearization witness for work that may mutate peer state or publish a
+/// reactive announce.  The witness is acquired with one atomic observation of
+/// the lifecycle flag; shutdown's store is the corresponding transition.  A
+/// witness acquired before that transition may finish, but no later caller
+/// can enter the operation.  It carries no lock and is therefore safe to hold
+/// across an async cleanup await.
+pub(crate) struct ShutdownMutationPermit<'a> {
+    _state: &'a NetworkState,
 }
 
 impl NetworkState {
@@ -1085,13 +1150,16 @@ impl NetworkState {
             verified_bootstrap.policy(),
             crate::semantic::VerifiedProjectPolicy::Closed(_)
         );
-        let config_is_closed = matches!(config.kind, crate::network_state::NetworkKind::Closed);
+        let config_is_closed = matches!(config.kind, crate::config::NetworkKind::Closed);
         if bootstrap_is_closed != config_is_closed {
             return Err(Error::Network(format!(
                 "verified bootstrap policy shape does not match configured network kind {:?}",
                 config.kind
             )));
         }
+        config
+            .scheduler_policy()
+            .map_err(|error| Error::Network(format!("scheduler policy rejected: {error}")))?;
         let mesh_context_id = verified_bootstrap.context_id();
 
         let pinned: std::collections::HashSet<String> =
@@ -1102,11 +1170,13 @@ impl NetworkState {
         // authority-bearing fact. It therefore remains local configuration.
         let effective_topology = config.topology.clone();
         let topology_impl = crate::topology::from_mode(&effective_topology);
-        let (events_tx, _) = broadcast::channel(256);
+        let event_capacity = config.event_capacity_usize()?;
+        let trace_capacity = config.connection_trace_capacity_usize()?;
+        let (events_tx, _) = broadcast::channel(event_capacity);
         // Deep enough to ride out a transition storm (a sleep/wake
         // fan-out re-handshaking every peer) without the watcher lagging;
         // lossy past that, with a `lagged` marker surfaced to the stream.
-        let (conn_trace_tx, _) = broadcast::channel(512);
+        let (conn_trace_tx, _) = broadcast::channel(trace_capacity);
         let conn_trace_force_on =
             std::env::var("MYOWNMESH_CONN_TRACE").is_ok_and(|v| !v.is_empty() && v != "0");
         let (signaling_tx, signaling_outbound_rx) =
@@ -1178,6 +1248,13 @@ impl NetworkState {
         } else {
             None
         };
+        let closed_relay_pending_expiry_capacity = if config.closed_relay.enabled {
+            usize::try_from(config.closed_relay.max_pending_handshakes).map_err(|_| {
+                Error::Network("closed relay pending expiry registry rejected".into())
+            })?
+        } else {
+            0
+        };
         let closed_relay_endpoints = if config.closed_relay.enabled {
             Some(
                 super::closed_relay::ClosedRelayEndpointRegistry::new(&config.closed_relay)
@@ -1199,6 +1276,16 @@ impl NetworkState {
             )
         } else {
             None
+        };
+        let closed_relay_abandonment_capacity = if config.closed_relay.enabled {
+            usize::try_from(config.closed_relay.max_allocations)
+                .map_err(|_| Error::Network("closed relay abandonment registry rejected".into()))?
+                .checked_mul(2)
+                .ok_or_else(|| {
+                    Error::Network("closed relay abandonment registry rejected".into())
+                })?
+        } else {
+            0
         };
         let durable_root = instance_root
             .clone()
@@ -1251,8 +1338,24 @@ impl NetworkState {
             closed_relay_allocations: Mutex::new(closed_relay_allocations),
             closed_relay_closing: Mutex::new(closed_relay_closing),
             closed_relay_pending: Mutex::new(closed_relay_pending),
+            closed_relay_pending_expiries: Mutex::new(Some(Vec::with_capacity(
+                closed_relay_pending_expiry_capacity,
+            ))),
+            closed_relay_pending_expiry_observations: Mutex::new(Some(Vec::with_capacity(
+                closed_relay_pending_expiry_capacity,
+            ))),
+            closed_relay_pending_expiry_lifecycle: Mutex::new(()),
+            peer_event_pumps: Mutex::new(PeerEventPumpRegistry::new()),
+            peer_event_pump_ready: Notify::new(),
+            peer_event_pump_shutdown_waiting: Notify::new(),
+            peer_event_pump_shutdown_started: AtomicBool::new(false),
             closed_relay_endpoints: Mutex::new(closed_relay_endpoints),
             closed_relay_target_accepts: Mutex::new(closed_relay_target_accepts),
+            closed_relay_abandonments: Mutex::new(if config.closed_relay.enabled {
+                Some(Vec::with_capacity(closed_relay_abandonment_capacity))
+            } else {
+                None
+            }),
             durable_semantic_owner,
             durable_publication_gate: Mutex::new(()),
             durable_provisional: Mutex::new(durable_provisional),
@@ -1276,6 +1379,7 @@ impl NetworkState {
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             recovery_cohort: Mutex::new(RecoveryCohort::new()),
@@ -1306,6 +1410,10 @@ impl NetworkState {
             conn_trace_tx,
             conn_trace_force_on,
         });
+        // Rebuild the compatibility roster from the restored canonical graph
+        // before the state becomes observable. The roster is UI metadata only;
+        // no admission decision may depend on its persisted bytes.
+        super::governance::apply_canonical_projection(&state);
         // A restored canonical eviction must be visible before this state can
         // escape to callers.  The driver repeats this refresh before any
         // announce or dial, but it is spawned asynchronously; deferring the
@@ -1364,33 +1472,6 @@ impl NetworkState {
         &self,
     ) -> Option<&crate::runtime::relay::ClosedRelayRuntime> {
         self.closed_relay_runtime.as_ref()
-    }
-
-    /// Admit one exact A-B-C Closed relay allocation. Semantic binding and
-    /// provider permit issuance happen before this bounded state registry is
-    /// mutated; a refusal therefore leaves both runtime and registry
-    /// unchanged.
-    pub(crate) fn admit_closed_relay(
-        self: &Arc<Self>,
-        requester: crate::semantic::DeviceId,
-        relay: crate::semantic::DeviceId,
-        target: crate::semantic::DeviceId,
-        session_id: [u8; 16],
-    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        let runtime = self
-            .closed_relay_runtime
-            .as_ref()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-        let profile = self.config.read().closed_relay.clone();
-        let admission = super::closed_relay::admit_closed_relay(
-            self, runtime, &profile, requester, relay, target, session_id,
-        )?;
-        self.closed_relay_allocations
-            .lock()
-            .as_mut()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
-            .insert(session_id, admission)
-            .map(|_| ())
     }
 
     pub(crate) fn insert_closed_relay_admission(
@@ -1498,11 +1579,14 @@ impl NetworkState {
         session_id: [u8; 16],
         opposite: &crate::semantic::DeviceId,
         witness: &crate::runtime::session_broker::SessionValidityWitness,
+        allocation_epoch: u64,
     ) -> Option<super::closed_relay::ClosedRelayCloseRecord> {
-        self.closed_relay_closing
-            .lock()
-            .as_mut()?
-            .take(session_id, opposite, witness)
+        self.closed_relay_closing.lock().as_mut()?.take(
+            session_id,
+            opposite,
+            witness,
+            allocation_epoch,
+        )
     }
 
     pub(crate) fn cancel_closed_relay_close(
@@ -1521,6 +1605,7 @@ impl NetworkState {
         generation: super::closed_relay::ClosedRelayGeneration,
         handle: crate::runtime::relay::ClosedRelayHandle,
         terminal: super::closed_relay::ClosedRelayTerminalWitness,
+        lease: ResourceLease,
         control: std::sync::Arc<super::closed_relay::ClosedRelayCheckoutControl>,
     ) {
         let settlement = self
@@ -1528,10 +1613,11 @@ impl NetworkState {
             .lock()
             .as_mut()
             .and_then(|registry| {
-                registry.finish_checkout(session_id, generation, handle, terminal, control)
+                registry.finish_checkout(session_id, generation, handle, terminal, lease, control)
             });
-        if let Some((handle, terminal)) = settlement {
-            let _ = super::closed_relay::settle_closed_relay(handle, terminal);
+        if let Some(admission) = settlement {
+            let _ = super::closed_relay::settle_closed_relay(admission.handle, admission.terminal);
+            drop(admission.lease);
         }
     }
 
@@ -1560,7 +1646,15 @@ impl NetworkState {
         self: &Arc<Self>,
         session_id: [u8; 16],
         direction: crate::runtime::relay::RelayDirection,
-    ) -> Option<crate::protocol::OpaqueRelayPacket> {
+    ) -> Option<(
+        crate::protocol::OpaqueRelayPacket,
+        crate::semantic::MeshContextId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+        u64,
+        super::closed_relay::ClosedRelayGeneration,
+    )> {
         let mut checkout = {
             let mut allocations = self.closed_relay_allocations.lock();
             allocations.as_mut()?.take_checkout(self, session_id)?
@@ -1573,18 +1667,32 @@ impl NetworkState {
             None
         } else {
             tokio::select! {
-                packet = checkout.recv(direction) => packet,
+                packet = checkout.recv(direction) => match packet {
+                    Ok(packet) => packet,
+                    Err(_) => {
+                        checkout.control().request_close();
+                        None
+                    }
+                },
                 _ = &mut closing_notified => None,
                 _ = self.wait_for_shutdown() => None,
             }
         };
+        if packet.is_none() {
+            checkout.control().request_close();
+        }
         if self
             .shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
         {
             checkout.control().request_close();
         }
-        packet
+        packet.map(|packet| {
+            let (route, generation) = checkout.route_and_generation();
+            (
+                packet, route.0, route.1, route.2, route.3, route.4, generation,
+            )
+        })
     }
 
     pub(crate) fn closed_relay_route(
@@ -1595,11 +1703,44 @@ impl NetworkState {
         crate::semantic::DeviceId,
         crate::semantic::DeviceId,
         crate::semantic::DeviceId,
+        u64,
     )> {
         self.closed_relay_allocations
             .lock()
             .as_ref()?
             .route(session_id)
+    }
+
+    pub(crate) fn closed_relay_route_if_generation(
+        &self,
+        session_id: [u8; 16],
+        generation: &super::closed_relay::ClosedRelayGeneration,
+    ) -> Option<(
+        crate::semantic::MeshContextId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+        crate::semantic::DeviceId,
+        u64,
+    )> {
+        self.closed_relay_allocations
+            .lock()
+            .as_ref()?
+            .route_if_generation(session_id, generation)
+    }
+
+    pub(crate) fn retire_closed_relay_exact(
+        &self,
+        session_id: [u8; 16],
+        generation: &super::closed_relay::ClosedRelayGeneration,
+    ) -> std::result::Result<
+        crate::runtime::relay::ClosedRelayTerminal,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        self.closed_relay_allocations
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
+            .retire_exact(session_id, generation)
     }
 
     pub(crate) fn settle_closed_relay_exact(
@@ -1617,9 +1758,9 @@ impl NetworkState {
             .settle_exact(session_id, generation)
     }
 
-    /// Shutdown fence for the driver owner. Every slot is attempted once;
-    /// slots temporarily receiving a packet are left for their owner to
-    /// restore, while no lock is ever held across an await here.
+    /// Shutdown fence for the driver owner. Every immediately-owned slot is
+    /// settled once; checked-out slots remain for their owner Drop to return
+    /// or settle exact custody, while no lock is held across an await here.
     pub(crate) fn settle_all_closed_relay(&self) -> usize {
         let mut allocations = self.closed_relay_allocations.lock();
         let Some(registry) = allocations.as_mut() else {
@@ -1628,11 +1769,153 @@ impl NetworkState {
         registry.settle_all()
     }
 
+    /// Wait for every checked-out allocation owner to return its exact handle
+    /// and lease. The registry is only inspected synchronously; each await is
+    /// on an owned notification, never while its mutex is held.
+    async fn wait_closed_relay_checkouts(&self) {
+        loop {
+            let control = self
+                .closed_relay_allocations
+                .lock()
+                .as_ref()
+                .and_then(super::closed_relay::ClosedRelayRegistry::checkout_control);
+            let Some(control) = control else {
+                return;
+            };
+            let finished = control.finished_notified();
+            tokio::pin!(finished);
+            finished.as_mut().enable();
+            if control.is_finished() {
+                continue;
+            }
+            finished.await;
+        }
+    }
+
     pub(crate) fn cancel_all_closed_relay_pending(&self) -> usize {
         self.closed_relay_pending
             .lock()
             .as_mut()
             .map_or(0, super::closed_relay::ClosedRelayPendingRegistry::clear)
+    }
+
+    /// Retire every Closed-relay entry whose stored owner witness is no
+    /// longer the exact live installation. Device-id successors are never
+    /// substituted: each registry compares its retained witness/token before
+    /// removing custody, and allocation checkouts are explicitly woken.
+    pub(crate) fn settle_stale_closed_relay_owners(&self) -> usize {
+        let mut retired = 0;
+        if let Some(registry) = self.closed_relay_allocations.lock().as_mut() {
+            retired += registry.retire_stale();
+        }
+        if let Some(registry) = self.closed_relay_pending.lock().as_mut() {
+            retired += registry.remove_stale();
+        }
+        if let Some(registry) = self.closed_relay_closing.lock().as_mut() {
+            retired += registry.remove_stale(self);
+        }
+        if let Some(registry) = self.closed_relay_endpoints.lock().as_mut() {
+            retired += registry.remove_stale(self);
+        }
+        if let Some(registry) = self.closed_relay_target_accepts.lock().as_mut() {
+            retired += registry.remove_stale(self);
+        }
+        retired
+    }
+
+    /// Start the exact pending-handshake expiry under the same bounded
+    /// registry that owns its handshake guard. The task is registered before
+    /// this method returns; shutdown takes and awaits every registered handle.
+    pub(crate) fn arm_closed_relay_pending_expiry(
+        self: &Arc<Self>,
+        session_id: [u8; 16],
+        expiry: Arc<super::closed_relay::ClosedRelayPendingExpiryControl>,
+    ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
+        let pending_timeout = self
+            .config
+            .read()
+            .closed_relay
+            .pending_handshake_timeout()
+            .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
+        let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
+        let mut finished = Vec::new();
+        let result = {
+            let mut tasks = self.closed_relay_pending_expiries.lock();
+            let Some(tasks) = tasks.as_mut() else {
+                expiry.cancel();
+                let _ = self.take_closed_relay_pending(session_id);
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            };
+            let mut index = 0;
+            while index < tasks.len() {
+                if tasks[index].is_finished() {
+                    finished.push(tasks.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if tasks.len() >= tasks.capacity() {
+                expiry.cancel();
+                let _ = self.take_closed_relay_pending(session_id);
+                Err(crate::runtime::relay::ClosedRelayRefusal::QueueFull)
+            } else {
+                let state = Arc::downgrade(self);
+                let task = tokio::spawn(async move {
+                    let deadline = tokio::time::sleep(pending_timeout);
+                    tokio::pin!(deadline);
+                    let cancelled = expiry.cancelled();
+                    tokio::pin!(cancelled);
+                    cancelled.as_mut().enable();
+                    if expiry.is_cancelled() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = &mut deadline => {
+                            if !expiry.is_cancelled() {
+                                if let Some(state) = state.upgrade() {
+                                    state.expire_closed_relay_pending(session_id);
+                                }
+                            }
+                        }
+                        _ = &mut cancelled => {}
+                    }
+                });
+                tasks.push(task);
+                Ok(())
+            }
+        };
+        self.observe_closed_relay_pending_expiries(finished);
+        result
+    }
+
+    /// Observe completed expiry tasks without holding the registry lock. A
+    /// finished Tokio handle is expected to poll Ready; retaining a Pending
+    /// handle keeps the ownership invariant intact if that observation races
+    /// the runtime's final wake-up.
+    fn observe_closed_relay_pending_expiries(&self, finished: Vec<JoinHandle<()>>) {
+        let mut pending = Vec::new();
+        for mut task in finished {
+            let waker = std::task::Waker::noop();
+            let mut context = std::task::Context::from_waker(waker);
+            match std::pin::Pin::new(&mut task).poll(&mut context) {
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Ready(Err(error)) => {
+                    tracing::warn!(%error, "closed relay pending expiry task failed");
+                }
+                std::task::Poll::Pending => pending.push(task),
+            }
+        }
+        if !pending.is_empty() {
+            self.closed_relay_pending_expiry_observations
+                .lock()
+                .as_mut()
+                .expect("expiry observations remain live with the registry")
+                .extend(pending);
+        }
+    }
+
+    fn expire_closed_relay_pending(&self, session_id: [u8; 16]) {
+        let _ = self.take_closed_relay_pending(session_id);
     }
 
     pub(crate) fn insert_closed_relay_pending(
@@ -1653,11 +1936,43 @@ impl NetworkState {
         self.closed_relay_pending.lock().as_mut()?.take(session_id)
     }
 
-    pub(crate) fn pending_closed_relay_count(&self) -> usize {
+    pub(crate) fn closed_relay_pending_epoch(&self, session_id: [u8; 16]) -> Option<u64> {
         self.closed_relay_pending
             .lock()
             .as_ref()
-            .map_or(0, super::closed_relay::ClosedRelayPendingRegistry::len)
+            .and_then(|registry| registry.epoch(session_id))
+    }
+
+    pub(crate) fn take_closed_relay_pending_matching(
+        &self,
+        session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
+        target_witness: &crate::runtime::session_broker::SessionValidityWitness,
+    ) -> std::result::Result<
+        super::closed_relay::ClosedRelayPending,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        self.closed_relay_pending
+            .lock()
+            .as_mut()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .take_matching(session_id, route, target_witness)
+    }
+
+    pub(crate) fn closed_relay_pending_authorization(
+        &self,
+        session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
+        target_witness: &crate::runtime::session_broker::SessionValidityWitness,
+    ) -> std::result::Result<
+        super::closed_relay::ClosedRelayAuthorization,
+        crate::runtime::relay::ClosedRelayRefusal,
+    > {
+        self.closed_relay_pending
+            .lock()
+            .as_ref()
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
+            .matching_authorization(session_id, route, target_witness)
     }
 
     pub(crate) fn insert_closed_relay_endpoint(
@@ -1684,6 +1999,7 @@ impl NetworkState {
     pub(crate) fn complete_closed_relay_endpoint(
         &self,
         session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
         target_share: &crate::protocol::relay::RelayKeyShare,
     ) -> std::result::Result<
         super::closed_relay::EndpointSession,
@@ -1695,13 +2011,26 @@ impl NetworkState {
             .as_ref()
             .and_then(|registry| registry.find(session_id))
             .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
+        let metadata = session.metadata();
+        if metadata.context != route.context_id
+            || metadata.requester != route.requester
+            || metadata.relay != route.relay
+            || metadata.target != route.target
+            || metadata.session_id != route.session_id
+            || (metadata.allocation_epoch != 0
+                && metadata.allocation_epoch != route.allocation_epoch)
+        {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerMismatch);
+        }
         session.complete(target_share)?;
+        session.set_allocation_epoch(route.allocation_epoch);
         Ok(session)
     }
 
     pub(crate) fn deliver_closed_relay_endpoint(
         &self,
         session_id: [u8; 16],
+        route: &crate::protocol::relay::ClosedRelayRoute,
         packet: crate::protocol::OpaqueRelayPacket,
     ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
         let session = self
@@ -1710,6 +2039,16 @@ impl NetworkState {
             .as_ref()
             .and_then(|registry| registry.find(session_id))
             .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
+        let metadata = session.metadata();
+        if metadata.context != route.context_id
+            || metadata.requester != route.requester
+            || metadata.relay != route.relay
+            || metadata.target != route.target
+            || metadata.session_id != route.session_id
+            || metadata.allocation_epoch != route.allocation_epoch
+        {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerMismatch);
+        }
         session.deliver(packet)
     }
 
@@ -1725,6 +2064,104 @@ impl NetworkState {
         }
     }
 
+    pub(crate) fn enqueue_closed_relay_abandonment(
+        &self,
+        abandonment: super::closed_relay::ClosedRelayAbandonment,
+    ) {
+        let mut abandonments = self.closed_relay_abandonments.lock();
+        let Some(abandonments) = abandonments.as_mut() else {
+            return;
+        };
+        if abandonments
+            .iter()
+            .any(|existing| existing.route.session_id == abandonment.route.session_id)
+        {
+            return;
+        }
+        if abandonments.len() < abandonments.capacity() {
+            abandonments.push(abandonment);
+        }
+    }
+
+    pub(crate) fn cancel_unpulled_closed_relay(&self, session_id: [u8; 16]) -> bool {
+        let session = self
+            .closed_relay_target_accepts
+            .lock()
+            .as_mut()
+            .and_then(|registry| registry.take_unpulled_for_cancel(session_id));
+        let Some(session) = session else {
+            return false;
+        };
+        session.cancel_consumer();
+        true
+    }
+
+    pub(crate) fn cancel_all_unpulled_closed_relay(&self) -> usize {
+        let sessions = self
+            .closed_relay_target_accepts
+            .lock()
+            .as_mut()
+            .map(super::closed_relay::ClosedRelayTargetAcceptedRegistry::take_all_unpulled_for_cancel)
+            .unwrap_or_default();
+        let count = sessions.len();
+        for session in sessions {
+            session.cancel_consumer();
+        }
+        count
+    }
+
+    /// Move every endpoint node out of the registry and synchronously hand
+    /// its exact route to the bounded abandonment owner. This covers public
+    /// endpoint handles still held by callers as well as accepted sessions
+    /// already claimed from the target queue; no Arc-count guess or detached
+    /// Drop task is needed.
+    pub(crate) fn cancel_all_closed_relay_endpoints(&self) -> usize {
+        let sessions = self
+            .closed_relay_endpoints
+            .lock()
+            .as_mut()
+            .map(super::closed_relay::ClosedRelayEndpointRegistry::take_all_for_cancel)
+            .unwrap_or_default();
+        let count = sessions.len();
+        for session in sessions {
+            session.cancel_consumer();
+        }
+        count
+    }
+
+    pub(crate) async fn drain_closed_relay_abandonments(self: &Arc<Self>) {
+        let count = self
+            .closed_relay_abandonments
+            .lock()
+            .as_ref()
+            .map_or(0, Vec::len);
+        for _ in 0..count {
+            let abandonment = self
+                .closed_relay_abandonments
+                .lock()
+                .as_mut()
+                .and_then(|abandonments| abandonments.pop());
+            let Some(abandonment) = abandonment else {
+                return;
+            };
+            if let Err(abandonment) =
+                super::closed_relay::settle_closed_relay_abandonment(self, abandonment).await
+            {
+                // Preserve exact custody when the captured relay owner is
+                // temporarily unavailable; this bounded retry is revisited
+                // by the next engine boundary and never spawns from Drop.
+                // The queue was pre-sized by max_allocations, so this cannot
+                // grow beyond the owner-selected bound.
+                let mut abandonments = self.closed_relay_abandonments.lock();
+                if let Some(abandonments) = abandonments.as_mut() {
+                    if abandonments.len() < abandonments.capacity() {
+                        abandonments.push(abandonment);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn publish_closed_relay_target_accept(
         &self,
         session: super::closed_relay::EndpointSession,
@@ -1734,57 +2171,6 @@ impl NetworkState {
             .as_mut()
             .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?
             .publish(session)
-    }
-
-    pub(crate) async fn await_closed_relay_target_accept(
-        &self,
-        session_id: [u8; 16],
-    ) -> std::result::Result<
-        super::closed_relay::EndpointSession,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
-        loop {
-            if self
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-            let wake = {
-                let mut accepts = self.closed_relay_target_accepts.lock();
-                let registry = accepts
-                    .as_mut()
-                    .ok_or(crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
-                if let Some(session) = registry.take(session_id) {
-                    return Ok(session);
-                }
-                registry.wake()
-            };
-            if self
-                .closed_relay_endpoints
-                .lock()
-                .as_ref()
-                .and_then(|registry| registry.find(session_id))
-                .is_none()
-            {
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-            let notified = wake.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-            }
-            tokio::select! {
-                _ = &mut notified => {},
-                _ = self.wait_for_shutdown() => {
-                    return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
-                }
-            }
-        }
     }
 
     pub(crate) async fn await_next_closed_relay_target_accept(
@@ -1851,6 +2237,13 @@ impl NetworkState {
 
     pub(crate) fn local_application_resource_scope(&self) -> Result<LocalApplicationResourceScope> {
         Ok(self.local_resources.child()?)
+    }
+
+    pub(crate) fn acquire_closed_relay_lease(
+        &self,
+        claim: ResourceClaim,
+    ) -> std::result::Result<ResourceLease, ResourceUnavailable> {
+        self.local_resources.acquire(claim)
     }
 
     /// Reached by every exact-session retirement site, after it has captured the
@@ -2058,7 +2451,6 @@ pub(crate) struct RpcSendBoundary {
     passed: std::sync::atomic::AtomicUsize,
     abandoned: std::sync::atomic::AtomicUsize,
     finished: std::sync::atomic::AtomicUsize,
-    semantic_finished: std::sync::atomic::AtomicUsize,
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -2169,19 +2561,9 @@ impl RpcSendBoundary {
         self.finished.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Record that one durable semantic reducer returned successfully. This is
-    /// separate from task/epilogue completion: a task may finish without
-    /// committing the semantic effect the control is proving.
-    pub(crate) fn mark_semantic_finished(&self) {
-        self.semantic_finished
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// How many durable semantic reducer completions were recorded.
-    pub(crate) fn semantic_finished(&self) -> usize {
-        self.semantic_finished
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
+    /// Keep the legacy test callsite source-compatible; task completion is the
+    /// only observable boundary this control needs.
+    pub(crate) fn mark_semantic_finished(&self) {}
 }
 
 /// Records one handler task's end, **after** that task's lease has been
@@ -2330,6 +2712,26 @@ impl NetworkState {
         *live = restored_graph;
         *self.durable_provisional.lock() = restored_provisional;
         Ok(())
+    }
+
+    /// Purge this network instance's canonical semantic snapshot.  This is
+    /// intentionally available only after shutdown has been requested: the
+    /// lifecycle owner must first quiesce the engine and release its writer
+    /// lease, after which the same owner performs the exact-slot purge.
+    pub(crate) fn purge_durable_semantic_state(&self) -> Result<()> {
+        if !self
+            .shutdown_complete
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Network(
+                "durable semantic purge requires completed network shutdown".into(),
+            ));
+        }
+        let _publication = self.durable_publication_gate.lock();
+        let _semantic_fence = self.fact_graph.write();
+        self.durable_semantic_owner
+            .purge()
+            .map_err(|error| Error::Network(format!("semantic snapshot purge: {error}")))
     }
 
     /// Compact and reopen this network's canonical semantic snapshot through
@@ -3053,6 +3455,9 @@ impl NetworkState {
         &self,
         runtime: &Arc<super::signaling_ingress::SignalingRuntime>,
     ) {
+        let Some(_shutdown_permit) = self.try_admit_shutdown_mutation() else {
+            return;
+        };
         let replaced = self.signaling_runtime.write().replace(Arc::clone(runtime));
         if let Some(replaced) = replaced.filter(|replaced| !Arc::ptr_eq(replaced, runtime)) {
             // A reattach supersedes the old runtime.  Release its exact guard
@@ -3519,12 +3924,27 @@ impl NetworkState {
 
     pub fn request_shutdown(&self) {
         self.shutdown_requested
-            .store(true, std::sync::atomic::Ordering::Release);
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.shutdown_ready.notify_waiters();
         self.cmd_tx.close();
         self.speculative_promotion_tx.close();
         self.signaling_inbound_tx.close();
         self.signaling_tx.close();
+    }
+
+    /// Admit one peer mutation or reactive announcement at the shutdown
+    /// linearization point.  Callers must retain the returned witness until
+    /// the admitted operation has completed; it is an ownership marker, not a
+    /// mutex, so no lock is held across async cleanup.
+    pub(crate) fn try_admit_shutdown_mutation(&self) -> Option<ShutdownMutationPermit<'_>> {
+        if self
+            .shutdown_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            None
+        } else {
+            Some(ShutdownMutationPermit { _state: self })
+        }
     }
 
     /// Run one local signaling attach while holding the registration fence.
@@ -3582,10 +4002,19 @@ impl NetworkState {
     /// ([`clear_reconnect_intent`](Self::clear_reconnect_intent) on
     /// `DataChannelOpen`), so the next loss opens a fresh window.
     pub fn record_reconnect_intent(&self, device_id: &str, sticky: bool) {
+        let policy = match self.config.read().scheduler_policy() {
+            Ok(policy) => policy,
+            Err(_) => return,
+        };
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
+        let Some(give_up_at) = now.checked_add(std::time::Duration::from_millis(
+            policy.reconnecting_grace_ms,
+        )) else {
+            return;
+        };
         let intent = map.entry(device_id.to_string()).or_insert(ReconnectIntent {
-            give_up_at: now + std::time::Duration::from_millis(RECONNECTING_GRACE_MS),
+            give_up_at,
             next_retry_at: now,
             attempt: 0,
             sticky,
@@ -4033,6 +4462,10 @@ impl NetworkState {
     /// the state-watch tick re-offers each at most once per backoff step.
     #[cfg(test)]
     pub fn due_reconnect_intents(&self) -> Vec<String> {
+        let policy = match self.config.read().scheduler_policy() {
+            Ok(policy) => policy,
+            Err(_) => return Vec::new(),
+        };
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
         map.retain(|_, i| i.sticky || now < i.give_up_at);
@@ -4044,11 +4477,12 @@ impl NetworkState {
             // A sticky intent past its active schedule parks: the entry
             // stays (so the peer's next announce dials immediately) but
             // the tick stops issuing blind offers into the void.
-            if intent.sticky && intent.attempt >= RECONNECT_RETRY_BACKOFF_MS.len() + 2 {
+            if intent.sticky && intent.attempt >= policy.reconnect_retry_backoff_ms.len() + 2 {
                 continue;
             }
-            due.push(id.clone());
-            advance_backoff(intent, now);
+            if advance_backoff(intent, now, &policy.reconnect_retry_backoff_ms) {
+                due.push(id.clone());
+            }
         }
         due
     }
@@ -4058,18 +4492,26 @@ impl NetworkState {
     /// re-offering everything we owe at once, rather than waiting for each
     /// one's backoff to come due on the tick.
     pub fn flush_reconnect_intents(&self) -> Vec<String> {
+        let policy = match self.config.read().scheduler_policy() {
+            Ok(policy) => policy,
+            Err(_) => return Vec::new(),
+        };
         let now = std::time::Instant::now();
         let mut map = self.reconnect_intents.lock();
         map.retain(|_, i| i.sticky || now < i.give_up_at);
-        for intent in map.values_mut() {
-            advance_backoff(intent, now);
-        }
-        map.keys().cloned().collect()
+        map.iter_mut()
+            .filter_map(|(id, intent)| {
+                advance_backoff(intent, now, &policy.reconnect_retry_backoff_ms).then(|| id.clone())
+            })
+            .collect()
     }
 
     /// Register the signaling driver's force-reconnect signal. Called
     /// once when the Nostr driver is attached.
     pub fn set_relay_reconnect(&self, signal: Arc<watch::Sender<u64>>) {
+        let Some(_shutdown_permit) = self.try_admit_shutdown_mutation() else {
+            return;
+        };
         *self.relay_reconnect.lock() = Some(signal);
     }
 
@@ -4077,6 +4519,9 @@ impl NetworkState {
     /// `relay_connected` generation). Called once when the Nostr driver is
     /// attached, alongside [`set_relay_reconnect`].
     pub fn set_relay_connected_signal(&self, signal: Arc<watch::Sender<u64>>) {
+        let Some(_shutdown_permit) = self.try_admit_shutdown_mutation() else {
+            return;
+        };
         *self.relay_connected.lock() = Some(signal);
     }
 
@@ -4095,6 +4540,9 @@ impl NetworkState {
     /// for a stale socket to time out. Cheap and idempotent — bumps a
     /// `watch` generation the relay tasks observe.
     pub fn request_relay_reconnect(&self) -> bool {
+        let Some(_shutdown_permit) = self.try_admit_shutdown_mutation() else {
+            return false;
+        };
         match self.relay_reconnect.lock().as_ref() {
             Some(signal) => {
                 signal.send_modify(|gen| *gen = gen.wrapping_add(1));
@@ -4109,7 +4557,7 @@ impl NetworkState {
     }
 
     /// Like [`request_relay_reconnect`], but throttled to at most one
-    /// redial per [`RELAY_RESCUE_MIN_INTERVAL_MS`]. This is the rescue
+    /// redial per the configured rescue interval. This is the rescue
     /// path for the "ICE timed out with zero remote candidates"
     /// fingerprint — the peer's candidates never crossed the relay, which
     /// is almost always a relay socket that went stale after a network
@@ -4126,12 +4574,19 @@ impl NetworkState {
     /// *and* past the throttle), `false` when suppressed — callers log the
     /// distinction so the rescue's decisions are visible in diagnostics.
     pub fn request_relay_reconnect_throttled(&self) -> bool {
+        let Some(_shutdown_permit) = self.try_admit_shutdown_mutation() else {
+            return false;
+        };
+        let policy = match self.config.read().scheduler_policy() {
+            Ok(policy) => policy,
+            Err(_) => return false,
+        };
         let now = std::time::Instant::now();
         {
             let mut guard = self.last_relay_rescue_at.lock();
             let due = guard.is_none_or(|prev| {
                 now.duration_since(prev)
-                    >= std::time::Duration::from_millis(RELAY_RESCUE_MIN_INTERVAL_MS)
+                    >= std::time::Duration::from_millis(policy.relay_rescue_min_interval_ms)
             });
             if !due {
                 return false;
@@ -4872,57 +5327,60 @@ impl NetworkState {
             .map_err(|_| Error::Network("engine dropped broadcast reply".into()))
     }
 
-    /// Persist `device_id` into the per-network roster. Does NOT
+    /// Refresh the compatibility roster after canonical admission. It does NOT
     /// transition any active session — call
-    /// [`crate::engine::handshake::send_local_approve`] (or the
-    /// higher-level [`crate::JoinedNetwork::roster_approve`])
-    /// to actually emit the `approve` frame.
-    pub async fn approve_roster(&self, device_id: &str, label: &str) -> Result<()> {
-        self.approve_roster_now(device_id, label)
-    }
-
-    /// Synchronous roster commit used by an already-serialized runtime owner.
-    ///
-    /// The public facade remains async, but the underlying roster mutation and
-    /// file replacement contain no await point. The admitted handshake path
-    /// uses this form while holding the exact peer-installation fence so a
-    /// replacement cannot land between owner validation and persistence.
-    pub(super) fn approve_roster_now(&self, device_id: &str, label: &str) -> Result<()> {
+    /// It never emits a transport approval frame.
+    pub(super) fn refresh_roster_projection(&self, device_id: &str, label: &str) -> Result<()> {
         let graph = self.fact_graph.read();
-        let admitted = super::governance::canonical_policy_admits_from(
-            &self.verified_bootstrap,
-            &graph,
-            self.identity.public_id(),
-            device_id,
-        );
+        let target = crate::semantic::DeviceId::from_canonical_str(device_id)
+            .map_err(|error| Error::Network(format!("noncanonical roster projection: {error}")))?;
+        let evaluator = graph.evaluator();
+        let admitted = evaluator.effective_authorized_role(&target).is_some()
+            && evaluator.effective_membership(&target) != Some(false)
+            && !evaluator.is_stood_down(&target);
         drop(graph);
         if !admitted {
             return Err(Error::Network(
-                "Closed membership requires a signed governance grant".into(),
+                "canonical projection does not admit roster projection".into(),
             ));
         }
-        // Defense in depth behind the handshake's eviction gate: on a
-        // closed network a device the signed state evicted can't be
-        // rostered by ANY path — not mutual-ACTIVE persistence, not a
-        // manual approve from a stale UI. Re-admission is a signed member
-        // grant (the owner re-claiming it), which flips the verdict first.
         let mut roster = self.roster.write();
         crate::roster::add_peer_in(&mut roster, device_id, label);
         crate::roster::save(&roster)?;
         Ok(())
     }
 
-    /// Remove a peer from the roster and tear down any session.
-    pub async fn remove_roster(&self, device_id: &str) -> Result<()> {
-        let mut roster = self.roster.write();
-        crate::roster::remove_peer_in(&mut roster, device_id);
-        crate::roster::save(&roster)?;
-        Ok(())
+    // Defense in depth behind the handshake's eviction gate: on a
+    // closed network a device the signed state evicted can't be
+    // rostered by ANY path — not mutual-ACTIVE persistence, not a
+    // manual approve from a stale UI. Re-admission is a signed member
+    // grant (the owner re-claiming it), which flips the verdict first.
+
+    /// True if the canonical projection currently admits the peer.
+    ///
+    /// This compatibility query is read-only and non-authoritative. The
+    /// persisted roster is only a UI cache and is intentionally not consulted.
+    pub fn is_rostered(&self, device_id: &str) -> bool {
+        let Ok(target) = crate::semantic::DeviceId::from_canonical_str(device_id) else {
+            return false;
+        };
+        let graph = self.fact_graph.read();
+        let evaluator = graph.evaluator();
+        evaluator.effective_authorized_role(&target).is_some()
+            && evaluator.effective_membership(&target) != Some(false)
+            && !evaluator.is_stood_down(&target)
     }
 
-    /// True if the peer is currently in the roster.
-    pub fn is_rostered(&self, device_id: &str) -> bool {
-        crate::roster::is_authorized(&self.roster.read(), device_id)
+    /// Return the compatibility/UI roster filtered by the canonical graph.
+    /// Persisted rows provide display metadata only and never authorize.
+    pub(crate) fn canonical_roster_view(&self) -> Vec<crate::roster::AuthorizedPeer> {
+        self.roster
+            .read()
+            .authorized_devices
+            .iter()
+            .filter(|peer| self.is_rostered(&peer.device_id))
+            .cloned()
+            .collect()
     }
 
     /// Total count of peers in any state.
@@ -4993,16 +5451,46 @@ impl NetworkState {
 
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
-    pub(crate) async fn shutdown(&self) {
+    pub(crate) async fn shutdown(self: &Arc<Self>) {
+        // Drain public endpoint abandonments while peer owners and the relay
+        // carrier are still available for exact Close delivery/settlement.
+        self.cancel_all_closed_relay_endpoints();
+        self.cancel_all_unpulled_closed_relay();
+        self.drain_closed_relay_abandonments().await;
         self.request_shutdown();
+        self.settle_stale_closed_relay_owners();
         self.cancel_all_closed_relay_pending();
+        let (expiry_tasks, expiry_observations) = {
+            let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
+            let tasks = self
+                .closed_relay_pending_expiries
+                .lock()
+                .take()
+                .unwrap_or_default();
+            let observations = self
+                .closed_relay_pending_expiry_observations
+                .lock()
+                .take()
+                .unwrap_or_default();
+            (tasks, observations)
+        };
+        for task in expiry_tasks.into_iter().chain(expiry_observations) {
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "closed relay pending expiry task failed during shutdown");
+            }
+        }
         if let Some(registry) = self.closed_relay_allocations.lock().as_mut() {
             registry.request_close_all();
         }
+        self.wait_closed_relay_checkouts().await;
+        self.cancel_all_closed_relay_endpoints();
+        self.cancel_all_unpulled_closed_relay();
+        self.drain_closed_relay_abandonments().await;
         self.closed_relay_closing.lock().take();
         self.settle_all_closed_relay();
         self.closed_relay_endpoints.lock().take();
         self.closed_relay_target_accepts.lock().take();
+        self.closed_relay_abandonments.lock().take();
         self.cancel_all_recovery_demands();
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is
@@ -5024,6 +5512,30 @@ impl NetworkState {
             }
         }
         self.peers.await_replaced_closes().await;
+        self.peer_event_pump_shutdown_started
+            .store(true, Ordering::Release);
+        self.peer_event_pump_shutdown_waiting.notify_waiters();
+        let event_pumps = loop {
+            let notified = self.peer_event_pump_ready.notified();
+            let drained = {
+                let mut registry = self.peer_event_pumps.lock();
+                if registry.pending_registrations == 0 {
+                    registry.closed = true;
+                    Some(std::mem::take(&mut registry.handles))
+                } else {
+                    None
+                }
+            };
+            if let Some(event_pumps) = drained {
+                break event_pumps;
+            }
+            notified.await;
+        };
+        for pump in event_pumps {
+            if let Err(error) = pump.await {
+                tracing::warn!(%error, "peer event pump failed during shutdown");
+            }
+        }
         drop(retired);
         drop(runtime);
         self.signaling_runtime.write().take();
@@ -5056,8 +5568,90 @@ impl NetworkState {
         // becomes permanently unavailable to stale state facades.
         let _publication = self.durable_publication_gate.lock();
         let _semantic_fence = self.fact_graph.write();
-        if let Err(error) = self.durable_semantic_owner.release() {
-            tracing::warn!(%error, "durable semantic owner release failed during shutdown");
+        match self.durable_semantic_owner.release() {
+            Ok(()) => {
+                self.shutdown_complete
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "durable semantic owner release failed during shutdown");
+            }
+        }
+    }
+
+    /// Begin registering one production peer-event pump.  Shutdown closes the
+    /// registry only after all begun registrations have handed in their
+    /// handles, so a pump can never race into detached custody.
+    pub(crate) fn begin_peer_event_pump_registration(&self) -> bool {
+        let mut pumps = self.peer_event_pumps.lock();
+        if pumps.closed {
+            return false;
+        }
+        let Some(pending) = pumps.pending_registrations.checked_add(1) else {
+            return false;
+        };
+        pumps.pending_registrations = pending;
+        true
+    }
+
+    /// Complete a previously begun registration.  If the lifecycle has
+    /// already closed, this method remains the exact runtime owner and awaits
+    /// the handle itself instead of aborting or dropping it.
+    pub(crate) async fn finish_peer_event_pump_registration(&self, pump: JoinHandle<()>) {
+        let mut pump = Some(pump);
+        let await_here = {
+            let mut registry = self.peer_event_pumps.lock();
+            debug_assert!(registry.pending_registrations > 0);
+            registry.pending_registrations -= 1;
+            if registry.closed {
+                true
+            } else {
+                registry
+                    .handles
+                    .push(pump.take().expect("open registration owns its pump"));
+                false
+            }
+        };
+        self.peer_event_pump_ready.notify_waiters();
+        if await_here {
+            if let Err(error) = pump
+                .take()
+                .expect("closed registration retains its pump")
+                .await
+            {
+                tracing::warn!(%error, "late peer event pump failed during registration");
+            }
+        }
+    }
+
+    /// Transport-lab-only access to the production peer-pump registration
+    /// fence. The integration control uses the same begin/finish ownership
+    /// path as the engine and cannot install an unregistered worker.
+    #[cfg(feature = "transport-lab")]
+    pub fn begin_peer_event_pump_registration_for_lab(&self) -> bool {
+        self.begin_peer_event_pump_registration()
+    }
+
+    #[cfg(feature = "transport-lab")]
+    pub async fn finish_peer_event_pump_registration_for_lab(&self, pump: JoinHandle<()>) {
+        self.finish_peer_event_pump_registration(pump).await;
+    }
+
+    /// Wait until shutdown has reached its exact peer-pump drain barrier.
+    /// This is a lifecycle observation, not a timer or a readiness guess.
+    #[cfg(feature = "transport-lab")]
+    pub async fn wait_peer_event_pump_shutdown_for_lab(&self) {
+        loop {
+            let notified = self.peer_event_pump_shutdown_waiting.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .peer_event_pump_shutdown_started
+                .load(Ordering::Acquire)
+            {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -5244,25 +5838,9 @@ impl NetworkState {
         }
     }
 
-    /// True when this network uses local `Silent` connection policy. The load-bearing
-    /// predicate for the two Silent behaviours: the engine suppresses
-    /// auto-dial-on-presence (see `handle_signaling_inbound`) and roster
-    /// gossip (see [`super::governance::broadcast_roster_summary`]). This is
-    /// not a durable semantic governance kind.
+    /// True when this network uses local `Silent` connection policy.
     pub fn is_silent(&self) -> bool {
-        matches!(
-            self.config.read().kind,
-            crate::network_state::NetworkKind::Silent
-        )
-    }
-
-    /// Whether this network gossips its roster (the membership summary /
-    /// entries anti-entropy). True everywhere except `Silent` networks, on
-    /// which membership is never advertised — every connection is deliberate,
-    /// so there is nothing to converge. Presence (`Sighted`) and the per-peer
-    /// handshake are unaffected; only the roster gossip is suppressed.
-    pub fn gossip_roster_enabled(&self) -> bool {
-        !self.is_silent()
+        matches!(self.config.read().kind, crate::config::NetworkKind::Silent)
     }
 }
 

@@ -497,6 +497,36 @@ impl DurableSemanticStore {
         }
     }
 
+    /// Remove this instance's canonical semantic snapshot while holding both
+    /// the in-process gate and the cross-process writer lease.  The lease
+    /// pathname is deliberately retained: it is the stable identity of this
+    /// exact `(instance_root, local_slot)` slot, not disposable snapshot data.
+    /// An active [`DurableSemanticOwner`] therefore makes purge fail closed
+    /// with [`DurableStoreError::WriterBusy`] instead of racing its final
+    /// publication.
+    pub fn purge(&self) -> Result<(), DurableStoreError> {
+        let _gate = self.lock_process()?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| DurableStoreError::InvalidPath(self.path.clone()))?;
+        std::fs::create_dir_all(parent).map_err(|source| DurableStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lease = WriterLease::acquire(&self.lock_path)?;
+        let result = match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(DurableStoreError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        };
+        drop(lease);
+        result
+    }
+
     fn lock_process(&self) -> Result<MutexGuard<'_, ()>, DurableStoreError> {
         self.process_gate
             .lock()
@@ -775,6 +805,15 @@ impl DurableSemanticOwner {
             .map_err(|_| DurableStoreError::InProcessGatePoisoned)?;
         lease.take();
         Ok(())
+    }
+
+    /// Release this instance's writer lease and remove its canonical snapshot.
+    /// The caller must hold the lifecycle fence that proves no live engine
+    /// publication can follow the release. Keeping the operation on the owner
+    /// prevents a caller from reconstructing a store from a guessed path.
+    pub(crate) fn purge(&self) -> Result<(), DurableStoreError> {
+        self.release()?;
+        self.store.purge()
     }
 
     pub fn commit<I>(&self, graph: &FactGraph, provisional: I) -> Result<(), DurableStoreError>
@@ -1680,6 +1719,23 @@ mod tests {
         ));
         drop(lease);
         store.begin_write().expect("lease released");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn purge_fences_live_owner_then_removes_only_canonical_snapshot() {
+        let root = root();
+        let store = DurableSemanticStore::new(&root, "purge-slot");
+        let owner = store.open_writable().expect("live owner");
+        std::fs::write(store.path(), b"canonical snapshot").expect("test canonical snapshot");
+        assert!(matches!(
+            store.purge(),
+            Err(DurableStoreError::WriterBusy { .. })
+        ));
+        assert!(store.path().exists(), "live owner must fence purge");
+        owner.release().expect("release live owner");
+        store.purge().expect("purge released slot");
+        assert!(!store.path().exists(), "canonical snapshot was purged");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -1,31 +1,23 @@
-//! Roster and governance: the two snapshots, the five signed-transition
-//! operations, and local MFA custody.
+//! Governance control dispatch for the canonical semantic authority model.
 //!
-//! Two things distinguish this domain from the rest, and both are about
-//! admitting work before doing it.
+//! Durable authority is represented by verified `SignedFact` records in the
+//! semantic `FactGraph`; this module only authorizes bounded control replies
+//! and forwards typed authoring requests to the joined-network facade.
 //!
-//! The snapshots hold a lock over state whose size is not known until it is
-//! walked. Both take the response owner *before* the first traversal, so the
-//! walk that decides how big the answer is, is itself work the connection was
-//! admitted to do. The encoded line is measured after, over the sealed reply.
+//! Roster data is a read-only projection and never a source of membership or
+//! role authority. Response ownership is acquired before any variable-size
+//! result is traversed, encoded, or sealed.
 //!
-//! The twelve operations answer with something whose size depends on a remote
-//! result — an error string, a proposal id — so each takes the right to answer
-//! before the operation runs. `operation_owner` and `answered` are that pair,
-//! written once here rather than twelve times.
-//!
-//! Every operation is its own function, called from its own arm, so a missing
-//! transition is a missing arm in the connection loop's total match rather than
-//! a runtime fall-through.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::{funded, refused_text, unknown_network, Answer};
+use super::{funded, unknown_network, Answer};
 use crate::control::framing::FrameAdmission;
 use crate::control::reply::{
-    FundedDiagnostic, FundedVariableReply, OperationReplyData, PreparedReply, ResponseOwner,
+    governance_error_code, FundedDiagnostic, FundedVariableReply, OperationReplyData,
+    PreparedReply, ResponseOwner,
 };
 use crate::control::ControlState;
 
@@ -55,6 +47,28 @@ fn answered(
         .context("governance/network response line was not admitted")
 }
 
+fn governance_refusal(error: myownmesh_core::Error) -> OperationReplyData {
+    OperationReplyData::GovernanceRefused {
+        code: governance_error_code(&error).to_owned(),
+        error: error.to_string(),
+    }
+}
+
+fn governance_message(message: String, code: &'static str) -> OperationReplyData {
+    OperationReplyData::GovernanceRefused {
+        error: message,
+        code: code.to_owned(),
+    }
+}
+
+fn refused_governance(error: myownmesh_core::Error, admission: &FrameAdmission) -> Result<Answer> {
+    answered(
+        Ok(governance_refusal(error)),
+        operation_owner(admission)?,
+        admission,
+    )
+}
+
 /// The authorized-device roster, measured before it is walked.
 pub(in crate::control) async fn roster_list(
     state: &Arc<ControlState>,
@@ -65,51 +79,12 @@ pub(in crate::control) async fn roster_list(
         return unknown_network(&network, admission);
     };
     let owner = ResponseOwner::acquire(admission)
-        .context("RosterList diagnostic snapshot was not admitted")?;
+        .context("RosterList diagnostic report was not admitted")?;
     funded(
         PreparedReply::Roster(FundedDiagnostic::new(joined.roster_list().await?, owner)),
         admission,
     )
     .context("RosterList response line was not admitted")
-}
-
-/// Admit a device onto the roster.
-pub(in crate::control) async fn roster_approve(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    device_id: String,
-    label: Option<String>,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .roster_approve(&device_id, label.as_deref().unwrap_or(""))
-            .await
-            .map(|_| OperationReplyData::Approved(device_id))
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
-}
-
-/// Drop a device from the roster.
-pub(in crate::control) async fn roster_remove(
-    state: &Arc<ControlState>,
-    admission: &FrameAdmission,
-    network: String,
-    device_id: String,
-) -> Result<Answer> {
-    let owner = operation_owner(admission)?;
-    let result = match state.registry.get(&network) {
-        Some(net) => net
-            .roster_remove(&device_id)
-            .await
-            .map(|_| OperationReplyData::Removed(device_id))
-            .map_err(|error| error.to_string()),
-        None => Err(no_such_network(&network)),
-    };
-    answered(result, owner, admission)
 }
 
 /// Set the local topology directly.
@@ -141,16 +116,15 @@ pub(in crate::control) async fn propose_role_grant(
     admission: &FrameAdmission,
     network: String,
     target: String,
-    role: myownmesh_core::network_state::Role,
+    role: myownmesh_core::semantic::Role,
     mfa_code: Option<String>,
 ) -> Result<Answer> {
     let owner = operation_owner(admission)?;
     let result = match state.registry.get(&network) {
-        Some(net) => net
-            .propose_role_grant(&target, role, mfa_code)
-            .await
-            .map(|id| OperationReplyData::ProposalId(id.to_string()))
-            .map_err(|error| error.to_string()),
+        Some(net) => match net.propose_role_grant(&target, role, mfa_code).await {
+            Ok(id) => Ok(OperationReplyData::ProposalId(id.to_string())),
+            Err(error) => Ok(governance_refusal(error)),
+        },
         None => Err(no_such_network(&network)),
     };
     answered(result, owner, admission)
@@ -166,11 +140,10 @@ pub(in crate::control) async fn propose_role_revoke(
 ) -> Result<Answer> {
     let owner = operation_owner(admission)?;
     let result = match state.registry.get(&network) {
-        Some(net) => net
-            .propose_role_revoke(&target, mfa_code)
-            .await
-            .map(|id| OperationReplyData::ProposalId(id.to_string()))
-            .map_err(|error| error.to_string()),
+        Some(net) => match net.propose_role_revoke(&target, mfa_code).await {
+            Ok(id) => Ok(OperationReplyData::ProposalId(id.to_string())),
+            Err(error) => Ok(governance_refusal(error)),
+        },
         None => Err(no_such_network(&network)),
     };
     answered(result, owner, admission)
@@ -186,11 +159,10 @@ pub(in crate::control) async fn propose_evict(
 ) -> Result<Answer> {
     let owner = operation_owner(admission)?;
     let result = match state.registry.get(&network) {
-        Some(net) => net
-            .propose_evict(&target, mfa_code)
-            .await
-            .map(|id| OperationReplyData::ProposalId(id.to_string()))
-            .map_err(|error| error.to_string()),
+        Some(net) => match net.propose_evict(&target, mfa_code).await {
+            Ok(id) => Ok(OperationReplyData::ProposalId(id.to_string())),
+            Err(error) => Ok(governance_refusal(error)),
+        },
         None => Err(no_such_network(&network)),
     };
     answered(result, owner, admission)
@@ -254,7 +226,7 @@ pub(in crate::control) fn mfa_query(
             }
             Ok(myownmesh_core::custody::EnrollmentTransaction::Committed) => ("committed", None),
             Ok(myownmesh_core::custody::EnrollmentTransaction::Absent) => ("absent", None),
-            Err(error) => return refused_text(error.to_string(), admission),
+            Err(error) => return answered(Ok(governance_refusal(error)), owner, admission),
         };
     funded(
         PreparedReply::Variable(FundedVariableReply::mfa_transaction(
@@ -280,14 +252,26 @@ pub(in crate::control) fn mfa_redeliver(
     {
         Ok(myownmesh_core::custody::EnrollmentTransaction::Prepared(prepared)) => prepared,
         Ok(myownmesh_core::custody::EnrollmentTransaction::Committed) => {
-            return refused_text("MFA transaction is already committed".into(), admission);
+            return answered(
+                Ok(governance_message(
+                    "MFA transaction is already committed".into(),
+                    "mfa_state",
+                )),
+                owner,
+                admission,
+            );
         }
         Ok(myownmesh_core::custody::EnrollmentTransaction::Absent) => {
-            return refused_text("MFA transaction is absent".into(), admission);
+            return answered(
+                Ok(governance_message(
+                    "MFA transaction is absent".into(),
+                    "mfa_state",
+                )),
+                owner,
+                admission,
+            );
         }
-        Err(error) => {
-            return refused_text(error.to_string(), admission);
-        }
+        Err(error) => return answered(Ok(governance_refusal(error)), owner, admission),
     };
     let result = Ok(prepared.enrolled().clone());
     funded(
@@ -328,7 +312,7 @@ pub(in crate::control) fn mfa_commit_or_abort(
         };
     let state = match settlement {
         Ok(state) => state,
-        Err(error) => return refused_text(error.to_string(), admission),
+        Err(error) => return answered(Ok(governance_refusal(error)), owner, admission),
     };
     funded(
         PreparedReply::Variable(FundedVariableReply::mfa_transaction(
@@ -370,6 +354,6 @@ pub(in crate::control) fn mfa_disable(
             },
             admission,
         ),
-        Err(error) => refused_text(error.to_string(), admission),
+        Err(error) => refused_governance(error, admission),
     }
 }

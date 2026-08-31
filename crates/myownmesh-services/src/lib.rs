@@ -52,6 +52,9 @@ pub enum Error {
     /// The underlying `turn` crate returned an error.
     #[error("turn: {0}")]
     Turn(String),
+    /// A service listener task terminated unexpectedly while being joined.
+    #[error("service task: {0}")]
+    TaskJoin(String),
 }
 
 /// Crate result alias.

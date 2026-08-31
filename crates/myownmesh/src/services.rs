@@ -37,15 +37,31 @@ pub struct ServiceManager {
 
 /// Why a service configuration was refused.
 ///
-/// A second variant used to sit here, refusing any configuration that enabled
-/// ordinary-member application payload relay. There is no longer a
-/// configuration that can ask for it: the key is gone from `ServicesConfig`, so
-/// the refusal has nothing left to refuse and the exclusion is now structural.
-/// See `no_service_configuration_can_advertise_a_member_payload_relay`.
+/// A former policy check referred to ordinary-member application-payload
+/// relay. That capability is not part of the hosted-services
+/// configuration/status/advertisement namespace: `ServicesConfig` exposes the
+/// signaling relay, STUN, and TURN services only, so there is no such request
+/// for this error to refuse.
 #[derive(Debug, thiserror::Error)]
 pub enum ServicePolicyError {
     #[error("connector resource policy is required before enabling node participation")]
     ConnectorPolicyRequired,
+}
+
+/// Terminal failures observed while stopping hosted services.
+///
+/// Every stop is still attempted in the prescribed order; the aggregate is
+/// returned only after all owned handles have reached their terminal boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("hosted service shutdown failed: {failures:?}")]
+pub struct ServiceShutdownError {
+    pub failures: Vec<ServiceShutdownFailure>,
+}
+
+#[derive(Debug)]
+pub struct ServiceShutdownFailure {
+    pub service: &'static str,
+    pub error: String,
 }
 
 struct ManagerState {
@@ -157,13 +173,10 @@ impl Serialize for SocketDisplay {
     }
 }
 
-// There is no member-payload-relay report.
-//
-// It carried `enabled`, a relayed-network count, and a fanout ceiling for a
-// service an ordinary member could host to forward other members' application
-// payload. Nothing publishes it now: the configuration key, the runtime, the
-// service role, and the advert field are all gone, so a status field would be a
-// permanent `false` describing a service the daemon has no way to run.
+// The hosted-services report contains node participation plus signaling relay,
+// STUN, and TURN endpoint state. It has no separate application-payload relay
+// field because that capability is outside this namespace and has no daemon
+// runtime or configuration entry.
 
 impl ServiceManager {
     /// Validate a service configuration against this daemon incarnation.
@@ -230,7 +243,9 @@ impl ServiceManager {
             || g.config.turn != desired.turn
         {
             if let Some(h) = g.stun.take() {
-                h.stop();
+                if let Err(error) = h.stop_and_wait().await {
+                    warn!("STUN service failed to stop during reconfiguration: {error}");
+                }
             }
             if run_standalone_stun {
                 match StunServer::start(&desired.stun).await {
@@ -263,7 +278,9 @@ impl ServiceManager {
             || g.config.signaling != desired.signaling
         {
             if let Some(h) = g.signaling.take() {
-                h.stop_and_wait().await;
+                if let Err(error) = h.stop_and_wait().await {
+                    warn!("signaling service failed to stop during reconfiguration: {error}");
+                }
             }
             if desired.signaling.enabled {
                 match SignalingServer::start(
@@ -294,11 +311,13 @@ impl ServiceManager {
     }
 
     /// Snapshot the current service status without changing anything.
+    #[cfg(test)]
     pub async fn status(&self) -> ServicesReport {
         self.status_source().await.build_report()
     }
 
     /// The currently-applied config (for persistence round-trips).
+    #[cfg(test)]
     pub async fn current_config(&self) -> ServicesConfig {
         self.state.lock().await.config.clone()
     }
@@ -313,10 +332,9 @@ impl ServiceManager {
     /// Hook for when a network joins after services were applied: push the
     /// current advert onto it.
     ///
-    /// Nothing per-network is started here any more. The two owners this hook
-    /// used to bind — a routing facade and a plain-envelope member relay — were
-    /// the only per-network service runtimes, and both are gone; the surviving
-    /// services (signaling, STUN, TURN) are device-wide listeners.
+    /// Nothing per-network is started here. The hosted signaling relay, STUN,
+    /// and TURN services are device-wide listeners; this hook only refreshes
+    /// their advertised roles on the newly joined network.
     pub async fn on_network_added(&self, config_id: &str) {
         let _ = config_id;
         let g = self.state.lock().await;
@@ -330,16 +348,44 @@ impl ServiceManager {
     }
 
     /// Stop every running service. Called on daemon shutdown.
-    pub async fn shutdown(&self) {
+    ///
+    /// All owned handles are consumed and awaited before returning. A failure
+    /// is retained as a typed terminal result instead of being discarded as
+    /// if the service had stopped cleanly.
+    pub async fn shutdown(&self) -> Result<(), ServiceShutdownError> {
         let mut g = self.state.lock().await;
+        let mut failures = Vec::new();
         if let Some(h) = g.stun.take() {
-            h.stop();
+            if let Err(error) = h.stop_and_wait().await {
+                warn!("STUN service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "stun",
+                    error: error.to_string(),
+                });
+            }
         }
         if let Some(h) = g.signaling.take() {
-            h.stop_and_wait().await;
+            if let Err(error) = h.stop_and_wait().await {
+                warn!("signaling service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "signaling",
+                    error: error.to_string(),
+                });
+            }
         }
         if let Some(h) = g.turn.take() {
-            let _ = h.stop().await;
+            if let Err(error) = h.stop().await {
+                warn!("TURN service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "turn",
+                    error: error.to_string(),
+                });
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ServiceShutdownError { failures })
         }
     }
 
@@ -451,15 +497,14 @@ impl ServicesStatusSource<'_> {
     pub(crate) fn typed_claim(
         &self,
     ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<(ServicesReport, ServicesConfig)>(
-            &self.view(),
-        )
+        serialized_typed_claim::<(ServicesReport, ServicesConfig)>(&self.view())
     }
 
     pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
         services_status_line_ceiling(&self.view())
     }
 
+    #[cfg(test)]
     fn build_report(&self) -> ServicesReport {
         self.captured.build()
     }
@@ -487,6 +532,44 @@ impl ServicesStatusSource<'_> {
             _retention: retention,
         })
     }
+}
+
+fn serialized_typed_claim<T>(
+    value: &impl serde::Serialize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let (retained, queued, allocations) = myownmesh_core::mailbox_measure_serialized(value)?;
+    let fixed = std::mem::size_of::<T>().checked_add(retained).ok_or(
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let fixed = u64::try_from(fixed).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let queued = u64::try_from(queued).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::QueuedBytes,
+        }
+    })?;
+    let allocations = u64::try_from(allocations)
+        .map_err(|_| myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?
+        .checked_add(1)
+        .ok_or(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?;
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (myownmesh_core::ResourceClass::AccountedMemoryBytes, fixed),
+        (myownmesh_core::ResourceClass::QueuedBytes, queued),
+        (myownmesh_core::ResourceClass::ParsingOrCpuWork, queued),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            allocations,
+        ),
+    ])?)
 }
 
 fn services_status_line_ceiling(
@@ -530,9 +613,9 @@ impl CapturedServicesReport {
 /// hint, since an operator who set it has declared the device's routable
 /// address).
 fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
-    // Every role a device can advertise is here. There is no member-relay tag
-    // because there is no such role to offer — see
-    // `no_service_configuration_can_advertise_a_member_payload_relay`.
+    // Every hosted service role is emitted here. The signaling relay is the
+    // only relay role in this advert namespace; application-payload relay is
+    // not a hosted service role.
     let mut tags = Vec::new();
     if config.signaling.enabled {
         tags.push(ServiceRole::Signaling.tag().to_string());
@@ -715,20 +798,14 @@ mod tests {
         assert_eq!(ServiceAdvert::from_extra(&advert.extra), None);
     }
 
-    /// No service configuration reaches a member payload relay.
+    /// Hosted-service adverts contain only the configured infrastructure roles.
+    /// The signaling relay is advertised as `service:signaling`; no separate
+    /// application-payload relay role exists in this namespace.
     ///
-    /// This used to be a refusal: a config could ask for `relay.enabled` and
-    /// the daemon answered with an error. The key is now gone from
-    /// `ServicesConfig`, so the stronger claim is available and is what this
-    /// asserts — with *every* service a device can host turned on, nothing the
-    /// daemon offers peers names a payload relay. A peer reading this advert
-    /// has no way to select this device as a hop for another member's data.
-    ///
-    /// Non-vacuous by construction: the same advert must carry the three roles
-    /// that do exist, so a build that stopped advertising anything at all fails
-    /// here rather than passing as "no relay".
+    /// Non-vacuous by construction: the advert must carry all three roles that
+    /// do exist, so a build that stopped advertising services fails here.
     #[test]
-    fn no_service_configuration_can_advertise_a_member_payload_relay() {
+    fn hosted_service_advertises_only_infrastructure_roles() {
         let mut cfg = ServicesConfig::default();
         cfg.node.enabled = true;
         cfg.signaling.enabled = true;
@@ -745,11 +822,6 @@ mod tests {
                 "service:turn".to_string(),
             ],
             "the roles a device can host are exactly these three"
-        );
-        let published = serde_json::to_string(&advert).expect("advert serializes");
-        assert!(
-            !published.contains("relay"),
-            "nothing published to peers may name a relay: {published}"
         );
     }
 
@@ -781,19 +853,14 @@ mod tests {
         assert!(!manager.current_config().await.node.enabled);
     }
 
-    /// A running daemon reports no member payload relay authority.
-    ///
-    /// The refusal this replaces asked the manager to enable `relay` and
-    /// checked the error. That request is now unrepresentable, so what is left
-    /// to prove is the other half: a live manager's published status describes
-    /// no relay it could be asked about. A client cannot read a relay state off
-    /// this daemon, because it has none to report.
+    /// A running daemon's hosted-services status contains the infrastructure
+    /// endpoints and no application-payload relay field.
     ///
     /// Asserted on a real running manager rather than on the report type,
     /// because the claim is about what a daemon serving the control socket
     /// actually says, not about which fields a struct happens to declare.
     #[tokio::test]
-    async fn a_running_daemon_reports_no_member_payload_relay_authority() {
+    async fn a_running_daemon_reports_hosted_services_only() {
         let identity = Arc::new(myownmesh_core::Identity::ephemeral());
         let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
             MeshConfig::default(),
@@ -817,8 +884,9 @@ mod tests {
             "the status must still describe the services that do exist: {status}"
         );
         assert!(
-            !status.contains("relay"),
-            "a running daemon publishes no relay state: {status}"
+            !status.contains("application_payload_relay")
+                && !status.contains("member_payload_relay"),
+            "hosted-services status has no application-payload relay field: {status}"
         );
     }
 

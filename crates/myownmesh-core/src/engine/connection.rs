@@ -21,6 +21,44 @@ use crate::runtime::peer_session::{
     DedupToken, DetachedDedupSet, PromotedChannelBinding, PromotedDedupDrain, PromotedDedupSet,
 };
 
+/// Fixed inline storage for one peer's rolling clock-skew samples.
+///
+/// The window size is the existing heartbeat policy window. Keeping the
+/// samples beside the peer state avoids a heap allocation on every admitted
+/// ping while retaining the same newest-last eviction order.
+#[derive(Debug)]
+pub struct ClockSkewSamples {
+    values: [i64; SKEW_WINDOW],
+    len: usize,
+}
+
+pub(super) const SKEW_WINDOW: usize = 5;
+
+impl Default for ClockSkewSamples {
+    fn default() -> Self {
+        Self {
+            values: [0; SKEW_WINDOW],
+            len: 0,
+        }
+    }
+}
+
+impl ClockSkewSamples {
+    pub(super) fn push(&mut self, sample: i64) {
+        if self.len < SKEW_WINDOW {
+            self.values[self.len] = sample;
+            self.len += 1;
+        } else {
+            self.values.copy_within(1.., 0);
+            self.values[SKEW_WINDOW - 1] = sample;
+        }
+    }
+
+    pub(super) fn as_slice(&self) -> &[i64] {
+        &self.values[..self.len]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerStatus {
@@ -101,8 +139,8 @@ pub struct PeerStateData {
     /// heartbeat ping contributes one — its `t` is the sender's wall clock,
     /// corrected by half our measured RTT — so the estimate is purely
     /// passive: no extra traffic to any node. Capped at
-    /// `heartbeat::SKEW_WINDOW`.
-    pub clock_skew_samples: Vec<i64>,
+    /// `SKEW_WINDOW`.
+    pub clock_skew_samples: ClockSkewSamples,
     /// Median of [`Self::clock_skew_samples`] — the per-peer estimate
     /// surfaced in `PeerInfo` and folded into the network-wide check in
     /// `heartbeat::tick`. `None` until the first inbound ping.
@@ -206,6 +244,11 @@ pub struct PeerStateSnapshot {
 }
 
 impl PeerStateData {
+    pub(super) fn record_clock_skew_sample(&mut self, sample: i64) -> Option<i64> {
+        self.clock_skew_samples.push(sample);
+        crate::engine::heartbeat::median(self.clock_skew_samples.as_slice())
+    }
+
     /// The admission boundary: `true` once this peer has proven its ed25519
     /// identity (`authenticated`) **and** both sides have approved (`Active`,
     /// or `Shelved` — an admitted `Active` peer parked by the topology
@@ -216,6 +259,9 @@ impl PeerStateData {
     /// channel is not authorization. The `authenticated` conjunct is defence in
     /// depth — even if some path reached `Active` without authenticating, no
     /// traffic flows.
+    /// Test-only legacy observation. Production admission uses the
+    /// provenance-bearing channel or promoted-session slot instead.
+    #[cfg(test)]
     pub fn is_admitted(&self) -> bool {
         self.authenticated && matches!(self.status, PeerStatus::Active | PeerStatus::Shelved)
     }
@@ -270,7 +316,7 @@ impl Default for PeerStateData {
             last_liveness_probe_at: None,
             last_ping_t: None,
             rtt_ms: None,
-            clock_skew_samples: Vec::new(),
+            clock_skew_samples: ClockSkewSamples::default(),
             clock_skew_ms: None,
             ice_disconnected_since: None,
             session_started_at: None,
@@ -404,10 +450,9 @@ impl PeerConnection {
             ),
         ])
         .expect("candidate correlation claim is representable");
-        let accounted = node_claim
+        node_claim
             .checked_add(correlation_claim)
-            .expect("candidate record accounting cannot overflow");
-        accounted
+            .expect("candidate record accounting cannot overflow")
     }
 }
 
@@ -1389,12 +1434,9 @@ impl PeerConnection {
             return None;
         }
         let mut candidates = self.speculative.lock();
-        if candidates
-            .remove_where(|attempt| {
-                attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, &candidate)
-            })
-            .is_some()
-        {}
+        let _ = candidates.remove_where(|attempt| {
+            attempt.correlation == correlation && Arc::ptr_eq(&attempt.session, &candidate)
+        });
         Some(SpeculativePromotion {
             displaced_attempt: None,
             // Selection is now an explicit policy seam; authenticated
@@ -1529,6 +1571,9 @@ impl PeerConnection {
         // dropped on the same edge. Dropping it also releases its
         // post-authentication resource reservation, so a retired connector does
         // not hold session capacity its replacement then has to compete for.
+        // The coalesced renegotiation slot is another strong worker owner; clear
+        // it under the same retirement fence before collecting close custody.
+        drop(self.media_renegotiation_worker.lock().take());
         let mut workers = self.promoted_session.take_workers_with_dedup();
         // Retire the endpoint-auth task at the source, so a superseded
         // connector refuses promotion rather than merely failing to install
@@ -1714,6 +1759,12 @@ impl PeerConnection {
             return false;
         }
         let mut pending = self.media_renegotiation_worker.lock();
+        // Retirement may have removed this exact channel after the optimistic
+        // check above. Re-prove ownership while holding the coalescing slot so a
+        // stale caller cannot repopulate it after retirement clears the slot.
+        if !self.owns_authenticated_worker(worker) {
+            return false;
+        }
         match pending.as_ref() {
             None => {
                 *pending = Some(Arc::clone(worker));
@@ -1989,8 +2040,8 @@ impl PeerConnection {
     /// broker, because a capability whose own record does not match this entry's
     /// context is one this entry must not keep.
     ///
-    /// The selected slot is consulted before the compatibility `session`
-    /// mirror, and each guard is released before the next slot/fence is taken.
+    /// The selected slot is consulted before the unpromoted phase state, and
+    /// each guard is released before the next slot/fence is taken.
     /// This keeps membership and selection in one authority while avoiding a
     /// nested slot/mirror lock cycle. Reading the worker a moment early costs
     /// nothing: a connector that retires in the gap fails the `is_current_for`

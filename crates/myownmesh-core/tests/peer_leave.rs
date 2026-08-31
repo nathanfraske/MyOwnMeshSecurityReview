@@ -66,8 +66,11 @@ fn fresh_network(id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: "peer-leave-test".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),

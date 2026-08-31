@@ -9,6 +9,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "node --test --test-reporter=tap tests/wire-serialization.test.mjs",
     "tauri": "tauri",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },

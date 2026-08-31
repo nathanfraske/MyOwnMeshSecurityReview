@@ -29,6 +29,7 @@ fn client_id_roundtrips_through_string() {
     assert_eq!(parsed, id);
     assert!("not-an-id".parse::<ClientId>().is_err());
     assert!("c-99".parse::<ClientId>().is_err());
+    assert!("c042".parse::<ClientId>().is_err());
 }
 
 #[test]

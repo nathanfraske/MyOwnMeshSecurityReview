@@ -44,11 +44,8 @@ pub mod tick;
 pub mod traffic;
 pub mod wake;
 
-#[cfg(not(feature = "transport-lab"))]
-pub(crate) use signaling_bridge::attach_signaling;
 pub use signaling_bridge::SignalingDrivers;
-#[cfg(feature = "transport-lab")]
-pub(crate) use signaling_bridge::{attach_local, attach_signaling};
+pub use signaling_bridge::{attach_local, attach_signaling};
 // The ingress boundary is the Signaling Node's, and none of it is public — not
 // the admitted value, not the thing that makes one. `EphemeralIngress` appears
 // in `NetworkState`'s inbound sender and in `run_driver`'s receiver, and both of
@@ -64,12 +61,16 @@ use signaling_ingress::{CarrierAttribution, EphemeralIngress};
 #[cfg(test)]
 use state::SignalingEmissionId;
 
+/// Test-only compatibility values for the configured policy tests. Production
+/// announce decisions read the owning network's checked scheduler policy.
+///
 /// Minimum gap between announces we publish in response to a peer's
 /// announce. The engine fires one reflected announce per inbound
 /// announce; this floor coalesces a burst of inbound announces (a
 /// new joiner triggering N existing peers to all react at once)
 /// into a single outbound publish per N-peer wave so we don't put
 /// quadratic load on the relay pool.
+#[cfg(test)]
 const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 
 /// Minimum gap between re-offers we send to the same peer while
@@ -78,6 +79,7 @@ const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
 /// re-offer per window so we don't pile up SDP renegotiations on
 /// the remote PC. Sized small enough that two restart-aligned
 /// peers converge inside a handful of seconds.
+#[cfg(test)]
 const REOFFER_MIN_INTERVAL_MS: u64 = 2_000;
 
 use std::sync::Arc;
@@ -89,9 +91,9 @@ use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::sdp_type::RTCSdpType;
 
+use crate::config::SchedulerPolicyConfig;
 use crate::error::{Error, Result};
 use crate::events::{DropReason, MeshEvent, PeerEvent};
-use crate::identity::Identity;
 use crate::protocol::{
     rpc::{
         CapabilitiesUpdateMessage, RpcRequestMessage, RpcResponseMessage, RpcStreamChunkMessage,
@@ -100,9 +102,11 @@ use crate::protocol::{
     topology::ShelveMessage,
     CapabilityAdvert, DepartureCorrelation, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
-use crate::semantic::{DeviceId, VerifiedBootstrap};
+use crate::semantic::DeviceId;
+#[cfg(test)]
+use crate::semantic::VerifiedBootstrap;
 use crate::transport::{
-    DataChannelOpenOwnership, RemoteCandidateDisposition, Role, Transport, TransportEvent,
+    DataChannelOpenOwnership, RemoteCandidateDisposition, Role, TransportEvent,
     WebRtcConnectorEvent,
 };
 
@@ -118,7 +122,9 @@ pub(crate) use lifecycle::{
     join_open_participation, spawn_network_in_mesh_scope,
 };
 pub(crate) use state::{NetworkCmd, NetworkState};
-pub(crate) use supervisor::{handle_command, run_driver};
+#[cfg(test)]
+pub(crate) use supervisor::handle_command;
+pub(crate) use supervisor::run_driver;
 #[cfg(all(test, feature = "transport-lab"))]
 mod supervisor_tests;
 #[cfg(all(test, feature = "transport-lab"))]
@@ -142,6 +148,18 @@ use state::SignalingOutbound;
 // leave a public type nothing public mentions, which is what §7.3's "no dead
 // public re-export" rules out. The type itself stays exactly where it was.
 use state::SignalingInbound;
+
+/// Copy the validated per-network scheduler policy before a bounded await.
+/// Construction is required to validate this policy before state exposure;
+/// refusing here instead of falling back keeps a malformed live state from
+/// silently reverting to process-wide timing.
+fn scheduler_policy(state: &Arc<NetworkState>) -> SchedulerPolicyConfig {
+    state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects")
+}
 
 #[cfg(test)]
 fn test_departure_control() -> crate::protocol::SessionControl {
@@ -173,6 +191,7 @@ pub mod transport_lab {
         identity: Arc<Identity>,
         transport: Transport,
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::spawn_network(config, identity, transport).await
     }
 
@@ -184,6 +203,7 @@ pub mod transport_lab {
         transport: Transport,
         creation_id: [u8; 32],
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::create_network(config, identity, transport, creation_id).await
     }
 
@@ -195,6 +215,7 @@ pub mod transport_lab {
         root: PathBuf,
         creation_id: [u8; 32],
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::create_network_in_instance_root(config, identity, transport, root, creation_id).await
     }
 
@@ -207,6 +228,7 @@ pub mod transport_lab {
         expected_context_id: crate::semantic::MeshContextId,
         record: crate::semantic::BootstrapRecord,
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::import_network(config, identity, transport, expected_context_id, record).await
     }
 
@@ -219,6 +241,7 @@ pub mod transport_lab {
         expected_context_id: crate::semantic::MeshContextId,
         record: crate::semantic::BootstrapRecord,
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::import_network_in_instance_root(
             config,
             identity,
@@ -237,6 +260,7 @@ pub mod transport_lab {
         transport: Transport,
         root: PathBuf,
     ) -> crate::Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
+        config.scheduler_policy()?;
         super::spawn_network_in_instance_root(config, identity, transport, root).await
     }
 
@@ -301,27 +325,6 @@ pub mod transport_lab {
             .cmd_tx
             .send(super::NetworkCmd::SetTopology(mode))
             .is_ok()
-    }
-
-    /// Approve a roster peer through the low-level lab command boundary.
-    pub async fn approve_roster(
-        state: &Arc<NetworkState>,
-        device_id: String,
-        label: String,
-    ) -> std::result::Result<(), String> {
-        let (reply, response) = tokio::sync::oneshot::channel();
-        state
-            .cmd_tx
-            .send(super::NetworkCmd::ApproveRoster {
-                device_id,
-                label,
-                reply,
-            })
-            .map_err(|_| "network command queue refused approval".to_string())?;
-        response
-            .await
-            .map_err(|_| "network approval response was dropped".to_string())?
-            .map_err(|error| error.to_string())
     }
 
     /// Construct a channel for a low-level transport-lab state. Normal
@@ -803,11 +806,28 @@ impl OpenedAs {
 /// tell a legitimate offerer re-poke from the role reversal above; and a
 /// genuine offerer waiting on an answer sits at `HaveLocalOffer`, which is
 /// exactly the case this branch exists to re-poke.
+#[cfg(test)]
 fn reoffer_permitted(
     opened_as: Option<OpenedAs>,
     status: PeerStatus,
     last_offer_sent_at: Option<Instant>,
     now: Instant,
+) -> bool {
+    reoffer_permitted_with_interval(
+        opened_as,
+        status,
+        last_offer_sent_at,
+        now,
+        REOFFER_MIN_INTERVAL_MS,
+    )
+}
+
+fn reoffer_permitted_with_interval(
+    opened_as: Option<OpenedAs>,
+    status: PeerStatus,
+    last_offer_sent_at: Option<Instant>,
+    now: Instant,
+    min_interval_ms: u64,
 ) -> bool {
     if !opened_as.is_some_and(OpenedAs::is_offerer) {
         return false;
@@ -816,7 +836,7 @@ fn reoffer_permitted(
         return false;
     }
     match last_offer_sent_at {
-        Some(prev) => now.duration_since(prev) >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS),
+        Some(prev) => now.duration_since(prev) >= Duration::from_millis(min_interval_ms),
         None => true,
     }
 }
@@ -830,12 +850,28 @@ fn reoffer_permitted(
 /// cannot spend the window on behalf of an announce that was never going to
 /// offer. A permitted one claims it *before* `create_offer` runs, so a
 /// `create_offer` that fails still spends the window, exactly as before.
+#[cfg(test)]
 fn claim_reoffer(
     data: &mut connection::PeerStateData,
     opened_as: Option<OpenedAs>,
     now: Instant,
 ) -> bool {
-    if !reoffer_permitted(opened_as, data.status, data.last_offer_sent_at, now) {
+    claim_reoffer_with_interval(data, opened_as, now, REOFFER_MIN_INTERVAL_MS)
+}
+
+fn claim_reoffer_with_interval(
+    data: &mut connection::PeerStateData,
+    opened_as: Option<OpenedAs>,
+    now: Instant,
+    min_interval_ms: u64,
+) -> bool {
+    if !reoffer_permitted_with_interval(
+        opened_as,
+        data.status,
+        data.last_offer_sent_at,
+        now,
+        min_interval_ms,
+    ) {
         return false;
     }
     data.last_offer_sent_at = Some(now);
@@ -971,7 +1007,12 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                     .with_current(&owner, |peer| {
                         let mut data = peer.state.write();
                         let worker = peer.current_worker()?;
-                        if !claim_reoffer(&mut data, Some(OpenedAs::of(&worker)), now) {
+                        if !claim_reoffer_with_interval(
+                            &mut data,
+                            Some(OpenedAs::of(&worker)),
+                            now,
+                            scheduler_policy(state).reoffer_min_interval_ms,
+                        ) {
                             return None;
                         }
                         let attempt = peer.attempt_for_worker(&worker)?;
@@ -1213,7 +1254,7 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                 .map(|owner| {
                     connecting_stuck_past_grace(
                         &owner.connection().state.read(),
-                        scheduler::RESTART_TRAFFIC_GRACE_MS,
+                        scheduler_policy(state).restart_traffic_grace_ms,
                     )
                 })
                 .unwrap_or(false);
@@ -1236,6 +1277,10 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
                     }),
                 );
                 if let Some(owner) = existing_owner.as_ref() {
+                    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+                        forget_dedup_owned(state, dedup.take());
+                        return;
+                    };
                     let Some(removed) = state.peers.remove_if_current_unpromoted(owner) else {
                         forget_dedup_owned(state, dedup.take());
                         return;
@@ -1797,7 +1842,7 @@ pub(crate) fn short_peer(id: &str) -> String {
 }
 
 /// Emit a presence announce, but only if we haven't already emitted one
-/// within `REACTIVE_ANNOUNCE_MIN_INTERVAL_MS`. Every reactive announce
+/// within the configured reactive-announce interval. Every reactive announce
 /// — reflecting a peer's announce, re-seeding discovery after a
 /// checking-timeout rebuild, kicking discovery on a network change —
 /// goes through here so a burst of triggers (a REQ-replay wave, a
@@ -1814,6 +1859,12 @@ enum ReactiveAnnounceResult {
 }
 
 fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounceResult {
+    // This witness linearizes the whole synchronous publication path against
+    // request_shutdown; a pre-shutdown caller may finish, but no new
+    // announce or recovery queue mutation enters after the lifecycle fence.
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return ReactiveAnnounceResult::Refused;
+    };
     // Recovery publications are carrier-admission work, not ordinary
     // presence reflection.  Capture and queue them before consulting the
     // presence floor; the cohort is settled later by the exact carrier
@@ -1828,7 +1879,8 @@ fn maybe_reactive_announce_result(state: &Arc<NetworkState>) -> ReactiveAnnounce
     let now = Instant::now();
     let due = guard
         .map(|prev| {
-            now.duration_since(prev) >= Duration::from_millis(REACTIVE_ANNOUNCE_MIN_INTERVAL_MS)
+            now.duration_since(prev)
+                >= Duration::from_millis(scheduler_policy(state).reactive_announce_min_interval_ms)
         })
         .unwrap_or(true);
     if !due {
@@ -2222,7 +2274,7 @@ async fn run_media_renegotiation(
 ///     that is deliberately dialled, and lex order would hand the restart
 ///     to the end holding the answerer. The roles two live ends hold are
 ///     complementary by construction, so exactly one still offers.
-///   * Single-flighted on `last_offer_sent_at` (`REOFFER_MIN_INTERVAL_MS`)
+///   * Single-flighted on `last_offer_sent_at` (the configured re-offer interval)
 ///     so the network-change watcher, the ICE watchdog, and an inbound
 ///     announce collapse into one offer per window instead of a storm.
 ///   * Skipped while a renegotiation is already in flight (ICE
@@ -2310,7 +2362,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
                 .last_offer_sent_at
                 .map(|t| {
                     Instant::now().duration_since(t)
-                        >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                        >= Duration::from_millis(scheduler_policy(state).reoffer_min_interval_ms)
                 })
                 .unwrap_or(true);
             if !due {
@@ -2391,7 +2443,7 @@ pub(crate) async fn renegotiate_ice_for_owner(
         // ufrag/pwd flip, not a gather, so it isn't wrapped — and timing it out
         // would cancel it mid-flight, which we don't know to be safe.)
         let built = tokio::time::timeout(
-            Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
+            Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
             session.create_offer(),
         )
         .await;
@@ -2557,7 +2609,7 @@ async fn start_speculative_local_offer(
     }
     let cfg = state.config.read().clone();
     let construction = tokio::time::timeout(
-        Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
             Role::Offerer,
             &cfg.stun_servers,
@@ -2718,7 +2770,7 @@ async fn start_speculative_offer(
     }
     let cfg = state.config.read().clone();
     let construction = tokio::time::timeout(
-        Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
             Role::Answerer,
             &cfg.stun_servers,
@@ -2801,7 +2853,11 @@ async fn start_speculative_offer(
     let peer_id = device_id.to_string();
     let attempt = correlation.to_string();
     let task_observation = session.observe_owned_task();
-    tokio::spawn(async move {
+    if !state.begin_peer_event_pump_registration() {
+        session.retire();
+        return;
+    }
+    let pump = tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(event) = rx.recv().await {
             let handled = match connector_state.peers.speculative_worker_route(
@@ -2840,6 +2896,7 @@ async fn start_speculative_offer(
         // owned by this attempt; a promoted replacement is already absent.
         retire_speculative_terminal(&connector_state, &exact_owner, &attempt, &session).await;
     });
+    state.finish_peer_event_pump_registration(pump).await;
 }
 
 async fn retire_speculative_exact(
@@ -3306,7 +3363,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     debug!(peer = %short_peer(device_id), ?role, "ensure_peer_session: opening transport session");
     let cfg = state.config.read().clone();
     let construction = tokio::time::timeout(
-        Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
             role,
             &cfg.stun_servers,
@@ -3334,11 +3391,11 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
                 format!(
                     "open_peer for {} did not complete within the existing {} ms connection-attempt window",
                     short_peer(device_id),
-                    scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS
+                    scheduler_policy(state).data_channel_open_timeout_ms
                 ),
                 serde_json::json!({
                     "peer": device_id,
-                    "timeout_ms": scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS,
+                    "timeout_ms": scheduler_policy(state).data_channel_open_timeout_ms,
                 }),
             );
             return;
@@ -3395,17 +3452,19 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     if role == Role::Offerer {
         let Some(witness) = offer_witness else {
             warn!(peer = %device_id, "offer refused: exact owner/worker/attempt witness unavailable");
-            spawn_peer_event_pump(
+            spawn_registered_peer_event_pump(
+                state,
                 Arc::clone(state),
                 device_id.to_string(),
                 Arc::clone(&session),
                 rx,
                 pump_owner,
-            );
+            )
+            .await;
             return;
         };
         let built = tokio::time::timeout(
-            Duration::from_millis(scheduler::OFFER_BUILD_TIMEOUT_MS),
+            Duration::from_millis(scheduler_policy(state).offer_build_timeout_ms),
             witness.worker.create_offer(),
         )
         .await;
@@ -3457,7 +3516,7 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
                     format!(
                         "create_offer for {} did not complete within {} ms — abandoning this attempt (the connect watchdog will rebuild it)",
                         short_peer(device_id),
-                        scheduler::OFFER_BUILD_TIMEOUT_MS
+                        scheduler_policy(state).offer_build_timeout_ms
                     ),
                     serde_json::json!({ "peer": device_id }),
                 );
@@ -3470,13 +3529,15 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // worker's bounded mailbox. Connector events never enter the unbounded
     // general command queue. The receiver stamps each value with the exact
     // connector worker identity that owns its callback source.
-    spawn_peer_event_pump(
+    spawn_registered_peer_event_pump(
+        state,
         Arc::clone(state),
         device_id.to_string(),
         Arc::clone(&session),
         rx,
         pump_owner,
-    );
+    )
+    .await;
 }
 
 /// Spawn the production per-peer receiver pump with its exact installation
@@ -3520,6 +3581,25 @@ fn spawn_peer_event_pump(
             .await;
         }
     })
+}
+
+/// Spawn and retain one production peer-event pump under its exact network
+/// lifecycle owner.  Test controls use [`spawn_peer_event_pump`] directly so
+/// they can own and await their fixture handle themselves.
+async fn spawn_registered_peer_event_pump(
+    state: &Arc<NetworkState>,
+    connector_state: Arc<NetworkState>,
+    peer_id: String,
+    pump_session: Arc<crate::transport::WebRtcConnectorWorker>,
+    rx: crate::transport::webrtc::WebRtcConnectorEventReceiver,
+    pump_owner: Option<peer_registry::PeerOwnerToken>,
+) {
+    if !state.begin_peer_event_pump_registration() {
+        pump_session.retire();
+        return;
+    }
+    let pump = spawn_peer_event_pump(connector_state, peer_id, pump_session, rx, pump_owner);
+    state.finish_peer_event_pump_registration(pump).await;
 }
 
 async fn apply_remote_sdp(
@@ -3691,7 +3771,9 @@ async fn reoffer_after_failed_answer(state: &Arc<NetworkState>, device_id: &str)
                     .last_offer_sent_at
                     .map(|t| {
                         Instant::now().duration_since(t)
-                            >= Duration::from_millis(REOFFER_MIN_INTERVAL_MS)
+                            >= Duration::from_millis(
+                                scheduler_policy(state).reoffer_min_interval_ms,
+                            )
                     })
                     .unwrap_or(true);
                 if !due {
@@ -4180,7 +4262,10 @@ async fn handle_ice_state_change(
                 // network-change handler regardless of this.
                 let carrying_traffic = data
                     .last_recv_at
-                    .map(|t| t.elapsed() < Duration::from_millis(scheduler::HEARTBEAT_TIMEOUT_MS))
+                    .map(|t| {
+                        t.elapsed()
+                            < Duration::from_millis(scheduler_policy(state).heartbeat_timeout_ms)
+                    })
                     .unwrap_or(false);
                 !carrying_traffic
             }
@@ -4268,9 +4353,9 @@ async fn record_selected_pair_for_owner(
     // lock, so on a single slow core mid-gather it can park the driver. This
     // is a GUI/diagnostic read that drives no recovery, so skip it this pass
     // rather than freeze command + signaling handling (see
-    // `scheduler::ICE_INTROSPECT_TIMEOUT_MS`).
+    // the configured ICE introspection timeout.
     let pair = match tokio::time::timeout(
-        Duration::from_millis(scheduler::ICE_INTROSPECT_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).ice_introspect_timeout_ms),
         session.selected_candidate_pair(),
     )
     .await
@@ -4364,9 +4449,9 @@ async fn log_ice_check_snapshot_for_owner(
     // the agent's candidate pairs under its lock, which a mid-gather agent on a
     // single slow core can hold long enough to wedge the driver. Diagnostic
     // only, so a timed-out pass just drops one log line (see
-    // `scheduler::ICE_INTROSPECT_TIMEOUT_MS`).
+    // the configured ICE introspection timeout.
     let snap = match tokio::time::timeout(
-        Duration::from_millis(scheduler::ICE_INTROSPECT_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).ice_introspect_timeout_ms),
         session.ice_check_snapshot(),
     )
     .await
@@ -4595,7 +4680,7 @@ async fn send_pending_proof_ack(
         return;
     };
     let sent = match tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
         send.send(bytes),
     )
     .await
@@ -4628,6 +4713,14 @@ async fn handle_inbound_frame_from(
     bytes: Bytes,
 ) {
     let device_id = owner.device_id();
+    if bytes.len() > crate::protocol::RECEIVE_FRAME_BYTES {
+        warn!(
+            peer = %device_id,
+            bytes = bytes.len(),
+            "discarding frame above the exact receive-safe protocol boundary"
+        );
+        return;
+    }
     let Some(class) = crate::protocol::classify_frame(&bytes) else {
         warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
@@ -4965,11 +5058,11 @@ async fn handle_inbound_frame_from(
     // captured installation, through the witness or through its owner token.
     // The Semantic Node takes its own first, whole.
     //
-    // Durable semantic exchange — the transition log, the roster, and the
-    // comparisons and requests that converge them — is a different ownership
-    // from everything below. Routing it through one closed typed admission
-    // keeps that separation structural rather than a property of this match
-    // staying correct.
+    // Durable semantic exchange — signed facts and the exact-context
+    // comparisons and requests that locate missing dependencies — has a
+    // different owner from everything below. Routing it through one closed
+    // typed admission keeps that separation structural rather than a property
+    // of this match staying correct.
     //
     // **This session is the reply route, and it is not why any of it is
     // believed.** A promoted session is one producer of that port, not the
@@ -5001,8 +5094,12 @@ async fn handle_inbound_frame_from(
         MeshMessage::SessionControl(control) => on_session_control(state, &dispatch, control).await,
         MeshMessage::CapabilitiesUpdate(u) => on_capabilities_update(state, &dispatch, u).await,
         MeshMessage::ClosedRelayControl(control) => {
-            if let Err(error) = control.validate() {
-                trace!(peer = %device_id, "discarding invalid Closed relay control: {error}");
+            let relay_profile = state.config.read().closed_relay.clone();
+            if !relay_profile.validate_closed_relay_control(&control) {
+                trace!(
+                    peer = %device_id,
+                    "discarding Closed relay control refused by configured profile or wire bound"
+                );
             } else {
                 match closed_relay::handle_control(state, dispatch.owner(), control).await {
                     Ok(Some(endpoint_session)) => {
@@ -5073,8 +5170,13 @@ async fn handle_inbound_frame_from(
         // Nothing is owed out here, which is why this arm does nothing.
         MeshMessage::ChannelAck { .. } => {}
         MeshMessage::ClosedRelayData(data) => {
+            let relay_profile = state.config.read().closed_relay.clone();
+            if !relay_profile.validate() {
+                trace!(peer = %device_id, "Closed relay data refused by invalid configured profile");
+                return;
+            }
             let max_ciphertext_bytes = match crate::runtime::relay::checked_ciphertext_ceiling(
-                state.config.read().closed_relay.max_frame_ciphertext_bytes,
+                relay_profile.max_frame_ciphertext_bytes,
             ) {
                 Ok(max_ciphertext_bytes) => max_ciphertext_bytes,
                 Err(_) => {
@@ -5096,7 +5198,7 @@ async fn handle_inbound_frame_from(
             };
             let session_id = data.session_id;
             let relay_local = DeviceId::from_canonical_str(state.identity.public_id())
-                .map_or(false, |local| data.relay == local);
+                .is_ok_and(|local| data.relay == local);
             if let Err(error) = closed_relay::handle_data(state, dispatch.owner(), data).await {
                 trace!(peer = %device_id, "Closed relay data refused: {error}");
             } else if relay_local {
@@ -5130,14 +5232,10 @@ async fn handle_inbound_frame_from(
         | MeshMessage::AuthResponse(_)
         | MeshMessage::Approve(_)
         | MeshMessage::Deny(_)
-        | MeshMessage::NetworkState(_)
         | MeshMessage::Fact(_)
         | MeshMessage::FactBundle(_)
         | MeshMessage::FactInventory(_)
-        | MeshMessage::FactRequest(_)
-        | MeshMessage::RosterSummary(_)
-        | MeshMessage::RosterRequest(_)
-        | MeshMessage::RosterEntries(_) => {
+        | MeshMessage::FactRequest(_) => {
             trace!(peer = %device_id, "discarding misclassified protocol frame");
         }
     }
@@ -6981,7 +7079,7 @@ async fn send_pending_semantic_message(
     let (captured_owner, worker, _endpoint_auth, _mesh_context, _work) = operation.into_parts();
     let send = worker.begin_send()?;
     let sent = tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
         send.send(bytes),
     )
     .await
@@ -7005,7 +7103,7 @@ async fn send_prepared_durable_proof(
         admission.into_parts();
     let send = worker.begin_send()?;
     let sent = tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
         send.send(bytes),
     )
     .await
@@ -7040,7 +7138,7 @@ async fn send_speculative_eviction_proof(
         }
     };
     let proof_sent = match tokio::time::timeout(
-        Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+        Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
         proof_send.send(proof_bytes),
     )
     .await
@@ -7148,7 +7246,7 @@ async fn settle_speculative_proof_ack(
     let (captured_owner, deny_worker, _endpoint_auth, _mesh_context, work) = operation.into_parts();
     let sent = match deny_worker.begin_send() {
         Ok(send) => tokio::time::timeout(
-            Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+            Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms),
             send.send(deny_bytes),
         )
         .await
@@ -7184,7 +7282,7 @@ pub(crate) async fn send_to_peer_owner(
 ) -> Result<()> {
     let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
     let class = traffic::class_of(msg);
-    let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+    let timeout = Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms);
     if matches!(message_admission(msg), Admission::Application) {
         return send_application_bytes(state, owner, Bytes::from(serialized), class).await;
     }
@@ -7281,7 +7379,7 @@ pub(crate) async fn send_application_bytes(
     frame: Bytes,
     class: traffic::FrameClass,
 ) -> Result<()> {
-    let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+    let timeout = Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms);
     let sent = state
         .peers
         .admit_application_operation(
@@ -7312,7 +7410,7 @@ pub(in crate::engine) async fn send_logical_reply(
 ) -> Result<()> {
     let serialized = serde_json::to_vec(msg).map_err(Error::Serde)?;
     let class = traffic::class_of(msg);
-    let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+    let timeout = Duration::from_millis(scheduler_policy(state).peer_send_timeout_ms);
     let sent = state
         .peers
         .admit_logical_reply_application_operation(operation)
@@ -7570,11 +7668,15 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
                         match data.tier {
                             ConnectionTier::IceRestart { started } => {
                                 started.elapsed()
-                                    < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                                    < Duration::from_millis(
+                                        scheduler_policy(state).data_channel_open_timeout_ms,
+                                    )
                             }
                             ConnectionTier::IceWatchdog { since } => {
                                 since.elapsed()
-                                    < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                                    < Duration::from_millis(
+                                        scheduler_policy(state).data_channel_open_timeout_ms,
+                                    )
                             }
                             _ => false,
                         }
@@ -7602,6 +7704,9 @@ async fn clear_stale_session_if_zombie(state: &Arc<NetworkState>, device_id: &st
         None => None,
     };
     if let Some(owner) = zombie_owner {
+        let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+            return;
+        };
         if let Some(removed) = state.peers.remove_if_current_unpromoted(&owner) {
             state.log_diag_with(
                 crate::events::DiagLevel::Info,
@@ -7681,17 +7786,25 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
             let restart_in_flight = match data.tier {
                 ConnectionTier::IceRestart { started } => {
                     started.elapsed()
-                        < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                        < Duration::from_millis(
+                            scheduler_policy(state).data_channel_open_timeout_ms,
+                        )
                 }
                 ConnectionTier::IceWatchdog { since } => {
-                    since.elapsed() < Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS)
+                    since.elapsed()
+                        < Duration::from_millis(
+                            scheduler_policy(state).data_channel_open_timeout_ms,
+                        )
                 }
                 _ => false,
             };
             let probed_recently = data
                 .last_liveness_probe_at
                 .map(|t| {
-                    t.elapsed() < Duration::from_millis(scheduler::LIVENESS_PROBE_MIN_INTERVAL_MS)
+                    t.elapsed()
+                        < Duration::from_millis(
+                            scheduler_policy(state).liveness_probe_min_interval_ms,
+                        )
                 })
                 .unwrap_or(false);
             if established && silent && !restart_in_flight && !probed_recently {
@@ -7724,22 +7837,35 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
     heartbeat::send_ping_to_owner(state, &owner).await;
 
     // Confirm by inbound traffic after the probe delay. Pointer identity
-    // ensures this task can reclaim only the exact worker it probed.
-    let state = state.clone();
+    // ensures this task can reclaim only the exact worker it probed. The
+    // delayed task owns no state, peer, or worker while asleep: promotion or
+    // shutdown makes its weak witness fail closed before any mutation.
+    let delay_ms = scheduler_policy(state).wake_probe_delay_ms;
+    let weak_state = Arc::downgrade(state);
+    // Move the strong worker only into the stamped token used to create the
+    // weak witness; no worker ownership crosses the configured delay.
+    let weak_owner = owner.for_worker(probed_worker).downgrade();
     let device_id = device_id.to_string();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS)).await;
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        let Some(state) = weak_state.upgrade() else {
+            return;
+        };
+        let Some(owner) = weak_owner.upgrade() else {
+            return;
+        };
+        if shutdown_requested_now(&state).await {
+            return;
+        }
+        // `get_if_current` rederives the installed peer under the stamped
+        // owner fence, including the exact worker witness. A replacement W1
+        // therefore cannot inherit this delayed W0 decision.
         let still_silent = state.peers.get_if_current(&owner).is_some_and(|peer| {
-            let current_worker = peer.current_worker();
-            current_worker
-                .as_ref()
-                .is_some_and(|worker| Arc::ptr_eq(worker, &probed_worker))
-                && peer
-                    .state
-                    .read()
-                    .last_recv_at
-                    .map(|t| t.elapsed().as_millis() as u64 > scheduler::WAKE_PROBE_DELAY_MS)
-                    .unwrap_or(true)
+            peer.state
+                .read()
+                .last_recv_at
+                .map(|t| t.elapsed().as_millis() as u64 > delay_ms)
+                .unwrap_or(true)
         });
         if still_silent {
             state.log_diag_with(
@@ -7754,9 +7880,19 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
             drop_peer_if_current(&state, &owner, crate::events::DropReason::HeartbeatTimeout).await;
             // Re-seed discovery so the rebuilt peer reconnects on the next
             // round-trip rather than waiting for its own announce schedule.
-            maybe_reactive_announce(&state);
+            if !shutdown_requested_now(&state).await {
+                maybe_reactive_announce(&state);
+            }
         }
     });
+}
+
+async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
+    tokio::select! {
+        biased;
+        _ = state.wait_for_shutdown() => true,
+        _ = std::future::ready(()) => false,
+    }
 }
 
 async fn finish_drop_peer(
@@ -7873,6 +8009,7 @@ async fn finish_drop_peer_inner_with_recovery(
             warn!(%error, "peer cleanup did not complete successfully");
         }
         state.peers.complete_removed_close(&peer);
+        state.settle_stale_closed_relay_owners();
         // Policy can change while native close is in flight.  Revalidate at
         // the terminal boundary and detach the exact provider-owned cohort;
         // this path must never turn a stale terminal handle into admission.
@@ -7892,7 +8029,7 @@ async fn finish_drop_peer_inner_with_recovery(
             network_id: state.network_id.clone(),
             device_id: device_id.to_string(),
             reason: reason.clone(),
-            grace_window_ms: scheduler::RECONNECTING_GRACE_MS,
+            grace_window_ms: scheduler_policy(state).reconnecting_grace_ms,
         }));
         state.log_diag_with(
             crate::events::DiagLevel::Warn,
@@ -8018,6 +8155,12 @@ async fn drop_peer_if_current_with_correlation(
     reason: DropReason,
     explicit_correlation: Option<&str>,
 ) {
+    // Acquire the state-owned shutdown witness before preparing or mutating
+    // any peer/worker custody. The witness contains no lock, so it may span
+    // the exact cleanup await while still fencing new post-shutdown callers.
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     if let Some(worker) = owner.worker().cloned() {
         if let Some(correlation) = explicit_correlation.filter(|correlation| {
@@ -8169,6 +8312,9 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
     reason: DropReason,
     correlation: &str,
 ) {
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     let Some(worker) = owner
         .worker()
@@ -8223,6 +8369,7 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                     warn!(%error, "carrier promoted cleanup did not complete");
                 }
                 state.peers.complete_removed_close(&peer);
+                state.settle_stale_closed_relay_owners();
                 if recovery.is_none() {
                     state.clear_reconnect_intent(owner.device_id());
                 }
@@ -8247,6 +8394,7 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                         warn!(%error, "carrier current-worker cleanup did not complete");
                     }
                     state.peers.complete_removed_close(&peer);
+                    state.settle_stale_closed_relay_owners();
                     if recovery.is_none() {
                         state.clear_reconnect_intent(owner.device_id());
                     }
@@ -8268,6 +8416,9 @@ pub(super) fn drop_carrier_if_current_now(
     reason: DropReason,
     correlation: &str,
 ) {
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &reason);
     let Some(worker) = owner
         .worker()
@@ -8355,6 +8506,9 @@ async fn drop_unpromoted_offer_if_current(
     attempt: &str,
     reason: DropReason,
 ) -> bool {
+    let Some(_shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return false;
+    };
     let current = state.peers.with_current(owner, |peer| {
         !peer.holds_promoted_session() && peer.attempt() == attempt
     }) == Some(true);
@@ -8613,12 +8767,15 @@ fn build_test_state_parts_metered_with_creation(
     let config = crate::config::NetworkConfig {
         id: network_id.clone(),
         network_id,
+        event_capacity: 256,
+        connection_trace_capacity: 512,
         label: "test".into(),
         kind: if closed_creation_id.is_some() {
-            crate::network_state::NetworkKind::Closed
+            crate::config::NetworkKind::Closed
         } else {
             Default::default()
         },
+        scheduler: crate::config::SchedulerPolicyConfig::default(),
         topology: crate::config::TopologyMode::FullMesh,
         signaling: crate::config::SignalingConfig::default(),
         closed_relay: crate::config::ClosedRelayPolicyConfig::default(),
@@ -9704,25 +9861,6 @@ impl LinkedPromotedSession {
         let _far_ended = far_pump.await;
         drop(near_peer);
         drop(_far_peer);
-        outcomes
-    }
-}
-
-#[cfg(feature = "transport-lab")]
-impl LinkedPromotedPeer {
-    /// Close both fixture connectors, releasing the far side's retained
-    /// ownership only after both closes have been awaited.
-    ///
-    /// The installed peer is deliberately *not* retired here: retiring it is
-    /// the near engine's own work, and a fixture that did it first would be
-    /// standing in for the shutdown path a control is asserting on.
-    pub(crate) async fn close_outcomes(self) -> Vec<crate::Result<()>> {
-        let LinkedPromotedPeer {
-            peer,
-            receive_ready,
-        } = self;
-        let outcomes = receive_ready.close_outcomes().await;
-        drop(peer);
         outcomes
     }
 }
@@ -10876,7 +11014,7 @@ mod tests {
     fn pre_connect_timeout_instant() -> Instant {
         Instant::now()
             .checked_sub(Duration::from_millis(
-                scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS + 5_000,
+                SchedulerPolicyConfig::DEFAULT.data_channel_open_timeout_ms + 5_000,
             ))
             .expect("test host monotonic clock has enough headroom")
     }
@@ -10887,7 +11025,7 @@ mod tests {
         // must be surfaced as discovered (Sighted, visible in `peers()`) but
         // must NOT cause the engine to open a WebRTC session on its own.
         let state = build_test_state("silent-no-autodial");
-        state.config.write().kind = crate::network_state::NetworkKind::Silent;
+        state.config.write().kind = crate::config::NetworkKind::Silent;
         assert!(state.is_silent());
 
         let peer = "peerpubkeyzzz-customer";
@@ -10919,7 +11057,7 @@ mod tests {
         // announce path deliberately skipped, upgrading the discovery-only
         // placeholder in place (rather than short-circuiting on the stub).
         let state = build_test_state("silent-connect-peer");
-        state.config.write().kind = crate::network_state::NetworkKind::Silent;
+        state.config.write().kind = crate::config::NetworkKind::Silent;
 
         let peer = "peerpubkeyzzz-tech";
         // Discover first (session-less placeholder), as an announce would.
@@ -10931,23 +11069,6 @@ mod tests {
         assert!(
             state.peers.get(peer).unwrap().has_current_worker(),
             "connect_peer must open a session, upgrading the Sighted placeholder"
-        );
-    }
-
-    #[tokio::test]
-    async fn silent_network_suppresses_roster_gossip_predicate() {
-        // The gossip gate: `broadcast_roster_summary` / `on_roster_request`
-        // early-return on `!gossip_roster_enabled()`, which is exactly
-        // "is this network Silent?".
-        let state = build_test_state("silent-gossip-gate");
-        assert!(
-            state.gossip_roster_enabled(),
-            "a non-silent network gossips its roster as before"
-        );
-        state.config.write().kind = crate::network_state::NetworkKind::Silent;
-        assert!(
-            !state.gossip_roster_enabled(),
-            "a silent network must suppress roster gossip"
         );
     }
 
@@ -13224,7 +13345,7 @@ mod tests {
             .peers
             .owner(&device_id)
             .expect("the captured peer is installed");
-        let timeout = Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS);
+        let timeout = Duration::from_millis(SchedulerPolicyConfig::DEFAULT.peer_send_timeout_ms);
 
         // Same-fixture positive baseline: a witness minted under the fence
         // sends through the captured session and records on the captured peer.
@@ -14286,7 +14407,6 @@ mod tests {
         // Report cases 1,2,5,6: a Handshaking peer's application / reliable /
         // RPC / governance frame is dropped before it counts as received,
         // refreshes liveness, or reaches a handler.
-        use crate::protocol::RosterRequestMessage;
         let cases: Vec<(&str, MeshMessage)> = vec![
             (
                 "channel",
@@ -14312,10 +14432,6 @@ mod tests {
                     payload: serde_json::json!(1),
                     streaming: false,
                 }),
-            ),
-            (
-                "governance",
-                MeshMessage::RosterRequest(RosterRequestMessage::default()),
             ),
         ];
         for (name, msg) in cases {
@@ -14533,7 +14649,7 @@ mod tests {
     #[tokio::test]
     async fn early_approve_cannot_activate_unauthenticated_peer() {
         // Report case 7: an `Approve` that arrives before authentication (and a
-        // `roster_approve` that latched `local_approve_sent`) must NOT promote
+        // A local approval observation must NOT promote
         // the peer to Active. The latch is harmless; the transition now requires
         // `authenticated` (the full handshake→Active path is covered by the
         // two_peer_handshake / governance integration tests).
@@ -16057,7 +16173,7 @@ mod tests {
 
     #[test]
     fn connecting_stuck_detection_keys_off_data_channel_and_age() {
-        let grace = scheduler::RESTART_TRAFFIC_GRACE_MS;
+        let grace = SchedulerPolicyConfig::DEFAULT.restart_traffic_grace_ms;
         let old = Instant::now()
             .checked_sub(Duration::from_millis(grace + 1_000))
             .expect("clock headroom");
@@ -16319,25 +16435,12 @@ mod tests {
         let evicted = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::RoleGrant {
-                target: evicted.clone(),
-                role: crate::network_state::Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("canonical member fixture admits");
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::Evict {
-                target: evicted.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("canonical eviction fixture admits");
+        governance::propose_role_grant(&state, &evicted, crate::semantic::Role::Member, None)
+            .await
+            .expect("canonical member fixture admits");
+        governance::propose_evict(&state, &evicted, None)
+            .await
+            .expect("canonical eviction fixture admits");
         assert!(governance::log_evicted(&state, &evicted));
 
         let intentional = insert_promoted_peer(&state, "intentional-answerer-recovery").await;
@@ -16709,25 +16812,12 @@ mod tests {
             .public_id()
             .to_string();
         let state = build_test_closed_state(&format!("evicted-no-reconnect-{evicted}"), [0x73; 32]);
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::RoleGrant {
-                target: evicted.clone(),
-                role: crate::network_state::Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("canonical member grant admits the eviction control target");
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::Evict {
-                target: evicted.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("canonical eviction tombstones the control target");
+        governance::propose_role_grant(&state, &evicted, crate::semantic::Role::Member, None)
+            .await
+            .expect("canonical member grant admits the eviction control target");
+        governance::propose_evict(&state, &evicted, None)
+            .await
+            .expect("canonical eviction tombstones the control target");
         assert!(
             governance::log_evicted(&state, &evicted),
             "seed must make the target read as evicted"
@@ -17177,7 +17267,10 @@ mod tests {
         // Inbound traffic answers the probe partway through the confirm
         // window — a real pong refreshes `last_recv_at` exactly this way,
         // landing well before the sweep at `WAKE_PROBE_DELAY_MS`.
-        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS / 3)).await;
+        tokio::time::sleep(Duration::from_millis(
+            SchedulerPolicyConfig::DEFAULT.wake_probe_delay_ms / 3,
+        ))
+        .await;
         state
             .peers
             .get("peer-answers")
@@ -17188,7 +17281,10 @@ mod tests {
 
         // Wait past the sweep; the session must survive because traffic
         // confirmed it, even though it looked stale when we pinged.
-        tokio::time::sleep(Duration::from_millis(scheduler::WAKE_PROBE_DELAY_MS)).await;
+        tokio::time::sleep(Duration::from_millis(
+            SchedulerPolicyConfig::DEFAULT.wake_probe_delay_ms,
+        ))
+        .await;
         assert!(
             state.peers.contains_key("peer-answers"),
             "a probe answered by inbound traffic must not rebuild the session"
@@ -17271,6 +17367,77 @@ mod tests {
             peer.state.read().last_liveness_probe_at.is_none(),
             "a session mid in-place restart owns its recovery window"
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_fence_rejects_late_delayed_peer_effects() {
+        let state = build_test_state("shutdown-probe-fence");
+        insert_session_less_peer(&state, "peer-shutdown-fence", Some(stale_instant()));
+        let owner = state
+            .peers
+            .owner("peer-shutdown-fence")
+            .expect("the peer is installed before shutdown");
+        let (reconnect_signal, reconnect_rx) = tokio::sync::watch::channel(0_u64);
+        state.set_relay_reconnect(Arc::new(reconnect_signal));
+        let runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("the runtime control has a local resource scope"),
+        );
+        state.publish_signaling_runtime(&runtime);
+        let installed_runtime = state
+            .signaling_runtime()
+            .expect("the runtime is published before shutdown");
+        let pre_shutdown = state
+            .try_admit_shutdown_mutation()
+            .expect("the pre-shutdown operation gets the linearization witness");
+
+        state.request_shutdown();
+
+        assert!(
+            state.try_admit_shutdown_mutation().is_none(),
+            "the shutdown transition rejects every later peer effect"
+        );
+        assert!(
+            !maybe_reactive_announce(&state),
+            "a delayed probe cannot publish after shutdown"
+        );
+        let reconnect_generation = *reconnect_rx.borrow();
+        assert!(
+            !state.request_relay_reconnect(),
+            "a post-shutdown reconnect cannot mutate the relay generation"
+        );
+        assert_eq!(*reconnect_rx.borrow(), reconnect_generation);
+        let replacement_runtime = signaling_ingress::SignalingRuntime::new(
+            state.signaling_inbound_tx.clone(),
+            state
+                .local_application_resource_scope()
+                .expect("the replacement runtime control has a local resource scope"),
+        );
+        state.publish_signaling_runtime(&replacement_runtime);
+        assert!(
+            Arc::ptr_eq(
+                &state
+                    .signaling_runtime()
+                    .expect("the pre-shutdown runtime remains published"),
+                &installed_runtime,
+            ),
+            "a post-shutdown runtime publish cannot replace the installed owner"
+        );
+        assert!(
+            !drop_unpromoted_offer_if_current(&state, &owner, "", DropReason::HeartbeatTimeout,)
+                .await,
+            "a post-shutdown offer cleanup cannot remove the peer"
+        );
+        drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
+        assert!(
+            state.peers.get("peer-shutdown-fence").is_some(),
+            "a delayed probe cannot retire a peer after shutdown"
+        );
+
+        drop(pre_shutdown);
+        state.shutdown().await;
     }
 
     // ---- Arc 04 F2: a request id is not an authority ---------------------
@@ -19233,7 +19400,7 @@ mod tests {
     ///
     /// Assembled with production's own pieces and committed through the
     /// registry's own governance commit: the transitions are real
-    /// [`Transition`](crate::network_state::Transition)s over
+    /// canonical governance facts over
     /// `transition_payload`, signed by a key this fixture holds and granted
     /// Owner in the same state, so `member_log_removed` verifies and authorises
     /// them exactly as it does a log adopted from a peer.
@@ -19279,16 +19446,9 @@ mod tests {
         // invalidate the before-tombstone non-vacuity assertions.
         let state = build_test_closed_state(&format!("evicted-not-admitted-{target}"), [0x71; 32]);
         let me = state.identity.public_id().to_string();
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::RoleGrant {
-                target: target.clone(),
-                role: crate::network_state::Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("the canonical member grant admits the target");
+        governance::propose_role_grant(&state, &target, crate::semantic::Role::Member, None)
+            .await
+            .expect("the canonical member grant admits the target");
 
         // Non-vacuity: before the tombstone this really is an admitted,
         // rostered member of a closed network.
@@ -19316,15 +19476,9 @@ mod tests {
 
         // The owner's canonical removal is applied through the same authoring
         // path as every other durable governance fact.
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::Evict {
-                target: target.clone(),
-            },
-            None,
-        )
-        .await
-        .expect("the canonical eviction admits");
+        governance::propose_evict(&state, &target, None)
+            .await
+            .expect("the canonical eviction admits");
 
         assert!(
             governance::log_evicted(&state, &target),
@@ -19415,16 +19569,9 @@ mod tests {
         let target = crate::identity::Identity::ephemeral()
             .public_id()
             .to_string();
-        governance::propose(
-            &state,
-            crate::network_state::TransitionVariant::RoleGrant {
-                target: target.clone(),
-                role: crate::network_state::Role::Member,
-            },
-            None,
-        )
-        .await
-        .expect("the canonical member grant admits the target");
+        governance::propose_role_grant(&state, &target, crate::semantic::Role::Member, None)
+            .await
+            .expect("the canonical member grant admits the target");
 
         // Non-vacuity: a closed network with a real signed member, so the
         // assertions after the withdrawal are about something that could have
@@ -19540,8 +19687,8 @@ mod tests {
     ///
     /// What it may not do is *become* something. So the assertions are the two
     /// that matter: whatever the announce left behind holds no promoted session,
-    /// and the durable state — roster version, roster size, transition log,
-    /// member log — is byte-identical before and after both reports. A
+    /// and the durable projection — roster version, roster size, and canonical
+    /// entries — is byte-identical before and after both reports. A
     /// before/after comparison rather than a list of things that did not happen,
     /// because a list can only name the movements somebody thought of.
     ///
@@ -19551,7 +19698,7 @@ mod tests {
     #[tokio::test]
     async fn v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable() {
         /// Everything a signaling report is forbidden to touch, in one value.
-        fn durable(state: &Arc<NetworkState>) -> (usize, u32, String) {
+        fn durable(state: &Arc<NetworkState>) -> (usize, u32, Vec<crate::roster::AuthorizedPeer>) {
             let fact_count = {
                 let graph = state.authoritative_fact_graph();
                 let graph = graph.read();
@@ -19561,7 +19708,7 @@ mod tests {
             (
                 fact_count,
                 roster.version,
-                crate::roster::membership_root(&roster),
+                roster.authorized_devices.clone(),
             )
         }
 
@@ -20589,7 +20736,8 @@ mod tests {
             NetworkCmd::AttemptOutcome {
                 owner: accepted_owner,
                 outcome: myownmesh_signaling::AttemptOutcome {
-                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::try_fresh()
+                        .expect("accepted source identity exists"),
                     attempt: accepted_attempt.clone(),
                     event_id: "accepted-event".to_string(),
                     kind: myownmesh_signaling::AttemptOutcomeKind::Accepted { session: None },
@@ -20610,7 +20758,8 @@ mod tests {
             NetworkCmd::AttemptOutcome {
                 owner: typed_owner,
                 outcome: myownmesh_signaling::AttemptOutcome {
-                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::try_fresh()
+                        .expect("typed refusal source identity exists"),
                     attempt: typed_attempt.clone(),
                     event_id: "typed-event".to_string(),
                     kind: myownmesh_signaling::AttemptOutcomeKind::TypedRefused(
@@ -20637,7 +20786,8 @@ mod tests {
             NetworkCmd::AttemptOutcome {
                 owner: unavailable_owner,
                 outcome: myownmesh_signaling::AttemptOutcome {
-                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::fresh(),
+                    source: myownmesh_signaling::nostr::delivery::AdmissionSource::try_fresh()
+                        .expect("unavailable source identity exists"),
                     attempt: unavailable_attempt.clone(),
                     event_id: "unavailable-event".to_string(),
                     kind: myownmesh_signaling::AttemptOutcomeKind::CarrierUnavailable,
@@ -21581,7 +21731,7 @@ mod tests {
             .begin_send()
             .expect("the exact W1 candidate has a live data channel");
         tokio::time::timeout(
-            Duration::from_millis(scheduler::PEER_SEND_TIMEOUT_MS),
+            Duration::from_millis(SchedulerPolicyConfig::DEFAULT.peer_send_timeout_ms),
             send.send(Bytes::from(proof_bytes)),
         )
         .await
@@ -22601,7 +22751,7 @@ mod tests {
     ) {
         loop {
             let correlation = tokio::time::timeout(
-                Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+                Duration::from_millis(SchedulerPolicyConfig::DEFAULT.data_channel_open_timeout_ms),
                 promotions.recv(),
             )
             .await
@@ -22701,7 +22851,7 @@ mod tests {
             build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
         let (state_b, command_driver_b, mut promotions_b, _promotion_gate_b, mut signaling_in_rx_b) =
             build_test_state_with_command_driver_and_slots("b2-real-replacement-shared", 4);
-        let mut linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
+        let linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
 
         let device_a = state_a.identity.public_id().to_string();
         let device_b = state_b.identity.public_id().to_string();
@@ -23593,7 +23743,7 @@ mod tests {
             }
         };
         let second_offer = tokio::time::timeout(
-            Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
+            Duration::from_millis(SchedulerPolicyConfig::DEFAULT.data_channel_open_timeout_ms),
             second_offer_ready_rx,
         )
         .await
@@ -23733,64 +23883,7 @@ mod tests {
             })
             .expect("the B gateway serves the handoff control method");
         let (handoff_request, handoff_waiter) = file_pending(&state_a, &device_b);
-        // B2-G semantic control: seed one B-only roster row so the actual
-        // RosterEntries reply carries an unsigned membership hint. The
-        // canonical contract is that this carrier does not mutate A's roster.
-        // The request is sent through A's exact selected W0 and reaches B
-        // through the normal connector pump, not a direct reducer invocation.
-        let roster_probe = crate::identity::Identity::ephemeral()
-            .public_id()
-            .to_string();
-        crate::roster::add_peer_in(
-            &mut state_b.roster.write(),
-            &roster_probe,
-            "b2-g-surviving-roster",
-        );
-        crate::roster::remove_peer_in(&mut state_a.roster.write(), &roster_probe);
-        let roster_arrival = state_b.rpc_send_boundary.arrival();
-        tokio::pin!(roster_arrival);
-        roster_arrival.as_mut().enable();
-        state_b.rpc_send_boundary.arm();
         let w0_owner_b = owner_b.for_worker(Arc::clone(&old_b));
-        let w0_owner_a = owner_a.for_worker(Arc::clone(&old_a));
-        let roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
-            crate::protocol::RosterRequestMessage {
-                include_all: true,
-                subtree_hashes: Vec::new(),
-            },
-        ))
-        .expect("the production roster request serializes");
-        state_a
-            .peers
-            .admit_application_operation(
-                &w0_owner_a,
-                state_a.session_broker.as_ref(),
-                &state_a.mesh_context_id().to_string(),
-            )
-            .expect("A's exact selected W0 funds the production roster request")
-            .send_frame(
-                &state_a.peers,
-                Bytes::from(roster_request),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("A's exact selected W0 sends the production roster request");
-        tokio::time::timeout(
-            Duration::from_millis(scheduler::DATA_CHANNEL_OPEN_TIMEOUT_MS),
-            roster_arrival.as_mut(),
-        )
-        .await
-        .expect("timed out waiting for the exact-W0 roster arrival on B");
-        assert_eq!(
-            state_b.rpc_send_boundary.entered(),
-            1,
-            "B admits and funds the roster request on exact W0 before semantic reduction"
-        );
-        assert_eq!(
-            state_b.rpc_send_boundary.passed(),
-            0,
-            "the admitted roster request remains paused before its logical reply"
-        );
         let (saved_reliable_reply, mut saved_reliable_waiter) = tokio::sync::oneshot::channel();
         let saved_reliable_stream = state_b
             .peers
@@ -23858,7 +23951,7 @@ mod tests {
         };
         on_rpc_request(&state_b, &handoff_dispatch, handoff_req).await;
         assert!(
-            settle_until(|| state_b.rpc_send_boundary.entered() == 2).await,
+            settle_until(|| state_b.rpc_send_boundary.entered() == 1).await,
             "the admitted W0 handler reaches the shared reply boundary"
         );
         assert_eq!(
@@ -24081,10 +24174,6 @@ mod tests {
             handoff_waiter.await.is_ok(),
             "the actual admitted RPC reply settles A's pending call through W1"
         );
-        assert!(
-            !state_a.is_rostered(&roster_probe),
-            "the B-only unsigned roster carrier does not mutate A's canonical roster"
-        );
         assert_eq!(
             pending_len(&state_a, &device_b),
             Some(1),
@@ -24133,53 +24222,6 @@ mod tests {
             admit_inbound_for_test(&state_b, &standby_owner_b, depart.clone())
                 .expect("W1 captures the duplicate L0 Depart authority before replacement")
                 .into_dispatch();
-
-        // B2-G successor discriminator: park a second production RosterRequest
-        // after L0 has committed, then revoke L0 in place and install a real
-        // L1 over the same PeerConnection installations.  The parked logical
-        // route must be refused after the witness changes, while a fresh L1
-        // request must cross the newly selected native pair.
-        let stale_roster_probe = crate::identity::Identity::ephemeral()
-            .public_id()
-            .to_string();
-        crate::roster::add_peer_in(
-            &mut state_b.roster.write(),
-            &stale_roster_probe,
-            "b2-g-stale-l0-roster",
-        );
-        crate::roster::remove_peer_in(&mut state_a.roster.write(), &stale_roster_probe);
-        let stale_roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
-            crate::protocol::RosterRequestMessage {
-                include_all: true,
-                subtree_hashes: Vec::new(),
-            },
-        ))
-        .expect("the parked L0 roster request serializes");
-        let w1_owner_a = owner_a.for_worker(Arc::clone(&first_promoted_a));
-        state_a
-            .peers
-            .admit_application_operation(
-                &w1_owner_a,
-                state_a.session_broker.as_ref(),
-                &state_a.mesh_context_id().to_string(),
-            )
-            .expect("A's selected L0 W1 funds the parked successor control")
-            .send_frame(
-                &state_a.peers,
-                Bytes::from(stale_roster_request),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("A's selected L0 W1 sends the parked successor control");
-        assert!(
-            settle_until(|| state_b.rpc_send_boundary.entered() == 3).await,
-            "the second production roster request commits on L0 before revocation"
-        );
-        assert_eq!(
-            state_b.rpc_send_boundary.passed(),
-            2,
-            "the new L0 roster reply is the only request held at the armed boundary"
-        );
 
         owner_a.connection().revoke_promoted_session();
         owner_b.connection().revoke_promoted_session();
@@ -24271,123 +24313,6 @@ mod tests {
         );
         assert!(state_a.peers.get_if_current(&owner_a).is_some());
         assert!(state_b.peers.get_if_current(&owner_b).is_some());
-
-        // Keep the two event receivers as disjoint borrows for the production
-        // two-direction pump below. The right receiver is extracted once;
-        // the left receiver remains the link's lifetime anchor.
-        let mut l1_right_events = l1_link.link.take_right_events();
-        let semantic_finished_before_stale_l1 = state_b.rpc_send_boundary.semantic_finished();
-        let frames_before_stale_l1 = owner_a.connection().state.read().diag.frames_in;
-        state_b.rpc_send_boundary.release();
-        assert!(
-            settle_until(|| state_b.rpc_send_boundary.passed() == 3).await,
-            "the parked L0 route is released only after L1 selection"
-        );
-        assert!(
-            settle_until(|| {
-                state_b.rpc_send_boundary.semantic_finished()
-                    == semantic_finished_before_stale_l1 + 1
-            })
-            .await,
-            "the stale L0 semantic reducer completes before a fresh L1 request"
-        );
-        assert!(
-            !state_a.is_rostered(&stale_roster_probe),
-            "the parked L0 response cannot cross the replacement L1"
-        );
-        assert_eq!(
-            owner_a.connection().state.read().diag.frames_in,
-            frames_before_stale_l1,
-            "the stale L0 reply contributes no inbound frame on the selected L1"
-        );
-
-        crate::roster::remove_peer_in(&mut state_b.roster.write(), &stale_roster_probe);
-        let fresh_roster_probe = crate::identity::Identity::ephemeral()
-            .public_id()
-            .to_string();
-        crate::roster::add_peer_in(
-            &mut state_b.roster.write(),
-            &fresh_roster_probe,
-            "b2-g-fresh-l1-roster",
-        );
-        crate::roster::remove_peer_in(&mut state_a.roster.write(), &fresh_roster_probe);
-        let fresh_roster_request = serde_json::to_vec(&MeshMessage::RosterRequest(
-            crate::protocol::RosterRequestMessage {
-                include_all: true,
-                subtree_hashes: Vec::new(),
-            },
-        ))
-        .expect("the fresh L1 roster request serializes");
-        let l1_owner_a = owner_a.for_worker(Arc::clone(&l1_left));
-        state_a
-            .peers
-            .admit_application_operation(
-                &l1_owner_a,
-                state_a.session_broker.as_ref(),
-                &state_a.mesh_context_id().to_string(),
-            )
-            .expect("A's selected L1 funds the fresh roster request")
-            .send_frame(
-                &state_a.peers,
-                Bytes::from(fresh_roster_request),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("A's selected L1 sends the fresh roster request");
-        let ((), ()) = tokio::join!(
-            async {
-                while state_b.rpc_send_boundary.entered() < 4 {
-                    let event =
-                        tokio::time::timeout(Duration::from_secs(1), l1_right_events.recv())
-                            .await
-                            .unwrap_or_else(|_| {
-                                panic!("timed out polling A-to-B L1 right receiver")
-                            })
-                            .expect("the L1 right event stream remains live");
-                    let _ = handle_transport_event(&state_b, device_a.clone(), event).await;
-                }
-            },
-            async {
-                assert!(
-                    settle_until(|| state_b.rpc_send_boundary.entered() >= 4).await,
-                    "the fresh L1 request reaches B's exact boundary"
-                );
-                assert_eq!(
-                    state_b.rpc_send_boundary.entered(),
-                    4,
-                    "the fresh L1 boundary observer sees exactly one new request"
-                );
-                state_b.rpc_send_boundary.release();
-            }
-        );
-        assert_eq!(
-            state_b.rpc_send_boundary.entered(),
-            4,
-            "the fresh request reaches B through the selected L1"
-        );
-        while !state_a.is_rostered(&fresh_roster_probe) {
-            let event = tokio::time::timeout(
-                Duration::from_secs(1),
-                l1_link.link.left_events_mut().recv(),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("timed out polling B-to-A L1 left receiver"))
-            .expect("the L1 left event stream remains live");
-            let _ = handle_transport_event(&state_a, device_b.clone(), event).await;
-        }
-        assert!(
-            state_a.is_rostered(&fresh_roster_probe),
-            "a fresh L1 roster request receives its expected response"
-        );
-        assert!(
-            !state_a.is_rostered(&stale_roster_probe),
-            "the fresh L1 response does not carry the stale L0 roster row"
-        );
-        assert_eq!(
-            owner_a.connection().state.read().diag.frames_in,
-            frames_before_stale_l1 + 1,
-            "only the fresh L1 response adds one inbound frame after the stale baseline"
-        );
 
         on_session_control(&state_b, &old_depart_dispatch, test_departure_control()).await;
         assert!(

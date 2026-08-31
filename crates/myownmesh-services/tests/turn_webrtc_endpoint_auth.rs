@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer,
-    TurnServiceConfig,
+    NetworkConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode, TurnCredential,
+    TurnServer as IceTurnServer, TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::transport_lab::{
@@ -28,8 +28,11 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
     NetworkConfig {
         id: label.to_string(),
         network_id: "turn-endpoint-auth".to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.to_string(),
         kind: Default::default(),
+        scheduler: SchedulerPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),

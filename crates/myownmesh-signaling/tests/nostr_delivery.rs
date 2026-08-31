@@ -15,12 +15,35 @@ use myownmesh_signaling::nostr::delivery::{
     DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
 };
 use myownmesh_signaling::nostr::driver::{
-    start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
+    start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound, NostrTimingConfig,
 };
 use myownmesh_signaling::nostr::handle::derive_room_handle;
 use myownmesh_signaling::nostr::shuffle::select_top_n;
 use myownmesh_signaling::server::{Limits, SignalingServer};
+use myownmesh_signaling::AttemptRefusal;
 use myownmesh_signaling::{ErasedOwner, InboundSink, OwnedSignal, UnboundedSource};
+
+fn test_nostr_timing() -> NostrTimingConfig {
+    NostrTimingConfig {
+        reconnect_initial: Duration::from_secs(2),
+        reconnect_max: Duration::from_secs(60),
+        reconnect_max_attempts: 6,
+        jitter_percent: 15,
+        fallback_poll: Duration::from_secs(3),
+        fallback_activation_grace: Duration::from_secs(20),
+        session_close_timeout: Duration::from_secs(1),
+        announcer_cancel_quantum: Duration::from_secs(1),
+    }
+}
+
+fn open_test_session(store: &DeliveryStore) -> (RelaySessionId, Vec<AttemptRefusal>) {
+    let (session, session_refusal, refused) = store.open_session_with_refusals();
+    assert!(
+        session_refusal.is_none(),
+        "test session admission must succeed"
+    );
+    (session, refused)
+}
 
 struct DeliveryStats {
     refuse_first_session: AtomicBool,
@@ -529,6 +552,7 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
             denylist: Vec::new(),
             redundancy: 2,
             public_fallback: false,
+            timing: test_nostr_timing(),
         },
         Box::new(UnboundedSource::new(out_rx)),
         InboundSink::from_unbounded(in_tx),
@@ -536,7 +560,8 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
             stats: Arc::clone(&stats),
             source_live: Arc::new(AtomicUsize::new(0)),
         }),
-    );
+    )
+    .expect("valid Nostr timing configuration");
     let reconnect = driver.reconnect_signal();
     let mut reconnect_seen = reconnect.subscribe();
     let previous_generation = *reconnect_seen.borrow();
@@ -596,8 +621,14 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
     driver.stop_and_join().await;
     drop(out_tx);
     assert!(stats.finished.load(Ordering::SeqCst) > 0);
-    relay_a.stop_and_wait().await;
-    relay_b.stop_and_wait().await;
+    relay_a
+        .stop_and_wait()
+        .await
+        .expect("primary relay shutdown succeeds");
+    relay_b
+        .stop_and_wait()
+        .await
+        .expect("secondary relay shutdown succeeds");
 }
 
 #[tokio::test]
@@ -619,11 +650,13 @@ async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
             denylist: Vec::new(),
             redundancy: 1,
             public_fallback: false,
+            timing: test_nostr_timing(),
         },
         Box::new(UnboundedSource::new(out_rx)),
         InboundSink::from_unbounded(in_tx),
         provider.clone(),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     tokio::time::timeout(Duration::from_secs(10), first_refusal)
         .await
@@ -637,7 +670,8 @@ async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
     drop(out_tx);
     tokio::time::timeout(Duration::from_secs(2), relay.stop_and_wait())
         .await
-        .expect("relay shutdown remains prompt after refusal");
+        .expect("relay shutdown remains prompt after refusal")
+        .expect("relay shutdown completes after refusal");
 
     assert!(
         immediate_retry.is_err(),
@@ -677,7 +711,10 @@ async fn relay_returns_exact_nip01_ok_for_accepted_event() {
     assert_eq!(ok[1], id);
     assert_eq!(ok[2], true);
     assert!(ok[3].is_string());
-    relay.stop_and_wait().await;
+    relay
+        .stop_and_wait()
+        .await
+        .expect("refusal-control relay shutdown succeeds");
 }
 
 #[test]
@@ -695,8 +732,8 @@ fn old_relay_session_cannot_settle_a_reconnected_attempt() {
         stats: Arc::clone(&stats),
         source_live: Arc::new(AtomicUsize::new(0)),
     }));
-    let (old, _) = store.open_session();
-    let (other, _) = store.open_session();
+    let (old, _) = open_test_session(&store);
+    let (other, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -713,8 +750,8 @@ fn old_relay_session_cannot_settle_a_reconnected_attempt() {
     assert!(report.refused.is_empty());
     assert!(store.settle(&old, &id, DeliveryTerminal::Accepted));
     store.close_session(other, DeliveryTerminal::Cancelled);
-    let (fresh, _) = store.open_session();
-    assert_eq!(store.pending(&fresh), vec![id.clone()]);
+    let (fresh, _) = open_test_session(&store);
+    assert_eq!(store.next_pending(&fresh), Some(id.clone()));
     assert!(!store.settle(&old, &id, DeliveryTerminal::Accepted));
     assert_eq!(
         store.finish_attempt("attempt-aba", DeliveryTerminal::Shutdown),
@@ -741,8 +778,8 @@ fn partial_refusal_has_one_live_entry_and_exact_cancel_terminal() {
         stats: Arc::clone(&stats),
         source_live: Arc::new(AtomicUsize::new(0)),
     }));
-    let (first, _) = store.open_session();
-    let (second, _) = store.open_session();
+    let (first, _) = open_test_session(&store);
+    let (second, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -764,8 +801,8 @@ fn partial_refusal_has_one_live_entry_and_exact_cancel_terminal() {
         &first
     };
     let refused_session = &report.refused[0].0;
-    assert_eq!(store.pending(accepted_session).len(), 1);
-    assert!(store.pending(refused_session).is_empty());
+    assert!(store.next_pending(accepted_session).is_some());
+    assert!(store.next_pending(refused_session).is_none());
     assert_eq!(
         store.finish_attempt("attempt-partial", DeliveryTerminal::Cancelled),
         1
@@ -790,7 +827,7 @@ fn identical_live_event_same_attempt_is_source_scoped() {
         stats: Arc::clone(&stats),
         source_live: Arc::clone(&source_live),
     }));
-    let (session, _) = store.open_session();
+    let (session, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -818,7 +855,7 @@ fn identical_live_event_same_attempt_is_source_scoped() {
         1,
         "duplicate source custody is released immediately"
     );
-    assert_eq!(store.pending(&session), vec![event_id.clone()]);
+    assert_eq!(store.next_pending(&session), Some(event_id.clone()));
     assert!(!store.settle_source(
         second.source,
         &session,
@@ -868,7 +905,7 @@ fn remote_pressure_refusal_releases_all_attempt_custody() {
         live: Arc::clone(&live),
         refuse_relays: Arc::clone(&refuse_relays),
     }));
-    let (session, _) = store.open_session();
+    let (session, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -884,7 +921,7 @@ fn remote_pressure_refusal_releases_all_attempt_custody() {
     assert_eq!(report.accepted_sessions, 0);
     assert_eq!(report.refused.len(), 1);
     assert!(report.attempt_refusal.is_some());
-    assert!(store.pending(&session).is_empty());
+    assert!(store.next_pending(&session).is_none());
     assert!(
         live.load(Ordering::SeqCst) > 0,
         "the live attempt is retryable"
@@ -909,7 +946,7 @@ fn refused_emission_reconnects_and_drains_after_pressure_clears() {
         live: Arc::clone(&live),
         refuse_relays: Arc::clone(&refuse_relays),
     }));
-    let (old, _) = store.open_session();
+    let (old, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -926,9 +963,9 @@ fn refused_emission_reconnects_and_drains_after_pressure_clears() {
     store.close_session(old, DeliveryTerminal::Cancelled);
     refuse_relays.store(false, Ordering::SeqCst);
 
-    let (fresh, refusals) = store.open_session();
+    let (fresh, refusals) = open_test_session(&store);
     assert!(refusals.is_empty());
-    assert_eq!(store.pending(&fresh), vec![event_id.clone()]);
+    assert_eq!(store.next_pending(&fresh), Some(event_id.clone()));
     assert!(store.settle(&fresh, &event_id, DeliveryTerminal::Accepted));
     store.close_session(fresh, DeliveryTerminal::Shutdown);
     assert_eq!(live.load(Ordering::SeqCst), 0);
@@ -941,8 +978,8 @@ fn last_carrier_copy_releases_provider_custody_exactly_once() {
         live: Arc::clone(&live),
         refuse_relays: Arc::new(AtomicBool::new(false)),
     }));
-    let (first, _) = store.open_session();
-    let (second, _) = store.open_session();
+    let (first, _) = open_test_session(&store);
+    let (second, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -974,7 +1011,7 @@ fn source_closure_cancels_pending_attempt_and_releases_custody() {
         live: Arc::clone(&live),
         refuse_relays: Arc::new(AtomicBool::new(false)),
     }));
-    let (session, _) = store.open_session();
+    let (session, _) = open_test_session(&store);
     let event = myownmesh_signaling::nostr::event::make_event(
         &myownmesh_signaling::nostr::event::NostrIdentity::generate(),
         21077,
@@ -988,7 +1025,7 @@ fn source_closure_cancels_pending_attempt_and_releases_custody() {
         OwnedSignal::new(event, Box::new(()) as ErasedOwner),
     );
     assert_eq!(report.accepted_sessions, 1);
-    assert_eq!(store.pending(&session), vec![event_id]);
+    assert_eq!(store.next_pending(&session), Some(event_id));
     assert!(live.load(Ordering::SeqCst) > 0);
 
     assert_eq!(

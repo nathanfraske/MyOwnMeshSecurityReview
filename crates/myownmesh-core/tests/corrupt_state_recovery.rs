@@ -8,7 +8,7 @@
 //! an empty `rosters/{fleet}.json`. These tests pin the recovery
 //! contract:
 //!
-//!  * corrupt roster / network_state / config → quarantined aside as
+//!  * corrupt roster / config → quarantined aside as
 //!    `{name}.corrupt` (bytes preserved) and the load returns a fresh
 //!    default, so the daemon comes up and the state re-converges;
 //!  * saves go through the atomic temp+rename path — a completed save
@@ -18,7 +18,7 @@
 //! first thing) because the env var is process-global; the sub-cases
 //! run sequentially inside one `#[test]` for the same reason.
 
-use myownmesh_core::{config::MeshConfig, network_state, roster};
+use myownmesh_core::{config::MeshConfig, roster};
 
 #[test]
 fn corrupt_state_files_quarantine_and_heal() {
@@ -26,7 +26,6 @@ fn corrupt_state_files_quarantine_and_heal() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     corrupt_roster_heals();
-    corrupt_network_state_heals();
     corrupt_config_heals();
     atomic_saves_round_trip();
 }
@@ -53,20 +52,6 @@ fn corrupt_roster_heals() {
     roster::save(&fresh).expect("save after heal");
     let back = roster::load(net).expect("load after heal");
     assert_eq!(back.authorized_devices.len(), 1);
-}
-
-/// Same contract for the signed-governance state file.
-fn corrupt_network_state_heals() {
-    let net = "gov-brick-repro";
-    let dir = myownmesh_core::dirs::states_dir().expect("states dir");
-    std::fs::create_dir_all(&dir).expect("create states dir");
-    let path = dir.join(format!("{net}.json"));
-    std::fs::write(&path, b"{\"version\": 2, \"netwo").expect("plant half-written state");
-
-    let loaded = network_state::load(net).expect("corrupt state must not error");
-    assert_eq!(loaded.network_id, net);
-    assert!(!path.exists(), "corrupt file must be moved aside");
-    assert!(dir.join(format!("{net}.json.corrupt")).exists());
 }
 
 /// Same contract for config.json — a corrupt config used to stop the

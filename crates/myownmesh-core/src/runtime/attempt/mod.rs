@@ -96,7 +96,7 @@ impl<T> AttemptOwnerSet<T> {
         self.entries.for_each(|_, value| visit(value));
     }
 
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
@@ -115,6 +115,7 @@ impl<T> AttemptOwnerSet<T> {
         self.entries.pop_first_entry().map(|(_, value)| value)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         !self.entries.any_value(|_| true)
     }
@@ -684,7 +685,8 @@ mod tests {
         assert_eq!(provider.in_use().amount(ResourceClass::ParsingOrCpuWork), 1);
 
         let connected = candidate
-            .promote_if_live(|candidate| candidate)
+            .try_promote_if_live(|candidate| candidate)
+            .ok()
             .expect("the active attempt atomically promotes");
         assert_eq!(provider.in_use().amount(ResourceClass::ParsingOrCpuWork), 0);
         drop(connected);
@@ -952,15 +954,17 @@ mod tests {
         let (promotion_entered_tx, promotion_entered_rx) = std::sync::mpsc::channel();
         let (release_promotion_tx, release_promotion_rx) = std::sync::mpsc::channel();
         let promotion = std::thread::spawn(move || {
-            candidate.promote_if_live(|candidate| {
-                promotion_entered_tx
-                    .send(())
-                    .expect("the test observes the promotion lock");
-                release_promotion_rx
-                    .recv()
-                    .expect("the test releases promotion");
-                candidate
-            })
+            candidate
+                .try_promote_if_live(|candidate| {
+                    promotion_entered_tx
+                        .send(())
+                        .expect("the test observes the promotion lock");
+                    release_promotion_rx
+                        .recv()
+                        .expect("the test releases promotion");
+                    candidate
+                })
+                .ok()
         });
         promotion_entered_rx
             .recv()

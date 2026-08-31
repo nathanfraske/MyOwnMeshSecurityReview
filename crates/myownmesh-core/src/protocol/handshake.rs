@@ -5,7 +5,22 @@
 //! gate after mutual authentication. Canonical governance proof is exchanged
 //! as semantic facts, never as unsigned fields on a handshake frame.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Deserializer, Deserialize, Serialize};
+
+fn deserialize_current_protocol<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let protocol = u32::deserialize(deserializer)?;
+    if protocol == crate::PROTOCOL_VERSION {
+        Ok(protocol)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported core wire protocol version {protocol}; expected {}",
+            crate::PROTOCOL_VERSION
+        )))
+    }
+}
 
 pub(crate) fn verification_code_has_protocol_shape(code: &str) -> bool {
     code.len() == 6
@@ -22,6 +37,7 @@ pub(crate) fn verification_code_has_protocol_shape(code: &str) -> bool {
 pub struct HelloMessage {
     /// The closed wire profile version. Unknown frame kinds and unsupported
     /// profiles fail closed; there is no optional-frame negotiation.
+    #[serde(deserialize_with = "deserialize_current_protocol")]
     pub protocol: u32,
     /// Bare-pubkey Device ID, base32-lowercase, with any display suffix omitted.
     pub device_id: String,
@@ -35,6 +51,23 @@ pub struct HelloMessage {
     /// Closed profile advertisement; must include `endpoint_auth_v1`.
     #[serde(default)]
     pub features: Vec<String>,
+}
+
+impl HelloMessage {
+    /// Validate the non-negotiable core wire version for programmatically
+    /// constructed hellos. Wire deserialization applies the same check before
+    /// an engine handshake can reach endpoint authentication.
+    pub fn validate_protocol(&self) -> Result<(), String> {
+        if self.protocol == crate::PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(format!(
+                "unsupported core wire protocol version {}; expected {}",
+                self.protocol,
+                crate::PROTOCOL_VERSION
+            ))
+        }
+    }
 }
 
 /// Response proving possession of the key matching `HelloMessage::device_id`.
@@ -72,5 +105,63 @@ mod verification_code_tests {
                 "{malformed:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_version_tests {
+    use super::HelloMessage;
+
+    fn hello_json(protocol: Option<u32>) -> String {
+        let mut value = serde_json::json!({
+            "device_id": "device",
+            "label": "label",
+            "nonce": "nonce",
+            "verification_code": "abc123",
+            "features": ["endpoint_auth_v1"]
+        });
+        if let Some(protocol) = protocol {
+            value["protocol"] = serde_json::json!(protocol);
+        }
+        value.to_string()
+    }
+
+    #[test]
+    fn previous_and_future_versions_refuse_before_auth() {
+        for protocol in [
+            crate::PROTOCOL_VERSION.saturating_sub(1),
+            crate::PROTOCOL_VERSION.saturating_add(1),
+        ] {
+            let error = serde_json::from_str::<HelloMessage>(&hello_json(Some(protocol)))
+                .expect_err("non-current core version must fail at wire decode");
+            assert!(error
+                .to_string()
+                .contains("unsupported core wire protocol version"));
+        }
+    }
+
+    #[test]
+    fn missing_version_refuses_before_auth() {
+        let error = serde_json::from_str::<HelloMessage>(&hello_json(None))
+            .expect_err("missing core version must fail at wire decode");
+        assert!(error.to_string().contains("missing field `protocol`"));
+    }
+
+    #[test]
+    fn current_version_is_the_only_programmatic_version() {
+        let hello = HelloMessage {
+            protocol: crate::PROTOCOL_VERSION,
+            device_id: "device".into(),
+            label: String::new(),
+            nonce: "nonce".into(),
+            verification_code: "abc123".into(),
+            features: Vec::new(),
+        };
+        hello
+            .validate_protocol()
+            .expect("current version validates");
+        let mut stale = hello;
+        stale.protocol = crate::PROTOCOL_VERSION.saturating_sub(1);
+        assert!(stale.validate_protocol().is_err());
     }
 }

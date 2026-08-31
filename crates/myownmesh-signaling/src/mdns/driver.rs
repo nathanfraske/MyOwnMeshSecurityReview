@@ -26,17 +26,32 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
+
+#[cfg(test)]
+static TEST_REAPED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FALLBACK_WAKE: OnceLock<Notify> = OnceLock::new();
+
+#[cfg(test)]
+fn record_reaped_fallback() {
+    TEST_REAPED_FALLBACKS.fetch_add(1, Ordering::AcqRel);
+    TEST_REAPED_FALLBACK_WAKE
+        .get_or_init(Notify::new)
+        .notify_one();
+}
 
 use super::discovery::{
     Discovery, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits, MdnsTimingProfile,
@@ -454,7 +469,9 @@ where
         peers: Mutex::new(PeerOwnership::with_max_peers(
             config.limits.max_discovered_peers,
         )),
-        aliases: Mutex::new(AliasOwnership::default()),
+        aliases: Mutex::new(AliasOwnership::with_max_aliases(
+            config.limits.max_discovered_peers,
+        )),
         conns: Mutex::new(ConnectionOwnership::default()),
         connection_slots: Arc::new(Semaphore::new(config.limits.max_active_connections)),
         outbound_queue_capacity: config.limits.outbound_queue_capacity,
@@ -510,23 +527,40 @@ where
         }));
     }
 
+    let (supervisor_stop, supervisor_stop_rx) = oneshot::channel();
+    let (supervisor_done, supervisor_done_rx) = oneshot::channel();
+    let supervisor = tokio::spawn(supervise_driver_tasks(
+        tasks,
+        shared.connection_tasks.clone(),
+        supervisor_stop_rx,
+        supervisor_done,
+    ));
+    let (supervisor_reaper, supervisor_reaper_task) = spawn_task_reaper(1);
+
     Ok(MdnsDriverHandle {
         discovery,
-        tasks,
-        connection_tasks: shared.connection_tasks.clone(),
         stopped: shared.stopped.clone(),
         cancel: shared.cancel.clone(),
+        supervisor: Some(supervisor),
+        supervisor_reaper: Some(supervisor_reaper),
+        supervisor_reaper_task: Some(supervisor_reaper_task),
+        supervisor_stop: Some(supervisor_stop),
+        supervisor_done: Some(supervisor_done_rx),
     })
 }
 
-/// Handle returned by [`start`]. Drop or call [`Self::stop`] to
-/// withdraw the advertisement and stop every spawned task.
+/// Handle returned by [`start`]. Drop requests shutdown and cancels every
+/// task; all child handles remain owned by the runtime supervisor. Async owners
+/// should use [`Self::stop_and_join`] to observe its terminal join.
 pub struct MdnsDriverHandle {
     discovery: Arc<Discovery>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
     stopped: Arc<AtomicBool>,
     cancel: watch::Sender<bool>,
+    supervisor: Option<JoinHandle<()>>,
+    supervisor_reaper: Option<mpsc::Sender<JoinHandle<()>>>,
+    supervisor_reaper_task: Option<JoinHandle<()>>,
+    supervisor_stop: Option<oneshot::Sender<()>>,
+    supervisor_done: Option<oneshot::Receiver<()>>,
 }
 
 impl MdnsDriverHandle {
@@ -537,7 +571,7 @@ impl MdnsDriverHandle {
         let _ = self.cancel.send(true);
         // Goodbye first (peers get PeerLeft promptly), then shut the
         // backend down (closes the browse stream). The async owner joins
-        // tasks after this signal; the compatibility stop aborts them.
+        // tasks after this signal; Drop cancels them if no async owner remains.
         self.discovery.unregister();
         self.discovery.shutdown();
     }
@@ -545,30 +579,100 @@ impl MdnsDriverHandle {
     /// Signal shutdown and join every driver-owned Tokio task.
     pub async fn stop_and_join(mut self) {
         self.request_stop();
-        while let Some(task) = self.tasks.pop() {
-            let _ = task.await;
+        self.request_supervisor_stop();
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.await;
         }
-        let mut connection_tasks = self.connection_tasks.lock().take().unwrap_or_default();
-        while connection_tasks.join_next().await.is_some() {}
+        if let Some(done) = self.supervisor_done.take() {
+            let _ = done.await;
+        }
+        let reaper = self.supervisor_reaper.take();
+        drop(reaper);
+        if let Some(reaper_task) = self.supervisor_reaper_task.take() {
+            let _ = reaper_task.await;
+        }
     }
 
-    /// Compatibility signal-only stop for callers that cannot await. The
-    /// owning async boundary should prefer [`Self::stop_and_join`].
-    pub fn stop(&self) {
-        self.request_stop();
-        for t in &self.tasks {
-            t.abort();
-        }
-        if let Some(mut connection_tasks) = self.connection_tasks.lock().take() {
-            connection_tasks.abort_all();
+    fn request_supervisor_stop(&mut self) {
+        if let Some(stop) = self.supervisor_stop.take() {
+            let _ = stop.send(());
         }
     }
 }
 
 impl Drop for MdnsDriverHandle {
     fn drop(&mut self) {
-        self.stop();
+        self.request_stop();
+        self.request_supervisor_stop();
+        if let Some(supervisor) = self.supervisor.take() {
+            if let Some(reaper) = self.supervisor_reaper.as_ref() {
+                join_supervisor(reaper, supervisor);
+            } else {
+                let _ = futures::executor::block_on(supervisor);
+            }
+        }
+        drop(self.supervisor_reaper.take());
     }
+}
+
+fn join_supervisor(reaper: &mpsc::Sender<JoinHandle<()>>, supervisor: JoinHandle<()>) {
+    match reaper.try_send(supervisor) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(supervisor))
+        | Err(tokio::sync::mpsc::error::TrySendError::Closed(supervisor)) => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = supervisor.await;
+                    #[cfg(test)]
+                    record_reaped_fallback();
+                });
+            } else {
+                let _ = futures::executor::block_on(supervisor);
+                #[cfg(test)]
+                record_reaped_fallback();
+            }
+        }
+    }
+}
+
+fn spawn_task_reaper(capacity: usize) -> (mpsc::Sender<JoinHandle<()>>, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let task = tokio::spawn(async move {
+        reap_owned_tasks(receiver).await;
+    });
+    (sender, task)
+}
+
+async fn reap_owned_tasks(mut receiver: mpsc::Receiver<JoinHandle<()>>) {
+    while let Some(task) = receiver.recv().await {
+        let _ = task.await;
+    }
+}
+
+/// Runtime-owned reaper for every Tokio task created by one driver. The
+/// handle intentionally does not retain any child [`JoinHandle`], so dropping
+/// it outside an async runtime cannot detach those children or skip custody
+/// observation; the reaper consumes, aborts, and joins them exactly once.
+async fn supervise_driver_tasks(
+    mut tasks: Vec<tokio::task::JoinHandle<()>>,
+    connection_tasks: Arc<Mutex<Option<JoinSet<()>>>>,
+    supervisor_stop: oneshot::Receiver<()>,
+    done: oneshot::Sender<()>,
+) {
+    let _ = supervisor_stop.await;
+    // Let the cancellation watches reach their owners before the hard reaper
+    // fence. This is a scheduling handoff only; termination never depends on
+    // a timer or an unbounded retry.
+    tokio::task::yield_now().await;
+    for task in &tasks {
+        task.abort();
+    }
+    while let Some(task) = tasks.pop() {
+        let _ = task.await;
+    }
+    let mut connection_tasks = { connection_tasks.lock().take().unwrap_or_default() };
+    while connection_tasks.join_next().await.is_some() {}
+    let _ = done.send(());
 }
 
 struct Shared {
@@ -742,10 +846,16 @@ impl PeerOwnership {
 /// Exact DNS-SD alias ownership. A decoded peer may be represented by more
 /// than one backend service key (for example, one per interface), so one key's
 /// removal cannot withdraw the peer while another key remains live.
-#[derive(Default)]
 pub struct AliasOwnership {
     head: Option<Box<AliasNode>>,
     count: usize,
+    max_aliases: usize,
+}
+
+impl Default for AliasOwnership {
+    fn default() -> Self {
+        Self::with_max_aliases(MdnsLimits::default().max_discovered_peers)
+    }
 }
 
 struct AliasNode {
@@ -757,6 +867,15 @@ struct AliasNode {
 }
 
 impl AliasOwnership {
+    /// Create alias ownership with an explicit finite policy-derived bound.
+    pub fn with_max_aliases(max_aliases: usize) -> Self {
+        Self {
+            head: None,
+            count: 0,
+            max_aliases,
+        }
+    }
+
     /// Bind one exact service key to a decoded peer. Returns an old peer only
     /// when rebinding made that peer lose its final alias.
     pub fn bind(
@@ -779,6 +898,10 @@ impl AliasOwnership {
                 return Ok(displaced);
             }
             cursor = node.next.as_mut();
+        }
+        if self.count >= self.max_aliases {
+            drop(owner);
+            return Err(AliasRefusal::Provider("alias capacity exhausted".into()));
         }
         if self.count == usize::MAX {
             drop(owner);
@@ -1632,10 +1755,19 @@ async fn run_writer(
         };
         match next {
             Ok(Some(line)) => {
-                if write_half.write_all(line.value().as_bytes()).await.is_err() {
+                if !write_with_cancellation(
+                    &mut write_half,
+                    line.value().as_bytes(),
+                    &mut cancel,
+                    &mut local_cancel,
+                )
+                .await
+                {
                     return;
                 }
-                if write_half.write_all(b"\n").await.is_err() {
+                if !write_with_cancellation(&mut write_half, b"\n", &mut cancel, &mut local_cancel)
+                    .await
+                {
                     return;
                 }
                 drop(line);
@@ -1643,6 +1775,25 @@ async fn run_writer(
             // Sender dropped (driver stopping / conn replaced) or idle.
             Ok(None) | Err(_) => return,
         }
+    }
+}
+
+/// Race each socket write with both the driver and exact-connection stop
+/// signals. A peer that stops reading must not keep the shutdown join fence
+/// waiting on an unbounded `write_all`.
+async fn write_with_cancellation(
+    write_half: &mut tokio::net::tcp::OwnedWriteHalf,
+    bytes: &[u8],
+    cancel: &mut watch::Receiver<bool>,
+    local_cancel: &mut watch::Receiver<bool>,
+) -> bool {
+    if *cancel.borrow() || *local_cancel.borrow() {
+        return false;
+    }
+    tokio::select! {
+        result = write_half.write_all(bytes) => result.is_ok(),
+        _ = cancel.changed() => false,
+        _ = local_cancel.changed() => false,
     }
 }
 
@@ -1855,6 +2006,22 @@ async fn run_reannounce(shared: Arc<Shared>) {
 mod tests {
     use super::*;
 
+    fn panicking_task(
+        message: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx
+                .send(())
+                .expect("the panic child start barrier remains live");
+            panic!("{message}");
+        });
+        (task, started_rx)
+    }
+
     struct DropCounter(Arc<AtomicU64>);
 
     impl Drop for DropCounter {
@@ -1944,6 +2111,30 @@ mod tests {
         assert_eq!(released.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn alias_registry_refuses_at_policy_bound_before_mutation() {
+        let released = Arc::new(AtomicU64::new(0));
+        let mut aliases = AliasOwnership::with_max_aliases(1);
+        aliases
+            .bind(
+                "service-a".into(),
+                "peer-a".into(),
+                1,
+                Box::new(DropCounter(Arc::clone(&released))),
+            )
+            .expect("first alias admitted");
+        let refused = aliases.bind(
+            "service-b".into(),
+            "peer-b".into(),
+            2,
+            Box::new(DropCounter(Arc::clone(&released))),
+        );
+        assert!(refused.is_err());
+        assert_eq!(aliases.alias_count("peer-a"), 1);
+        assert_eq!(aliases.alias_count("peer-b"), 0);
+        assert_eq!(released.load(Ordering::Acquire), 1);
+    }
+
     #[cfg_attr(
         any(target_os = "ios", feature = "system-dnssd"),
         ignore = "requires the system mDNS daemon"
@@ -1958,6 +2149,9 @@ mod tests {
                 max_resolve_owners: 2,
                 event_capacity: 3,
                 max_event_epochs: 4,
+                max_txt_entries: 64,
+                max_txt_bytes: 4096,
+                max_resolved_addresses: 32,
             },
             timing: MdnsTimingProfile::default(),
         };
@@ -2112,6 +2306,119 @@ mod tests {
         assert!(supervisor.join_next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn runtime_reaper_aborts_and_observes_every_owned_task() {
+        struct DropMark(Arc<AtomicBool>);
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _mark = DropMark(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        let (stop, stop_rx) = oneshot::channel();
+        let (done, done_rx) = oneshot::channel();
+        let connection_tasks = Arc::new(Mutex::new(Some(JoinSet::new())));
+        tokio::spawn(supervise_driver_tasks(
+            vec![task],
+            connection_tasks,
+            stop_rx,
+            done,
+        ));
+        stop.send(()).expect("reaper is waiting for shutdown");
+        timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("reaper completes")
+            .expect("reaper completion is published");
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaper_full_and_closed_fallbacks_observe_panics_in_and_outside_runtime() {
+        let wake = TEST_REAPED_FALLBACK_WAKE.get_or_init(Notify::new);
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the first handle fills the bounded reaper channel");
+        let (task, started) = panicking_task("injected mdns panic through full fallback");
+        started
+            .await
+            .expect("the full fallback child starts before transfer");
+        join_supervisor(&full_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "a full active-runtime transfer joins the exact panicking child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the full-channel filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) = panicking_task("injected mdns panic through closed fallback");
+        started
+            .await
+            .expect("the closed fallback child starts before transfer");
+        join_supervisor(&closed_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 2,
+            "a closed active-runtime transfer joins the exact panicking child"
+        );
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the no-runtime full channel is deterministically occupied");
+        let (task, started) =
+            panicking_task("injected mdns panic through outside-runtime full fallback");
+        started
+            .await
+            .expect("the outside-runtime full child starts before transfer");
+        std::thread::spawn(move || join_supervisor(&full_sender, task))
+            .join()
+            .expect("outside-runtime full fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 3,
+            "a full no-runtime transfer synchronously observes the child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the no-runtime full filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) =
+            panicking_task("injected mdns panic through outside-runtime closed fallback");
+        started
+            .await
+            .expect("the outside-runtime closed child starts before transfer");
+        std::thread::spawn(move || join_supervisor(&closed_sender, task))
+            .join()
+            .expect("outside-runtime closed fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 4,
+            "a closed no-runtime transfer synchronously observes the child"
+        );
+    }
+
     #[test]
     fn configured_limits_are_finite_and_reject_zero() {
         let limits = MdnsLimits::default();
@@ -2185,6 +2492,9 @@ mod tests {
                 max_resolve_owners: 11,
                 event_capacity: 13,
                 max_event_epochs: 17,
+                max_txt_entries: 19,
+                max_txt_bytes: 2048,
+                max_resolved_addresses: 23,
             },
             timing: MdnsTimingProfile {
                 accept_error_backoff: Duration::from_millis(41),
@@ -2200,6 +2510,9 @@ mod tests {
         assert_eq!(limits.discovery.event_capacity, 13);
         assert_eq!(limits.discovery.max_resolve_owners, 11);
         assert_eq!(limits.discovery.max_event_epochs, 17);
+        assert_eq!(limits.discovery.max_txt_entries, 19);
+        assert_eq!(limits.discovery.max_txt_bytes, 2048);
+        assert_eq!(limits.discovery.max_resolved_addresses, 23);
         assert_eq!(
             limits.timing.accept_error_backoff,
             Duration::from_millis(41)
@@ -2348,6 +2661,9 @@ mod tests {
                 max_resolve_owners: 2,
                 event_capacity: 3,
                 max_event_epochs: 4,
+                max_txt_entries: 64,
+                max_txt_bytes: 4096,
+                max_resolved_addresses: 32,
             },
             timing: MdnsTimingProfile::default(),
         };

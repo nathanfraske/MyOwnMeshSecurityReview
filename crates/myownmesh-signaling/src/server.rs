@@ -38,8 +38,12 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -64,6 +68,7 @@ type WriterRegistry = Arc<Mutex<HashMap<u64, Option<JoinHandle<()>>>>>;
 type WriterSettlementSender = mpsc::Sender<u64>;
 type ConnectionRegistry = Arc<Mutex<HashMap<u64, JoinHandle<()>>>>;
 type ConnectionCompletionSender = mpsc::Sender<u64>;
+type TaskReaperSender = mpsc::Sender<JoinHandle<()>>;
 
 #[cfg(test)]
 static TEST_PARK_NEXT_WRITER: AtomicBool = AtomicBool::new(false);
@@ -72,7 +77,21 @@ static TEST_WRITER_PARKED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static TEST_PANIC_AFTER_WRITER: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
+static TEST_REAPED_TASKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FALLBACK_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+#[cfg(test)]
 static TEST_GATE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn record_reaped_fallback() {
+    TEST_REAPED_FALLBACKS.fetch_add(1, Ordering::AcqRel);
+    TEST_REAPED_FALLBACK_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_one();
+}
 
 /// Flood-protection limits for the signaling relay. Every field is finite and
 /// non-zero: an unbounded deployment is not a valid server configuration.
@@ -106,6 +125,9 @@ pub struct Limits {
     pub max_stored_events: u32,
     /// Seconds a stored event remains replayable.
     pub stored_retention_secs: u64,
+    /// Seconds between operator-visible activity heartbeat snapshots.
+    /// Independent from event-retention policy.
+    pub stats_heartbeat_interval_secs: u64,
     /// Max events materialized for one `REQ` replay.
     pub max_replay_per_req: u32,
     /// Max pending wire frames per connection.
@@ -133,6 +155,7 @@ impl Default for Limits {
             max_frame_bytes: 65_536,
             max_stored_events: 8192,
             stored_retention_secs: 15 * 60,
+            stats_heartbeat_interval_secs: 15 * 60,
             max_replay_per_req: 500,
             outbound_queue_cap: 128,
             strike_limit: 50,
@@ -176,6 +199,10 @@ impl Limits {
         }
         for (name, value) in [
             ("stored_retention_secs", self.stored_retention_secs),
+            (
+                "stats_heartbeat_interval_secs",
+                self.stats_heartbeat_interval_secs,
+            ),
             ("handshake_timeout_secs", self.handshake_timeout_secs),
             ("writer_stop_timeout_secs", self.writer_stop_timeout_secs),
         ] {
@@ -232,6 +259,12 @@ impl Limits {
         Duration::from_secs(self.writer_stop_timeout_secs)
     }
 
+    /// Keep the activity heartbeat on its own operator-selected horizon;
+    /// storage retention is a separate policy and must not control it.
+    fn stats_heartbeat_interval(&self) -> Duration {
+        Duration::from_secs(self.stats_heartbeat_interval_secs)
+    }
+
     fn checked_product(name: &'static str, left: u32, right: u32) -> Result<usize> {
         let value = u64::from(left)
             .checked_mul(u64::from(right))
@@ -285,9 +318,24 @@ pub struct SignalingServerHandle {
     connections: ConnectionRegistry,
     writers: WriterRegistry,
     registry_terminal: Arc<RegistryTerminal>,
+    task_reaper: Mutex<Option<TaskReaperSender>>,
+    task_reaper_handle: Mutex<Option<JoinHandle<()>>>,
     writer_stop_timeout: Duration,
     local_addr: SocketAddr,
     hub: Hub,
+}
+
+/// Terminal failures observed while draining the server's owned tasks.
+#[derive(Debug, thiserror::Error)]
+#[error("signaling server shutdown failed: {failures:?}")]
+pub struct SignalingShutdownError {
+    pub failures: Vec<SignalingShutdownFailure>,
+}
+
+#[derive(Debug)]
+pub struct SignalingShutdownFailure {
+    pub task: String,
+    pub error: String,
 }
 
 impl SignalingServerHandle {
@@ -326,31 +374,78 @@ impl SignalingServerHandle {
     /// connection, and await all owned connection/writer tasks. A writer that
     /// cannot close within the bounded stop interval is aborted and joined so
     /// no detached task survives this fence.
-    pub async fn stop_and_wait(mut self) {
+    pub async fn stop_and_wait(mut self) -> std::result::Result<(), SignalingShutdownError> {
         self.hub.shutdown();
+        let mut failures = Vec::new();
         if let Some(task) = self.task.take() {
             if let Err(error) = task.await {
                 warn!("signaling accept loop did not complete normally: {error}");
+                if !error.is_cancelled() {
+                    failures.push(SignalingShutdownFailure {
+                        task: "accept".into(),
+                        error: error.to_string(),
+                    });
+                }
             }
         }
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
-            let _ = heartbeat.await;
+            if let Err(error) = heartbeat.await {
+                warn!("signaling heartbeat did not complete normally: {error}");
+                if !error.is_cancelled() {
+                    failures.push(SignalingShutdownFailure {
+                        task: "heartbeat".into(),
+                        error: error.to_string(),
+                    });
+                }
+            }
         }
 
         let tasks = {
             let mut owned = self.connections.lock();
             std::mem::take(&mut *owned)
         };
-        for (_, task) in tasks {
+        for (conn_id, task) in tasks {
             if let Err(error) = task.await {
                 warn!("signaling connection task did not complete normally: {error}");
+                if !error.is_cancelled() {
+                    failures.push(SignalingShutdownFailure {
+                        task: format!("connection:{conn_id}"),
+                        error: error.to_string(),
+                    });
+                }
             }
         }
 
         let writer_ids = self.writers.lock().keys().copied().collect::<Vec<_>>();
         for conn_id in writer_ids {
-            settle_writer(&self.writers, conn_id, self.writer_stop_timeout).await;
+            if let Err(error) =
+                settle_writer_observed(&self.writers, conn_id, self.writer_stop_timeout).await
+            {
+                failures.push(SignalingShutdownFailure {
+                    task: format!("writer:{conn_id}"),
+                    error,
+                });
+            }
+        }
+        let reaper_sender = self.task_reaper.lock().take();
+        drop(reaper_sender);
+        let reaper = self.task_reaper_handle.lock().take();
+        if let Some(reaper) = reaper {
+            if let Err(error) = reaper.await {
+                warn!("signaling task reaper did not complete normally: {error}");
+                if !error.is_cancelled() {
+                    failures.push(SignalingShutdownFailure {
+                        task: "reaper".into(),
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(SignalingShutdownError { failures })
         }
     }
 }
@@ -358,18 +453,34 @@ impl SignalingServerHandle {
 impl Drop for SignalingServerHandle {
     fn drop(&mut self) {
         self.hub.shutdown();
+        let reaper = self.task_reaper.lock().take();
         if let Some(task) = self.task.take() {
-            task.abort();
+            if let Some(reaper) = reaper.as_ref() {
+                abort_and_join(reaper, task);
+            } else {
+                task.abort();
+                let _ = futures::executor::block_on(task);
+            }
         }
         if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
+            if let Some(reaper) = reaper.as_ref() {
+                abort_and_join(reaper, heartbeat);
+            } else {
+                heartbeat.abort();
+                let _ = futures::executor::block_on(heartbeat);
+            }
         }
         let tasks = {
             let mut owned = self.connections.lock();
             std::mem::take(&mut *owned)
         };
         for (_, task) in tasks {
-            task.abort();
+            if let Some(reaper) = reaper.as_ref() {
+                abort_and_join(reaper, task);
+            } else {
+                task.abort();
+                let _ = futures::executor::block_on(task);
+            }
         }
         let writers = {
             let mut owned = self.writers.lock();
@@ -377,9 +488,61 @@ impl Drop for SignalingServerHandle {
         };
         for (_, writer) in writers {
             if let Some(writer) = writer {
-                writer.abort();
+                if let Some(reaper) = reaper.as_ref() {
+                    abort_and_join(reaper, writer);
+                } else {
+                    writer.abort();
+                    let _ = futures::executor::block_on(writer);
+                }
             }
         }
+        drop(reaper);
+    }
+}
+
+/// Abort a task owned by a dropped server, then transfer its exact join handle
+/// to the runtime-owned reaper. The channel capacity is derived from the
+/// maximum number of connection and writer slots, so this synchronous Drop
+/// path never needs to block or detach a task when it runs outside a Tokio
+/// runtime.
+fn abort_and_join(reaper: &TaskReaperSender, task: JoinHandle<()>) {
+    task.abort();
+    match reaper.try_send(task) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(task))
+        | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = task.await;
+                    #[cfg(test)]
+                    record_reaped_fallback();
+                });
+            } else {
+                let _ = futures::executor::block_on(task);
+                #[cfg(test)]
+                record_reaped_fallback();
+            }
+        }
+    }
+}
+
+fn spawn_task_reaper(capacity: usize) -> (TaskReaperSender, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    let task = tokio::spawn(async move {
+        reap_owned_tasks(receiver).await;
+    });
+    (sender, task)
+}
+
+async fn reap_owned_tasks(mut receiver: mpsc::Receiver<JoinHandle<()>>) {
+    while let Some(task) = receiver.recv().await {
+        if let Err(error) = task.await {
+            if !error.is_cancelled() {
+                warn!("dropped signaling task did not join normally: {error}");
+            }
+        }
+        #[cfg(test)]
+        TEST_REAPED_TASKS.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -390,6 +553,7 @@ impl SignalingServer {
     pub async fn start(bind: &str, port: u16, limits: Limits) -> Result<SignalingServerHandle> {
         limits.validate()?;
         let writer_stop_timeout = limits.writer_stop_timeout();
+        let heartbeat_interval = limits.stats_heartbeat_interval();
         let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
         let addr = format!("{bind}:{port}");
         let listener = TcpListener::bind(&addr)
@@ -406,6 +570,11 @@ impl SignalingServer {
         let connections = Arc::new(Mutex::new(HashMap::with_capacity(registry_capacity)));
         let writers = Arc::new(Mutex::new(HashMap::with_capacity(registry_capacity)));
         let registry_terminal = Arc::new(RegistryTerminal::new());
+        let reaper_capacity = registry_capacity
+            .checked_mul(2)
+            .and_then(|capacity| capacity.checked_add(2))
+            .ok_or_else(|| Error::Other("signaling task reaper capacity overflow".into()))?;
+        let (task_reaper, task_reaper_handle) = spawn_task_reaper(reaper_capacity);
         let (writer_settlement_tx, writer_settlement_rx) = mpsc::channel(registry_capacity.max(1));
         let (completion_tx, completion_rx) = mpsc::channel(registry_capacity);
         let task = tokio::spawn(accept_loop(
@@ -423,13 +592,15 @@ impl SignalingServer {
                 writer_stop_timeout,
             },
         ));
-        let heartbeat = tokio::spawn(stats_heartbeat(hub.clone()));
+        let heartbeat = tokio::spawn(stats_heartbeat(hub.clone(), heartbeat_interval));
         Ok(SignalingServerHandle {
             task: Some(task),
             heartbeat: Some(heartbeat),
             connections,
             writers,
             registry_terminal,
+            task_reaper: Mutex::new(Some(task_reaper)),
+            task_reaper_handle: Mutex::new(Some(task_reaper_handle)),
             writer_stop_timeout,
             local_addr,
             hub,
@@ -441,8 +612,8 @@ impl SignalingServer {
 /// relay is alive and whether anyone is connected. `connections: 0` every
 /// interval is the tell that traffic isn't reaching the relay (DNS / TLS /
 /// firewall) rather than the relay itself being broken.
-async fn stats_heartbeat(hub: Hub) {
-    let mut tick = tokio::time::interval(Duration::from_secs(300));
+async fn stats_heartbeat(hub: Hub, interval: Duration) {
+    let mut tick = tokio::time::interval(interval);
     tick.tick().await; // consume the immediate first tick
     loop {
         tick.tick().await;
@@ -856,8 +1027,17 @@ fn writer_registry_slot_available(tasks: &WriterRegistry, capacity: usize) -> bo
     tasks.lock().len() < capacity
 }
 
+#[cfg(test)]
 async fn settle_writer(writers: &WriterRegistry, conn_id: u64, timeout: Duration) {
-    settle_writer_inner(writers, conn_id, timeout, None).await;
+    let _ = settle_writer_observed(writers, conn_id, timeout).await;
+}
+
+async fn settle_writer_observed(
+    writers: &WriterRegistry,
+    conn_id: u64,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
+    settle_writer_inner(writers, conn_id, timeout, None).await
 }
 
 async fn settle_writer_with_progress(
@@ -866,7 +1046,7 @@ async fn settle_writer_with_progress(
     timeout: Duration,
     registry_terminal: Arc<RegistryTerminal>,
 ) {
-    settle_writer_inner(writers, conn_id, timeout, Some(registry_terminal)).await;
+    let _ = settle_writer_inner(writers, conn_id, timeout, Some(registry_terminal)).await;
 }
 
 async fn settle_writer_inner(
@@ -874,7 +1054,7 @@ async fn settle_writer_inner(
     conn_id: u64,
     timeout: Duration,
     registry_terminal: Option<Arc<RegistryTerminal>>,
-) {
+) -> std::result::Result<(), String> {
     let writer = {
         let mut owned = writers.lock();
         owned.get_mut(&conn_id).and_then(Option::take)
@@ -886,21 +1066,18 @@ async fn settle_writer_inner(
         // retires the same ID.
         let writers = Arc::clone(writers);
         let reaper = tokio::spawn(async move {
-            await_writer_with_timeout(writer, timeout).await;
+            let result = await_writer_with_timeout(writer, timeout).await;
             writers.lock().remove(&conn_id);
             if let Some(registry_terminal) = registry_terminal {
                 publish_registry_progress(&registry_terminal);
             }
+            result
         });
-        if let Err(error) = reaper.await {
-            warn!(
-                conn_id,
-                "writer settlement owner did not complete normally: {error}"
-            );
-        }
+        reaper.await.map_err(|error| error.to_string())??;
     } else {
         writers.lock().remove(&conn_id);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -932,17 +1109,26 @@ fn notify_writer_settlement(sender: &WriterSettlementSender, conn_id: u64) -> bo
     }
 }
 
-async fn await_writer_with_timeout(mut writer: JoinHandle<()>, timeout: Duration) {
+async fn await_writer_with_timeout(
+    mut writer: JoinHandle<()>,
+    timeout: Duration,
+) -> std::result::Result<(), String> {
     match tokio::time::timeout(timeout, &mut writer).await {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             warn!("signaling writer task did not complete normally: {error}");
+            if error.is_cancelled() {
+                Ok(())
+            } else {
+                Err(error.to_string())
+            }
         }
         Err(_) => {
             writer.abort();
             if let Err(error) = writer.await {
                 warn!("signaling writer task aborted during bounded shutdown: {error}");
             }
+            Ok(())
         }
     }
 }
@@ -1435,6 +1621,17 @@ impl HubInner {
                 .unwrap_or(usize::MAX),
         );
 
+        // Retention is a live bound, not merely a bound applied when another
+        // publisher happens to arrive. Reap expired stored material before
+        // replay so an idle relay cannot hand out stale events or retain them
+        // indefinitely between publishes.
+        prune(
+            &mut self.stored,
+            Limits::checked_usize(self.limits.max_stored_events, "max_stored_events")
+                .unwrap_or(usize::MAX),
+            Duration::from_secs(self.limits.stored_retention_secs),
+        );
+
         // Enforce the per-connection subscription ceiling for new ids.
         if self.limits.max_subscriptions > 0 {
             if let Some(conn) = self.conns.get(&conn_id) {
@@ -1838,6 +2035,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio_tungstenite::connect_async;
 
+    fn panicking_task(
+        message: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx
+                .send(())
+                .expect("the panic child start barrier remains live");
+            panic!("{message}");
+        });
+        (task, started_rx)
+    }
+
     struct DropFlag(Arc<AtomicBool>);
 
     impl Drop for DropFlag {
@@ -2022,6 +2235,11 @@ mod tests {
         };
         cases.push(limits);
         let limits = Limits {
+            stats_heartbeat_interval_secs: 0,
+            ..Limits::default()
+        };
+        cases.push(limits);
+        let limits = Limits {
             max_replay_per_req: 0,
             ..Limits::default()
         };
@@ -2048,6 +2266,20 @@ mod tests {
         cases.push(limits);
         assert!(cases.into_iter().all(|limits| limits.validate().is_err()));
         assert!(Limits::default().validate().is_ok());
+    }
+
+    #[test]
+    fn activity_heartbeat_uses_its_configured_horizon() {
+        let limits = Limits {
+            stored_retention_secs: 7,
+            stats_heartbeat_interval_secs: 11,
+            ..Limits::default()
+        };
+        assert_eq!(
+            limits.stats_heartbeat_interval(),
+            Duration::from_secs(11),
+            "heartbeat cadence must remain independent from retention"
+        );
     }
 
     #[test]
@@ -2080,6 +2312,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 4]
         );
+    }
+
+    #[test]
+    fn malformed_client_frame_preserves_bounded_relay_state() {
+        let hub = Hub::new(Limits::default());
+        let (conn_id, _input) = test_connection(&hub, "127.0.0.1");
+        let before = hub.inner.lock();
+        let stored = before.stored.len();
+        let presence = before.presence.len();
+        let events_relayed = before.events_relayed;
+        drop(before);
+
+        assert!(hub.inner.lock().on_client_message(conn_id, "[not-json"));
+
+        let after = hub.inner.lock();
+        assert_eq!(after.stored.len(), stored);
+        assert_eq!(after.presence.len(), presence);
+        assert_eq!(after.events_relayed, events_relayed);
+        assert!(after.conns.contains_key(&conn_id));
     }
 
     #[test]
@@ -2134,6 +2385,34 @@ mod tests {
         );
         assert_eq!(stored.len(), 2);
         assert_eq!(stored.front().unwrap().event.created_at, 2);
+    }
+
+    #[test]
+    fn replay_request_reaps_expired_storage_before_materialization() {
+        let hub = Hub::new(Limits {
+            stored_retention_secs: 1,
+            ..Limits::default()
+        });
+        let (conn_id, mut input) = test_connection(&hub, "127.0.0.1");
+        hub.inner.lock().stored.push_back(StoredEvent {
+            received_at: Instant::now() - Duration::from_secs(2),
+            event: ev(1, "idle-room", 1),
+        });
+
+        let request = serde_json::to_string(&json!(["REQ", "idle", {"kinds": [1]}])).unwrap();
+        assert!(hub.inner.lock().on_client_message(conn_id, &request));
+
+        let mut replayed = false;
+        while let Ok(message) = input.try_recv() {
+            if let WsMessage::Text(text) = message {
+                replayed |= text.to_string().contains("EVENT");
+            }
+        }
+        assert!(
+            !replayed,
+            "expired material must not be replayed after an idle interval"
+        );
+        assert!(hub.inner.lock().stored.is_empty());
     }
 
     #[test]
@@ -2199,12 +2478,15 @@ mod tests {
         });
         let connections = Arc::new(Mutex::new(HashMap::from([(conn_id, connection_task)])));
         armed_rx.await.expect("cleanup task must arm before drop");
+        let (task_reaper, task_reaper_handle) = spawn_task_reaper(4);
         let handle = SignalingServerHandle {
             task: None,
             heartbeat: None,
             connections,
             writers: Arc::new(Mutex::new(HashMap::new())),
             registry_terminal: Arc::new(RegistryTerminal::new()),
+            task_reaper: Mutex::new(Some(task_reaper)),
+            task_reaper_handle: Mutex::new(Some(task_reaper_handle)),
             writer_stop_timeout: Duration::from_secs(2),
             local_addr: "127.0.0.1:0".parse().unwrap(),
             hub,
@@ -2292,12 +2574,15 @@ mod tests {
         .expect("completion must extract the exact child before drop");
         tokio::task::yield_now().await;
 
+        let (task_reaper, task_reaper_handle) = spawn_task_reaper(4);
         let handle = SignalingServerHandle {
             task: Some(accept_task),
             heartbeat: None,
             connections: Arc::clone(&connections),
             writers: Arc::clone(&writers),
             registry_terminal: Arc::clone(&registry_terminal),
+            task_reaper: Mutex::new(Some(task_reaper)),
+            task_reaper_handle: Mutex::new(Some(task_reaper_handle)),
             writer_stop_timeout: Duration::from_secs(2),
             local_addr: "127.0.0.1:0".parse().unwrap(),
             hub,
@@ -2517,7 +2802,12 @@ mod tests {
             .get_mut(&conn_id)
             .and_then(Option::take)
             .expect("writer remains owned until timeout settlement");
-        await_writer_with_timeout(writer, Duration::ZERO).await;
+        assert!(
+            await_writer_with_timeout(writer, Duration::ZERO)
+                .await
+                .is_ok(),
+            "bounded writer timeout settlement should succeed"
+        );
         writers.lock().remove(&conn_id);
         tokio::task::yield_now().await;
 
@@ -2766,7 +3056,10 @@ mod tests {
         })
         .await
         .expect("W1 must settle before shutdown");
-        server.stop_and_wait().await;
+        server
+            .stop_and_wait()
+            .await
+            .expect("configured writer timeout shutdown succeeds");
     }
 
     #[tokio::test]
@@ -2809,12 +3102,29 @@ mod tests {
         .await
         .expect("writer settlement must be in flight before shutdown");
 
+        let writer_id = server
+            .writers
+            .lock()
+            .keys()
+            .next()
+            .copied()
+            .expect("the parked writer remains exactly owned");
         let progress_before_shutdown = *progress.borrow();
         drop(first);
         let hub = server.hub.clone();
         let connections = Arc::clone(&server.connections);
         let writers = Arc::clone(&server.writers);
-        server.stop_and_wait().await;
+        let error = server
+            .stop_and_wait()
+            .await
+            .expect_err("the injected writer panic must reach the shutdown result");
+        assert!(
+            error
+                .failures
+                .iter()
+                .any(|failure| failure.task == format!("writer:{writer_id}")),
+            "shutdown must identify the exact panicking writer: {error}"
+        );
 
         assert!(
             *progress.borrow() > progress_before_shutdown,
@@ -2879,6 +3189,115 @@ mod tests {
             "writer terminal progress must be published after server drop"
         );
         assert!(writers.lock().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outside_runtime_drop_transfers_task_to_runtime_reaper() {
+        let _gate = TEST_GATE_SERIAL.lock().await;
+        TEST_REAPED_TASKS.store(0, Ordering::Release);
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            armed_tx
+                .send(())
+                .expect("reaper control task must arm before drop");
+            std::future::pending::<()>().await;
+        });
+        armed_rx.await.expect("reaper control task must be running");
+
+        std::thread::spawn(move || abort_and_join(&reaper_sender, task))
+            .join()
+            .expect("outside-runtime owner drop must return");
+
+        reaper_task
+            .await
+            .expect("runtime-owned reaper must terminate after its sender closes");
+        assert_eq!(
+            TEST_REAPED_TASKS.load(Ordering::Acquire),
+            1,
+            "the exact aborted task must be awaited by the runtime reaper"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaper_full_and_closed_fallbacks_observe_panics_in_and_outside_runtime() {
+        let _gate = TEST_GATE_SERIAL.lock().await;
+        let wake = TEST_REAPED_FALLBACK_WAKE.get_or_init(tokio::sync::Notify::new);
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the first handle fills the bounded reaper channel");
+        let (task, started) = panicking_task("injected server panic through full fallback");
+        started
+            .await
+            .expect("the full fallback child starts before transfer");
+        abort_and_join(&full_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "a full active-runtime transfer joins the exact panicking child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the full-channel filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) = panicking_task("injected server panic through closed fallback");
+        started
+            .await
+            .expect("the closed fallback child starts before transfer");
+        abort_and_join(&closed_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 2,
+            "a closed active-runtime transfer joins the exact panicking child"
+        );
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the no-runtime full channel is deterministically occupied");
+        let (task, started) =
+            panicking_task("injected server panic through outside-runtime full fallback");
+        started
+            .await
+            .expect("the outside-runtime full child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&full_sender, task))
+            .join()
+            .expect("outside-runtime full fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 3,
+            "a full no-runtime transfer synchronously observes the child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the no-runtime full filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) =
+            panicking_task("injected server panic through outside-runtime closed fallback");
+        started
+            .await
+            .expect("the outside-runtime closed child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&closed_sender, task))
+            .join()
+            .expect("outside-runtime closed fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 4,
+            "a closed no-runtime transfer synchronously observes the child"
+        );
     }
 
     #[tokio::test]

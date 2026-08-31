@@ -34,12 +34,17 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-#[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use parking_lot::Mutex;
 
-#[cfg(any(test, feature = "transport-lab"))]
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
+
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
-use myownmesh_signaling::mdns::discovery::MdnsTimingProfile;
+use myownmesh_signaling::mdns::discovery::{
+    MdnsTimingProfile, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES,
+};
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
     MdnsLimits, PeerRetention,
@@ -53,11 +58,13 @@ use myownmesh_signaling::nostr::delivery::{
 };
 use myownmesh_signaling::nostr::driver::{
     self as nostr_driver, NostrDriverConfig, NostrDriverHandle, NostrInbound, NostrOutbound,
+    NostrTimingConfig,
 };
 use myownmesh_signaling::{
     AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierCommit,
     CarrierCommitUnit, InboundOutcome, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
 };
+use tokio::sync::mpsc;
 use tracing::{trace, warn};
 
 use crate::events::DropReason;
@@ -74,6 +81,23 @@ use super::state::{
     CarrierEmissionAdmission, CarrierEmissionRecord, NetworkCmd, NetworkState,
     RecoveryCarrierInstance, RecoveryPublishId, SignalingEmissionId, SignalingOutbound,
 };
+
+type FanoutReaperSender = mpsc::Sender<tokio::task::JoinHandle<()>>;
+
+#[cfg(test)]
+static TEST_REAPED_FANOUTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FANOUT_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_REAPED_FANOUT_FALLBACK_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+
+#[cfg(test)]
+fn record_fanout_fallback() {
+    TEST_REAPED_FANOUT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    TEST_REAPED_FANOUT_FALLBACK_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_one();
+}
 
 /// One driver's outbound side: the engine's admitted values, translated on the
 /// driver's own pull.
@@ -1044,6 +1068,9 @@ fn mdns_limits_from_policy(policy: &crate::config::MdnsPolicyConfig) -> Option<M
             max_resolve_owners: usize::try_from(policy.max_resolve_owners).ok()?,
             event_capacity: usize::try_from(policy.event_capacity).ok()?,
             max_event_epochs: usize::try_from(policy.max_event_epochs).ok()?,
+            max_txt_entries: MAX_TXT_ENTRIES,
+            max_txt_bytes: MAX_TXT_BYTES,
+            max_resolved_addresses: MAX_RESOLVED_ADDRESSES,
         },
         timing: MdnsTimingProfile {
             dial_timeout: mdns_duration(policy.dial_timeout_ms)?,
@@ -1223,7 +1250,6 @@ impl AliasProvider for CoreMdnsAliasProvider {
 /// The scope is what bounds every record the runtime retains, so a runtime that
 /// cannot get one is not built at all rather than built with an invented
 /// capacity: there is no unfunded mode to fall back to.
-#[cfg(feature = "transport-lab")]
 fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<SignalingRuntime>> {
     let runtime = SignalingRuntime::new(
         state.signaling_inbound_tx.clone(),
@@ -1240,8 +1266,7 @@ fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<Sign
 /// Spawns two pump tasks (outbound engine → broker, inbound
 /// broker → engine) that live until either side closes its
 /// queue. Returns once both pumps are spawned.
-#[cfg(feature = "transport-lab")]
-pub(crate) fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
+pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     let room = myownmesh_signaling::nostr::handle::derive_room_handle(
         &resolve_app_id(),
         &state.network_id,
@@ -1435,7 +1460,6 @@ enum CarrierReport {
     },
 }
 
-#[cfg(any(test, feature = "transport-lab"))]
 impl From<LocalInbound> for CarrierReport {
     fn from(inbound: LocalInbound) -> Self {
         match inbound {
@@ -1560,6 +1584,16 @@ fn attach_nostr_with(
         denylist: cfg.signaling.denylist.clone(),
         redundancy: cfg.signaling.redundancy as usize,
         public_fallback: cfg.signaling.public_fallback,
+        timing: NostrTimingConfig {
+            reconnect_initial: Duration::from_secs(2),
+            reconnect_max: Duration::from_secs(60),
+            reconnect_max_attempts: 6,
+            jitter_percent: 15,
+            fallback_poll: Duration::from_secs(3),
+            fallback_activation_grace: Duration::from_secs(20),
+            session_close_timeout: Duration::from_secs(1),
+            announcer_cancel_quantum: Duration::from_secs(1),
+        },
     };
     let redundancy = nostr_cfg.redundancy;
     drop(cfg);
@@ -1652,7 +1686,7 @@ fn attach_nostr_with(
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
     // through this carrier's attach on the shared runtime.
-    let handle = nostr_driver::start_with_delivery_provider_and_sinks(
+    let handle = match nostr_driver::start_with_delivery_provider_and_sinks(
         nostr_cfg,
         outbound,
         carrier_sink(attach),
@@ -1667,7 +1701,13 @@ fn attach_nostr_with(
             instance: recovery_instance,
             guard: Arc::clone(&guard),
         }),
-    );
+    ) {
+        Ok(handle) => handle,
+        Err(error) => {
+            warn!(?error, "Nostr driver timing configuration refused");
+            return None;
+        }
+    };
     // Hand the engine the force-reconnect signal so resume-from-sleep
     // (and any other recovery path) can make every relay redial at
     // once instead of waiting out a zombie socket. See
@@ -1836,6 +1876,8 @@ pub struct SignalingDrivers {
     nostr: Option<Arc<NostrDriverHandle>>,
     mdns: Option<MdnsDriverHandle>,
     fanout: Option<tokio::task::JoinHandle<()>>,
+    fanout_reaper: Mutex<Option<FanoutReaperSender>>,
+    fanout_reaper_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl SignalingDrivers {
@@ -1896,15 +1938,63 @@ impl SignalingDrivers {
         if let Some(mdns) = self.mdns.take() {
             mdns.stop_and_join().await;
         }
+        let reaper_sender = self.fanout_reaper.lock().take();
+        drop(reaper_sender);
+        if let Some(reaper) = self.fanout_reaper_task.lock().take() {
+            let _ = reaper.await;
+        }
     }
 }
 
 impl Drop for SignalingDrivers {
     fn drop(&mut self) {
         if let Some(fanout) = self.fanout.take() {
-            fanout.abort();
+            if let Some(reaper) = self.fanout_reaper.lock().as_ref() {
+                abort_and_join(reaper, fanout);
+            } else {
+                fanout.abort();
+                let _ = futures::executor::block_on(fanout);
+            }
         }
-        // nostr / mdns handles stop via their own Drop impls.
+        // nostr / mdns handles stop via their own Drop impls; Nostr's Drop
+        // transfers its exact task list to its runtime-owned reaper.
+    }
+}
+
+fn spawn_task_reaper(capacity: usize) -> (FanoutReaperSender, tokio::task::JoinHandle<()>) {
+    let (sender, mut receiver) = mpsc::channel::<tokio::task::JoinHandle<()>>(capacity);
+    let task = tokio::spawn(async move {
+        while let Some(task) = receiver.recv().await {
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    warn!("signaling fanout did not join normally: {error}");
+                }
+            }
+            #[cfg(test)]
+            TEST_REAPED_FANOUTS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    });
+    (sender, task)
+}
+
+fn abort_and_join(reaper: &FanoutReaperSender, task: tokio::task::JoinHandle<()>) {
+    task.abort();
+    match reaper.try_send(task) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(task))
+        | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = task.await;
+                    #[cfg(test)]
+                    record_fanout_fallback();
+                });
+            } else {
+                let _ = futures::executor::block_on(task);
+                #[cfg(test)]
+                record_fanout_fallback();
+            }
+        }
     }
 }
 
@@ -1927,9 +2017,7 @@ impl Drop for SignalingDrivers {
 /// config in a multicast-less environment) still drains the engine's
 /// outbound queue so it can't grow unboundedly — the network is
 /// simply unreachable, and warnings say so.
-pub(crate) fn attach_signaling(
-    state: &Arc<NetworkState>,
-) -> crate::Result<Option<SignalingDrivers>> {
+pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<SignalingDrivers>> {
     let (strategy, mdns_on) = {
         let cfg = state.config.read();
         (cfg.signaling.strategy.clone(), cfg.signaling.mdns)
@@ -1993,12 +2081,15 @@ pub(crate) fn attach_signaling(
                     (mdns_instance, mdns_tx, mdns_attach.guard()),
                 ],
             );
+            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
             let nostr = attach_nostr_shared(state, nostr_rx, nostr_attach, nostr_instance, false);
             let mdns = attach_mdns_with(state, mdns_rx, mdns_attach, mdns_instance, false);
             SignalingDrivers {
                 nostr,
                 mdns,
                 fanout: Some(fanout),
+                fanout_reaper: Mutex::new(Some(fanout_reaper)),
+                fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
             }
         }
         (true, false) => {
@@ -2018,10 +2109,13 @@ pub(crate) fn attach_signaling(
                 outbound_rx,
                 vec![(recovery_instance, nostr_tx, attach.guard())],
             );
+            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
             SignalingDrivers {
                 nostr: attach_nostr_shared(state, nostr_rx, attach, recovery_instance, false),
                 mdns: None,
                 fanout: Some(fanout),
+                fanout_reaper: Mutex::new(Some(fanout_reaper)),
+                fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
             }
         }
         (false, true) => {
@@ -2041,6 +2135,7 @@ pub(crate) fn attach_signaling(
                 outbound_rx,
                 vec![(recovery_instance, mdns_tx, attach.guard())],
             );
+            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
             let mdns = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false);
             if mdns.is_none() {
                 warn!(
@@ -2053,6 +2148,8 @@ pub(crate) fn attach_signaling(
                 nostr: None,
                 mdns,
                 fanout: Some(fanout),
+                fanout_reaper: Mutex::new(Some(fanout_reaper)),
+                fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
             }
         }
         (false, false) => {
@@ -2063,10 +2160,13 @@ pub(crate) fn attach_signaling(
             );
             // Drain the engine's outbound queue so it can't grow
             // unboundedly against a receiver nobody holds.
+            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
             SignalingDrivers {
                 nostr: None,
                 mdns: None,
                 fanout: Some(spawn_fanout(state.clone(), outbound_rx, Vec::new())),
+                fanout_reaper: Mutex::new(Some(fanout_reaper)),
+                fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
             }
         }
     };
@@ -2253,7 +2353,7 @@ fn spawn_fanout(
             #[cfg(test)]
             let fanout_gate = {
                 FANOUT_AFTER_ADMISSION
-                    .get_or_init(|| Mutex::new(None))
+                    .get_or_init(|| StdMutex::new(None))
                     .lock()
                     .expect("fanout test hook mutex is not poisoned")
                     .clone()
@@ -2382,12 +2482,138 @@ struct FanoutTestGate {
 }
 
 #[cfg(test)]
-static FANOUT_AFTER_ADMISSION: OnceLock<Mutex<Option<Arc<FanoutTestGate>>>> = OnceLock::new();
+static FANOUT_AFTER_ADMISSION: OnceLock<StdMutex<Option<Arc<FanoutTestGate>>>> = OnceLock::new();
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::signaling_ingress::{self, EphemeralSignal};
+    use std::sync::atomic::Ordering;
+
+    fn panicking_task(
+        message: &'static str,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx
+                .send(())
+                .expect("the panic child start barrier remains live");
+            panic!("{message}");
+        });
+        (task, started_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outside_runtime_fanout_drop_transfers_task_to_reaper() {
+        let before = TEST_REAPED_FANOUTS.load(std::sync::atomic::Ordering::Acquire);
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            armed_tx
+                .send(())
+                .expect("fanout reaper control task must arm before drop");
+            std::future::pending::<()>().await;
+        });
+        armed_rx
+            .await
+            .expect("fanout reaper control task must be running");
+
+        std::thread::spawn(move || abort_and_join(&reaper_sender, task))
+            .join()
+            .expect("outside-runtime fanout owner drop must return");
+
+        reaper_task
+            .await
+            .expect("fanout reaper must terminate after its sender closes");
+        assert_eq!(
+            TEST_REAPED_FANOUTS.load(std::sync::atomic::Ordering::Acquire),
+            before + 1,
+            "the exact aborted fanout must be awaited by the runtime reaper"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_full_and_closed_reaper_fallbacks_observe_panics_in_and_outside_runtime() {
+        let wake = TEST_REAPED_FANOUT_FALLBACK_WAKE.get_or_init(tokio::sync::Notify::new);
+        let before = TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire);
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the first handle fills the bounded reaper channel");
+        let (task, started) = panicking_task("injected fanout panic through full fallback");
+        started
+            .await
+            .expect("the full fallback child starts before transfer");
+        abort_and_join(&full_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "a full active-runtime transfer joins the exact panicking child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the full-channel filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) = panicking_task("injected fanout panic through closed fallback");
+        started
+            .await
+            .expect("the closed fallback child starts before transfer");
+        abort_and_join(&closed_sender, task);
+        wake.notified().await;
+        assert_eq!(
+            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
+            before + 2,
+            "a closed active-runtime transfer joins the exact panicking child"
+        );
+
+        let (full_sender, mut full_receiver) = mpsc::channel(1);
+        full_sender
+            .try_send(tokio::spawn(std::future::pending::<()>()))
+            .expect("the no-runtime full channel is deterministically occupied");
+        let (task, started) =
+            panicking_task("injected fanout panic through outside-runtime full fallback");
+        started
+            .await
+            .expect("the outside-runtime full child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&full_sender, task))
+            .join()
+            .expect("outside-runtime full fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
+            before + 3,
+            "a full no-runtime transfer synchronously observes the child"
+        );
+        let filler = full_receiver
+            .try_recv()
+            .expect("the no-runtime full filler remains explicitly owned");
+        filler.abort();
+        let _ = filler.await;
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        let (task, started) =
+            panicking_task("injected fanout panic through outside-runtime closed fallback");
+        started
+            .await
+            .expect("the outside-runtime closed child starts before transfer");
+        std::thread::spawn(move || abort_and_join(&closed_sender, task))
+            .join()
+            .expect("outside-runtime closed fallback returns after joining");
+        assert_eq!(
+            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
+            before + 4,
+            "a closed no-runtime transfer synchronously observes the child"
+        );
+    }
 
     #[test]
     fn mdns_policy_translation_preserves_sentinels_and_rejects_zero() {
@@ -2787,7 +3013,8 @@ mod tests {
             baseline, 0,
             "a fresh production provider starts at baseline"
         );
-        let (session, session_refusals) = store.open_session();
+        let (session, session_refusal, session_refusals) = store.open_session_with_refusals();
+        assert!(session_refusal.is_none());
         assert!(session_refusals.is_empty());
         let after_session = provider.ledger.load(std::sync::atomic::Ordering::SeqCst);
         assert!(after_session > baseline);
@@ -3311,7 +3538,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         *FANOUT_AFTER_ADMISSION
-            .get_or_init(|| Mutex::new(None))
+            .get_or_init(|| StdMutex::new(None))
             .lock()
             .expect("fanout test hook mutex is not poisoned") = Some(gate.clone());
         let attempt = "fanout-copy-fence".to_string();
@@ -3388,7 +3615,7 @@ mod tests {
         fanout.abort();
         let _ = fanout.await;
         *FANOUT_AFTER_ADMISSION
-            .get_or_init(|| Mutex::new(None))
+            .get_or_init(|| StdMutex::new(None))
             .lock()
             .expect("fanout test hook mutex is not poisoned") = None;
         state.shutdown().await;
@@ -3464,7 +3691,8 @@ mod tests {
             Some(candidate_emission)
         );
         state.mark_carrier_emission_claimed(candidate_emission, &candidate_attempt);
-        let candidate_source = AdmissionSource::fresh();
+        let candidate_source =
+            AdmissionSource::try_fresh().expect("candidate source identity exists");
         assert!(candidate_guard.bind_admission_source(candidate_source, &candidate_attempt));
 
         // Script one real provider pressure before the command send.  This
@@ -3576,7 +3804,8 @@ mod tests {
             Some(promoted_emission)
         );
         state.mark_carrier_emission_claimed(promoted_emission, "promoted-pressure");
-        let promoted_source = AdmissionSource::fresh();
+        let promoted_source =
+            AdmissionSource::try_fresh().expect("promoted source identity exists");
         assert!(promoted_guard.bind_admission_source(promoted_source, "promoted-pressure"));
         provider.script_pressure(crate::resource::ResourceClass::CallbackOrScheduledWork);
         CoreAttemptOutcomeSink {
@@ -3669,8 +3898,8 @@ mod tests {
         assert!(guard.track_attempt(second_emission, "shared-attempt"));
         assert_eq!(guard.claim_attempt("shared-attempt"), Some(first_emission));
         assert_eq!(guard.claim_attempt("shared-attempt"), Some(second_emission));
-        let first_source = AdmissionSource::fresh();
-        let second_source = AdmissionSource::fresh();
+        let first_source = AdmissionSource::try_fresh().expect("first source identity exists");
+        let second_source = AdmissionSource::try_fresh().expect("second source identity exists");
         assert!(guard.bind_admission_source(first_source, "shared-attempt"));
         assert!(guard.bind_admission_source(second_source, "shared-attempt"));
         state.mark_carrier_emission_claimed(first_emission, "shared-attempt");

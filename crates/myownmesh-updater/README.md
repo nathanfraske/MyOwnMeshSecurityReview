@@ -10,7 +10,10 @@ myownmesh-updater = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2
 ## Lifecycle
 
 1. Background ticker polls the release feed every
-   `check_interval_hours` (default 6).
+   `check_interval_hours` (default 6). Each feed and artifact request uses
+   its explicit `auto_update.feed_request_timeout_ms` and
+   `auto_update.artifact_download_timeout_ms` owner-configured limits
+   (defaults 15000 and 300000 milliseconds); zero values are rejected.
 2. Latest version compared to running `CARGO_PKG_VERSION`. If
    newer and policy permits, the asset is downloaded.
 3. SHA-256 verified against the sidecar `.sha256` published next
@@ -55,11 +58,13 @@ MYOWNMESH_RELEASE_URL_BETA    → github.com/mrjeeves/MyOwnMesh/releases
 Runtime overrides in `~/.myownmesh/config.json`:
 
 ```jsonc
-{
-  "auto_update": {
-    "channel": "stable",
-    "auto_apply": "all",
-    "stable_url": "https://your.cdn/myownmesh/latest"
+  {
+    "auto_update": {
+      "channel": "stable",
+      "auto_apply": "all",
+      "feed_request_timeout_ms": 15000,
+      "artifact_download_timeout_ms": 300000,
+      "stable_url": "https://your.cdn/myownmesh/latest"
   }
 }
 ```

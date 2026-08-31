@@ -28,6 +28,19 @@ use myownmesh_signaling::{InboundSink, UnboundedSource};
 
 const SIGNALLING_TEST_DELIVERY_CAPACITY: usize = 256;
 
+fn test_nostr_timing() -> myownmesh_signaling::nostr::driver::NostrTimingConfig {
+    myownmesh_signaling::nostr::driver::NostrTimingConfig {
+        reconnect_initial: Duration::from_secs(2),
+        reconnect_max: Duration::from_secs(60),
+        reconnect_max_attempts: 6,
+        jitter_percent: 15,
+        fallback_poll: Duration::from_secs(3),
+        fallback_activation_grace: Duration::from_secs(20),
+        session_close_timeout: Duration::from_secs(1),
+        announcer_cancel_quantum: Duration::from_secs(1),
+    }
+}
+
 struct FiniteTestProvider {
     live: Arc<AtomicUsize>,
 }
@@ -215,7 +228,10 @@ async fn relay_forwards_event_to_matching_subscriber() {
     assert_eq!(delivered[1], "sub1");
     assert_eq!(delivered[2]["content"], "hello");
 
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("raw event server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -252,7 +268,10 @@ async fn relay_replays_stored_presence_to_late_subscriber() {
     let eose = parse(&next_text(&mut sub).await);
     assert_eq!(eose[0], "EOSE");
 
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("presence replay server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -282,7 +301,10 @@ async fn ephemeral_events_are_not_stored() {
     let first = parse(&next_text(&mut sub).await);
     assert_eq!(first[0], "EOSE", "ephemeral event must not be replayed");
 
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("ephemeral event server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -323,7 +345,10 @@ async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
         !received,
         "only the advertised presence/negotiation profiles match"
     );
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("profile filter server shutdown succeeds");
 }
 
 // The headline test: two real Nostr drivers, pointed ONLY at a
@@ -352,6 +377,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
         // No public fallback in tests — keep the driver strictly on the
         // local test relay so it never reaches for real public relays.
         public_fallback: false,
+        timing: test_nostr_timing(),
     };
 
     // Keep the outbound senders and driver handles bound for the whole
@@ -363,7 +389,8 @@ async fn two_drivers_discover_via_self_hosted_relay() {
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
@@ -372,7 +399,8 @@ async fn two_drivers_discover_via_self_hosted_relay() {
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     // Drivers auto-announce on start; B should learn about A through the
     // self-hosted relay (live forward or stored replay).
@@ -393,7 +421,10 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // Hold the senders/handles until here.
     drop(out_tx_a);
     drop(out_tx_b);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("Nostr discovery server shutdown succeeds");
 }
 
 // End-to-end: a driver that makes a *deliberate* exit announces its own
@@ -422,6 +453,7 @@ async fn driver_self_announced_leave_reaches_peer() {
         denylist: vec![],
         redundancy: 1,
         public_fallback: false,
+        timing: test_nostr_timing(),
     };
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
@@ -431,7 +463,8 @@ async fn driver_self_announced_leave_reaches_peer() {
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
@@ -440,7 +473,8 @@ async fn driver_self_announced_leave_reaches_peer() {
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     // B discovers A first.
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -476,7 +510,10 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     drop(out_tx_a);
     drop(out_tx_b);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("leave propagation server shutdown succeeds");
 }
 
 // Intelligent-relay behaviour: when a member's socket drops, the relay emits a
@@ -525,7 +562,10 @@ async fn relay_emits_leave_when_member_disconnects() {
     assert_eq!(content["kind"], "leave");
     assert_eq!(content["peer_id"], "devA");
 
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("relay departure server shutdown succeeds");
 }
 
 // End-to-end: a driver learns a peer left soon after the relay sees the
@@ -560,6 +600,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
         denylist: vec![],
         redundancy: 1,
         public_fallback: false,
+        timing: test_nostr_timing(),
     };
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
@@ -569,7 +610,8 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
@@ -578,7 +620,8 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
         Arc::clone(&provider),
-    );
+    )
+    .expect("valid Nostr timing configuration");
 
     // First B discovers A.
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -611,7 +654,10 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
     assert!(saw_leave, "B never saw A's departure");
 
     drop(out_tx_b);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("peer-left server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -647,7 +693,10 @@ async fn global_admission_cap_applies_before_websocket_handshake() {
     );
     assert_eq!(server.stats().connections, 1);
     drop(first);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("zero-limit server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -677,7 +726,10 @@ async fn normal_connection_completion_releases_admission_before_shutdown() {
     .await
     .expect("normal connection completion should release admission");
     assert_eq!(server.stats().connections, 0);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("normal completion server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -722,7 +774,10 @@ async fn stalled_peer_stays_admitted_until_writer_settlement_then_allows_success
         .await
         .expect("W1 registry terminal observation should complete");
     assert_eq!(server.stats().connections, 0);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("stalled peer server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -742,7 +797,10 @@ async fn handshake_bytes_are_bounded_before_websocket_parser() {
         .await
         .expect("oversized handshake should be closed promptly");
     assert_eq!(server.stats().connections, 0);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("handshake bound server shutdown succeeds");
 }
 
 #[tokio::test]
@@ -766,5 +824,8 @@ async fn websocket_frame_and_message_limits_refuse_before_json_parse() {
         Some(Err(_)) | Some(Ok(Message::Close(_)))
     ));
     assert_eq!(server.stats().connections, 0);
-    server.stop_and_wait().await;
+    server
+        .stop_and_wait()
+        .await
+        .expect("websocket limit server shutdown succeeds");
 }

@@ -86,8 +86,11 @@ fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> Net
     NetworkConfig {
         id: id.to_string(),
         network_id: network_id.to_string(),
+        event_capacity: 256,
+        connection_trace_capacity: 512,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling,
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -414,6 +417,9 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     bob_state.request_shutdown();
     alice_driver.await.expect("alice engine driver");
     bob_driver.await.expect("bob engine driver");
-    relay.stop_and_wait().await;
+    relay
+        .stop_and_wait()
+        .await
+        .expect("mDNS signaling relay shutdown succeeds");
 }
 mod support;

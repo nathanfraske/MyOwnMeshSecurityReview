@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use std::marker::PhantomData;
 
 use super::{
     FundedArc, LeasedQueue, LocalApplicationResourceScope, ResourceClaim,
@@ -33,8 +34,38 @@ struct MailboxInner<T> {
 /// Implementations count the value itself and every allocation or handle it
 /// retains. The mailbox adds one scheduled-work obligation and owns the queue
 /// node separately, so all three parts of an accepted entry leave together.
-pub trait ResourceMailboxItem {
-    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError>;
+#[must_use = "a mailbox measurement must be consumed by admission or planning"]
+pub struct MailboxMeasurement<T> {
+    claim: ResourceClaim,
+    _item: PhantomData<fn() -> T>,
+}
+
+impl<T> MailboxMeasurement<T> {
+    pub(crate) fn from_parts(
+        retained_bytes: usize,
+        queued_bytes: usize,
+        allocations: usize,
+    ) -> Result<Self, ResourceMailboxItemError> {
+        Ok(Self {
+            claim: mailbox_retained_claim::<T>(retained_bytes, queued_bytes, allocations)?,
+            _item: PhantomData,
+        })
+    }
+
+    pub(crate) fn into_claim(self) -> ResourceClaim {
+        self.claim
+    }
+}
+
+/// Measurements are opaque and are produced by the central mailbox
+/// arithmetic, so a safe caller cannot forge a claim.
+///
+/// # Safety
+///
+/// An implementation must return a token that funds the exact value and all
+/// off-node state retained by it, including allocations, handles, and effects.
+pub unsafe trait ResourceMailboxItem: Sized {
+    fn measured_claim(&self) -> Result<MailboxMeasurement<Self>, ResourceMailboxItemError>;
 }
 
 /// A mailbox value described before it is constructed.
@@ -46,19 +77,25 @@ pub trait ResourceMailboxItem {
 /// the borrowed inputs, then consumes them only after the mailbox has acquired
 /// both the value-retention and queue-node leases.
 ///
-/// The claim has the same contract as [`ResourceMailboxItem::retained_claim`]:
+/// The claim has the same contract as [`ResourceMailboxItem::measured_claim`]:
 /// it names the finished value's off-node retention only, and must equal the
 /// claim `build()`'s result would answer. Controls for a borrowed mirror should
 /// compare the two directly; the mailbox cannot do so without constructing the
 /// value before admission and defeating this interface. The mailbox adds its
 /// scheduled-work obligation and owns the queue node separately.
-pub trait ResourceMailboxItemBuilder<T: ResourceMailboxItem> {
-    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError>;
+///
+/// # Safety
+///
+/// The measurement must fund the exact value returned by `build`, and `build`
+/// must not be invoked before the mailbox has acquired its leases.
+pub unsafe trait ResourceMailboxItemBuilder<T: ResourceMailboxItem> {
+    fn measured_claim(&self) -> Result<MailboxMeasurement<T>, ResourceMailboxItemError>;
     fn build(self) -> T;
 }
 
 /// Conservatively measure a serializable, JSON-shaped mailbox value and return
-/// the off-node claim that must remain leased while the typed value is queued.
+/// an opaque token for the off-node claim that must remain leased while the
+/// typed value is queued.
 ///
 /// The encoded length bounds both the decoded tree's owned fragments and its
 /// allocation count. The value's inline representation is added separately;
@@ -66,34 +103,47 @@ pub trait ResourceMailboxItemBuilder<T: ResourceMailboxItem> {
 /// measured length prices the serialization pass as parsing/CPU work. This is
 /// the shared measurement for pure-data mailbox items; values carrying opaque
 /// handles or effects must add those dependencies in their own implementation.
-pub fn serialized_mailbox_item_claim<T: serde::Serialize>(
-    value: &T,
-) -> Result<ResourceClaim, ResourceMailboxItemError> {
-    serialized_mailbox_item_claim_as::<T>(value)
+pub fn measure_serialized_mailbox_item<T>(
+    value: &impl serde::Serialize,
+) -> Result<MailboxMeasurement<T>, ResourceMailboxItemError> {
+    let (retained, queued, allocations) = mailbox_measure_serialized(value)?;
+    MailboxMeasurement::from_parts(retained, queued, allocations)
+}
+
+/// Measure one mailbox value and remove the bare retention already funded by
+/// an upstream owner of part of that value.
+///
+/// The subtraction is performed on the central opaque claim, dimension by
+/// dimension. An underflow therefore rejects a mismatched or incomplete
+/// funded claim before any builder can construct its owned value. This is the
+/// only supported composition seam; callers cannot forge a measurement from a
+/// claim or bypass the serialized measurement.
+pub fn measure_serialized_mailbox_item_after_funded<T>(
+    value: &impl serde::Serialize,
+    funded: ResourceClaim,
+) -> Result<MailboxMeasurement<T>, ResourceMailboxItemError> {
+    let measured = measure_serialized_mailbox_item::<T>(value)?.into_claim();
+    Ok(MailboxMeasurement {
+        claim: measured.checked_sub(funded)?,
+        _item: PhantomData,
+    })
 }
 
 /// Measure a serializable borrowed view as the mailbox value it will build.
 ///
 /// The view must encode byte-for-byte like `T`. Its serialization supplies the
 /// decoded-tree, queued-byte and allocation measurements, while `T` supplies
-/// the inline size of the value the mailbox will actually retain. Using
-/// [`serialized_mailbox_item_claim`] on the view itself would instead charge
+/// the inline size of the value the mailbox will actually retain. Measuring
+/// the view as its own type would instead charge
 /// for its references and could underfund the owned value constructed after
 /// admission.
-pub fn serialized_mailbox_item_claim_as<T>(
-    value: &impl serde::Serialize,
-) -> Result<ResourceClaim, ResourceMailboxItemError> {
-    let (retained, queued, allocations) = mailbox_measure_serialized(value)?;
-    mailbox_retained_claim::<T>(retained, queued, allocations)
-}
-
 /// Measure a borrowed value as three totals: retained bytes, queued bytes, and
 /// allocations.
 ///
 /// The measurement kit an owner needs when the thing to be funded is *not* one
 /// serializable value but several borrowed pieces that will be assembled after
-/// admission. [`serialized_mailbox_item_claim_as`] is this composed with
-/// [`mailbox_retained_claim`] for the single-value case; an owner measuring a
+/// admission. [`measure_serialized_mailbox_item`] is this composed with the
+/// central retained-claim arithmetic for the single-value case; an owner measuring a
 /// borrowed source field by field composes the parts with
 /// [`checked_measure_add`] instead and only then acquires.
 ///
@@ -149,7 +199,7 @@ pub fn mailbox_measure_serialized(
 /// The final step of the borrowed-measurement path: measure with
 /// [`mailbox_measure_serialized`], combine with [`checked_measure_add`], claim
 /// here, acquire, and only then build the owned value.
-pub fn mailbox_retained_claim<T>(
+pub(crate) fn mailbox_retained_claim<T>(
     retained_bytes: usize,
     queued_bytes: usize,
     allocations: usize,
@@ -656,7 +706,8 @@ impl<T> ResourceMailboxSender<T> {
             return Err(ResourceMailboxAdmissionError::Closed);
         }
         let retention_claim = builder
-            .retained_claim()?
+            .measured_claim()?
+            .into_claim()
             .checked_add(Self::scheduled_work_claim().map_err(ResourceMailboxItemError::from)?)
             .map_err(ResourceMailboxItemError::from)?;
         let retention = self
@@ -706,7 +757,7 @@ impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
     pub fn accepted_item_planning_charge(
         value: &T,
     ) -> Result<ResourceClaim, ResourceMailboxPlanningError> {
-        Self::item_planning_charge(value.retained_claim()?)
+        Self::item_planning_charge(value.measured_claim()?.into_claim())
     }
 
     /// Exact provider capacity consumed by accepting what this builder will
@@ -718,7 +769,7 @@ impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
     where
         B: ResourceMailboxItemBuilder<T>,
     {
-        Self::item_planning_charge(builder.retained_claim()?)
+        Self::item_planning_charge(builder.measured_claim()?.into_claim())
     }
 
     /// Exact provider charge for accepting one concrete item in a fixture.
@@ -749,8 +800,9 @@ impl<T: ResourceMailboxItem> ResourceMailboxSender<T> {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(ResourceMailboxSendError::Closed(value));
         }
-        let retention_claim = match value.retained_claim().and_then(|claim| {
-            claim
+        let retention_claim = match value.measured_claim().and_then(|measurement| {
+            measurement
+                .into_claim()
                 .checked_add(Self::scheduled_work_claim()?)
                 .map_err(Into::into)
         }) {
@@ -838,21 +890,47 @@ impl<T> Drop for ResourceMailboxReceiver<T> {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
     struct TestItem(Vec<u8>);
 
-    impl ResourceMailboxItem for TestItem {
-        fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
-            let bytes = u64::try_from(self.0.len()).map_err(|_| {
-                ResourceClaimArithmeticError::Overflow {
-                    dimension: ResourceClass::AccountedMemoryBytes,
-                }
-            })?;
-            Ok(ResourceClaim::try_from_entries([
-                (ResourceClass::AccountedMemoryBytes, bytes),
-                (ResourceClass::QueuedBytes, bytes),
-                (ResourceClass::OpaqueDependencyResidual, 1),
-            ])?)
+    unsafe impl ResourceMailboxItem for TestItem {
+        fn measured_claim(&self) -> Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
+            measure_serialized_mailbox_item::<Self>(self)
+        }
+    }
+
+    struct CountingBuilder {
+        item: TestItem,
+        builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe impl ResourceMailboxItemBuilder<TestItem> for CountingBuilder {
+        fn measured_claim(&self) -> Result<MailboxMeasurement<TestItem>, ResourceMailboxItemError> {
+            measure_serialized_mailbox_item::<TestItem>(&self.item)
+        }
+
+        fn build(self) -> TestItem {
+            self.builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.item
+        }
+    }
+
+    struct FundedCountingBuilder {
+        item: TestItem,
+        funded: ResourceClaim,
+        builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    unsafe impl ResourceMailboxItemBuilder<TestItem> for FundedCountingBuilder {
+        fn measured_claim(&self) -> Result<MailboxMeasurement<TestItem>, ResourceMailboxItemError> {
+            measure_serialized_mailbox_item_after_funded::<TestItem>(&self.item, self.funded)
+        }
+
+        fn build(self) -> TestItem {
+            self.builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.item
         }
     }
 
@@ -903,6 +981,74 @@ mod tests {
         (tx, rx, observed)
     }
 
+    fn funded_fixture(
+        item: &TestItem,
+        one_unit_short: bool,
+    ) -> (
+        ResourceMailboxSender<TestItem>,
+        ResourceMailboxReceiver<TestItem>,
+        super::super::FiniteResourceProvider,
+        ResourceLease,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ResourceClaim,
+    ) {
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(item).expect("the funded payload is measurable");
+        let funded =
+            crate::application_gateway::GatewayMailbox::<serde_json::Value>::retention_claim(
+                retained,
+                queued,
+                allocations,
+            )
+            .expect("the funded payload claim is representable");
+        let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let builder = FundedCountingBuilder {
+            item: item.clone(),
+            funded,
+            builds: std::sync::Arc::clone(&builds),
+        };
+        let mailbox_charge =
+            ResourceMailboxSender::<TestItem>::building_item_planning_charge(&builder)
+                .expect("the remaining mailbox charge is representable");
+        let scopes = super::super::FiniteResourceProvider::scope_record_charge_for_test()
+            .checked_scale(2)
+            .expect("process and local-application scope records fit");
+        let root = super::super::FiniteResourceProvider::reservation_charge_for_test(
+            ResourceMailboxSender::<TestItem>::root_claim().expect("mailbox root claim fits"),
+        )
+        .expect("mailbox root reservation fits");
+        let payload = super::super::FiniteResourceProvider::reservation_charge_for_test(funded)
+            .expect("the upstream payload reservation fits");
+        let grant = scopes
+            .checked_add(root)
+            .and_then(|claim| claim.checked_add(payload))
+            .and_then(|claim| claim.checked_add(mailbox_charge))
+            .expect("the exact funded fixture grant fits");
+        let grant = if one_unit_short {
+            grant
+                .checked_sub(ResourceClaim::single(ResourceClass::ParsingOrCpuWork, 1))
+                .expect("one unit can be removed from the outer claim")
+        } else {
+            grant
+        };
+        let provider = super::super::FiniteResourceProvider::new(grant);
+        let observed = provider.clone();
+        let port = super::super::ResourceProviderPort::new(provider)
+            .expect("fixture provider admits its process scope");
+        let process = super::super::ProcessResourceRoot::isolated();
+        process
+            .install_local_application_provider(port)
+            .expect("fixture installs its local provider");
+        let scope = process
+            .issue_local_application_scope()
+            .expect("fixture issues its local scope");
+        let payload_lease = scope
+            .acquire(funded)
+            .expect("the exact grant funds the upstream payload");
+        let (tx, rx) = resource_mailbox(scope).expect("fixture mailbox is funded");
+        (tx, rx, observed, payload_lease, builds, funded)
+    }
+
     #[test]
     fn pressure_returns_the_exact_value_and_retains_no_entry() {
         let item = TestItem(vec![7; 32]);
@@ -916,6 +1062,169 @@ mod tests {
         assert_eq!(refused.into_value(), TestItem(vec![7; 32]));
         assert!(rx.try_recv().is_none());
         assert_eq!(provider.in_use(), before);
+    }
+
+    /// A builder is not allowed to construct an owned value before the exact
+    /// retained-value and queue-node leases are admitted. Pressure therefore
+    /// refuses without invoking `build`, and the successful path invokes it
+    /// only after both reservations exist.
+    #[test]
+    fn building_mailbox_item_is_gated_by_exact_admission() {
+        let item = TestItem(vec![4; 32]);
+        let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, mut rx, provider) = fixture(None);
+        let before = provider.in_use();
+        assert!(matches!(
+            tx.send_building(CountingBuilder {
+                item: item.clone(),
+                builds: std::sync::Arc::clone(&builds),
+            }),
+            Err(ResourceMailboxAdmissionError::Pressure(_))
+        ));
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "pressure is observed before the owned value is constructed"
+        );
+        assert!(rx.try_recv().is_none());
+        assert_eq!(provider.in_use(), before);
+
+        let (tx, mut rx, provider) = fixture(Some(&item));
+        let baseline = provider.in_use();
+        tx.send_building(CountingBuilder {
+            item: item.clone(),
+            builds: std::sync::Arc::clone(&builds),
+        })
+        .expect("the exact fixture grant admits one built item");
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the builder runs exactly once after admission"
+        );
+        assert_eq!(
+            rx.try_recv()
+                .expect("the built item is queued")
+                .into_parts()
+                .0,
+            item
+        );
+        drop(tx);
+        drop(rx);
+        assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[test]
+    fn serialized_view_measurement_is_branded_for_the_built_type() {
+        let item = TestItem(vec![9; 17]);
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(&item).expect("the borrowed production view is measurable");
+        let measured = measure_serialized_mailbox_item::<TestItem>(&item)
+            .expect("the target type receives the central measurement");
+        let expected = MailboxMeasurement::<TestItem>::from_parts(retained, queued, allocations)
+            .expect("the measured view claim is representable");
+        assert_eq!(measured.claim, expected.claim);
+        assert_eq!(
+            ResourceMailboxSender::<TestItem>::building_item_planning_charge(&CountingBuilder {
+                item: item.clone(),
+                builds: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })
+            .expect("builder planning charge is representable"),
+            ResourceMailboxSender::<TestItem>::accepted_item_planning_charge(&item)
+                .expect("concrete planning charge is representable")
+        );
+    }
+
+    #[test]
+    fn funded_measurement_subtracts_exact_payload_and_rejects_mismatch() {
+        let item = TestItem(vec![3; 24]);
+        let (retained, queued, allocations) =
+            mailbox_measure_serialized(&item).expect("the outer value is measurable");
+        let funded =
+            crate::application_gateway::GatewayMailbox::<serde_json::Value>::retention_claim(
+                retained,
+                queued,
+                allocations,
+            )
+            .expect("the bare payload claim is representable");
+        let full = measure_serialized_mailbox_item::<TestItem>(&item)
+            .expect("the full outer claim is representable")
+            .into_claim();
+        let remaining = measure_serialized_mailbox_item_after_funded::<TestItem>(&item, funded)
+            .expect("the exact bare payload can be netted")
+            .into_claim();
+        assert_eq!(
+            remaining,
+            full.checked_sub(funded).expect("the subtraction is exact")
+        );
+        assert!(matches!(
+            measure_serialized_mailbox_item_after_funded::<TestItem>(
+                &item,
+                ResourceClaim::single(ResourceClass::SocketOrHandle, 1),
+            ),
+            Err(ResourceMailboxItemError::Claim(
+                ResourceClaimArithmeticError::Underflow {
+                    dimension: ResourceClass::SocketOrHandle,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn funded_builder_accepts_exact_remaining_grant_and_holds_payload_after_pop() {
+        let item = TestItem(vec![4; 24]);
+        let (tx, mut rx, provider, payload_lease, builds, funded) = funded_fixture(&item, false);
+        let before_send = provider.in_use();
+        tx.send_building(FundedCountingBuilder {
+            item: item.clone(),
+            funded,
+            builds: std::sync::Arc::clone(&builds),
+        })
+        .expect("the exact remaining grant admits the outer value");
+        let delivery = rx.try_recv().expect("the admitted value is queued");
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "construction occurs only after exact subtraction and admission"
+        );
+        drop(delivery);
+        assert_eq!(
+            provider.in_use(),
+            before_send,
+            "popping releases only the outer mailbox charge; the upstream payload remains funded"
+        );
+        drop(tx);
+        drop(rx);
+        let with_payload = provider.in_use();
+        drop(payload_lease);
+        assert_ne!(
+            provider.in_use(),
+            with_payload,
+            "the independently funded payload reservation outlives mailbox delivery"
+        );
+    }
+
+    #[test]
+    fn funded_builder_one_unit_short_refuses_without_building() {
+        let item = TestItem(vec![5; 24]);
+        let (tx, mut rx, provider, payload_lease, builds, funded) = funded_fixture(&item, true);
+        assert!(matches!(
+            tx.send_building(FundedCountingBuilder {
+                item,
+                funded,
+                builds: std::sync::Arc::clone(&builds),
+            }),
+            Err(ResourceMailboxAdmissionError::Pressure(_))
+        ));
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an admission refusal never constructs the outer value"
+        );
+        assert!(rx.try_recv().is_none());
+        drop(tx);
+        drop(rx);
+        drop(payload_lease);
+        let _ = provider;
     }
 
     #[tokio::test]
@@ -1043,18 +1352,9 @@ mod tests {
         at_drop: std::sync::Arc<parking_lot::Mutex<Option<ResourceClaim>>>,
     }
 
-    impl ResourceMailboxItem for FundingWitness {
-        fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
-            let bytes = u64::try_from(self.bytes.len()).map_err(|_| {
-                ResourceClaimArithmeticError::Overflow {
-                    dimension: ResourceClass::AccountedMemoryBytes,
-                }
-            })?;
-            Ok(ResourceClaim::try_from_entries([
-                (ResourceClass::AccountedMemoryBytes, bytes),
-                (ResourceClass::QueuedBytes, bytes),
-                (ResourceClass::OpaqueDependencyResidual, 1),
-            ])?)
+    unsafe impl ResourceMailboxItem for FundingWitness {
+        fn measured_claim(&self) -> Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
+            MailboxMeasurement::from_parts(0, self.bytes.len(), 0)
         }
     }
 

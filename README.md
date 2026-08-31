@@ -8,7 +8,6 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/macOS_·_Linux_·_Windows_·_Pi-2ea44f.svg)](#platforms)
-[![Tests](https://img.shields.io/badge/tests-passing-2ea44f.svg)](crates/myownmesh-core/tests)
 
 </div>
 
@@ -36,10 +35,10 @@ myownmesh-updater        # self-update with configurable release feed
 
 ## Install
 
-One command — detects platform, fetches the binaries from
-[GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases),
-verifies SHA-256, drops `myownmesh` **and** the `myownmesh-gui`
-desktop app on your PATH (so a bare `myownmesh` opens the GUI).
+The platform installer scripts can fetch a matching release artifact from
+[GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases), verify its
+SHA-256 sidecar, and install the daemon and, when supplied, the GUI bundle.
+Exact artifact and platform availability is release-dependent.
 
 ```sh
 # macOS / Linux
@@ -54,19 +53,18 @@ irm https://raw.githubusercontent.com/mrjeeves/MyOwnMesh/main/scripts/install.ps
 The installer writes to `/usr/local/bin` (or `~/.local/bin` if not
 writable) on Unix and `%LOCALAPPDATA%\Programs\MyOwnMesh` on
 Windows, and adds the directory to PATH if it isn't already there.
-The desktop GUI goes in by default — it's small and very handy;
-pass `--no-gui` (Unix) or `-NoGui` (Windows) for a daemon-only
-install on a headless box. The GUI binary relies on the system
+The desktop GUI is included by default where the selected release provides
+it; pass `--no-gui` (Unix) or `-NoGui` (Windows) for a daemon-only install on
+a headless box. The GUI binary relies on the system
 webview (libwebkit2gtk / WebView2 / WKWebView); for full OS
 integration (menu entry, icon) grab the `.deb` / `.AppImage` /
 `.dmg` / `.msi` bundle from Releases instead. Pass `--serve` (Unix)
 or `-Serve` (Windows) to launch the daemon once the install
 finishes.
 
-Prefer a tarball directly? The portable binaries
-(`myownmesh-<platform>.{tar.gz,zip}` + `.sha256` sidecar) are on
-[Releases](https://github.com/mrjeeves/MyOwnMesh/releases) for the
-five platforms in the [matrix](#platforms).
+Prefer a tarball directly? Portable binaries and their `.sha256` sidecars,
+when published for a release, are listed on
+[Releases](https://github.com/mrjeeves/MyOwnMesh/releases).
 
 ## Get started
 
@@ -89,19 +87,20 @@ just serve                                    # MYOWNMESH_LOG=debug cargo run -p
 Arc 03 connector-capable daemon startup requires an explicit finite process
 resource grant. The owner also selects whether optional local ceilings and
 codec-neutral real-time ownership are enabled. Ordinary elastic construction
-does not require static Mesh, peer, attempt, queue, or flow counts. Native close
-has no timeout or owner-selected close-policy input. See
-[the quickstart policy input list](docs/QUICKSTART.md#2-open-the-mesh). An
-explicitly non-participating infrastructure host needs no connector policy.
+outside an explicitly bounded optional profile does not require static Mesh,
+peer, attempt, queue, or flow counts. The separate Closed-member relay
+profile applies finite allocation, queue, handshake, replay, frame, control,
+bandwidth, lifetime, and shutdown bounds, with route and generation fences,
+pending-preserving refusal, and joined terminal custody. See [the quickstart
+policy input list](docs/QUICKSTART.md#2-open-the-mesh). An explicitly
+non-participating infrastructure host needs no connector policy.
 
 ### 2. Run the desktop GUI
 
-The [one-command install](#install) above already includes the GUI
-binary, so a bare `myownmesh` opens it. For full OS integration,
-pre-built installers (`.deb` / `.AppImage` / `.dmg` / `.msi` /
-`.exe`) ship in the same [GitHub Releases](https://github.com/mrjeeves/MyOwnMesh/releases)
-as the daemon. The GUI auto-spawns the daemon as a child process,
-so installing only the GUI bundle gets you both.
+Where a release provides the GUI bundle, a bare `myownmesh` opens it. For
+full OS integration, consult the release-specific platform artifacts. The
+GUI auto-spawns the daemon as a child process when the selected bundle
+includes that supported pairing.
 
 From source, two shells:
 
@@ -150,6 +149,7 @@ async fn run(
         kind: Default::default(),                 // Open governance
         topology: TopologyMode::default(),       // FullMesh
         signaling: Default::default(),            // Nostr + mDNS defaults
+        closed_relay: Default::default(),
         stun_servers: Default::default(),
         turn_servers: Default::default(),
         roster_path: None,
@@ -225,12 +225,13 @@ protocol-message checklist, and the topology-mode checklist.
 - **ed25519 mutual auth, with eyeballs.** Every peer encounter exchanges a `hello` + `auth_response` where each side signs the other's nonce under `myownmesh-mesh-auth-v1:`. A 6-char `[a-z0-9]` verification code rides along for out-of-band confirmation ("the code I see matches what you read me"). Approved peers land in a per-network roster and skip the prompt on reconnect.
 - **Recovery from reliable signals, not ICE guesswork.** webrtc-rs reports ICE `Connected` on dead relay paths and `Failed` on live ones, so the engine trusts only the data-channel open/close events and inbound-frame recency. Its graduated sequence is Steady → Wake probe → ICE watchdog → in-place ICE restart (confirmed by inbound traffic, not by ICE state) → clean rebuild → stop-and-start. It uses the cheapest action that still recovers from the failure class above it and never tears a live link down on an ICE-state blip. The retained pre-V4 evidence for each tunable is in [`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md); V4 ownership and authority come from the canonical architecture documents.
 - **Trystero-wire-compatible Nostr signaling.** Same room-handle derivation as JS Trystero v0.24 (`SHA-256(app_id || ":" || network_id)`), same deterministic relay shuffle. Eight published-fix patches against `@trystero-p2p/core` are baked in natively — catalogued in [`crates/myownmesh-signaling/src/upstream.rs`](crates/myownmesh-signaling/src/upstream.rs) so upstream-tracking is a code-level diff, not a patches/ folder.
-- **Zeroconf LAN discovery, on by default.** An mDNS/DNS-SD driver runs alongside Nostr: each network registers a `_myownmesh._tcp.local.` instance with the room handle in TXT, browses for peers in the same room, and exchanges SDP over a unicast TCP port advertised in SRV. Pure Rust (`mdns-sd` — no Avahi/Bonjour binding; coexists with system daemons on 5353) and clock-free, so it works on a device whose RTC still reads the epoch. Outbound signals fan out to both drivers and an inbound gate drops cross-transport duplicates, so co-located peers mesh even with every relay unreachable. Set `signaling.strategy = "none"` and keep `mdns = true` for a fully air-gapped mesh — zero remote infrastructure. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
-- **Host your own infrastructure.** A device can be any combination of a mesh node and hosted services: a relay (roster-gated routing), an **intelligent signaling relay** (a NIP-01 server the built-in driver speaks to unchanged — with live presence, instant-departure coordination, and flood limits, so it's safe to run publicly), and STUN / TURN servers (RFC 5389 / 5766, the latter with a per-connection bandwidth cap). Turn off the node role for a **pure-infrastructure box**. Toggle everything from the GUI (Settings → Services), the CLI (`myownmesh ctl services …`), or `config.json`; hosts advertise their roles + endpoints so the fleet self-discovers them. This is what makes a **fully internet-isolated network** trivial — no Google STUN, no Cloudflare TURN, no public relay. See [`docs/SERVICES.md`](docs/SERVICES.md).
+- **LAN discovery and signaling.** The signaling package includes mDNS/DNS-SD alongside its configured remote strategy. It advertises a network room handle and exchanges signaling data over the local transport when enabled. Backend, operating-system, and network availability remain deployment-dependent; configure `signaling.mdns` and the remote strategy explicitly for the intended environment. Details in [`crates/myownmesh-signaling/README.md`](crates/myownmesh-signaling/README.md).
+- **Hosted infrastructure and network-scoped relay.** A device can host the signaling, STUN, and TURN services described in [`docs/SERVICES.md`](docs/SERVICES.md). Those are device-wide infrastructure services and advertise only their own service roles. Separately, an authorized member of a Closed network may provide a network-scoped opaque relay through bounded `NetworkConfig.closed_relay` policy. Its independently promoted A-B and B-C legs use explicit route-bound `Open` / `Offer` / `Accept` / `Close` controls; B forwards only opaque ciphertext through provider-backed directional queues. Generation tombstones, pending-preserving refusal, bounded controls, and joined shutdown custody protect the exact session. It is not a hosted URL, service role, GUI service toggle, or generic WebRTC A-C upgrade.
+- **Self-hosted signaling, STUN, and TURN.** The signaling server speaks the supported NIP-01 subset, while STUN and TURN provide their respective ICE services. Turn off the node role for a **pure-infrastructure box**. Hosted-service configuration and release-specific deployment limits are documented in [`docs/SERVICES.md`](docs/SERVICES.md).
 - **Selectable topologies.** FullMesh is the default. Ring uses sorted peers with 2 neighbours and shortcuts, while Star uses an explicit hub. All use the same shelving primitive; both sides of every pair run the same pure-function selector over the same sorted input, so the result is symmetric without coordination.
 - **Typed pub/sub + generic RPC over one data channel.** `Channel<T>` is a typed publish/subscribe channel keyed by name. `Rpc::call` / `serve` / `call_stream` / `serve_stream` is the generic request/response surface. Embedders define their own message types — the mesh treats payloads opaquely.
 - **Embed without the GUI or updater.** The daemon, the library, and the desktop GUI are separate crates. An app embedding `myownmesh-core` doesn't pull in the HTTP self-updater or the Tauri stack. The GUI itself is a *client* of the daemon (over a local control socket) so crashing the UI never disturbs the running mesh.
-- **Appliance-ready daemon builds.** Every release ships two daemon-only, fully static musl tarballs — `myownmesh-linux-riscv64.tar.gz` (NanoKVM) and `myownmesh-linux-aarch64-musl.tar.gz` (NanoKVM-Pro) — one binary, no glibc. See [`docs/NANOKVM.md`](docs/NANOKVM.md).
+- **Appliance documentation.** Cross-building daemon-only musl artifacts is described in [`docs/NANOKVM.md`](docs/NANOKVM.md); availability depends on the selected release artifacts.
 - **One identity, many networks.** Per-device long-lived ed25519 keypair under `~/.myownmesh/.secrets/identity.json` (0600). Per-network rosters at `~/.myownmesh/mesh/rosters/{network_id}.json`. Switching the active network swaps rosters but preserves identity.
 
 ## Daemon + CLI
@@ -283,7 +284,7 @@ source checkout.
 
 - **Node graph** — self at the centre, peers laid out by topology. Click a node (or pick it from the sidebar) for label / display suffix / RTT / capabilities; during pending approval the popup surfaces the per-session 6-char verification code as a tile for out-of-band confirmation.
 - **Approvals tab** (default in Settings) — pending peer requests from every joined network flatten into one list with Approve / Deny inline.
-- **Networks** — one home per network: Status · Settings (label, topology, signaling / STUN / TURN, auto-approve, export, remove) · Connections (live peer table) · Roster (approved devices + roles) · Governance (open ↔ closed, propose / sign / deny). The per-network gear in the sidebar jumps straight here.
+- **Networks** — one home per network: Status · Settings (label, topology, signaling / STUN / TURN, auto-approve, export, remove) · Connections (live peer table) · Roster (approved devices + roles) · network policy controls. The per-network gear in the sidebar jumps straight here.
 - **Updates** — current version, the auto-update toggle and policy (channel + which version bumps apply on their own), any staged update, and the release-feed URL for white-labelling.
 - **Activity** — unified event log: peer state transitions, phase changes, ICE / handshake / signaling diagnostics. Quiet toggle suppresses info-level chatter; warns and errors always land.
 
@@ -291,18 +292,11 @@ Layout / wire protocol in [`gui/README.md`](gui/README.md).
 
 ## Platforms
 
-`linux-x86_64` · `linux-aarch64` (incl. Raspberry Pi 4 / 5) ·
-`macos-aarch64` · `macos-x86_64` · `windows-x86_64`. The release
-matrix builds and uploads bundles for all five, plus the two
-appliance targets below — seven release artifacts per tag. Linux
-is pinned to Ubuntu 22.04 (glibc 2.35) so binaries run on Debian
-12, Ubuntu 22.04+, and other distros still on glibc 2.35/2.36/2.38.
-
-Two **appliance** daemon-only builds ship alongside the desktop
-bundles as fully static musl binaries (no glibc dependency):
-`linux-riscv64` (`myownmesh-linux-riscv64.tar.gz`, the NanoKVM SoC)
-and `linux-aarch64-musl` (`myownmesh-linux-aarch64-musl.tar.gz`, the
-NanoKVM-Pro SoC). See [`docs/NANOKVM.md`](docs/NANOKVM.md).
+Source and release support are platform-specific. Consult the selected
+release artifacts and the installer for the available desktop, daemon, and
+appliance targets; the repository's cross-build notes are in
+[`docs/NANOKVM.md`](docs/NANOKVM.md). This README does not infer runtime,
+installer, or mDNS coverage for a platform from source presence alone.
 
 ## Lineage
 
@@ -320,7 +314,7 @@ relationship to the original TypeScript modules.
 
 [`docs/QUICKSTART.md`](docs/QUICKSTART.md) — embedder walkthrough ·
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md) — wire-protocol reference ·
-[`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks (role tiers, signed transitions, split + recovery) ·
+[`docs/NETWORK-TYPES.md`](docs/NETWORK-TYPES.md) — open vs closed networks and role tiers ·
 [`docs/NANOKVM.md`](docs/NANOKVM.md) — cross-building the daemon for a NanoKVM (riscv64 + musl) or NanoKVM-Pro (aarch64 + musl) ·
 [`ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, trust model, persistent state ·
 [`CONNECTION-ENGINE-FIELD-NOTES.md`](CONNECTION-ENGINE-FIELD-NOTES.md): retained recovery evidence and tunables ·

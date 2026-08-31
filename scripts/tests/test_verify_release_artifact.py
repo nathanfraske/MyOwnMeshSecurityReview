@@ -22,6 +22,14 @@ class ArchiveMemberControls(unittest.TestCase):
             scanner.scan_bytes("split-marker", prefix + marker)
         self.assertIn("transport-lab marker", str(error.exception))
 
+    def test_every_removed_v3_marker_is_rejected_across_scan_chunk_boundary(self) -> None:
+        for marker in scanner.REMOVED_V3_MARKERS:
+            prefix = b"x" * (scanner.SCAN_CHUNK_SIZE - len(marker) + 1)
+            with self.subTest(marker=marker):
+                with self.assertRaises(SystemExit) as error:
+                    scanner.scan_bytes("split-removed-marker", prefix + marker)
+                self.assertIn(marker.decode("ascii"), str(error.exception))
+
     def test_missing_expected_member_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "artifact.zip"

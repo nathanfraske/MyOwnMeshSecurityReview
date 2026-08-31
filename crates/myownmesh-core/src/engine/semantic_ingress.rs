@@ -18,7 +18,7 @@
 //! | what makes it actionable | nothing — it grants nothing | the embedded author, signature and domain context |
 //! | who may deliver it | any carrier | any carrier, cache, file or medium |
 //! | may change the roster | never | that is what it is for |
-//! | admitted by | [`super::signaling_ingress`] | [`admit`] |
+//! | admitted by | [`super::signaling_ingress`] | [`DurableSemanticPort::admit`] |
 //!
 //! # Fact authority is content, not carrier
 //!
@@ -60,7 +60,7 @@
 //!
 //! [`DurableSemanticExchange`] wraps a private enum. Nothing outside this module
 //! can name a variant, so nothing outside can build one — the only way to obtain
-//! the type is [`admit`], which is total over [`MeshMessage`] with no `_` arm. A
+//! the type is [`DurableSemanticPort::admit`], which is total over [`MeshMessage`] with no `_` arm. A
 //! future durable message reaches this module or it reaches nothing.
 //!
 //! # Why the outcome is its own enum and not a `Result`
@@ -77,8 +77,7 @@ use std::sync::Arc;
 use tracing::trace;
 
 use crate::protocol::{
-    FactBundleMessage, FactInventory, FactRequest, MeshMessage, NetworkStateBroadcast,
-    ProofDeliveryMessage, RosterRequestMessage, RosterSummaryMessage,
+    FactBundleMessage, FactInventory, FactRequest, MeshMessage, ProofDeliveryMessage,
 };
 use crate::semantic::{Admission, DeviceId, SignedFact};
 
@@ -89,7 +88,7 @@ use super::state::NetworkState;
 /// One admitted durable semantic exchange.
 ///
 /// The private field is the point: see the module documentation for why this
-/// type is obtainable only through [`admit`].
+/// type is obtainable only through [`DurableSemanticPort::admit`].
 pub(crate) struct DurableSemanticExchange {
     exchange: Exchange,
 }
@@ -111,12 +110,11 @@ pub(crate) struct DurableSemanticExchange {
 ///
 /// [`Self::FactBundle`] is the one arm where that is a review property instead
 /// of a type property, and the difference is worth stating plainly rather than
-/// rounding off. It is passed a `&str` device id read off the route, which
-/// reaches `governance::on_roster_entries` as a diagnostic label: it names who
-/// handed the bundle over, in a trace and in a log line, and scopes that name to
-/// the session it arrived on. It is not an input to verification, not compared
-/// against any author, and not able to make a bundle acceptable or
-/// unacceptable — the log walk from genesis decides that alone.
+/// rounding off. It is passed a `&str` device id read off the route only as a
+/// diagnostic label in a trace and log line, scoped to the session it arrived
+/// on. It is not an input to verification, not compared against any author,
+/// and not able to make a bundle acceptable or unacceptable — the log walk
+/// from genesis decides that alone.
 enum Exchange {
     /// A fact that carries its own author, signature and domain context.
     ///
@@ -124,11 +122,11 @@ enum Exchange {
     /// canonical payload that names this network and the state signing domain.
     /// Nothing about the delivery is consulted.
     SignedFact(Box<SignedFact>),
-    /// A bundle of facts: the signed governance and member transition logs.
+    /// A bundle of signed semantic facts.
     ///
-    /// Self-authenticating the same way, in bulk — `verify_log` and
-    /// `verify_member_log` walk it from genesis, and a fork or a bad signature
-    /// rejects the whole bundle rather than part of it.
+    /// Self-authenticating the same way, in bulk: each fact is verified and
+    /// reduced through the canonical graph, and a bad signature or invalid
+    /// causal relation is refused rather than treated as authority.
     ///
     /// The unsigned `entries` list is carrier material only, not an
     /// authority-bearing membership fact. Signed governance/member logs are
@@ -155,10 +153,6 @@ enum Exchange {
 
 /// A summary of the sender's state, for comparison.
 enum Inventory {
-    /// The sender's view of governance: kind, counts, membership root.
-    NetworkState(NetworkStateBroadcast),
-    /// A digest of the sender's roster.
-    Roster(RosterSummaryMessage),
     /// Exact-context FactIds known by the sender. This is coordination only;
     /// it carries no signed body and therefore cannot authorize anything.
     Facts(FactInventory),
@@ -166,22 +160,9 @@ enum Inventory {
 
 /// A request for rows the sender is missing.
 enum DependencyRequest {
-    /// The full roster and the signed logs behind it.
-    Roster(RosterRequestMessage),
     /// Exact-context FactIds whose signed bodies the sender requests. The
     /// response is a FactBundle; this request cannot install a fact.
     Facts(FactRequest),
-}
-
-/// What one decoded frame turned out to be.
-///
-/// Two outcomes, neither of them a failure. See the module documentation for why
-/// this is not a `Result`.
-pub(crate) enum SemanticAdmission {
-    /// A durable semantic exchange, for [`reduce`].
-    Durable(DurableSemanticExchange),
-    /// Not this module's, handed back whole and unmodified.
-    NotDurable(Box<MeshMessage>),
 }
 
 /// The durable-semantic port.  It admits only the closed durable exchange set
@@ -199,30 +180,11 @@ impl DurableSemanticPort {
             MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
             MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
             MeshMessage::ProofDelivery(m) => Exchange::ProofDelivery(m),
-            MeshMessage::NetworkState(m) => Exchange::Inventory(Inventory::NetworkState(m)),
-            MeshMessage::RosterSummary(m) => Exchange::Inventory(Inventory::Roster(m)),
             MeshMessage::FactInventory(m) => Exchange::Inventory(Inventory::Facts(m)),
-            MeshMessage::RosterRequest(m) => {
-                Exchange::DependencyRequest(DependencyRequest::Roster(m))
-            }
             MeshMessage::FactRequest(m) => Exchange::DependencyRequest(DependencyRequest::Facts(m)),
             other => return Err(Box::new(other)),
         };
         Ok(DurableSemanticExchange { exchange })
-    }
-}
-
-/// Admit a decoded frame as a durable semantic exchange, or hand it straight
-/// back.
-///
-/// Written as a total function over `MeshMessage` with no `_` arm, so a new
-/// variant is a compile error here and has to be classified deliberately rather
-/// than silently falling out of the durable set — and, now that the set has five
-/// classes, classified into the right one rather than into a single bucket.
-pub(crate) fn admit(message: MeshMessage) -> SemanticAdmission {
-    match DurableSemanticPort::admit(message) {
-        Ok(exchange) => SemanticAdmission::Durable(exchange),
-        Err(other) => SemanticAdmission::NotDurable(other),
     }
 }
 
@@ -240,10 +202,7 @@ impl DurableSemanticExchange {
             Exchange::SignedFact(_) => "signed_fact",
             Exchange::FactBundle(_) => "fact_bundle",
             Exchange::ProofDelivery(_) => "proof_delivery",
-            Exchange::Inventory(Inventory::NetworkState(_)) => "state_inventory",
-            Exchange::Inventory(Inventory::Roster(_)) => "roster_inventory",
             Exchange::Inventory(Inventory::Facts(_)) => "fact_inventory",
-            Exchange::DependencyRequest(DependencyRequest::Roster(_)) => "roster_request",
             Exchange::DependencyRequest(DependencyRequest::Facts(_)) => "fact_request",
         }
     }
@@ -294,10 +253,9 @@ pub(super) async fn reduce(
         // name `reply`, so the compiler is what keeps a courier out of the
         // decision.
         Exchange::SignedFact(m) => reduce_signed_fact(state, *m).await,
-        // The bundle does see a device id off the route — as a label for the
-        // trace and the log, scoped to this session, and never as a reason to
-        // accept or reject anything. `on_roster_entries` verifies the logs from
-        // genesis; `source` does not appear in that decision.
+        // The bundle does see a device id off the route as a label for the trace
+        // and log, scoped to this session, and never as a reason to accept or
+        // reject anything; `source` does not appear in that decision.
         Exchange::FactBundle(m) => {
             let facts = m.facts;
             for fact in facts.iter().cloned() {
@@ -359,8 +317,6 @@ pub(super) async fn reduce(
                 return;
             };
             match inventory {
-                Inventory::NetworkState(m) => governance::on_state_broadcast(state, route, m).await,
-                Inventory::Roster(m) => governance::on_roster_summary(state, route, m).await,
                 Inventory::Facts(m) => {
                     if m.context_id() != state.mesh_context_id() {
                         trace!(kind, "discarding fact inventory for a foreign mesh context");
@@ -376,9 +332,6 @@ pub(super) async fn reduce(
                 return;
             };
             match request {
-                DependencyRequest::Roster(m) => {
-                    governance::on_roster_request(state, route, m).await
-                }
                 DependencyRequest::Facts(m) => {
                     if m.context_id() != state.mesh_context_id() {
                         trace!(kind, "discarding fact request for a foreign mesh context");
@@ -455,29 +408,32 @@ async fn reduce_signed_fact(state: &Arc<NetworkState>, fact: SignedFact) {
 mod tests {
     use super::*;
 
-    /// The class [`admit`] put a message in, as a comparable word.
+    /// The canonical durable port's classification, as a comparable word.
     fn class(message: MeshMessage) -> &'static str {
-        match admit(message) {
-            SemanticAdmission::Durable(exchange) => match exchange.exchange {
+        match DurableSemanticPort::admit(message) {
+            Ok(exchange) => match exchange.exchange {
                 Exchange::SignedFact(_) => "signed_fact",
                 Exchange::FactBundle(_) => "fact_bundle",
                 Exchange::ProofDelivery(_) => "proof_delivery",
                 Exchange::Inventory(_) => "inventory",
                 Exchange::DependencyRequest(_) => "dependency_request",
             },
-            SemanticAdmission::NotDurable(_) => "not_durable",
+            Err(message) => {
+                // The durable port returns the original frame unchanged.
+                // Consume it here so the owned hand-back is explicit.
+                drop(message);
+                "not_durable"
+            }
         }
     }
 
     /// **Every durable message is admitted here, into the class it actually
     /// belongs to, and nothing else is admitted at all.**
     ///
-    /// The classification half is the correction. All seven used to be called
-    /// facts, which is why the reducer could take a session token for all seven
-    /// and nobody noticed that four of them were being handed one they had no
-    /// business needing. An inventory is a comparison and a request is a
-    /// question; neither is something to content-address, store or project, and
-    /// the two that are carry their own signatures.
+    /// The classification half is the correction. Durable semantic exchanges
+    /// are separated from transport controls: an inventory is a comparison
+    /// and a request is a question, while facts and proof deliveries carry the
+    /// content that the canonical reducer can verify and admit.
     ///
     /// The closure half is the other's non-vacuity: a classifier that admitted
     /// everything would pass the first alone, and one that admitted nothing
@@ -490,30 +446,11 @@ mod tests {
                 MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() }),
             ),
             (
-                "not_durable",
-                MeshMessage::RosterEntries(crate::protocol::RosterEntriesMessage {
-                    entries: Vec::new(),
-                }),
-            ),
-            (
                 "inventory",
-                MeshMessage::NetworkState(NetworkStateBroadcast {
-                    kind: crate::network_state::NetworkKind::Closed,
-                    fact_heads_count: 0,
-                    roster_root: String::new(),
-                }),
-            ),
-            (
-                "inventory",
-                MeshMessage::RosterSummary(RosterSummaryMessage {
-                    root: String::new(),
-                    count: 0,
-                    last_edit_ts: 0,
-                }),
-            ),
-            (
-                "dependency_request",
-                MeshMessage::RosterRequest(RosterRequestMessage::default()),
+                MeshMessage::FactInventory(FactInventory::new(
+                    crate::semantic::MeshContextId::from_bytes([0; 32]),
+                    [],
+                )),
             ),
         ];
         for (want, message) in expected {

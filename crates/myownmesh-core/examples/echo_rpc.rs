@@ -30,8 +30,11 @@ fn cfg(label: &str) -> NetworkConfig {
     NetworkConfig {
         id: label.into(),
         network_id: "echo-rpc-demo".into(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.into(),
         kind: Default::default(),
+        scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),

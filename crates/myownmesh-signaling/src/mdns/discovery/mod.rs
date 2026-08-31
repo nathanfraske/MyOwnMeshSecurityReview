@@ -71,6 +71,13 @@ pub struct DiscoveryLimits {
     /// Maximum exact system-backend service-key epochs retained for stale
     /// removal fencing.
     pub max_event_epochs: usize,
+    /// Maximum TXT entries copied from one resolved service.
+    pub max_txt_entries: usize,
+    /// Maximum encoded TXT bytes retained for one resolved service, including
+    /// one length octet per entry.
+    pub max_txt_bytes: usize,
+    /// Maximum unique IPv4 addresses retained for one resolved service.
+    pub max_resolved_addresses: usize,
 }
 
 impl Default for DiscoveryLimits {
@@ -79,7 +86,46 @@ impl Default for DiscoveryLimits {
             max_resolve_owners: 256,
             event_capacity: 128,
             max_event_epochs: 1024,
+            max_txt_entries: MAX_TXT_ENTRIES,
+            max_txt_bytes: MAX_TXT_BYTES,
+            max_resolved_addresses: MAX_RESOLVED_ADDRESSES,
         }
+    }
+}
+
+impl DiscoveryConfig {
+    /// Validate all caller-provided strings before either backend constructs a
+    /// daemon object or copies TXT material into its native representation.
+    pub(crate) fn validate(&self) -> bool {
+        if self.service_type.is_empty()
+            || self.service_type.len() > MAX_DNS_NAME_BYTES
+            || self.instance.is_empty()
+            || self.instance.len() > MAX_DNS_NAME_BYTES
+            || self.txt.len() > self.limits.max_txt_entries
+        {
+            return false;
+        }
+        self.txt
+            .iter()
+            .try_fold(0usize, |total, (key, value)| {
+                if key.is_empty()
+                    || key.len() > MAX_TXT_KEY_BYTES
+                    || value.len() > MAX_TXT_VALUE_BYTES
+                {
+                    return None;
+                }
+                let entry_bytes = key
+                    .len()
+                    .checked_add(1)
+                    .and_then(|bytes| bytes.checked_add(value.len()))?;
+                if entry_bytes > u8::MAX as usize {
+                    return None;
+                }
+                total
+                    .checked_add(1)
+                    .and_then(|total| total.checked_add(entry_bytes))
+            })
+            .is_some_and(|total| total <= self.limits.max_txt_bytes)
     }
 }
 
@@ -89,17 +135,35 @@ impl DiscoveryLimits {
             && self.event_capacity > 0
             && self.event_capacity <= tokio::sync::Semaphore::MAX_PERMITS
             && self.max_event_epochs > 0
+            && self.max_txt_entries > 0
+            && self.max_txt_bytes > 0
+            && self.max_txt_bytes <= u16::MAX as usize
+            && self.max_resolved_addresses > 0
     }
 }
-/// Maximum DNS-SD service-instance/name length accepted from a backend.
+/// DNS-SD's maximum encoded domain-name length (including length octets and
+/// the root terminator). This is a wire/dependency bound, not an application
+/// workload setting.
 pub const MAX_DNS_NAME_BYTES: usize = 255;
-/// Maximum number of TXT entries copied from one discovery response.
+/// Default owner-facing bound for TXT entries copied from one discovery
+/// response. DNS-SD does not define an entry-count policy; each deployment may
+/// override this through [`DiscoveryLimits::max_txt_entries`].
 pub const MAX_TXT_ENTRIES: usize = 64;
-/// Maximum key/value sizes copied from one TXT entry.
+/// Defensive key bound for the application's TXT map. The DNS-SD wire limit
+/// applies to each encoded TXT string, so this is intentionally distinct from
+/// [`MAX_TXT_VALUE_BYTES`].
 pub const MAX_TXT_KEY_BYTES: usize = 128;
+/// Maximum value size accepted by the application's TXT map. A DNS-SD TXT
+/// string carries its encoded length in one octet; the backend's encoder keeps
+/// that dependency limit as a final defensive check.
 pub const MAX_TXT_VALUE_BYTES: usize = 255;
-/// Maximum total TXT payload and resolved IPv4 addresses retained per event.
+/// Default owner-facing total TXT payload bound retained per event. This is
+/// not a DNS-SD wire maximum; deployments may override it through
+/// [`DiscoveryLimits::max_txt_bytes`], subject to the DNS-SD `u16` length.
 pub const MAX_TXT_BYTES: usize = 4096;
+/// Default owner-facing unique IPv4-address bound retained per event.
+/// DNS-SD supplies no application address-count limit; deployments may
+/// override it through [`DiscoveryLimits::max_resolved_addresses`].
 pub const MAX_RESOLVED_ADDRESSES: usize = 32;
 
 /// What a backend needs to advertise + browse one service instance.
@@ -639,6 +703,9 @@ mod tests {
             max_resolve_owners: 3,
             event_capacity: 5,
             max_event_epochs: 7,
+            max_txt_entries: 8,
+            max_txt_bytes: 512,
+            max_resolved_addresses: 4,
         };
         assert!(limits.validate());
         let coalescer = DiscoveryEventCoalescer::with_limits(limits);
@@ -684,6 +751,66 @@ mod tests {
         };
         assert!(!backoff_profile.validate());
         assert!(MdnsTimingProfile::default().validate());
+    }
+
+    #[test]
+    fn discovery_payload_limits_reject_zero_and_oversized_wire_bytes() {
+        let limits = DiscoveryLimits::default();
+        assert!(limits.validate());
+        assert!(!DiscoveryLimits {
+            max_txt_entries: 0,
+            ..limits
+        }
+        .validate());
+        assert!(!DiscoveryLimits {
+            max_txt_bytes: 0,
+            ..limits
+        }
+        .validate());
+        assert!(!DiscoveryLimits {
+            max_resolved_addresses: 0,
+            ..limits
+        }
+        .validate());
+        assert!(DiscoveryLimits {
+            max_txt_bytes: u16::MAX as usize,
+            ..limits
+        }
+        .validate());
+        assert!(!DiscoveryLimits {
+            max_txt_bytes: u16::MAX as usize + 1,
+            ..limits
+        }
+        .validate());
+    }
+
+    #[test]
+    fn discovery_config_bounds_payload_before_backend_start() {
+        let mut config = DiscoveryConfig {
+            service_type: "_mesh._tcp.local.".into(),
+            instance: "instance".into(),
+            port: 1,
+            txt: vec![("key".into(), "value".into())],
+            limits: DiscoveryLimits::default(),
+            timing: MdnsTimingProfile::default(),
+        };
+        assert!(config.validate());
+
+        config.limits = DiscoveryLimits {
+            max_txt_entries: 1,
+            max_txt_bytes: 64,
+            max_resolved_addresses: 1,
+            ..config.limits
+        };
+        config.txt = vec![("first".into(), "value".into()); 2];
+        assert!(!config.validate());
+
+        config.txt = vec![("key".into(), "value".into()); MAX_TXT_ENTRIES + 1];
+        assert!(!config.validate());
+        config.txt = vec![("key".into(), "x".repeat(MAX_TXT_VALUE_BYTES + 1))];
+        assert!(!config.validate());
+        config.txt = vec![("x".repeat(MAX_TXT_KEY_BYTES + 1), "value".into())];
+        assert!(!config.validate());
     }
 
     #[test]

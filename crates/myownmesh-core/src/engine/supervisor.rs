@@ -66,20 +66,27 @@ pub(crate) async fn run_driver(
         drop(cfg);
     }
 
+    let scheduler_policy = state
+        .config
+        .read()
+        .scheduler_policy()
+        .expect("scheduler policy is validated before engine side effects");
+
     // Top-level interval ticks. We hold them across the loop so
     // sleeping happens inside `tokio::select!` — no separate
     // task means a wake-event after a long-sleep tick gap is
     // observable here without coordination.
     let mut heartbeat = tokio::time::interval(Duration::from_millis(
-        super::scheduler::HEARTBEAT_INTERVAL_MS,
+        scheduler_policy.heartbeat_interval_ms,
     ));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // One periodic pass covers ICE watchdog and network watch together.
     // Recovery is event-driven first; this is the secondary safety-net tick
-    // (see [`super::scheduler::STATE_WATCH_INTERVAL_MS`]) that confirms state and
+    // (see the checked `NetworkConfig::scheduler.state_watch_interval_ms`)
+    // that confirms state and
     // handles the inherently time-based conditions.
     let mut state_watch = tokio::time::interval(Duration::from_millis(
-        super::scheduler::STATE_WATCH_INTERVAL_MS,
+        scheduler_policy.state_watch_interval_ms,
     ));
     state_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The secondary control path: a registry of time-based subsystems run on
@@ -161,7 +168,11 @@ pub(crate) async fn run_driver(
             }
 
             _ = heartbeat.tick() => {
-                wake_detector.observe(Instant::now(), super::scheduler::HEARTBEAT_INTERVAL_MS);
+                wake_detector.observe_with_policy(
+                    Instant::now(),
+                    scheduler_policy.heartbeat_interval_ms,
+                    &scheduler_policy,
+                );
                 super::heartbeat::tick(&state).await;
                 if wake_detector.take_wake_event() {
                     debug!(network = %state.network_id, "wake event observed");
@@ -218,25 +229,7 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             *state.topology_impl.write() = crate::topology::from_mode(&mode);
             ladder::reevaluate_topology(state).await;
         }
-        NetworkCmd::ApproveRoster {
-            device_id,
-            label,
-            reply,
-        } => {
-            let result = state.approve_roster(&device_id, &label).await;
-            // A successful approval changed our roster — advertise the new
-            // membership so other members converge (the same path the
-            // mutual-confirmation handshake takes, here for the explicit
-            // user-approve case).
-            if result.is_ok() {
-                governance::broadcast_roster_summary(state).await;
-            }
-            let _ = reply.send(result);
-        }
-        NetworkCmd::RemoveRoster { device_id, reply } => {
-            let result = state.remove_roster(&device_id).await;
-            let _ = reply.send(result);
-        }
+        // A successful approval changed our roster — advertise the new
         NetworkCmd::DropPeer { device_id, reason } => {
             drop_peer(state, &device_id, reason).await;
         }
@@ -392,12 +385,30 @@ pub(crate) async fn handle_command(state: &Arc<NetworkState>, cmd: NetworkCmd) {
             replay_local_capabilities_to_owner(state, &owner).await;
         }
         // ---- governance ops ----
-        NetworkCmd::ProposeTransition {
-            variant,
+        NetworkCmd::ProposeRoleGrant {
+            target,
+            role,
             mfa_code,
             reply,
         } => {
-            let result = governance::propose(state, variant, mfa_code.as_deref()).await;
+            let result =
+                governance::propose_role_grant(state, &target, role, mfa_code.as_deref()).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::ProposeRoleRevoke {
+            target,
+            mfa_code,
+            reply,
+        } => {
+            let result = governance::propose_role_revoke(state, &target, mfa_code.as_deref()).await;
+            let _ = reply.send(result);
+        }
+        NetworkCmd::ProposeEvict {
+            target,
+            mfa_code,
+            reply,
+        } => {
+            let result = governance::propose_evict(state, &target, mfa_code.as_deref()).await;
             let _ = reply.send(result);
         }
     }

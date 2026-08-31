@@ -382,7 +382,7 @@ pub(in crate::control) struct StreamCall {
 /// inbound-RPC and channel builders this one does not exist to avoid a clone.
 /// It exists to keep the outer queue from charging the process grant a second
 /// time for a graph core is already holding a reservation on. See
-/// [`Self::retained_claim`].
+/// [`Self::measured_claim`].
 struct StreamChunkBuilder<'a> {
     /// Borrowed from the forwarding task, which owns it for the whole stream.
     /// The frame's owned copy is made by [`Self::build`], past admission.
@@ -390,31 +390,22 @@ struct StreamChunkBuilder<'a> {
     chunk: myownmesh_core::rpc::RpcStreamChunk,
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for StreamChunkBuilder<'_> {
-    fn retained_claim(
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut>
+    for StreamChunkBuilder<'_>
+{
+    fn measured_claim(
         &self,
-    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        let outer = myownmesh_core::serialized_mailbox_item_claim_as::<crate::ipc::ServerOut>(
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<crate::ipc::ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
+        myownmesh_core::measure_serialized_mailbox_item_after_funded::<crate::ipc::ServerOut>(
             &crate::ipc::wire::ServerOutView::RpcCallStreamChunk {
                 request_id: self.request_id,
                 payload: self.chunk.value(),
             },
-        )?;
-        // What core still holds for this exact payload, recomputed from the
-        // same value by the same function that funded it, so it cannot drift
-        // from the reservation it names.
-        //
-        // The subtraction cannot underflow. The frame's encoding contains the
-        // payload's encoding verbatim, so every dimension of the inner claim is
-        // bounded by the same dimension of the outer one, and the outer claim
-        // carries strictly more besides: `size_of::<ServerOut>()`, the queue's
-        // parsing/CPU term, and one further allocation for the frame itself.
-        //
-        // The queue node is deliberately *not* subtracted. `pop` already
-        // returned it, so it is not part of what is still outstanding, and
-        // `send_building` acquires the new node separately anyway.
-        let already_funded = self.chunk.funded_claim()?;
-        Ok(outer.checked_sub(already_funded)?)
+            self.chunk.funded_claim()?,
+        )
     }
 
     fn build(self) -> crate::ipc::ServerOut {
@@ -437,11 +428,16 @@ struct StreamEndBuilder<'a> {
     reason: crate::ipc::wire::TerminalReasonView<'a>,
 }
 
-impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut> for StreamEndBuilder<'_> {
-    fn retained_claim(
+unsafe impl myownmesh_core::ResourceMailboxItemBuilder<crate::ipc::ServerOut>
+    for StreamEndBuilder<'_>
+{
+    fn measured_claim(
         &self,
-    ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<crate::ipc::ServerOut>(
+    ) -> Result<
+        myownmesh_core::MailboxMeasurement<crate::ipc::ServerOut>,
+        myownmesh_core::ResourceMailboxItemError,
+    > {
+        myownmesh_core::measure_serialized_mailbox_item::<crate::ipc::ServerOut>(
             &crate::ipc::wire::ServerOutView::RpcCallStreamEnd {
                 request_id: self.request_id,
                 error: self.reason,
@@ -683,7 +679,6 @@ impl PendingStreamForward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myownmesh_core::{ResourceMailboxItem as _, ResourceMailboxItemBuilder as _};
 
     /// The borrowed mirrors must encode byte-for-byte as the frames they stand
     /// in for. If they ever diverge the mailbox admitted one frame and queued a
@@ -720,14 +715,16 @@ mod tests {
                 error: builder.reason,
             })
             .expect("the mirror encodes");
-            let measured_claim = builder
-                .retained_claim()
+            let measured_claim =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::
+                    building_item_planning_charge(&builder)
                 .expect("the mirror's claim is representable");
 
             let built = builder.build();
             let built_bytes = serde_json::to_vec(&built).expect("the frame encodes");
-            let built_claim = built
-                .retained_claim()
+            let built_claim =
+                myownmesh_core::ResourceMailboxSender::<crate::ipc::ServerOut>::
+                    accepted_item_planning_charge(&built)
                 .expect("the frame's claim is representable");
 
             assert_eq!(

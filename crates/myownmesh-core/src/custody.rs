@@ -361,13 +361,6 @@ impl ProvisionalEnrollment {
         result
     }
 
-    /// Compatibility spelling for callers that describe the commit as the
-    /// successful handoff. Unlike the historical method, durable failure is
-    /// propagated rather than logged and discarded.
-    pub fn keep(self) -> Result<()> {
-        self.commit()
-    }
-
     /// The caller does not have the material, so remove exactly this lock.
     ///
     /// Reported rather than swallowed, so a daemon whose store it could not
@@ -386,11 +379,6 @@ impl ProvisionalEnrollment {
         )?;
         self.lease.take();
         Ok(())
-    }
-
-    /// Compatibility spelling for the explicit prepared-transaction abort.
-    pub fn roll_back(self) -> Result<()> {
-        self.abort()
     }
 }
 
@@ -1477,7 +1465,7 @@ mod tests {
                     install_provisional_enroll_at(&path, net, "phone").map(|installed| {
                         let material = installed.enrolled().clone();
                         // The response reached its caller, so the lock stands.
-                        installed.keep().expect("commit concurrent enrollment");
+                        installed.commit().expect("commit concurrent enrollment");
                         material
                     })
                 })
@@ -1771,7 +1759,7 @@ mod tests {
 
         let successor = install_provisional_enroll_at(&path, net, "laptop").expect("the successor");
         let successor_material = successor.enrolled().clone();
-        successor.keep().expect("commit successor enrollment");
+        successor.commit().expect("commit successor enrollment");
         assert!(
             is_enrolled_at(&path, net),
             "non-vacuity: there is a successor lock for a stale undo to threaten"

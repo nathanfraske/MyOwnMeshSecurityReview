@@ -39,8 +39,6 @@ impl FactDomain {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DeviceId(String);
 
-pub type CanonicalDeviceId = DeviceId;
-
 /// Signed, typed authority lineage for one authority-bearing subject.  The
 /// predecessor list is part of FactContent (and therefore of FactId), so a
 /// receiver cannot silently substitute a later or unrelated role head.

@@ -30,13 +30,17 @@ use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
-/// Mirror of `myownmesh::control::Request`. Kept in sync by hand —
-/// adding a variant here without the daemon side, or vice versa,
-/// surfaces as a JSON parse error on the receiving end (the daemon's
-/// dispatch returns `Response::err("parse: …")`).
+/// GUI-used subset of `myownmesh::control::Request`.
+///
+/// This is a wire schema: every field and tag
+/// below must match the daemon's current control protocol. Requests not used
+/// by the GUI stay on the daemon/CLI surface and are intentionally absent.
+/// The complete schema is retained so serialization and commit-policy
+/// controls cover every supported operation, including daemon/CLI-only ones.
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -47,15 +51,6 @@ pub enum Request {
     },
     RosterList {
         network: String,
-    },
-    RosterApprove {
-        network: String,
-        device_id: String,
-        label: Option<String>,
-    },
-    RosterRemove {
-        network: String,
-        device_id: String,
     },
     TopologySet {
         network: String,
@@ -76,6 +71,8 @@ pub enum Request {
     },
     NetworkRemove {
         network: String,
+        #[serde(default)]
+        purge: bool,
     },
     /// Forget every joined network at once (purges each network's signed state +
     /// roster; keeps the device identity). The daemon exits afterward so it
@@ -87,9 +84,23 @@ pub enum Request {
     /// Atomic in-place edit of an already-joined network. Hot-applies
     /// label / topology / auto-approve without dropping peers; restarts
     /// transport only for signaling/STUN/TURN edits. Preserves the roster
-    /// either way — replaces the GUI's old remove + re-add edit path.
+    /// either way; edits use `NetworkUpdate` so the daemon can preserve the
+    /// joined network's durable state.
     NetworkUpdate {
         config: serde_json::Value,
+    },
+    NetworkReconnect {
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+    },
+    NetworkConnectPeer {
+        network: String,
+        peer: String,
+        #[serde(default)]
+        pin: bool,
+        #[serde(default)]
+        wait_ms: u64,
     },
     /// Snapshot which infrastructure services this device hosts plus the
     /// persisted config. The daemon answers with `{ status, config }`.
@@ -102,38 +113,140 @@ pub enum Request {
         services: serde_json::Value,
     },
     EventsSubscribe,
+    TraceSubscribe {
+        network: String,
+    },
+
+    RpcRegister {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        method: String,
+        streaming: bool,
+    },
+    RpcUnregister {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        method: String,
+    },
+    RpcRespond {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
+        request_id: String,
+        operation_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    RpcStreamChunk {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
+        request_id: String,
+        operation_id: u64,
+        payload: serde_json::Value,
+    },
+    RpcStreamEnd {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
+        request_id: String,
+        operation_id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    RpcCall {
+        network: String,
+        peer: String,
+        method: String,
+        payload: serde_json::Value,
+    },
+    RpcCallStream {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        peer: String,
+        method: String,
+        payload: serde_json::Value,
+    },
+    ChannelSubscribe {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        channel: String,
+    },
+    ChannelUnsubscribe {
+        client_id: String,
+        client_capability: String,
+        network: String,
+        channel: String,
+    },
+    ChannelSendTo {
+        network: String,
+        channel: String,
+        peer: String,
+        payload: serde_json::Value,
+    },
+    ChannelSendReliable {
+        network: String,
+        channel: String,
+        peer: String,
+        payload: serde_json::Value,
+    },
+    ChannelSendAll {
+        network: String,
+        channel: String,
+        payload: serde_json::Value,
+    },
+    CapabilitiesSet {
+        network: String,
+        capabilities: CapabilityAdvert,
+    },
+
+    RealtimeFlowOpen {
+        network: String,
+        peer: String,
+        flow_label: String,
+        client_id: String,
+        client_capability: String,
+        direction: RealtimeFlowDirection,
+        rtp_kind: WebRtcRtpKind,
+        mime: String,
+        clock_rate: u32,
+        channels: u16,
+    },
+    RealtimeFlowClose {
+        client_id: String,
+        client_capability: String,
+        flow_capability: String,
+    },
+    RealtimePipe {
+        direction: RealtimePipeDirection,
+        network: String,
+        #[serde(default)]
+        peer: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+        #[serde(default)]
+        client_capability: Option<String>,
+        #[serde(default)]
+        flow_capability: Option<String>,
+    },
 
     // ---- closed-network governance --------------------------------
-    GovernanceState {
-        network: String,
-    },
-    GovernanceProposeKindChange {
-        network: String,
-        /// `"open"` or `"closed"`. The daemon's NetworkKind enum
-        /// serialises snake_case so we keep this stringly-typed on
-        /// the GUI side rather than re-deriving the enum here.
-        to: String,
-        /// Per-device custody second factor, when this device enrolled one
-        /// for the network (the `GovernanceMfa*` ops). Omitted otherwise.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mfa_code: Option<String>,
-    },
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
-        /// `"member"` | `"controller"` | `"owner"`.
-        role: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        mfa_code: Option<String>,
-    },
-    /// Owner-signed network-wide topology (mode + hub set + spoke
-    /// redundancy) — same string encoding `TopologySet` takes; once
-    /// ratified, every member's daemon converges onto the shape.
-    GovernanceProposeTopology {
-        network: String,
-        topology: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        hub: Option<String>,
+        role: Role,
         #[serde(skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
@@ -143,28 +256,30 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
-    GovernanceSign {
+    GovernanceProposeEvict {
         network: String,
-        proposal_id: String,
+        target: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         mfa_code: Option<String>,
     },
-    GovernanceDeny {
+    GovernanceMfaPrepare {
         network: String,
-        proposal_id: String,
     },
-    GovernanceWithdraw {
+    GovernanceMfaQuery {
         network: String,
-        proposal_id: String,
+        transaction_id: String,
     },
-    GovernanceSpawnSplit {
+    GovernanceMfaRedeliver {
         network: String,
-        proposal_id: String,
+        transaction_id: String,
     },
-    /// Enroll a per-device TOTP custody lock for `network`. Returns the
-    /// secret (base32 + `otpauth://` URI) and one-time recovery codes.
-    GovernanceMfaEnroll {
+    GovernanceMfaCommit {
         network: String,
+        transaction_id: String,
+    },
+    GovernanceMfaAbort {
+        network: String,
+        transaction_id: String,
     },
     /// Whether this device holds a custody enrollment for `network`.
     GovernanceMfaStatus {
@@ -185,6 +300,76 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// Whether dispatching this request may commit durable or remote state.
+    ///
+    /// Mutations keep an explicit uncertainty result if the daemon becomes
+    /// unreachable after the request may have been written. Read-only probes
+    /// retain their bounded response deadline.
+    pub(crate) fn may_commit(&self) -> bool {
+        !matches!(
+            self,
+            Self::Status
+                | Self::NetworksList
+                | Self::PeersList { .. }
+                | Self::RosterList { .. }
+                | Self::IdentityShow
+                | Self::NetworkIdGenerate
+                | Self::NetworkIdNormalize { .. }
+                | Self::ConfigShow
+                | Self::ServicesStatus
+                | Self::EventsSubscribe
+                | Self::TraceSubscribe { .. }
+                | Self::GovernanceMfaQuery { .. }
+                | Self::GovernanceMfaStatus { .. }
+                | Self::UpdateStatus
+        )
+    }
+}
+
+/// Exact wire representation of the daemon's semantic governance role.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Role {
+    Owner,
+    Controller,
+    Member,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RealtimeFlowDirection {
+    Outbound,
+    Inbound,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RealtimePipeDirection {
+    Outbound,
+    Inbound,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WebRtcRtpKind {
+    Audio,
+    Video,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct CapabilityAdvert {
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub app_version: Option<String>,
+    #[serde(default)]
+    pub extra: serde_json::Value,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Response {
@@ -193,6 +378,67 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(default)]
     pub data: Option<serde_json::Value>,
+}
+
+/// Outcome of one control request from the GUI's perspective.
+///
+/// Once a mutating request may have been written, a lost response cannot be
+/// reported as a definite failure: the daemon may have committed it before
+/// the connection failed. Callers must query authoritative daemon state before
+/// retrying an [`OutcomeUnknown`](Self::OutcomeUnknown) request.
+#[derive(Debug)]
+pub enum RequestError {
+    OutcomeUnknown,
+    Transport(anyhow::Error),
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutcomeUnknown => write!(
+                formatter,
+                "outcome unknown: the daemon may have committed the request; query state before retrying"
+            ),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OutcomeUnknown => None,
+            Self::Transport(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<anyhow::Error> for RequestError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Transport(error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestFailureStage {
+    Write,
+    Flush,
+    Read,
+    Eof,
+    Parse,
+    Timeout,
+}
+
+fn classify_request_failure(
+    may_commit: bool,
+    _stage: RequestFailureStage,
+    error: anyhow::Error,
+) -> RequestError {
+    if may_commit {
+        RequestError::OutcomeUnknown
+    } else {
+        RequestError::Transport(error)
+    }
 }
 
 /// Where the daemon's control socket lives. Unix uses a filesystem
@@ -253,28 +499,18 @@ impl ControlClient {
     /// JSON line in reply, then keeps the connection open for
     /// further requests; we close after the first response since
     /// pooling isn't worth the complexity.
-    pub async fn request(&self, req: &Request) -> Result<Response> {
+    pub async fn request(&self, req: &Request) -> std::result::Result<Response, RequestError> {
         let stream = self.connect().await?;
-        let (reader, mut writer) = stream.split();
-        let mut reader = BufReader::new(reader);
+        request_stream(req, stream, Duration::from_secs(5)).await
+    }
 
-        let line = serde_json::to_string(req)? + "\n";
-        writer
-            .write_all(line.as_bytes())
-            .await
-            .context("write request")?;
-        writer.flush().await.context("flush request")?;
-
-        let mut buf = String::new();
-        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut buf))
-            .await
-            .context("daemon response timed out")??;
-        if n == 0 {
-            bail!("daemon closed connection without a response");
-        }
-        let resp: Response =
-            serde_json::from_str(buf.trim()).with_context(|| format!("parse response: {buf}"))?;
-        Ok(resp)
+    /// Whether the daemon's control listener currently accepts a connection.
+    ///
+    /// This deliberately does not issue a request: lifecycle code uses it to
+    /// distinguish an endpoint that has terminated from one that is merely
+    /// slow to produce a status response.
+    pub async fn listener_reachable(&self) -> bool {
+        self.connect().await.is_ok()
     }
 
     /// Subscribe to the daemon's event stream. Spawns a task that
@@ -376,5 +612,574 @@ impl ControlClient {
             "connect daemon socket at {} — is `myownmesh serve` running?",
             self.addr
         ))
+    }
+}
+
+async fn request_stream<S>(
+    req: &Request,
+    stream: S,
+    response_deadline: Duration,
+) -> std::result::Result<Response, RequestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let may_commit = req.may_commit();
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+
+    let line = serde_json::to_string(req)
+        .map_err(|error| RequestError::Transport(anyhow!(error).context("serialize request")))?
+        + "\n";
+    writer.write_all(line.as_bytes()).await.map_err(|error| {
+        classify_request_failure(
+            may_commit,
+            RequestFailureStage::Write,
+            anyhow!(error).context("write request"),
+        )
+    })?;
+    writer.flush().await.map_err(|error| {
+        classify_request_failure(
+            may_commit,
+            RequestFailureStage::Flush,
+            anyhow!(error).context("flush request"),
+        )
+    })?;
+
+    let mut buf = String::new();
+    let n = match tokio::time::timeout(response_deadline, reader.read_line(&mut buf)).await {
+        Ok(result) => result.map_err(|error| {
+            classify_request_failure(
+                may_commit,
+                RequestFailureStage::Read,
+                anyhow!(error).context("read daemon response"),
+            )
+        })?,
+        Err(_) => {
+            return Err(classify_request_failure(
+                may_commit,
+                RequestFailureStage::Timeout,
+                anyhow!("daemon response timed out"),
+            ))
+        }
+    };
+    if n == 0 {
+        return Err(classify_request_failure(
+            may_commit,
+            RequestFailureStage::Eof,
+            anyhow!("daemon closed connection without a response"),
+        ));
+    }
+    let resp: Response = serde_json::from_str(buf.trim()).map_err(|error| {
+        classify_request_failure(
+            may_commit,
+            RequestFailureStage::Parse,
+            anyhow!(error).context(format!("parse response: {buf}")),
+        )
+    })?;
+    Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    enum FakeRead {
+        Bytes(Vec<u8>),
+        Error,
+        Eof,
+        Pending,
+    }
+
+    struct FakeSocket {
+        fail_write: bool,
+        fail_flush: bool,
+        read: FakeRead,
+    }
+
+    impl FakeSocket {
+        fn response(read: FakeRead) -> Self {
+            Self {
+                fail_write: false,
+                fail_flush: false,
+                read,
+            }
+        }
+
+        fn write_failure() -> Self {
+            Self {
+                fail_write: true,
+                fail_flush: false,
+                read: FakeRead::Eof,
+            }
+        }
+
+        fn flush_failure() -> Self {
+            Self {
+                fail_write: false,
+                fail_flush: true,
+                read: FakeRead::Eof,
+            }
+        }
+    }
+
+    impl AsyncRead for FakeSocket {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match std::mem::replace(&mut self.read, FakeRead::Eof) {
+                FakeRead::Bytes(bytes) => {
+                    buffer.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                FakeRead::Error => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "fake read failure",
+                ))),
+                FakeRead::Eof => Poll::Ready(Ok(())),
+                FakeRead::Pending => {
+                    self.read = FakeRead::Pending;
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    impl AsyncWrite for FakeSocket {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_write {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fake write failure",
+                )))
+            } else {
+                Poll::Ready(Ok(bytes.len()))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.fail_flush {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fake flush failure",
+                )))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn mutating_requests_are_explicitly_outcome_uncertain() {
+        assert!(Request::FactoryReset.may_commit());
+        assert!(Request::NetworkUpdate {
+            config: serde_json::json!({})
+        }
+        .may_commit());
+        assert!(!Request::Status.may_commit());
+        assert!(!Request::GovernanceMfaStatus {
+            network: "net".into()
+        }
+        .may_commit());
+        assert!(RequestError::OutcomeUnknown
+            .to_string()
+            .starts_with("outcome unknown:"));
+    }
+
+    #[test]
+    fn fake_socket_failures_preserve_mutation_uncertainty() {
+        let stages = [
+            RequestFailureStage::Write,
+            RequestFailureStage::Flush,
+            RequestFailureStage::Read,
+            RequestFailureStage::Eof,
+            RequestFailureStage::Parse,
+            RequestFailureStage::Timeout,
+        ];
+        for stage in stages {
+            assert!(matches!(
+                classify_request_failure(true, stage, anyhow!("held fake socket")),
+                RequestError::OutcomeUnknown
+            ));
+            assert!(matches!(
+                classify_request_failure(false, stage, anyhow!("held fake socket")),
+                RequestError::Transport(_)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_socket_request_path_covers_each_mutation_failure_stage() {
+        let sockets = [
+            FakeSocket::write_failure(),
+            FakeSocket::flush_failure(),
+            FakeSocket::response(FakeRead::Error),
+            FakeSocket::response(FakeRead::Eof),
+            FakeSocket::response(FakeRead::Bytes(b"not-json\n".to_vec())),
+            FakeSocket::response(FakeRead::Pending),
+        ];
+        for socket in sockets {
+            assert!(matches!(
+                request_stream(&Request::FactoryReset, socket, Duration::from_millis(1),).await,
+                Err(RequestError::OutcomeUnknown)
+            ));
+        }
+        assert!(matches!(
+            request_stream(
+                &Request::Status,
+                FakeSocket::response(FakeRead::Pending),
+                Duration::from_millis(1),
+            )
+            .await,
+            Err(RequestError::Transport(_))
+        ));
+    }
+
+    #[test]
+    fn request_policy_is_exhaustive_over_wire_fixture() {
+        let read_only = [
+            "status",
+            "networks_list",
+            "peers_list",
+            "roster_list",
+            "identity_show",
+            "network_id_generate",
+            "network_id_normalize",
+            "config_show",
+            "services_status",
+            "events_subscribe",
+            "trace_subscribe",
+            "governance_mfa_query",
+            "governance_mfa_status",
+            "update_status",
+        ];
+        let requests = fixture_requests();
+        assert_eq!(requests.len(), 51);
+        for request in requests {
+            let encoded = serde_json::to_value(&request).expect("request serializes");
+            let tag = encoded
+                .get("op")
+                .and_then(serde_json::Value::as_str)
+                .expect("request has wire tag");
+            assert_eq!(request.may_commit(), !read_only.contains(&tag), "{tag}");
+        }
+    }
+
+    fn fixture_requests() -> Vec<Request> {
+        vec![
+            Request::Status,
+            Request::NetworksList,
+            Request::PeersList {
+                network: "net".into(),
+            },
+            Request::RosterList {
+                network: "net".into(),
+            },
+            Request::TopologySet {
+                network: "net".into(),
+                topology: "full_mesh".into(),
+                hub: None,
+            },
+            Request::IdentityShow,
+            Request::IdentitySetLabel { label: "me".into() },
+            Request::NetworkIdGenerate,
+            Request::NetworkIdNormalize {
+                input: "net".into(),
+            },
+            Request::ConfigShow,
+            Request::NetworkAdd {
+                config: serde_json::json!({"id":"local","network_id":"net"}),
+            },
+            Request::NetworkRemove {
+                network: "net".into(),
+                purge: false,
+            },
+            Request::ForgetAllNetworks,
+            Request::FactoryReset,
+            Request::NetworkUpdate {
+                config: serde_json::json!({"id":"local","network_id":"net"}),
+            },
+            Request::NetworkReconnect {
+                network: "net".into(),
+                peer: Some("peer".into()),
+            },
+            Request::NetworkConnectPeer {
+                network: "net".into(),
+                peer: "peer".into(),
+                pin: true,
+                wait_ms: 10,
+            },
+            Request::ServicesStatus,
+            Request::ServicesSet {
+                services: serde_json::json!({}),
+            },
+            Request::EventsSubscribe,
+            Request::TraceSubscribe {
+                network: "net".into(),
+            },
+            Request::RpcRegister {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                method: "method".into(),
+                streaming: false,
+            },
+            Request::RpcUnregister {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                method: "method".into(),
+            },
+            Request::RpcRespond {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                peer: "peer".into(),
+                method: "method".into(),
+                request_id: "req".into(),
+                operation_id: 1,
+                ok: Some(serde_json::json!({"done":true})),
+                error: None,
+            },
+            Request::RpcStreamChunk {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                peer: "peer".into(),
+                method: "method".into(),
+                request_id: "req".into(),
+                operation_id: 1,
+                payload: serde_json::json!({"chunk":1}),
+            },
+            Request::RpcStreamEnd {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                peer: "peer".into(),
+                method: "method".into(),
+                request_id: "req".into(),
+                operation_id: 1,
+                error: None,
+            },
+            Request::RpcCall {
+                network: "net".into(),
+                peer: "peer".into(),
+                method: "method".into(),
+                payload: serde_json::json!({"arg":1}),
+            },
+            Request::RpcCallStream {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                peer: "peer".into(),
+                method: "method".into(),
+                payload: serde_json::json!({"arg":1}),
+            },
+            Request::ChannelSubscribe {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                channel: "updates".into(),
+            },
+            Request::ChannelUnsubscribe {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                network: "net".into(),
+                channel: "updates".into(),
+            },
+            Request::ChannelSendTo {
+                network: "net".into(),
+                channel: "updates".into(),
+                peer: "peer".into(),
+                payload: serde_json::json!({"value":1}),
+            },
+            Request::ChannelSendReliable {
+                network: "net".into(),
+                channel: "updates".into(),
+                peer: "peer".into(),
+                payload: serde_json::json!({"value":1}),
+            },
+            Request::ChannelSendAll {
+                network: "net".into(),
+                channel: "updates".into(),
+                payload: serde_json::json!({"value":1}),
+            },
+            Request::CapabilitiesSet {
+                network: "net".into(),
+                capabilities: CapabilityAdvert {
+                    tags: vec!["tag".into()],
+                    app_version: Some("0.3".into()),
+                    extra: serde_json::json!({"extra":true}),
+                },
+            },
+            Request::RealtimeFlowOpen {
+                network: "net".into(),
+                peer: "peer".into(),
+                flow_label: "screen".into(),
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                direction: RealtimeFlowDirection::Outbound,
+                rtp_kind: WebRtcRtpKind::Video,
+                mime: "video/H264".into(),
+                clock_rate: 90_000,
+                channels: 0,
+            },
+            Request::RealtimeFlowClose {
+                client_id: "c1".into(),
+                client_capability: "cap".into(),
+                flow_capability: "flow".into(),
+            },
+            Request::RealtimePipe {
+                direction: RealtimePipeDirection::Inbound,
+                network: "net".into(),
+                peer: Some("peer".into()),
+                client_id: Some("c1".into()),
+                client_capability: Some("cap".into()),
+                flow_capability: None,
+            },
+            Request::GovernanceProposeRoleGrant {
+                network: "net".into(),
+                target: "peer".into(),
+                role: Role::Owner,
+                mfa_code: Some("123456".into()),
+            },
+            Request::GovernanceProposeRoleRevoke {
+                network: "net".into(),
+                target: "peer".into(),
+                mfa_code: None,
+            },
+            Request::GovernanceProposeEvict {
+                network: "net".into(),
+                target: "peer".into(),
+                mfa_code: None,
+            },
+            Request::GovernanceMfaPrepare {
+                network: "net".into(),
+            },
+            Request::GovernanceMfaQuery {
+                network: "net".into(),
+                transaction_id: "tx".into(),
+            },
+            Request::GovernanceMfaRedeliver {
+                network: "net".into(),
+                transaction_id: "tx".into(),
+            },
+            Request::GovernanceMfaCommit {
+                network: "net".into(),
+                transaction_id: "tx".into(),
+            },
+            Request::GovernanceMfaAbort {
+                network: "net".into(),
+                transaction_id: "tx".into(),
+            },
+            Request::GovernanceMfaStatus {
+                network: "net".into(),
+            },
+            Request::GovernanceMfaDisable {
+                network: "net".into(),
+                code: "123456".into(),
+            },
+            Request::UpdateStatus,
+            Request::UpdateCheck,
+            Request::UpdateApply,
+            Request::UpdateSetPrefs {
+                prefs: serde_json::json!({"channel":"stable"}),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_current_request_variant_has_exact_wire_tag() {
+        let expected = [
+            "status",
+            "networks_list",
+            "peers_list",
+            "roster_list",
+            "topology_set",
+            "identity_show",
+            "identity_set_label",
+            "network_id_generate",
+            "network_id_normalize",
+            "config_show",
+            "network_add",
+            "network_remove",
+            "forget_all_networks",
+            "factory_reset",
+            "network_update",
+            "network_reconnect",
+            "network_connect_peer",
+            "services_status",
+            "services_set",
+            "events_subscribe",
+            "trace_subscribe",
+            "rpc_register",
+            "rpc_unregister",
+            "rpc_respond",
+            "rpc_stream_chunk",
+            "rpc_stream_end",
+            "rpc_call",
+            "rpc_call_stream",
+            "channel_subscribe",
+            "channel_unsubscribe",
+            "channel_send_to",
+            "channel_send_reliable",
+            "channel_send_all",
+            "capabilities_set",
+            "realtime_flow_open",
+            "realtime_flow_close",
+            "realtime_pipe",
+            "governance_propose_role_grant",
+            "governance_propose_role_revoke",
+            "governance_propose_evict",
+            "governance_mfa_prepare",
+            "governance_mfa_query",
+            "governance_mfa_redeliver",
+            "governance_mfa_commit",
+            "governance_mfa_abort",
+            "governance_mfa_status",
+            "governance_mfa_disable",
+            "update_status",
+            "update_check",
+            "update_apply",
+            "update_set_prefs",
+        ];
+        let mut requests = fixture_requests();
+        assert_eq!(requests.len(), expected.len());
+        for (request, op) in requests.drain(..).zip(expected) {
+            let encoded = serde_json::to_value(request).expect("request serializes");
+            assert_eq!(encoded["op"], op);
+        }
+    }
+
+    #[test]
+    fn exact_identity_fields_are_not_dropped_by_serialization() {
+        let request = Request::GovernanceProposeRoleGrant {
+            network: "net".into(),
+            target: "peer".into(),
+            role: Role::Member,
+            mfa_code: Some("123456".into()),
+        };
+        let encoded = serde_json::to_value(request).expect("request serializes");
+        assert_eq!(encoded["role"], "member");
+        assert_eq!(encoded["mfa_code"], "123456");
+
+        let remove = serde_json::to_value(Request::NetworkRemove {
+            network: "net".into(),
+            purge: true,
+        })
+        .expect("request serializes");
+        assert_eq!(remove["purge"], true);
     }
 }

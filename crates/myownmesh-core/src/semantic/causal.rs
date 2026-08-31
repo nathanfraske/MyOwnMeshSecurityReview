@@ -1,6 +1,7 @@
 //! Deterministic causal admission for canonical semantic facts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use super::content::{DeviceId, ExclusiveCell, FactBody, Role};
 use super::{
@@ -120,6 +121,17 @@ impl FactGraph {
 
     pub fn ids(&self) -> impl Iterator<Item = &FactId> {
         self.facts.keys()
+    }
+
+    /// Return canonical fact ids strictly after an optional cursor. The
+    /// cursor is a stable page boundary for bounded anti-entropy producers:
+    /// facts inserted before it may be repaired by a later pass, while facts
+    /// after it are observed in deterministic key order.
+    pub fn ids_after(&self, cursor: Option<FactId>) -> impl Iterator<Item = &FactId> {
+        let start = cursor.map_or(Bound::Unbounded, Bound::Excluded);
+        self.facts
+            .range((start, Bound::Unbounded))
+            .map(|(id, _)| id)
     }
 
     pub fn admit(&mut self, fact: SignedFact) -> Result<Admission, SemanticError> {
