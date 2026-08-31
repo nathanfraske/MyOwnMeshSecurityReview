@@ -48,7 +48,7 @@
 //!   - If we've also sent ours, transition to `Active` and emit
 //!     `PeerApproved`.
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
@@ -189,14 +189,14 @@ pub(super) async fn initiate(
     }
     let delayed_device_id = device_id.to_string();
     schedule_hello_retries(
-        Arc::downgrade(state),
+        state,
         owner.downgrade(),
         hello_msg,
         delayed_device_id.clone(),
         scheduler_policy,
     );
     schedule_watchdog(
-        Arc::downgrade(state),
+        state,
         owner.downgrade(),
         delayed_device_id,
         scheduler_policy,
@@ -220,15 +220,76 @@ async fn shutdown_requested_now(state: &Arc<NetworkState>) -> bool {
 }
 
 fn schedule_hello_retries(
-    state: Weak<NetworkState>,
+    state: &Arc<NetworkState>,
     owner: WeakPeerOwnerToken,
     hello: MeshMessage,
     device_id: String,
     scheduler_policy: SchedulerPolicyConfig,
 ) {
-    tokio::spawn(async move {
-        for &delay_ms in &scheduler_policy.handshake_hello_retry_schedule_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
+    let weak_state = Arc::downgrade(state);
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            let state = weak_state;
+            for &delay_ms in &scheduler_policy.handshake_hello_retry_schedule_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                let Some(state) = state.upgrade() else {
+                    return;
+                };
+                let Some(owner) = owner.upgrade() else {
+                    return;
+                };
+                if shutdown_requested_now(&state).await {
+                    return;
+                }
+                let still_handshaking = {
+                    let Some(peer) = state.peers.get_if_current(&owner) else {
+                        return;
+                    };
+                    let data = peer.state.read();
+                    matches!(data.status, PeerStatus::Handshaking) && !data.authenticated
+                };
+                if !still_handshaking {
+                    return;
+                }
+                if shutdown_requested_now(&state).await {
+                    return;
+                }
+                if let Err(e) = send_to_peer_owner(&state, &owner, &hello).await {
+                    debug!(peer = %device_id, "hello retry send failed: {e}");
+                }
+                if shutdown_requested_now(&state).await {
+                    return;
+                }
+                if let Some(peer) = state.peers.get_if_current(&owner) {
+                    let mut data = peer.state.write();
+                    data.hello_attempt = data.hello_attempt.saturating_add(1);
+                    data.diag.hellos_sent = data.diag.hellos_sent.saturating_add(1);
+                }
+            }
+        })
+    });
+}
+
+fn schedule_watchdog(
+    state: &Arc<NetworkState>,
+    owner: WeakPeerOwnerToken,
+    device_id: String,
+    scheduler_policy: SchedulerPolicyConfig,
+) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
+    let weak_state = Arc::downgrade(state);
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            let state = weak_state;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                scheduler_policy.handshake_timeout_ms,
+            ))
+            .await;
             let Some(state) = state.upgrade() else {
                 return;
             };
@@ -238,77 +299,30 @@ fn schedule_hello_retries(
             if shutdown_requested_now(&state).await {
                 return;
             }
-            let still_handshaking = {
+            let should_fail = {
                 let Some(peer) = state.peers.get_if_current(&owner) else {
                     return;
                 };
                 let data = peer.state.read();
-                matches!(data.status, PeerStatus::Handshaking) && !data.authenticated
+                !data.authenticated
+                    && matches!(data.status, PeerStatus::Handshaking)
+                    && data
+                        .handshake_started_at
+                        .map(|t| {
+                            t.elapsed().as_millis() as u64 >= scheduler_policy.handshake_timeout_ms
+                        })
+                        .unwrap_or(false)
             };
-            if !still_handshaking {
-                return;
+            if should_fail && !shutdown_requested_now(&state).await {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Warn,
+                    "handshake",
+                    format!("handshake watchdog fired for {device_id} — tearing down"),
+                    serde_json::json!({ "peer": device_id }),
+                );
+                super::drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
             }
-            if shutdown_requested_now(&state).await {
-                return;
-            }
-            if let Err(e) = send_to_peer_owner(&state, &owner, &hello).await {
-                debug!(peer = %device_id, "hello retry send failed: {e}");
-            }
-            if shutdown_requested_now(&state).await {
-                return;
-            }
-            if let Some(peer) = state.peers.get_if_current(&owner) {
-                let mut data = peer.state.write();
-                data.hello_attempt = data.hello_attempt.saturating_add(1);
-                data.diag.hellos_sent = data.diag.hellos_sent.saturating_add(1);
-            }
-        }
-    });
-}
-
-fn schedule_watchdog(
-    state: Weak<NetworkState>,
-    owner: WeakPeerOwnerToken,
-    device_id: String,
-    scheduler_policy: SchedulerPolicyConfig,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(
-            scheduler_policy.handshake_timeout_ms,
-        ))
-        .await;
-        let Some(state) = state.upgrade() else {
-            return;
-        };
-        let Some(owner) = owner.upgrade() else {
-            return;
-        };
-        if shutdown_requested_now(&state).await {
-            return;
-        }
-        let should_fail = {
-            let Some(peer) = state.peers.get_if_current(&owner) else {
-                return;
-            };
-            let data = peer.state.read();
-            !data.authenticated
-                && matches!(data.status, PeerStatus::Handshaking)
-                && data
-                    .handshake_started_at
-                    .map(|t| {
-                        t.elapsed().as_millis() as u64 >= scheduler_policy.handshake_timeout_ms
-                    })
-                    .unwrap_or(false)
-        };
-        if should_fail && !shutdown_requested_now(&state).await {
-            state.log_diag_with(
-                crate::events::DiagLevel::Warn,
-                "handshake",
-                format!("handshake watchdog fired for {device_id} — tearing down"),
-                serde_json::json!({ "peer": device_id }),
-            );
-            super::drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
-        }
+        })
     });
 }
 
@@ -893,6 +907,24 @@ async fn maybe_activate_after_check(
     owner: &PeerOwnerToken,
     before_commit: impl FnOnce(),
 ) {
+    maybe_activate_after_check_with_persistence(
+        state,
+        owner,
+        before_commit,
+        |state, device_id, label| state.refresh_roster_projection(device_id, label),
+    )
+    .await;
+}
+
+async fn maybe_activate_after_check_with_persistence<F, P>(
+    state: &Arc<NetworkState>,
+    owner: &PeerOwnerToken,
+    before_commit: F,
+    persist: P,
+) where
+    F: FnOnce(),
+    P: FnOnce(&Arc<NetworkState>, &str, &str) -> crate::Result<()>,
+{
     let device_id = owner.device_id();
     let eligible = state.peers.get_if_current(owner).is_some_and(|peer| {
         let data = peer.state.read();
@@ -911,8 +943,8 @@ async fn maybe_activate_after_check(
         return;
     }
 
-    let Some(Some(roster_result)) = state.peers.with_current(owner, |peer| {
-        let mut data = peer.state.write();
+    let Some(result) = state.peers.with_current(owner, |peer| {
+        let data = peer.state.write();
         // Guard the transition edge: a peer that re-sends Approve after
         // we're already ACTIVE shouldn't re-fire the on-active side
         // effects (roster persist, gossip, Approved event).
@@ -932,17 +964,31 @@ async fn maybe_activate_after_check(
         if !active || was_active {
             return None;
         }
+        let label = data.label.clone();
+        drop(data);
+
+        // Persist the projection before publishing ACTIVE or emitting the
+        // approval event. A failed save therefore leaves the exact owner
+        // pending and permits a later retry, rather than exposing a state that
+        // a restart would not recover.
+        if let Err(error) = persist(state, device_id, &label) {
+            return Some(Err(error));
+        }
+
+        let mut data = peer.state.write();
+        if !data.authenticated
+            || !data.local_approve_sent
+            || !data.remote_approve_seen
+            || matches!(data.status, PeerStatus::Active)
+        {
+            return None;
+        }
         data.status = PeerStatus::Active;
         data.tier = ConnectionTier::Steady;
         data.ice_failed_count = 0;
         data.no_turn_diag_emitted = false;
-        let label = data.label.clone();
         drop(data);
 
-        // This file mutation has no await point and runs while registry
-        // replacement is excluded. Replacement therefore linearizes before
-        // this complete commit or after it.
-        let roster_result = state.refresh_roster_projection(device_id, &label);
         state.log_diag_with(
             crate::events::DiagLevel::Info,
             "peer",
@@ -956,27 +1002,30 @@ async fn maybe_activate_after_check(
         }));
         state.resolve_connect_waiters(device_id, None);
         state.clear_reconnect_intent(device_id);
-        Some(roster_result)
+        Some(Ok(()))
     }) else {
         return;
     };
+    let Some(result) = result else {
+        return;
+    };
+    if let Err(error) = result {
+        state.log_diag(
+            crate::events::DiagLevel::Warn,
+            "roster",
+            format!(
+                "persist {} after mutual approve failed: {error}",
+                super::short_peer(device_id)
+            ),
+        );
+        return;
+    }
 
     // Nothing is installed here, and that absence is the design. Real-time work
     // is authorized by the promoted session, which the registry fence mints on
     // demand at the moment of use — so reaching Active is already everything
     // that has to be true, and a separate post-Active step could only be a
     // second copy of the same fact, taken at a different instant, able to drift.
-
-    if let Err(e) = roster_result {
-        state.log_diag(
-            crate::events::DiagLevel::Warn,
-            "roster",
-            format!(
-                "persist {} after mutual approve failed: {e}",
-                super::short_peer(device_id)
-            ),
-        );
-    }
 
     phase::recompute(state);
     super::reliable::flush_owner(state, owner).await;
@@ -1094,14 +1143,14 @@ mod tests {
             .scheduler_policy()
             .expect("test state has a validated scheduler policy");
         schedule_hello_retries(
-            Weak::new(),
+            &state,
             weak_owner.clone(),
             hello,
             "timer-owner".to_string(),
-            scheduler_policy.clone(),
+            scheduler_policy,
         );
         schedule_watchdog(
-            Weak::new(),
+            &state,
             weak_owner.clone(),
             "timer-owner".to_string(),
             scheduler_policy,
@@ -1999,6 +2048,83 @@ mod tests {
             assert!(!data.remote_approve_seen);
             assert_eq!(data.status, PeerStatus::PendingApproval);
         }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn v4_activation_save_refusal_stays_pending_and_suppresses_approval() {
+        let remote_identity = crate::identity::Identity::ephemeral();
+        let remote_device = remote_identity.public_id().to_string();
+        let state =
+            crate::engine::build_test_state(&format!("approve-save-refusal-{remote_device}"));
+        let local_device =
+            crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+                .expect("local fixture identity is canonical");
+        let remote_device_typed = crate::semantic::DeviceId::from_canonical_str(&remote_device)
+            .expect("remote fixture identity is canonical");
+        super::super::admit_canonical_test_fact(
+            &state,
+            crate::semantic::FactBody::OpenParticipation {
+                device_id: local_device,
+                joined: true,
+            },
+        );
+        let remote_fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::open_participation(
+                state.mesh_context_id(),
+                remote_device_typed,
+                true,
+                Vec::new(),
+            ),
+            remote_identity.signing_key(),
+        )
+        .expect("remote participation fact signs");
+        state
+            .authoritative_fact_graph()
+            .write()
+            .admit(remote_fact)
+            .expect("remote participation fact admits");
+        assert!(canonical_policy_admits_both(&state, &remote_device));
+
+        crate::engine::insert_session_less_peer(&state, &remote_device, None);
+        let owner = state.peers.owner(&remote_device).expect("peer owner");
+        state
+            .peers
+            .with_current(&owner, |peer| {
+                let mut data = peer.state.write();
+                data.authenticated = true;
+                data.local_approve_sent = true;
+                data.remote_approve_seen = true;
+                data.status = PeerStatus::PendingApproval;
+            })
+            .expect("peer remains current");
+        let mut events = state.events_tx.subscribe();
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted_by_persist = Arc::clone(&attempted);
+
+        maybe_activate_after_check_with_persistence(
+            &state,
+            &owner,
+            || {},
+            move |_, _, _| {
+                attempted_by_persist.store(true, std::sync::atomic::Ordering::SeqCst);
+                Err(crate::Error::Roster(
+                    "injected approval projection failure".into(),
+                ))
+            },
+        )
+        .await;
+
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        let peer = state
+            .peers
+            .get_if_current(&owner)
+            .expect("peer remains current");
+        assert_eq!(peer.state.read().status, PeerStatus::PendingApproval);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         state.shutdown().await;
     }
 

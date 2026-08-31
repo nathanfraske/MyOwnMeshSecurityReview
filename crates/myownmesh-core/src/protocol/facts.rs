@@ -72,6 +72,7 @@ impl ProofDeliveryMessage {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawProofDeliveryMessage {
     context_id: MeshContextId,
     target: DeviceId,
@@ -98,6 +99,7 @@ impl<'de> Deserialize<'de> for ProofDeliveryMessage {
 
 /// Verified durable receipt for one exact proof delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProofAckMessage {
     pub context_id: MeshContextId,
     pub target: DeviceId,
@@ -125,6 +127,7 @@ impl ProofAckMessage {
 /// Bundle membership is transport framing only. Each embedded `SignedFact`
 /// must be verified and reduced independently by the semantic owner.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FactBundleMessage {
     pub facts: Vec<SignedFact>,
 }
@@ -174,6 +177,7 @@ impl FactInventory {
     /// boundary. Pages retain the same context and canonical ordering; no
     /// page is authority and a lost page is repaired by the next inventory
     /// pass.
+    #[cfg(test)]
     pub(crate) fn pages(&self) -> ExactFramePages<'_, FactId, impl Fn(&[FactId]) -> Option<usize>> {
         let context_id = self.context_id;
         exact_frame_pages(&self.fact_ids, move |fact_ids| {
@@ -311,6 +315,7 @@ fn canonical_fact_ids(fact_ids: impl IntoIterator<Item = FactId>) -> Vec<FactId>
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawFactSet {
     context_id: crate::semantic::MeshContextId,
     fact_ids: Vec<FactId>,
@@ -405,6 +410,37 @@ mod tests {
     }
 
     #[test]
+    fn cutover_fact_wrappers_reject_unknown_fields() {
+        let context_id = MeshContextId::from_bytes([0x19; 32]);
+        let target_key = SigningKey::from_bytes(&[14; 32]);
+        let target =
+            DeviceId::from_public_key_bytes(*target_key.verifying_key().as_bytes()).unwrap();
+        let delivery =
+            ProofDeliveryMessage::new(context_id, target, vec![signed_fact(context_id)]).unwrap();
+
+        let mut delivery_wire = serde_json::to_value(&delivery).unwrap();
+        delivery_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ProofDeliveryMessage>(delivery_wire).is_err());
+
+        let mut ack_wire = serde_json::to_value(ProofAckMessage::for_delivery(&delivery)).unwrap();
+        ack_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ProofAckMessage>(ack_wire).is_err());
+
+        assert!(serde_json::from_str::<crate::protocol::MeshMessage>(
+            r#"{"kind":"fact_bundle","facts":[],"legacy":true}"#
+        )
+        .is_err());
+
+        let fact_id = FactId::from_bytes([1; 32]);
+        let context = serde_json::to_string(&context_id).unwrap();
+        let fact_id = serde_json::to_string(&fact_id).unwrap();
+        assert!(serde_json::from_str::<crate::protocol::MeshMessage>(&format!(
+            r#"{{"kind":"fact_inventory","context_id":{context},"fact_ids":[{fact_id}],"legacy":true}}"#
+        ))
+        .is_err());
+    }
+
+    #[test]
     fn anti_entropy_pages_are_canonical_and_fit_the_exact_frame_boundary() {
         let context_id = MeshContextId::from_bytes([0x42; 32]);
         let ids = (0u64..2_000)
@@ -418,7 +454,7 @@ mod tests {
         let mut pages = inventory.pages();
         let mut page_count = 0;
         let mut flattened = Vec::new();
-        while let Some(fact_ids) = pages.next() {
+        for fact_ids in pages.by_ref() {
             page_count += 1;
             assert!(fact_ids.windows(2).all(|pair| pair[0] < pair[1]));
             let page = FactInventory::new(context_id, fact_ids);

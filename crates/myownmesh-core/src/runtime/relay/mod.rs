@@ -34,6 +34,11 @@ const DERIVED_BYTES: usize = KEY_BYTES * 2 + NONCE_PREFIX_BYTES * 2;
 // unpadded base32. This is a representation bound for retained route strings,
 // not a relay workload selector.
 const CANONICAL_ROUTE_STRING_BYTES: usize = 52;
+const RELAY_DIRECTION_COUNT: usize = 2;
+// Each retained packet owns its three route strings and ciphertext buffer.
+// The channel node itself is a separate opaque dependency allocation.
+const PACKET_HEAP_ALLOCATIONS: u64 = 4;
+const CHANNEL_NODE_ALLOCATIONS: u64 = 1;
 
 /// Convert the owner-selected plaintext ceiling into the corresponding wire
 /// ciphertext ceiling.  The AEAD tag is part of the ciphertext, and the
@@ -153,10 +158,14 @@ impl RelayAllocationPermit {
         let queue = usize::try_from(profile.queue_items_per_direction)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         let max_ciphertext_bytes = checked_ciphertext_ceiling(profile.max_frame_ciphertext_bytes)?;
+        let retained_endpoint_string_bytes = CANONICAL_ROUTE_STRING_BYTES
+            .checked_mul(2)
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let retained_member_string_bytes = CANONICAL_ROUTE_STRING_BYTES;
         let packet_retained_bytes = std::mem::size_of::<OpaqueRelayPacket>()
             .checked_add(
                 CANONICAL_ROUTE_STRING_BYTES
-                    .checked_mul(3)
+                    .checked_mul(RELAY_DIRECTION_COUNT + 1)
                     .ok_or(ClosedRelayRefusal::InvalidProfile)?,
             )
             .and_then(|value| value.checked_add(max_ciphertext_bytes))
@@ -169,6 +178,9 @@ impl RelayAllocationPermit {
             .ok_or(ClosedRelayRefusal::InvalidProfile)?;
         let bytes = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<ClosedRelayHandle>())
+            .and_then(|value| value.checked_add(std::mem::size_of::<ActiveAllocation>()))
+            .and_then(|value| value.checked_add(retained_endpoint_string_bytes))
+            .and_then(|value| value.checked_add(retained_member_string_bytes))
             .and_then(|value| value.checked_add(queue_bytes))
             .ok_or(ClosedRelayRefusal::InvalidProfile)?;
         let queued_bytes = profile
@@ -181,9 +193,10 @@ impl RelayAllocationPermit {
             .checked_add(
                 u64::try_from(queue_slots)
                     .map_err(|_| ClosedRelayRefusal::InvalidProfile)?
-                    .checked_mul(5)
+                    .checked_mul(PACKET_HEAP_ALLOCATIONS + CHANNEL_NODE_ALLOCATIONS)
                     .ok_or(ClosedRelayRefusal::InvalidProfile)?,
             )
+            .and_then(|value| value.checked_add(1))
             .ok_or(ClosedRelayRefusal::InvalidProfile)?;
         ResourceClaim::try_from_entries([
             (
@@ -191,6 +204,7 @@ impl RelayAllocationPermit {
                 u64::try_from(bytes).map_err(|_| ClosedRelayRefusal::InvalidProfile)?,
             ),
             (ResourceClass::QueuedBytes, queued_bytes),
+            (ResourceClass::RelayOrProviderAllocation, 1),
             (ResourceClass::OpaqueDependencyResidual, opaque_allocations),
         ])
         .map_err(|_| ClosedRelayRefusal::InvalidProfile)
@@ -239,8 +253,7 @@ impl ClosedRelayRuntime {
             local_device_id,
             state: Arc::new(Mutex::new(RelayAdmissionState {
                 active_allocations: Vec::new(),
-                terminal_tombstones: None,
-                terminal_tombstone_count: 0,
+                terminal_tombstones: Vec::new(),
                 terminal_tombstone_capacity,
                 pending_handshakes: 0,
                 next_allocation_id: 0,
@@ -252,6 +265,11 @@ impl ClosedRelayRuntime {
     pub(crate) fn try_begin_handshake(
         &self,
     ) -> Result<ClosedRelayHandshakeGuard, ClosedRelayRefusal> {
+        let expires_at = Instant::now()
+            .checked_add(Duration::from_millis(
+                self.profile.pending_handshake_timeout_ms,
+            ))
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
         let mut state = self.state.lock();
         let limit = usize::try_from(self.profile.max_pending_handshakes)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
@@ -261,6 +279,7 @@ impl ClosedRelayRuntime {
         state.pending_handshakes += 1;
         Ok(ClosedRelayHandshakeGuard {
             state: Arc::clone(&self.state),
+            expires_at,
         })
     }
 
@@ -317,6 +336,12 @@ impl ClosedRelayRuntime {
         {
             let mut state = self.state.lock();
             if state
+                .terminal_tombstone(endpoints.session_id)
+                .is_some_and(|epoch| endpoints.allocation_epoch <= epoch)
+            {
+                return Err(ClosedRelayRefusal::OwnerMismatch);
+            }
+            if state
                 .active_allocations
                 .iter()
                 .any(|active| active.session_id == endpoints.session_id)
@@ -342,7 +367,6 @@ impl ClosedRelayRuntime {
                 id: allocation_id,
                 member: member.clone(),
                 session_id: endpoints.session_id,
-                allocation_epoch: endpoints.allocation_epoch,
             });
             let (requester_tx, requester_rx) = mpsc::channel(capacity);
             let (target_tx, target_rx) = mpsc::channel(capacity);
@@ -453,29 +477,60 @@ impl ClosedRelayHandle {
             ));
         }
         let bytes = packet.ciphertext.len();
-        let mut queue = self.queue.lock();
-        let queue = &mut queue[direction.index()];
-        if queue.items >= self.queue_items_capacity
-            || queue
-                .bytes
-                .checked_add(bytes)
-                .is_none_or(|total| total > self.queue_bytes_capacity)
         {
-            return Err(ClosedRelayRefusal::QueueFull);
+            let queues = self.queue.lock();
+            let queue = &queues[direction.index()];
+            if queue.items >= self.queue_items_capacity
+                || queue
+                    .bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > self.queue_bytes_capacity)
+            {
+                return Err(ClosedRelayRefusal::QueueFull);
+            }
+        }
+        let sender_is_closed = match direction {
+            RelayDirection::RequesterToTarget => self.requester_tx.is_closed(),
+            RelayDirection::TargetToRequester => self.target_tx.is_closed(),
+        };
+        if sender_is_closed {
+            self.terminate();
+            return Err(ClosedRelayRefusal::QueueClosed);
         }
         if !self.bandwidth.lock().consume(bytes) {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        let sender = match direction {
-            RelayDirection::RequesterToTarget => &self.requester_tx,
-            RelayDirection::TargetToRequester => &self.target_tx,
+        let channel_closed = {
+            let mut queues = self.queue.lock();
+            let queue = &mut queues[direction.index()];
+            if queue.items >= self.queue_items_capacity
+                || queue
+                    .bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > self.queue_bytes_capacity)
+            {
+                return Err(ClosedRelayRefusal::QueueFull);
+            }
+            let sender = match direction {
+                RelayDirection::RequesterToTarget => &self.requester_tx,
+                RelayDirection::TargetToRequester => &self.target_tx,
+            };
+            match sender.try_send(packet) {
+                Ok(()) => {
+                    queue.items += 1;
+                    queue.bytes += bytes;
+                    false
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return Err(ClosedRelayRefusal::QueueFull);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => true,
+            }
         };
-        sender.try_send(packet).map_err(|error| match error {
-            mpsc::error::TrySendError::Full(_) => ClosedRelayRefusal::QueueFull,
-            mpsc::error::TrySendError::Closed(_) => ClosedRelayRefusal::QueueClosed,
-        })?;
-        queue.items += 1;
-        queue.bytes += bytes;
+        if channel_closed {
+            self.terminate();
+            return Err(ClosedRelayRefusal::QueueClosed);
+        }
         self.last_activity = Instant::now();
         Ok(())
     }
@@ -499,18 +554,29 @@ impl ClosedRelayHandle {
         &mut self,
     ) -> Result<Option<OpaqueRelayPacket>, ClosedRelayRefusal> {
         self.ensure_active()?;
-        let deadline = self
-            .expiration_deadline()
-            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let Some(deadline) = self.expiration_deadline() else {
+            self.terminate();
+            return Err(ClosedRelayRefusal::InvalidProfile);
+        };
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::pin!(sleep);
         let (direction, packet) = tokio::select! {
             packet = self.requester_rx.recv() => Some((RelayDirection::RequesterToTarget, packet)),
             packet = self.target_rx.recv() => Some((RelayDirection::TargetToRequester, packet)),
-            _ = &mut sleep => return Err(ClosedRelayRefusal::Expired),
+            _ = &mut sleep => {
+                self.terminate();
+                return Err(ClosedRelayRefusal::Expired);
+            },
         }
         .ok_or(ClosedRelayRefusal::QueueClosed)?;
-        let packet = packet.ok_or(ClosedRelayRefusal::QueueClosed)?;
+        let packet = match packet {
+            Some(packet) => packet,
+            None => {
+                self.terminate();
+                return Err(ClosedRelayRefusal::QueueClosed);
+            }
+        };
+        self.ensure_active()?;
         Ok(Some(self.account_received(direction, packet)))
     }
 
@@ -521,22 +587,36 @@ impl ClosedRelayHandle {
         direction: RelayDirection,
     ) -> Result<Option<OpaqueRelayPacket>, ClosedRelayRefusal> {
         self.ensure_active()?;
-        let deadline = self
-            .expiration_deadline()
-            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let Some(deadline) = self.expiration_deadline() else {
+            self.terminate();
+            return Err(ClosedRelayRefusal::InvalidProfile);
+        };
         let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
         tokio::pin!(sleep);
         let packet = match direction {
             RelayDirection::RequesterToTarget => tokio::select! {
                 packet = self.requester_rx.recv() => packet,
-                _ = &mut sleep => return Err(ClosedRelayRefusal::Expired),
+                _ = &mut sleep => {
+                    self.terminate();
+                    return Err(ClosedRelayRefusal::Expired);
+                },
             },
             RelayDirection::TargetToRequester => tokio::select! {
                 packet = self.target_rx.recv() => packet,
-                _ = &mut sleep => return Err(ClosedRelayRefusal::Expired),
+                _ = &mut sleep => {
+                    self.terminate();
+                    return Err(ClosedRelayRefusal::Expired);
+                },
             },
-        }
-        .ok_or(ClosedRelayRefusal::QueueClosed)?;
+        };
+        let packet = match packet {
+            Some(packet) => packet,
+            None => {
+                self.terminate();
+                return Err(ClosedRelayRefusal::QueueClosed);
+            }
+        };
+        self.ensure_active()?;
         Ok(Some(self.account_received(direction, packet)))
     }
 
@@ -564,18 +644,21 @@ impl ClosedRelayHandle {
         ClosedRelayTerminal::Settled
     }
 
-    fn ensure_active(&self) -> Result<(), ClosedRelayRefusal> {
+    fn ensure_active(&mut self) -> Result<(), ClosedRelayRefusal> {
         if self.settled {
             return Err(ClosedRelayRefusal::OwnerNotLive);
         }
-        if !self.requester.is_live() || !self.target.is_live() {
-            return Err(ClosedRelayRefusal::OwnerNotLive);
-        }
-        let now = Instant::now();
-        if now.duration_since(self.opened_at) >= self.lifetime
-            || now.duration_since(self.last_activity) >= self.idle_timeout
-        {
-            return Err(ClosedRelayRefusal::Expired);
+        let refusal = if !self.requester.is_live() || !self.target.is_live() {
+            Some(ClosedRelayRefusal::OwnerNotLive)
+        } else {
+            let now = Instant::now();
+            (now.duration_since(self.opened_at) >= self.lifetime
+                || now.duration_since(self.last_activity) >= self.idle_timeout)
+                .then_some(ClosedRelayRefusal::Expired)
+        };
+        if let Some(refusal) = refusal {
+            self.terminate();
+            return Err(refusal);
         }
         Ok(())
     }
@@ -590,11 +673,7 @@ impl ClosedRelayHandle {
         if self.settled {
             return;
         }
-        let Some(permit) = self.permit.take() else {
-            self.settled = true;
-            return;
-        };
-        drop(permit);
+        let permit = self.permit.take();
         let mut state = self.state.lock();
         if let Some(index) = state
             .active_allocations
@@ -603,15 +682,9 @@ impl ClosedRelayHandle {
         {
             state.active_allocations.swap_remove(index);
         }
-        if state.terminal_tombstone_count < state.terminal_tombstone_capacity {
-            let next = state.terminal_tombstones.take();
-            state.terminal_tombstones = Some(Box::new(RelayTerminalTombstone {
-                session_id: self.endpoints.session_id,
-                allocation_epoch: self.endpoints.allocation_epoch,
-                next,
-            }));
-            state.terminal_tombstone_count += 1;
-        }
+        state.record_terminal_tombstone(self.endpoints.session_id, self.endpoints.allocation_epoch);
+        drop(state);
+        drop(permit);
         self.settled = true;
     }
 
@@ -619,7 +692,7 @@ impl ClosedRelayHandle {
         if self.settled {
             return;
         }
-        drop(self.permit.take());
+        let permit = self.permit.take();
         let mut state = self.state.lock();
         if let Some(index) = state
             .active_allocations
@@ -628,6 +701,9 @@ impl ClosedRelayHandle {
         {
             state.active_allocations.swap_remove(index);
         }
+        state.record_terminal_tombstone(self.endpoints.session_id, self.endpoints.allocation_epoch);
+        drop(state);
+        drop(permit);
         self.settled = true;
     }
 }
@@ -646,8 +722,7 @@ struct QueueAccounting {
 
 struct RelayAdmissionState {
     active_allocations: Vec<ActiveAllocation>,
-    terminal_tombstones: Option<Box<RelayTerminalTombstone>>,
-    terminal_tombstone_count: usize,
+    terminal_tombstones: Vec<RelayTerminalTombstone>,
     terminal_tombstone_capacity: usize,
     pending_handshakes: usize,
     next_allocation_id: u64,
@@ -658,30 +733,55 @@ struct ActiveAllocation {
     id: u64,
     member: String,
     session_id: [u8; 16],
-    allocation_epoch: u64,
 }
 
 struct RelayTerminalTombstone {
     session_id: [u8; 16],
     allocation_epoch: u64,
-    next: Option<Box<RelayTerminalTombstone>>,
 }
 
 impl RelayAdmissionState {
     fn terminal_tombstone(&self, session_id: [u8; 16]) -> Option<u64> {
-        let mut node = self.terminal_tombstones.as_deref();
-        while let Some(tombstone) = node {
-            if tombstone.session_id == session_id {
-                return Some(tombstone.allocation_epoch);
-            }
-            node = tombstone.next.as_deref();
+        self.terminal_tombstones
+            .iter()
+            .find(|tombstone| tombstone.session_id == session_id)
+            .map(|tombstone| tombstone.allocation_epoch)
+    }
+
+    fn record_terminal_tombstone(&mut self, session_id: [u8; 16], allocation_epoch: u64) {
+        if self.terminal_tombstone_capacity == 0 {
+            return;
         }
-        None
+        if let Some(tombstone) = self
+            .terminal_tombstones
+            .iter_mut()
+            .find(|tombstone| tombstone.session_id == session_id)
+        {
+            tombstone.allocation_epoch = tombstone.allocation_epoch.max(allocation_epoch);
+            return;
+        }
+        if self.terminal_tombstones.len() >= self.terminal_tombstone_capacity {
+            // The table is bounded by the configured allocation ceiling. The
+            // newest epoch is more useful than an older unrelated session,
+            // while replacing an existing session above preserves its fence.
+            self.terminal_tombstones.swap_remove(0);
+        }
+        self.terminal_tombstones.push(RelayTerminalTombstone {
+            session_id,
+            allocation_epoch,
+        });
     }
 }
 
 pub(crate) struct ClosedRelayHandshakeGuard {
     state: Arc<Mutex<RelayAdmissionState>>,
+    expires_at: Instant,
+}
+
+impl ClosedRelayHandshakeGuard {
+    fn is_expired(&self) -> bool {
+        Instant::now() >= self.expires_at
+    }
 }
 
 impl Drop for ClosedRelayHandshakeGuard {
@@ -820,6 +920,13 @@ impl PendingEndpointKeyAgreement {
         self,
         peer_share: &RelayKeyShare,
     ) -> Result<OpaqueRelaySession, ClosedRelayRefusal> {
+        if self
+            ._handshake
+            .as_ref()
+            .is_some_and(ClosedRelayHandshakeGuard::is_expired)
+        {
+            return Err(ClosedRelayRefusal::Expired);
+        }
         peer_share.validate().map_err(ClosedRelayRefusal::Crypto)?;
         if peer_share.mesh != self.mesh.base32()
             || peer_share.session_id != self.session_id
@@ -894,6 +1001,13 @@ impl PendingEndpointKeyAgreement {
         recv_key_bytes.copy_from_slice(recv_key);
         send_prefix_bytes.copy_from_slice(send_prefix);
         recv_prefix_bytes.copy_from_slice(recv_prefix);
+        if self
+            ._handshake
+            .as_ref()
+            .is_some_and(ClosedRelayHandshakeGuard::is_expired)
+        {
+            return Err(ClosedRelayRefusal::Expired);
+        }
         Ok(OpaqueRelaySession {
             mesh: self.mesh,
             local_id: self.local_id,
@@ -1101,6 +1215,7 @@ mod behavior_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resource::ResourceClass;
 
     #[test]
     fn endpoint_aead_round_trip_and_replay_fence() {
@@ -1143,5 +1258,54 @@ mod tests {
             usize::try_from(plaintext + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES)
                 .expect("safe boundary fits usize")
         );
+    }
+
+    #[test]
+    fn relay_allocation_claim_covers_payload_and_runtime_custody() {
+        let profile = ClosedRelayPolicyConfig {
+            enabled: true,
+            pending_handshake_timeout_ms: 30_000,
+            ..ClosedRelayPolicyConfig::default()
+        };
+        let claim = RelayAllocationPermit::allocation_claim(&profile)
+            .expect("valid relay profile has a finite claim");
+        assert_eq!(claim.amount(ResourceClass::RelayOrProviderAllocation), 1);
+        assert_eq!(
+            claim.amount(ResourceClass::QueuedBytes),
+            profile
+                .queue_bytes_per_direction
+                .checked_mul(RELAY_DIRECTION_COUNT as u64)
+                .expect("configured queue bytes fit")
+        );
+        assert!(
+            claim.amount(ResourceClass::AccountedMemoryBytes)
+                >= u64::try_from(
+                    std::mem::size_of::<RelayAllocationPermit>()
+                        + std::mem::size_of::<ClosedRelayHandle>()
+                        + std::mem::size_of::<ActiveAllocation>(),
+                )
+                .expect("test platform sizes fit")
+        );
+        assert!(claim.amount(ResourceClass::OpaqueDependencyResidual) > 0);
+    }
+
+    #[test]
+    fn terminal_tombstones_update_latest_epoch_with_a_bounded_table() {
+        let mut state = RelayAdmissionState {
+            active_allocations: Vec::new(),
+            terminal_tombstones: Vec::new(),
+            terminal_tombstone_capacity: 2,
+            pending_handshakes: 0,
+            next_allocation_id: 0,
+            next_allocation_epoch: 0,
+        };
+        state.record_terminal_tombstone([1; 16], 1);
+        state.record_terminal_tombstone([1; 16], 3);
+        assert_eq!(state.terminal_tombstone([1; 16]), Some(3));
+        assert_eq!(state.terminal_tombstones.len(), 1);
+        state.record_terminal_tombstone([2; 16], 1);
+        state.record_terminal_tombstone([3; 16], 1);
+        assert_eq!(state.terminal_tombstones.len(), 2);
+        assert_eq!(state.terminal_tombstone([3; 16]), Some(1));
     }
 }

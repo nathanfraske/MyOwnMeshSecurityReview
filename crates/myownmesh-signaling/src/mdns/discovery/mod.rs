@@ -81,6 +81,8 @@ pub struct DiscoveryLimits {
 }
 
 impl Default for DiscoveryLimits {
+    /// Backend defaults for direct signaling users. The core mesh translates
+    /// its persisted `MdnsPolicyConfig` into every field before attachment.
     fn default() -> Self {
         Self {
             max_resolve_owners: 256,
@@ -140,14 +142,128 @@ impl DiscoveryLimits {
             && self.max_txt_bytes <= u16::MAX as usize
             && self.max_resolved_addresses > 0
     }
+
+    /// Compute the complete bounded residency envelope for one backend.
+    ///
+    /// `payload_owner_slots` is the exact number of latest-state owners that
+    /// the backend can retain at once: the embedded backend has two bounded
+    /// event handoffs (`R + 2E`), while the system backend has one (`R + E`).
+    /// Per-resolver TXT, address, and scratch ownership is multiplied by `R`
+    /// with checked arithmetic. Library command/cache state and native DNS-SD
+    /// objects are reported only as bounded opaque residual slots; this API
+    /// deliberately does not claim byte precision for those dependencies.
+    pub fn checked_residency(
+        self,
+        backend: DiscoveryBackend,
+    ) -> Result<DiscoveryResidency, DiscoveryResidencyError> {
+        if !self.validate() {
+            return Err(DiscoveryResidencyError::InvalidLimits);
+        }
+        let event_queue_slots = match backend {
+            DiscoveryBackend::Embedded => self
+                .event_capacity
+                .checked_mul(2)
+                .ok_or(DiscoveryResidencyError::Overflow("event queue slots"))?,
+            DiscoveryBackend::System => self.event_capacity,
+        };
+        let payload_owner_slots = self
+            .max_resolve_owners
+            .checked_add(event_queue_slots)
+            .ok_or(DiscoveryResidencyError::Overflow("payload owner slots"))?;
+        let per_resolver_scratch_bytes = self
+            .max_txt_bytes
+            .checked_add(
+                self.max_resolved_addresses
+                    .checked_mul(std::mem::size_of::<IpAddr>())
+                    .ok_or(DiscoveryResidencyError::Overflow("resolver address bytes"))?,
+            )
+            .ok_or(DiscoveryResidencyError::Overflow("resolver scratch bytes"))?;
+        let concurrent_txt_entry_slots = self
+            .max_resolve_owners
+            .checked_mul(self.max_txt_entries)
+            .ok_or(DiscoveryResidencyError::Overflow("resolver TXT slots"))?;
+        let concurrent_address_slots = self
+            .max_resolve_owners
+            .checked_mul(self.max_resolved_addresses)
+            .ok_or(DiscoveryResidencyError::Overflow("resolver address slots"))?;
+        let concurrent_scratch_bytes = self
+            .max_resolve_owners
+            .checked_mul(per_resolver_scratch_bytes)
+            .ok_or(DiscoveryResidencyError::Overflow(
+                "resolver scratch aggregate",
+            ))?;
+        let (event_epoch_slots, opaque_residual_slots) = match backend {
+            DiscoveryBackend::Embedded => (0, 3),
+            DiscoveryBackend::System => (
+                self.max_event_epochs,
+                self.max_resolve_owners
+                    .checked_add(2)
+                    .ok_or(DiscoveryResidencyError::Overflow("native worker slots"))?,
+            ),
+        };
+        Ok(DiscoveryResidency {
+            backend,
+            event_queue_slots,
+            resolve_owner_slots: self.max_resolve_owners,
+            event_epoch_slots,
+            payload_owner_slots,
+            concurrent_txt_entry_slots,
+            concurrent_address_slots,
+            per_resolver_scratch_bytes,
+            concurrent_scratch_bytes,
+            opaque_residual_slots,
+        })
+    }
 }
+
+/// Discovery implementation selected by the platform and feature set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryBackend {
+    /// The pure-Rust `mdns-sd` backend with two bounded event handoffs.
+    Embedded,
+    /// The system DNS-SD backend with native resolver workers and epochs.
+    System,
+}
+
+/// Checked backend-specific residency plan consumed by driver custody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryResidency {
+    pub backend: DiscoveryBackend,
+    pub event_queue_slots: usize,
+    pub resolve_owner_slots: usize,
+    pub event_epoch_slots: usize,
+    pub payload_owner_slots: usize,
+    pub concurrent_txt_entry_slots: usize,
+    pub concurrent_address_slots: usize,
+    pub per_resolver_scratch_bytes: usize,
+    pub concurrent_scratch_bytes: usize,
+    pub opaque_residual_slots: usize,
+}
+
+/// Why a backend residency plan could not be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryResidencyError {
+    InvalidLimits,
+    Overflow(&'static str),
+}
+
+impl std::fmt::Display for DiscoveryResidencyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLimits => formatter.write_str("invalid discovery limits"),
+            Self::Overflow(field) => write!(formatter, "discovery residency overflow: {field}"),
+        }
+    }
+}
+
+impl std::error::Error for DiscoveryResidencyError {}
 /// DNS-SD's maximum encoded domain-name length (including length octets and
 /// the root terminator). This is a wire/dependency bound, not an application
 /// workload setting.
 pub const MAX_DNS_NAME_BYTES: usize = 255;
-/// Default owner-facing bound for TXT entries copied from one discovery
-/// response. DNS-SD does not define an entry-count policy; each deployment may
-/// override this through [`DiscoveryLimits::max_txt_entries`].
+/// Default bound for direct backend users. DNS-SD does not define an
+/// entry-count policy; the core mesh supplies its persisted owner value through
+/// [`DiscoveryLimits::max_txt_entries`].
 pub const MAX_TXT_ENTRIES: usize = 64;
 /// Defensive key bound for the application's TXT map. The DNS-SD wire limit
 /// applies to each encoded TXT string, so this is intentionally distinct from
@@ -157,13 +273,14 @@ pub const MAX_TXT_KEY_BYTES: usize = 128;
 /// string carries its encoded length in one octet; the backend's encoder keeps
 /// that dependency limit as a final defensive check.
 pub const MAX_TXT_VALUE_BYTES: usize = 255;
-/// Default owner-facing total TXT payload bound retained per event. This is
-/// not a DNS-SD wire maximum; deployments may override it through
-/// [`DiscoveryLimits::max_txt_bytes`], subject to the DNS-SD `u16` length.
+/// Default total TXT payload bound for direct backend users. This is not a
+/// DNS-SD wire maximum; the core mesh supplies its persisted owner value
+/// through [`DiscoveryLimits::max_txt_bytes`], subject to the DNS-SD `u16`
+/// length.
 pub const MAX_TXT_BYTES: usize = 4096;
-/// Default owner-facing unique IPv4-address bound retained per event.
-/// DNS-SD supplies no application address-count limit; deployments may
-/// override it through [`DiscoveryLimits::max_resolved_addresses`].
+/// Default unique IPv4-address bound for direct backend users. DNS-SD supplies
+/// no application address-count limit; the core mesh supplies its persisted
+/// owner value through [`DiscoveryLimits::max_resolved_addresses`].
 pub const MAX_RESOLVED_ADDRESSES: usize = 32;
 
 /// What a backend needs to advertise + browse one service instance.
@@ -739,6 +856,47 @@ mod tests {
     }
 
     #[test]
+    fn backend_residency_is_distinct_checked_and_bounded() {
+        let limits = DiscoveryLimits {
+            max_resolve_owners: 3,
+            event_capacity: 5,
+            max_event_epochs: 7,
+            max_txt_entries: 8,
+            max_txt_bytes: 512,
+            max_resolved_addresses: 4,
+        };
+        let per_resolver = 512 + 4 * std::mem::size_of::<IpAddr>();
+        let concurrent = 3 * per_resolver;
+        let embedded = limits
+            .checked_residency(DiscoveryBackend::Embedded)
+            .expect("embedded residency fits");
+        assert_eq!(embedded.event_queue_slots, 10);
+        assert_eq!(embedded.payload_owner_slots, 13);
+        assert_eq!(embedded.event_epoch_slots, 0);
+        assert_eq!(embedded.per_resolver_scratch_bytes, per_resolver);
+        assert_eq!(embedded.concurrent_scratch_bytes, concurrent);
+        assert_eq!(embedded.opaque_residual_slots, 3);
+
+        let system = limits
+            .checked_residency(DiscoveryBackend::System)
+            .expect("system residency fits");
+        assert_eq!(system.event_queue_slots, 5);
+        assert_eq!(system.payload_owner_slots, 8);
+        assert_eq!(system.event_epoch_slots, 7);
+        assert_eq!(system.concurrent_txt_entry_slots, 24);
+        assert_eq!(system.concurrent_address_slots, 12);
+        assert_eq!(system.concurrent_scratch_bytes, concurrent);
+        assert_eq!(system.opaque_residual_slots, 5);
+
+        let mut overflowing = limits;
+        overflowing.max_resolve_owners = usize::MAX;
+        assert!(matches!(
+            overflowing.checked_residency(DiscoveryBackend::System),
+            Err(DiscoveryResidencyError::Overflow(_))
+        ));
+    }
+
+    #[test]
     fn timing_profile_rejects_zero_before_backend_start() {
         let profile = MdnsTimingProfile {
             query_deadline: Duration::ZERO,
@@ -855,4 +1013,4 @@ pub use system::Discovery;
 #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
 mod embedded;
 #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
-pub use embedded::Discovery;
+pub use embedded::{checked_embedded_custody_plan, Discovery, EmbeddedCustodyPlan};

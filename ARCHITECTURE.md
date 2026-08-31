@@ -13,6 +13,26 @@ The existing-repository migration is governed by [`TRANSITION-PLAYBOOK.md`](TRAN
 
 ![MyOwnMesh end-to-end hybrid networking architecture](diagrams/01-end-to-end-hybrid.svg)
 
+The diagram names production owners, not conceptual placeholders. Its executable
+left-to-right path is:
+
+| Diagram stage | Production module |
+|---|---|
+| daemon and local application boundary | `crates/myownmesh/src/cli/serve.rs`, `control.rs`, `control/dispatch/channel.rs`, `ipc/bridge.rs` |
+| typed signaling and LAN discovery | `crates/myownmesh-core/src/engine/signaling_bridge.rs`, `crates/myownmesh-signaling/src/mdns/driver.rs`, and the selected `mdns/discovery/{embedded,system}.rs` backend |
+| candidate construction and packet carriage | `crates/myownmesh-core/src/engine/connection.rs`, `transport/webrtc.rs`, and `transport/ice.rs` |
+| channel-bound endpoint proof | `crates/myownmesh-core/src/endpoint_auth/task.rs`, `endpoint_auth/transcript.rs`, and `engine/handshake.rs` |
+| policy promotion and exact live-session ownership | `crates/myownmesh-core/src/runtime/session_broker/mod.rs`, `runtime/peer_session/slot.rs`, and `engine/state.rs` |
+| application delivery | `crates/myownmesh-core/src/application_gateway/channels.rs` and `crates/myownmesh/src/ipc/bridge.rs` |
+
+[`scripts/run-production-e2e.py`](scripts/run-production-e2e.py) executes one
+concrete instance of that path with two shipped daemon processes: production
+mDNS discovery, direct WebRTC construction, fresh endpoint authentication,
+bilateral automatic promotion on an Open network, and acknowledged typed-channel
+delivery. It requires an existing binary and an owner-selected finite resource
+grant; it neither builds the product nor substitutes `LocalBroker`. Its output is
+raw characterization material, not a release-evidence assertion.
+
 The architecture has five cooperating mechanisms:
 
 1. **Durable semantic state** stores and derives long-lived mesh meaning, such as Open participation, Closed governance, durable capability grants, and optional application contract facts.
@@ -38,6 +58,16 @@ No route must become a durable ledger object before the connector may try it.
 ## 2. Transport independence, not transport removal
 
 ![Transport independence without transport removal](diagrams/03-transport-independence.svg)
+
+The upper lane in the diagram is implemented by
+`semantic/{fact,verify,store,projection}.rs` and receives typed carrier inputs
+through `engine/{signaling_ingress,semantic_ingress}.rs`. The lower lane is
+implemented by `engine/signaling_bridge.rs`, `engine/connection.rs`,
+`transport/{ice,webrtc}.rs`, `endpoint_auth/task.rs`, and
+`runtime/session_broker/mod.rs`. Only the upper lane may create durable
+authority; only the lower lane can establish current packet reachability. The
+promotion edge between them consumes verified semantic policy without turning a
+carrier observation into authority.
 
 For durable semantic facts, equivalent accepted inputs produce equivalent durable state regardless of whether the bytes arrived through Nostr, mDNS, WebSocket, a signaling cache, a file, serial transport, shared storage, removable media, an optical encoding, or another suitable medium.
 
@@ -185,6 +215,16 @@ Signaling carriers may cache, delay, duplicate, reorder, censor, or reveal contr
 The connector owns pathfinding and packet transport. It may start useful work before endpoint identity and Closed authorization are fully proven.
 
 ![Usability-first pathfinding with a strict channel-promotion boundary](diagrams/02-channel-promotion-boundary.svg)
+
+The diagram's pre-promotion objects are owned by
+`engine/connection.rs` and `transport/webrtc.rs`. The proof task is
+`endpoint_auth/task.rs`; its transcript is fixed by
+`endpoint_auth/transcript.rs`. `engine/handshake.rs` delivers the verified
+result to `runtime/session_broker/mod.rs`, whose exact current slot lives in
+`runtime/peer_session/slot.rs`. Application entry points in
+`application_gateway/{channels,rpc}.rs` can consume only that promoted slot.
+Carrier replacement returns to connector work and must cross the same proof and
+promotion boundary again.
 
 An untrusted hint or partially authenticated signal may create only lease-backed speculative state, such as:
 
@@ -471,6 +511,15 @@ The relay may drop, delay, reorder, meter, or correlate opaque traffic and obser
 ## 8. Closed relay close and shutdown
 
 ![Closed member relay explicit setup and terminal close](diagrams/04-closed-member-relay-handoff.svg)
+
+The route vocabulary is `protocol/relay.rs`. Runtime allocation and endpoint
+state are owned by `runtime/relay/mod.rs`; engine dispatch and current promoted
+leg witnesses are owned by `engine/closed_relay.rs` and
+`runtime/peer_session/slot.rs`. Application plaintext enters and leaves only at
+the A/C endpoint session. B's production path accepts and emits only route-bound
+control plus `OpaqueRelayPacket` ciphertext. `Close`, acknowledgement, exact
+generation settlement, waiter wakeup, and driver join are part of the same
+runtime owner rather than an external cleanup convention.
 
 Close is also explicit and route-bound. An endpoint sends `Close` through its exact promoted leg; B validates the authenticated sender and exact allocation generation, marks the slot closing, and forwards the canonical close once to the opposite endpoint. The opposite endpoint closes its exact local session and returns the acknowledgement through B. B settles the exact allocation, and the initiator becomes terminal. Duplicate close messages are idempotent for the same terminal tombstone and cannot affect a successor allocation with a reused session identifier.
 

@@ -21,6 +21,8 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -380,6 +382,43 @@ pub struct Response {
     pub data: Option<serde_json::Value>,
 }
 
+/// Cancellation shared by the owned GUI event pump and its one socket reader.
+/// The atomic check closes the notify race; the notification wakes both the
+/// outer retry loop and the inner read/send loop without aborting either task.
+#[derive(Clone)]
+pub(crate) struct EventPumpCancellation {
+    stopped: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl EventPumpCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                break;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// Outcome of one control request from the GUI's perspective.
 ///
 /// Once a mutating request may have been written, a lost response cannot be
@@ -517,21 +556,41 @@ impl ControlClient {
     /// forwards each incoming line to `tx`. Returns immediately
     /// after the initial ack so the caller can wire `rx` into a
     /// Tauri event emitter.
-    pub async fn subscribe_events(&self, tx: mpsc::Sender<serde_json::Value>) -> Result<()> {
-        let stream = self.connect().await?;
+    pub async fn subscribe_events(
+        &self,
+        tx: mpsc::Sender<serde_json::Value>,
+        cancellation: EventPumpCancellation,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        if cancellation.is_cancelled() {
+            bail!("event subscription cancelled");
+        }
+        let stream = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => bail!("event subscription cancelled"),
+            result = self.connect() => result?,
+        };
         let (reader, mut writer) = stream.split();
         let mut reader = BufReader::new(reader);
 
         let line = serde_json::to_string(&Request::EventsSubscribe)? + "\n";
-        writer
-            .write_all(line.as_bytes())
-            .await
-            .context("write subscribe")?;
-        writer.flush().await.context("flush subscribe")?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => bail!("event subscription cancelled"),
+            result = writer.write_all(line.as_bytes()) => result.context("write subscribe")?,
+        }
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => bail!("event subscription cancelled"),
+            result = writer.flush() => result.context("flush subscribe")?,
+        }
 
         // Read the initial ack — Response { ok: true, data: { subscribed: true } }.
         let mut ack = String::new();
-        let n = reader.read_line(&mut ack).await.context("read ack")?;
+        let n = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => bail!("event subscription cancelled"),
+            result = reader.read_line(&mut ack) => result.context("read ack")?,
+        };
         if n == 0 {
             bail!("daemon closed connection before sending subscribe ack");
         }
@@ -547,7 +606,7 @@ impl ControlClient {
         // Spawn the forwarding loop. The writer goes with the stream
         // — its lifetime is tied to `reader` via the `split`. We
         // keep it on the stack here to keep the connection open.
-        tokio::spawn(async move {
+        let join = tokio::spawn(async move {
             // Keep `writer` alive for the duration of the read loop;
             // dropping it closes the half-duplex on the server side
             // (the daemon then exits its write loop too).
@@ -555,7 +614,12 @@ impl ControlClient {
             let mut buf = String::new();
             loop {
                 buf.clear();
-                match reader.read_line(&mut buf).await {
+                let read = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    result = reader.read_line(&mut buf) => result,
+                };
+                match read {
                     Ok(0) => break, // daemon disconnected
                     Ok(_) => {}
                     Err(e) => {
@@ -570,13 +634,18 @@ impl ControlClient {
                         continue;
                     }
                 };
-                if tx.send(value).await.is_err() {
+                let sent = tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break,
+                    result = tx.send(value) => result,
+                };
+                if sent.is_err() {
                     break; // GUI side dropped the channel
                 }
             }
         });
 
-        Ok(())
+        Ok(join)
     }
 
     async fn connect(&self) -> Result<LocalSocketStream> {
@@ -682,6 +751,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn event_pump_cancellation_is_latched_and_wakes_waiters() {
+        let cancellation = EventPumpCancellation::new();
+        cancellation.cancel();
+        cancellation.cancelled().await;
+        assert!(cancellation.is_cancelled());
+    }
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};

@@ -29,11 +29,12 @@ use myownmesh_core::engine::transport_lab::{
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::DeviceId;
 use myownmesh_core::{MeshEvent, PeerEvent};
+use myownmesh_signaling::mdns::discovery::DiscoveryBackend;
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
-    PeerRetention,
+    DiscoveryRetention, PeerRetention,
 };
-use myownmesh_signaling::ErasedOwner;
+use myownmesh_signaling::{DedicatedTaskCustodian, ErasedOwner, TaskCustodian};
 use tokio::time::Instant;
 
 /// Serializes the tests in this file — they mutate the process-wide
@@ -41,13 +42,96 @@ use tokio::time::Instant;
 /// await points is well-defined.
 static HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn driver_custodian() -> Arc<dyn TaskCustodian> {
+    DedicatedTaskCustodian::new(1).expect("driver custodian starts") as Arc<dyn TaskCustodian>
+}
+
+fn reaper_custodian() -> Arc<dyn TaskCustodian> {
+    DedicatedTaskCustodian::new(2).expect("reaper custodian starts") as Arc<dyn TaskCustodian>
+}
+
+#[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+fn backend_custodian() -> Option<Arc<dyn TaskCustodian>> {
+    let plan = myownmesh_signaling::mdns::discovery::checked_embedded_custody_plan()
+        .expect("embedded custody plan is valid");
+    assert_eq!(plan.observer_slots, 3);
+    Some(
+        DedicatedTaskCustodian::new(3).expect("embedded backend custodian starts")
+            as Arc<dyn TaskCustodian>,
+    )
+}
+
+#[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+fn backend_custodian() -> Option<Arc<dyn TaskCustodian>> {
+    None
+}
+
+struct CustodianGuards(Vec<Arc<dyn TaskCustodian>>);
+
+impl Drop for CustodianGuards {
+    fn drop(&mut self) {
+        for owner in &self.0 {
+            owner.close();
+        }
+    }
+}
+
 fn accept_any(_: &str) -> bool {
     true
+}
+
+#[test]
+fn configured_backend_selector_matches_active_feature() {
+    let backend = myownmesh_signaling::mdns::driver::configured_discovery_backend();
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    assert_eq!(backend, DiscoveryBackend::System);
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    assert_eq!(backend, DiscoveryBackend::Embedded);
+}
+
+#[test]
+fn configured_backend_uses_asymmetric_retention_formula() {
+    let limits = myownmesh_signaling::mdns::discovery::DiscoveryLimits {
+        max_resolve_owners: 4,
+        event_capacity: 6,
+        max_event_epochs: 9,
+        max_txt_entries: 12,
+        max_txt_bytes: 1_024,
+        max_resolved_addresses: 5,
+    };
+    let retention = DiscoveryRetention::from_backend(
+        limits,
+        myownmesh_signaling::mdns::driver::configured_discovery_backend(),
+    )
+    .expect("selected backend retention is valid");
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    {
+        assert_eq!(retention.event_queue_slots, limits.event_capacity);
+        assert_eq!(retention.native_worker_slots, limits.max_resolve_owners + 2);
+    }
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    {
+        assert_eq!(retention.event_queue_slots, limits.event_capacity * 2);
+        assert_eq!(retention.native_worker_slots, 0);
+    }
 }
 
 struct TestAliasProvider;
 
 impl AliasProvider for TestAliasProvider {
+    fn retain_discovery(&self, retention: DiscoveryRetention) -> Result<ErasedOwner, AliasRefusal> {
+        let expected = DiscoveryRetention::from_backend(
+            myownmesh_signaling::mdns::driver::MdnsLimits::default().discovery,
+            myownmesh_signaling::mdns::driver::configured_discovery_backend(),
+        )
+        .expect("default discovery retention is valid");
+        assert_eq!(
+            retention, expected,
+            "the fixture provider must account for every discovery dimension"
+        );
+        Ok(Box::new(retention))
+    }
+
     fn retain_alias(
         &self,
         _key: &str,
@@ -125,32 +209,62 @@ async fn multicast_available() -> bool {
     let (b_in_tx, _b_in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
     let a_in = myownmesh_signaling::InboundSink::from_unbounded(a_in_tx);
     let b_in = myownmesh_signaling::InboundSink::from_unbounded(b_in_tx);
-    let Ok(_a) = mdns::start(
+    let a_owner = driver_custodian();
+    let a_backend_owner = backend_custodian();
+    let a_reaper_owner = reaper_custodian();
+    let _a_custody = CustodianGuards(
+        std::iter::once(a_owner.clone())
+            .chain(a_backend_owner.clone())
+            .chain(std::iter::once(a_reaper_owner.clone()))
+            .collect(),
+    );
+    let Ok(a) = mdns::start_with_custodian(
         cfg("probe-a"),
         Box::new(myownmesh_signaling::UnboundedSource::new(a_out_rx)),
         a_in,
+        a_owner.clone(),
+        a_backend_owner.clone(),
+        a_reaper_owner.clone(),
     ) else {
         return false;
     };
-    let Ok(_b) = mdns::start(
+    let b_owner = driver_custodian();
+    let b_backend_owner = backend_custodian();
+    let b_reaper_owner = reaper_custodian();
+    let _b_custody = CustodianGuards(
+        std::iter::once(b_owner.clone())
+            .chain(b_backend_owner.clone())
+            .chain(std::iter::once(b_reaper_owner.clone()))
+            .collect(),
+    );
+    let Ok(b) = mdns::start_with_custodian(
         cfg("probe-b"),
         Box::new(myownmesh_signaling::UnboundedSource::new(b_out_rx)),
         b_in,
+        b_owner.clone(),
+        b_backend_owner.clone(),
+        b_reaper_owner.clone(),
     ) else {
+        a.stop_and_join().await;
         return false;
     };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    let found = loop {
+        if Instant::now() >= deadline {
+            break false;
+        }
         match tokio::time::timeout(Duration::from_millis(200), a_in_rx.recv()).await {
             Ok(Some(MdnsInbound::PeerAnnounced { device_id, .. })) if device_id == "probe-b" => {
-                return true;
+                break true;
             }
             Ok(Some(_)) => continue,
-            Ok(None) => return false,
+            Ok(None) => break false,
             Err(_) => continue,
         }
-    }
-    false
+    };
+    a.stop_and_join().await;
+    b.stop_and_join().await;
+    found
 }
 
 #[tokio::test]
@@ -161,7 +275,16 @@ async fn mdns_injected_core_validator_rejects_noncanonical_local_identity() {
     let (_out_tx, out_rx) = mpsc::unbounded_channel::<MdnsOutbound>();
     let (in_tx, _in_rx) = mpsc::unbounded_channel::<MdnsInbound>();
     let invalid = format!("{}-display", Identity::ephemeral().public_id());
-    let result = mdns::start(
+    let driver_owner = driver_custodian();
+    let backend_owner = backend_custodian();
+    let reaper_owner = reaper_custodian();
+    let _custody = CustodianGuards(
+        std::iter::once(driver_owner.clone())
+            .chain(backend_owner.clone())
+            .chain(std::iter::once(reaper_owner.clone()))
+            .collect(),
+    );
+    let result = mdns::start_with_custodian(
         MdnsDriverConfig {
             app_id: "mdns-validator-test".into(),
             network_id: "validator-network".into(),
@@ -173,10 +296,98 @@ async fn mdns_injected_core_validator_rejects_noncanonical_local_identity() {
         },
         Box::new(myownmesh_signaling::UnboundedSource::new(out_rx)),
         myownmesh_signaling::InboundSink::from_unbounded(in_tx),
+        driver_owner.clone(),
+        backend_owner.clone(),
+        reaper_owner.clone(),
     );
     assert!(
         result.is_err(),
         "noncanonical local identity must fail before publication"
+    );
+}
+
+#[test]
+fn mdns_core_budget_checks_full_resolve_envelope_before_backend_start() {
+    use myownmesh_signaling::mdns::discovery::DiscoveryLimits;
+    use myownmesh_signaling::mdns::driver::DiscoveryRetention;
+
+    let limits = DiscoveryLimits {
+        max_resolve_owners: 4,
+        event_capacity: 6,
+        max_event_epochs: 9,
+        max_txt_entries: 12,
+        max_txt_bytes: 1_024,
+        max_resolved_addresses: 5,
+    };
+    let per_resolve_bytes = limits
+        .max_txt_bytes
+        .checked_add(
+            limits
+                .max_resolved_addresses
+                .checked_mul(std::mem::size_of::<std::net::IpAddr>())
+                .expect("address bytes fit"),
+        )
+        .expect("per-resolve bytes fit");
+    let aggregate_bytes = limits
+        .max_resolve_owners
+        .checked_mul(per_resolve_bytes)
+        .expect("concurrent resolve bytes fit");
+    assert_eq!(
+        aggregate_bytes,
+        limits.max_resolve_owners
+            * (limits.max_txt_bytes
+                + limits.max_resolved_addresses * std::mem::size_of::<std::net::IpAddr>())
+    );
+    for (backend, event_queue_slots, event_epoch_slots, native_worker_slots, payload_owner_slots) in [
+        (
+            DiscoveryBackend::Embedded,
+            limits.event_capacity * 2,
+            0,
+            0,
+            limits.max_resolve_owners + 2 * limits.event_capacity,
+        ),
+        (
+            DiscoveryBackend::System,
+            limits.event_capacity,
+            limits.max_event_epochs,
+            limits.max_resolve_owners + 2,
+            limits.max_resolve_owners + limits.event_capacity,
+        ),
+    ] {
+        let retention = DiscoveryRetention::from_backend(limits, backend)
+            .expect("valid backend-specific discovery envelope");
+        assert_eq!(retention.event_queue_slots, event_queue_slots);
+        assert_eq!(retention.resolve_owner_slots, limits.max_resolve_owners);
+        assert_eq!(retention.event_epoch_slots, event_epoch_slots);
+        assert_eq!(
+            retention.txt_entry_slots,
+            limits.max_resolve_owners * limits.max_txt_entries
+        );
+        assert_eq!(retention.txt_bytes, aggregate_bytes);
+        assert_eq!(
+            retention.resolved_address_slots,
+            limits.max_resolve_owners * limits.max_resolved_addresses
+        );
+        assert_eq!(retention.native_worker_slots, native_worker_slots);
+        assert_eq!(retention.scratch_bytes, aggregate_bytes);
+        assert_eq!(
+            limits
+                .checked_residency(backend)
+                .expect("checked backend residency")
+                .payload_owner_slots,
+            payload_owner_slots
+        );
+    }
+
+    let mut overflowing = limits;
+    overflowing.max_resolved_addresses = usize::MAX;
+    assert!(
+        DiscoveryRetention::from_backend(
+            overflowing,
+            myownmesh_signaling::mdns::driver::configured_discovery_backend(),
+        )
+        .is_err(),
+        "checked address accounting refuses before a backend can allocate"
     );
 }
 
@@ -235,6 +446,10 @@ async fn wait_for_approval(
     }
 }
 
+#[cfg_attr(
+    any(target_os = "ios", feature = "system-dnssd"),
+    ignore = "requires a live system DNS-SD daemon"
+)]
 #[tokio::test(flavor = "multi_thread")]
 async fn two_peers_handshake_over_mdns_only() {
     let _guard = HOME_LOCK.lock().await;
@@ -242,11 +457,16 @@ async fn two_peers_handshake_over_mdns_only() {
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     if !multicast_available().await {
-        eprintln!(
-            "SKIP two_peers_handshake_over_mdns_only: no same-host mDNS discovery here \
-             (multicast blocked) — driver logic is covered by unit tests"
-        );
-        return;
+        #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+        panic!("live system DNS-SD discovery is required for this configured backend");
+        #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+        {
+            eprintln!(
+                "SKIP two_peers_handshake_over_mdns_only: no same-host mDNS discovery here \
+                 (multicast blocked) — driver logic is covered by unit tests"
+            );
+            return;
+        }
     }
 
     let lan_only = SignalingConfig {

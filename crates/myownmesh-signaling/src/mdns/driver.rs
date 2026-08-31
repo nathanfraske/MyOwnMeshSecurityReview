@@ -40,6 +40,65 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, trace, warn};
 
+/// Owner-scoped custody for handles that synchronous `Drop` could not return
+/// to the bounded channel reaper. Its capacity is fixed by the driver-owned
+/// supervisor/reaper pair, so fallback retention cannot grow with process
+/// lifetime or unrelated driver instances.
+struct FallbackReaperTasks {
+    #[cfg(test)]
+    capacity: usize,
+    tasks: Mutex<Vec<JoinHandle<()>>>,
+    overflow: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl FallbackReaperTasks {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            #[cfg(test)]
+            capacity,
+            tasks: Mutex::new(Vec::with_capacity(capacity)),
+            overflow: Mutex::new(None),
+        })
+    }
+
+    #[cfg(test)]
+    fn retain(&self, task: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
+        let mut tasks = self.tasks.lock();
+        if tasks
+            .len()
+            .checked_add(1)
+            .is_none_or(|len| len > self.capacity)
+        {
+            return Err(task);
+        }
+        tasks.push(task);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn retain_overflow(&self, task: JoinHandle<()>) -> Result<(), JoinHandle<()>> {
+        let mut overflow = self.overflow.lock();
+        if overflow.is_some() {
+            Err(task)
+        } else {
+            *overflow = Some(task);
+            Ok(())
+        }
+    }
+
+    fn take_tasks(&self) -> Vec<JoinHandle<()>> {
+        let mut tasks = self.tasks.lock().drain(..).collect::<Vec<_>>();
+        if let Some(task) = self.overflow.lock().take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    fn take_all(&self) -> Vec<JoinHandle<()>> {
+        self.take_tasks()
+    }
+}
+
 #[cfg(test)]
 static TEST_REAPED_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
@@ -54,10 +113,14 @@ fn record_reaped_fallback() {
 }
 
 use super::discovery::{
-    Discovery, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits, MdnsTimingProfile,
+    Discovery, DiscoveryBackend, DiscoveryConfig, DiscoveryEvent, DiscoveryLimits,
+    MdnsTimingProfile,
 };
 use super::wire::{self, DeviceIdValidator, Frame};
 use crate::nostr::handle::derive_room_handle;
+#[cfg(test)]
+use crate::task_custodian::DedicatedTaskCustodian;
+use crate::task_custodian::{CustodianReservation, TaskCustodian};
 use crate::{
     CarrierAttribution, ErasedOwner, ErasedSource, Error, InboundSink, OutboundSource, OwnedSignal,
     SignalingMessage,
@@ -98,6 +161,174 @@ impl MdnsLimits {
             && self.outbound_queue_capacity <= Semaphore::MAX_PERMITS
             && self.discovery.validate()
             && self.timing.validate()
+    }
+}
+
+/// Exact bounded discovery ownership acquired before a backend starts. The
+/// provider receives one lease for the complete envelope so its accounting
+/// cannot omit a queue, worker, parser, or retained-address dimension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiscoveryRetention {
+    pub event_queue_slots: usize,
+    pub resolve_owner_slots: usize,
+    pub event_epoch_slots: usize,
+    pub txt_entry_slots: usize,
+    pub txt_bytes: usize,
+    pub resolved_address_slots: usize,
+    pub backend_task_slots: usize,
+    pub native_worker_slots: usize,
+    /// The outer driver's four root tasks, supervisor, and supervisor reaper.
+    /// Backend-internal custody remains separately represented by
+    /// `backend_task_slots`/`native_worker_slots`.
+    pub outer_driver_task_slots: usize,
+    /// Maximum number of task handles held by the driver's root-task Vec.
+    /// Embedded discovery contributes one backend supervisor in addition to
+    /// the four outer roots; system discovery contributes none.
+    pub outer_driver_handle_slots: usize,
+    /// The stop and completion oneshot cells owned by the driver supervisor.
+    pub outer_driver_stop_signal_slots: usize,
+    pub outer_driver_done_signal_slots: usize,
+    /// The bounded supervisor-reaper channel and its fallback storage.
+    pub outer_driver_reaper_queue_slots: usize,
+    /// The independent two-slot observer reserved for the supervisor fallback
+    /// and reaper handles when primary custody refuses.
+    pub outer_driver_external_reaper_slots: usize,
+    pub outer_driver_fallback_slots: usize,
+    pub outer_driver_fallback_overflow_slots: usize,
+    /// One watch channel carries cancellation to the four outer roots.
+    pub outer_driver_cancel_signal_slots: usize,
+    /// Bounded state retained by the selected DNS-SD dependency itself. This
+    /// remains distinct from application tasks and native workers, even when
+    /// a backend's conservative numeric bounds coincide.
+    pub opaque_dependency_slots: usize,
+    pub scratch_bytes: usize,
+}
+
+/// Exact caller-funded custody split for one driver. The driver owner carries
+/// only the two final driver handles; the embedded backend receives its own
+/// owner because it has an independent observer/runtime envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverCustodyPlan {
+    pub outer_driver_handle_slots: usize,
+    pub backend_runtime_slots: usize,
+    pub backend_observer_slots: usize,
+    pub backend_queue_slots: usize,
+    pub reaper_observer_runtime_slots: usize,
+    pub reaper_observer_task_slots: usize,
+    pub reaper_observer_queue_slots: usize,
+}
+
+/// Derive the checked custody split consumed before any driver/backend task
+/// is spawned. The reaper observer dimensions are the exact dedicated-owner
+/// envelope used by the injected driver owner, not an additional allocation.
+pub fn checked_driver_custody_plan(
+    limits: DiscoveryLimits,
+    backend: DiscoveryBackend,
+) -> Result<DriverCustodyPlan, AliasRefusal> {
+    let retention = DiscoveryRetention::from_backend(limits, backend)?;
+    let (backend_runtime_slots, backend_observer_slots, backend_queue_slots) =
+        checked_backend_custody_dimensions(backend)?;
+    Ok(DriverCustodyPlan {
+        outer_driver_handle_slots: retention.outer_driver_handle_slots,
+        backend_runtime_slots,
+        backend_observer_slots,
+        backend_queue_slots,
+        reaper_observer_runtime_slots: 1,
+        reaper_observer_task_slots: 2,
+        reaper_observer_queue_slots: 2,
+    })
+}
+
+#[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+fn checked_backend_custody_dimensions(
+    backend: DiscoveryBackend,
+) -> Result<(usize, usize, usize), AliasRefusal> {
+    match backend {
+        DiscoveryBackend::Embedded => {
+            let plan = super::discovery::checked_embedded_custody_plan()
+                .ok_or_else(|| AliasRefusal::Arithmetic("invalid embedded custody plan".into()))?;
+            Ok((plan.runtime_slots, plan.observer_slots, plan.queue_slots))
+        }
+        DiscoveryBackend::System => Ok((0, 0, 0)),
+    }
+}
+
+#[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+fn checked_backend_custody_dimensions(
+    _backend: DiscoveryBackend,
+) -> Result<(usize, usize, usize), AliasRefusal> {
+    Ok((0, 0, 0))
+}
+
+impl DiscoveryRetention {
+    /// Derive every retained discovery dimension from the caller's finite
+    /// backend limits, rejecting invalid values or checked arithmetic loss.
+    pub fn from_limits(limits: DiscoveryLimits) -> Result<Self, AliasRefusal> {
+        Self::from_backend(limits, DiscoveryBackend::Embedded)
+    }
+
+    /// Derive retention from the exact backend selected by the build. The
+    /// backend owns the queue/worker shape, so the provider claim follows its
+    /// checked residency plan rather than duplicating a hidden formula here.
+    pub fn from_backend(
+        limits: DiscoveryLimits,
+        backend: DiscoveryBackend,
+    ) -> Result<Self, AliasRefusal> {
+        if !limits.validate() {
+            return Err(AliasRefusal::Arithmetic("invalid discovery limits".into()));
+        }
+        let residency = limits
+            .checked_residency(backend)
+            .map_err(|error| AliasRefusal::Arithmetic(error.to_string()))?;
+        let native_worker_slots = match backend {
+            DiscoveryBackend::Embedded => 0,
+            DiscoveryBackend::System => residency
+                .resolve_owner_slots
+                .checked_add(2)
+                .ok_or_else(|| AliasRefusal::Arithmetic("native worker slots overflow".into()))?,
+        };
+        // Four outer roots (browse, outbound, accept, re-announce), one
+        // supervisor, and one supervisor reaper. Keep this checked even
+        // though the present constants total six: changing the spawn graph
+        // must not silently wrap the provider-facing envelope.
+        let outer_driver_task_slots = 4usize
+            .checked_add(1)
+            .and_then(|slots| slots.checked_add(1))
+            .ok_or_else(|| AliasRefusal::Arithmetic("outer driver task slots overflow".into()))?;
+        let outer_driver_handle_slots = 4usize
+            .checked_add(usize::from(matches!(backend, DiscoveryBackend::Embedded)))
+            .ok_or_else(|| AliasRefusal::Arithmetic("outer driver handle slots overflow".into()))?;
+        let outer_driver_stop_signal_slots = 1;
+        let outer_driver_done_signal_slots = 1;
+        let outer_driver_reaper_queue_slots = 1;
+        let outer_driver_external_reaper_slots = 2;
+        let outer_driver_fallback_slots = 2;
+        let outer_driver_fallback_overflow_slots = 1;
+        let outer_driver_cancel_signal_slots = 1;
+        Ok(Self {
+            event_queue_slots: residency.event_queue_slots,
+            resolve_owner_slots: residency.resolve_owner_slots,
+            event_epoch_slots: residency.event_epoch_slots,
+            txt_entry_slots: residency.concurrent_txt_entry_slots,
+            txt_bytes: residency.concurrent_scratch_bytes,
+            resolved_address_slots: residency.concurrent_address_slots,
+            backend_task_slots: match backend {
+                DiscoveryBackend::Embedded => 3,
+                DiscoveryBackend::System => 0,
+            },
+            native_worker_slots,
+            outer_driver_task_slots,
+            outer_driver_handle_slots,
+            outer_driver_stop_signal_slots,
+            outer_driver_done_signal_slots,
+            outer_driver_reaper_queue_slots,
+            outer_driver_external_reaper_slots,
+            outer_driver_fallback_slots,
+            outer_driver_fallback_overflow_slots,
+            outer_driver_cancel_signal_slots,
+            opaque_dependency_slots: residency.opaque_residual_slots,
+            scratch_bytes: residency.concurrent_scratch_bytes,
+        })
     }
 }
 
@@ -317,6 +548,12 @@ impl AliasRetention {
 /// Required application seam for retaining one discovered service alias.
 /// The returned owner is held until that exact alias is removed or displaced.
 pub trait AliasProvider: Send + Sync {
+    /// Reserve the complete bounded discovery envelope before backend start.
+    fn retain_discovery(
+        &self,
+        retention: DiscoveryRetention,
+    ) -> std::result::Result<ErasedOwner, AliasRefusal>;
+
     fn retain_alias(
         &self,
         key: &str,
@@ -399,14 +636,88 @@ pub enum MdnsOutbound {
 // announce heartbeat, which the engine's re-offer pacing expects —
 // a peer stuck at Sighted is re-offered on announce arrivals.
 
+/// Return the discovery backend selected by the target and feature set.
+///
+/// This is the single selector shared by driver startup and higher-level
+/// adapters, so retention and backend-owner decisions cannot drift apart.
+pub fn configured_discovery_backend() -> DiscoveryBackend {
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    {
+        DiscoveryBackend::System
+    }
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    {
+        DiscoveryBackend::Embedded
+    }
+}
+
 /// Start the driver. Fails fast if the mDNS daemon or the TCP
 /// listener can't come up (unlike Nostr, the fallible setup here is
 /// synchronous) — callers keep their engine-side receiver and can
 /// fall back to other transports.
+#[cfg(test)]
 pub fn start<S>(
     config: MdnsDriverConfig,
     outbound: S,
     inbound_tx: InboundSink<MdnsInbound>,
+) -> crate::Result<MdnsDriverHandle>
+where
+    S: OutboundSource<MdnsOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
+    let owner = DedicatedTaskCustodian::new(2)
+        .map_err(|error| Error::Other(format!("mDNS custodian unavailable: {error:?}")))?;
+    let reaper_owner = DedicatedTaskCustodian::new(2)
+        .map_err(|error| Error::Other(format!("mDNS reaper custodian unavailable: {error:?}")))?;
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    let backend_owner = {
+        let plan = super::discovery::checked_embedded_custody_plan()
+            .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
+        Some(
+            DedicatedTaskCustodian::new(plan.observer_slots).map_err(|error| {
+                Error::Other(format!("mDNS backend custodian unavailable: {error:?}"))
+            })? as Arc<dyn TaskCustodian>,
+        )
+    };
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    let backend_owner = None;
+    start_with_custodian(
+        config,
+        outbound,
+        inbound_tx,
+        owner,
+        backend_owner,
+        reaper_owner,
+    )
+}
+
+#[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+fn start_discovery_with_custodian(
+    config: &DiscoveryConfig,
+    backend_custodian_owner: Option<Arc<dyn TaskCustodian>>,
+) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
+    let owner = backend_custodian_owner.ok_or_else(|| {
+        Error::Other("embedded discovery requires provider-funded task custody".into())
+    })?;
+    Discovery::start_with_custodian(config, owner)
+}
+
+#[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+fn start_discovery_with_custodian(
+    config: &DiscoveryConfig,
+    _backend_custodian_owner: Option<Arc<dyn TaskCustodian>>,
+) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
+    Discovery::start(config)
+}
+
+/// Start with lifecycle-owned bounded custody for final driver handles.
+pub fn start_with_custodian<S>(
+    config: MdnsDriverConfig,
+    outbound: S,
+    inbound_tx: InboundSink<MdnsInbound>,
+    custodian_owner: Arc<dyn TaskCustodian>,
+    backend_custodian_owner: Option<Arc<dyn TaskCustodian>>,
+    reaper_custodian_owner: Arc<dyn TaskCustodian>,
 ) -> crate::Result<MdnsDriverHandle>
 where
     S: OutboundSource<MdnsOutbound> + Send + 'static,
@@ -418,6 +729,18 @@ where
     if !config.limits.validate() {
         return Err(Error::Other("invalid mDNS workload limits".into()));
     }
+    let discovery_retention =
+        DiscoveryRetention::from_backend(config.limits.discovery, configured_discovery_backend())
+            .map_err(|refusal| {
+            Error::Other(format!("mDNS discovery retention refused: {refusal:?}"))
+        })?;
+    let discovery_owner = config
+        .alias_provider
+        .retain_discovery(discovery_retention)
+        .map_err(|refusal| {
+            Error::Other(format!("mDNS discovery retention refused: {refusal:?}"))
+        })?;
+    let discovery_owner = Arc::new(Mutex::new(Some(discovery_owner)));
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
 
     // TCP exchange listener first — its port goes into the SRV record.
@@ -432,16 +755,27 @@ where
         .map_err(|e| Error::Bind("set_nonblocking".into(), e))?;
 
     let instance = wire::instance_name(&room_handle, &config.device_id);
+    // Reserve the driver supervisor before Discovery::start or any driver
+    // task can spawn. The independent reaper owner below reserves both final
+    // reaper paths so refusal of this primary owner remains nonblocking.
+    let custodian = custodian_owner
+        .reserve(1)
+        .map_err(|error| Error::Other(format!("mDNS final-task custodian exhausted: {error:?}")))?;
+    let reaper_custodian = reaper_custodian_owner
+        .reserve(2)
+        .map_err(|error| Error::Other(format!("mDNS reaper custody exhausted: {error:?}")))?;
     // Browse starts inside the backend before the first register, so we never
     // miss a burst of resolves racing our own announce.
-    let (mut discovery, browse_rx) = Discovery::start(&DiscoveryConfig {
+    let discovery_config = DiscoveryConfig {
         service_type: wire::SERVICE_TYPE.to_string(),
         instance,
         port,
         txt: wire::txt_properties(&room_handle, &config.device_id),
         limits: config.limits.discovery,
         timing: config.limits.timing,
-    })?;
+    };
+    let (mut discovery, browse_rx) =
+        start_discovery_with_custodian(&discovery_config, backend_custodian_owner)?;
     let discovery_task = discovery.take_task();
     let discovery = Arc::new(discovery);
 
@@ -465,6 +799,7 @@ where
         device_id_validator: config.device_id_validator,
         alias_provider: config.alias_provider,
         discovery: discovery.clone(),
+        discovery_owner: discovery_owner.clone(),
         registered: AtomicBool::new(registered),
         peers: Mutex::new(PeerOwnership::with_max_peers(
             config.limits.max_discovered_peers,
@@ -535,7 +870,9 @@ where
         supervisor_stop_rx,
         supervisor_done,
     ));
-    let (supervisor_reaper, supervisor_reaper_task) = spawn_task_reaper(1);
+    let fallback_reaper_tasks = FallbackReaperTasks::new(2);
+    let (supervisor_reaper, supervisor_reaper_task) =
+        spawn_task_reaper(1, Arc::clone(&fallback_reaper_tasks));
 
     Ok(MdnsDriverHandle {
         discovery,
@@ -544,8 +881,14 @@ where
         supervisor: Some(supervisor),
         supervisor_reaper: Some(supervisor_reaper),
         supervisor_reaper_task: Some(supervisor_reaper_task),
+        fallback_reaper_tasks,
+        custodian_owner,
+        custodian: Some(custodian),
+        reaper_custodian_owner,
+        reaper_custodian: Some(reaper_custodian),
         supervisor_stop: Some(supervisor_stop),
         supervisor_done: Some(supervisor_done_rx),
+        discovery_owner,
     })
 }
 
@@ -559,8 +902,16 @@ pub struct MdnsDriverHandle {
     supervisor: Option<JoinHandle<()>>,
     supervisor_reaper: Option<mpsc::Sender<JoinHandle<()>>>,
     supervisor_reaper_task: Option<JoinHandle<()>>,
+    fallback_reaper_tasks: Arc<FallbackReaperTasks>,
+    custodian_owner: Arc<dyn TaskCustodian>,
+    custodian: Option<CustodianReservation>,
+    reaper_custodian_owner: Arc<dyn TaskCustodian>,
+    reaper_custodian: Option<CustodianReservation>,
     supervisor_stop: Option<oneshot::Sender<()>>,
     supervisor_done: Option<oneshot::Receiver<()>>,
+    /// Shared so synchronous Drop keeps the provider lease alive with the
+    /// supervisor-owned tasks until their exact joins have been observed.
+    discovery_owner: Arc<Mutex<Option<ErasedOwner>>>,
 }
 
 impl MdnsDriverHandle {
@@ -581,7 +932,7 @@ impl MdnsDriverHandle {
         self.request_stop();
         self.request_supervisor_stop();
         if let Some(supervisor) = self.supervisor.take() {
-            let _ = supervisor.await;
+            observe_mdns_task(supervisor, "mDNS supervisor").await;
         }
         if let Some(done) = self.supervisor_done.take() {
             let _ = done.await;
@@ -589,8 +940,14 @@ impl MdnsDriverHandle {
         let reaper = self.supervisor_reaper.take();
         drop(reaper);
         if let Some(reaper_task) = self.supervisor_reaper_task.take() {
-            let _ = reaper_task.await;
+            observe_mdns_task(reaper_task, "mDNS task reaper").await;
         }
+        reap_fallback_reaper_tasks(&self.fallback_reaper_tasks).await;
+        // All driver, connection, and discovery tasks have settled at this
+        // point, so releasing the provider lease cannot race backend use.
+        let _ = self.discovery_owner.lock().take();
+        self.custodian_owner.close();
+        self.reaper_custodian_owner.close();
     }
 
     fn request_supervisor_stop(&mut self) {
@@ -604,30 +961,103 @@ impl Drop for MdnsDriverHandle {
     fn drop(&mut self) {
         self.request_stop();
         self.request_supervisor_stop();
+        let mut custodian = self.custodian.take();
+        let mut reaper_custodian = self.reaper_custodian.take();
         if let Some(supervisor) = self.supervisor.take() {
-            if let Some(reaper) = self.supervisor_reaper.as_ref() {
-                join_supervisor(reaper, supervisor);
-            } else {
-                let _ = futures::executor::block_on(supervisor);
-            }
+            submit_to_terminal_custody(
+                &mut custodian,
+                &mut reaper_custodian,
+                supervisor,
+                "mDNS supervisor",
+            );
         }
         drop(self.supervisor_reaper.take());
+        if let Some(reaper_task) = self.supervisor_reaper_task.take() {
+            // Never route this handle through `fallback_reaper_tasks`: the
+            // reaper task owns the code that drains that queue. The separate
+            // injected owner has a reserved permit for this terminal handle.
+            submit_to_terminal_custody(
+                &mut reaper_custodian,
+                &mut custodian,
+                reaper_task,
+                "mDNS external reaper",
+            );
+        }
     }
 }
 
-fn join_supervisor(reaper: &mpsc::Sender<JoinHandle<()>>, supervisor: JoinHandle<()>) {
+fn submit_to_terminal_custody(
+    primary: &mut Option<CustodianReservation>,
+    independent: &mut Option<CustodianReservation>,
+    task: JoinHandle<()>,
+    context: &str,
+) {
+    let task = if let Some(primary) = primary.as_mut() {
+        match primary.submit(task) {
+            Ok(()) => return,
+            Err(task) => task,
+        }
+    } else {
+        task
+    };
+    if let Some(independent) = independent.as_mut() {
+        if independent.submit(task).is_ok() {
+            return;
+        }
+    }
+    // Reservations are exact and established before spawn. Reaching this
+    // branch means an injected lifecycle owner violated that contract; keep
+    // the failure explicit instead of blocking, detaching, or dropping the
+    // terminal handle on the caller's runtime.
+    panic!("{context} terminal custody refused after exact pre-reservation");
+}
+
+#[cfg(test)]
+fn submit_to_custodian_or_reaper_or_fallback(
+    custodian: &mut Option<CustodianReservation>,
+    reaper_custodian: &mut Option<CustodianReservation>,
+    fallback: &Arc<FallbackReaperTasks>,
+    task: JoinHandle<()>,
+    context: &str,
+) {
+    let task = if let Some(custodian) = custodian.as_mut() {
+        match custodian.submit(task) {
+            Ok(()) => return,
+            Err(task) => task,
+        }
+    } else {
+        task
+    };
+    let task = if let Some(reaper_custodian) = reaper_custodian.as_mut() {
+        match reaper_custodian.submit(task) {
+            Ok(()) => return,
+            Err(task) => task,
+        }
+    } else {
+        task
+    };
+    retain_or_overflow(fallback, task, context);
+}
+
+#[cfg(test)]
+fn join_supervisor(
+    reaper: &mpsc::Sender<JoinHandle<()>>,
+    supervisor: JoinHandle<()>,
+    fallback: &Arc<FallbackReaperTasks>,
+) {
     match reaper.try_send(supervisor) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(supervisor))
         | Err(tokio::sync::mpsc::error::TrySendError::Closed(supervisor)) => {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = supervisor.await;
-                    #[cfg(test)]
-                    record_reaped_fallback();
-                });
+            if tokio::runtime::Handle::try_current().is_ok() {
+                retain_or_overflow(fallback, supervisor, "mDNS supervisor");
             } else {
-                let _ = futures::executor::block_on(supervisor);
+                let result = futures::executor::block_on(supervisor);
+                if let Err(error) = result {
+                    if !error.is_cancelled() {
+                        warn!("synchronously reaped mDNS fallback supervisor: {error}");
+                    }
+                }
                 #[cfg(test)]
                 record_reaped_fallback();
             }
@@ -635,17 +1065,75 @@ fn join_supervisor(reaper: &mpsc::Sender<JoinHandle<()>>, supervisor: JoinHandle
     }
 }
 
-fn spawn_task_reaper(capacity: usize) -> (mpsc::Sender<JoinHandle<()>>, JoinHandle<()>) {
+#[cfg(test)]
+fn retain_or_overflow(fallback: &Arc<FallbackReaperTasks>, task: JoinHandle<()>, context: &str) {
+    let task = match fallback.retain(task) {
+        Ok(()) => return,
+        Err(task) => task,
+    };
+    if let Err(task) = fallback.retain_overflow(task) {
+        abort_and_observe(task, context);
+        #[cfg(test)]
+        record_reaped_fallback();
+    }
+}
+
+#[cfg(test)]
+fn abort_and_observe(task: JoinHandle<()>, context: &str) {
+    task.abort();
+    match futures::executor::block_on(task) {
+        Ok(()) => trace!(%context, "aborted task joined normally"),
+        Err(error) if error.is_cancelled() => {
+            debug!(%context, ?error, "aborted task terminal observed")
+        }
+        Err(error) if error.is_panic() => warn!(%context, ?error, "aborted task panicked"),
+        Err(error) => warn!(%context, ?error, "aborted task failed to join"),
+    }
+}
+
+async fn reap_fallback_reaper_tasks(fallback: &Arc<FallbackReaperTasks>) {
+    let tasks = fallback.take_all();
+    for task in tasks {
+        observe_mdns_task(task, "mDNS fallback reaper").await;
+        #[cfg(test)]
+        record_reaped_fallback();
+    }
+}
+
+async fn observe_mdns_task(task: JoinHandle<()>, context: &str) {
+    match task.await {
+        Ok(()) => trace!(%context, "task joined normally"),
+        Err(error) if error.is_cancelled() => {
+            debug!(%context, ?error, "task was cancelled")
+        }
+        Err(error) if error.is_panic() => warn!(%context, ?error, "task panicked"),
+        Err(error) => warn!(%context, ?error, "task failed to join"),
+    }
+}
+
+fn spawn_task_reaper(
+    capacity: usize,
+    fallback: Arc<FallbackReaperTasks>,
+) -> (mpsc::Sender<JoinHandle<()>>, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
     let task = tokio::spawn(async move {
-        reap_owned_tasks(receiver).await;
+        reap_owned_tasks(receiver, fallback).await;
     });
     (sender, task)
 }
 
-async fn reap_owned_tasks(mut receiver: mpsc::Receiver<JoinHandle<()>>) {
+async fn reap_owned_tasks(
+    mut receiver: mpsc::Receiver<JoinHandle<()>>,
+    fallback: Arc<FallbackReaperTasks>,
+) {
     while let Some(task) = receiver.recv().await {
-        let _ = task.await;
+        observe_mdns_task(task, "mDNS driver task").await;
+    }
+    let tasks = fallback.take_tasks();
+    for task in tasks {
+        observe_mdns_task(task, "mDNS fallback task").await;
+        #[cfg(test)]
+        record_reaped_fallback();
     }
 }
 
@@ -668,10 +1156,21 @@ async fn supervise_driver_tasks(
         task.abort();
     }
     while let Some(task) = tasks.pop() {
-        let _ = task.await;
+        observe_mdns_task(task, "mDNS driver task").await;
     }
     let mut connection_tasks = { connection_tasks.lock().take().unwrap_or_default() };
-    while connection_tasks.join_next().await.is_some() {}
+    while let Some(result) = connection_tasks.join_next().await {
+        match result {
+            Ok(()) => trace!("mDNS connection worker completed during shutdown"),
+            Err(error) if error.is_panic() => {
+                warn!(?error, "mDNS connection worker panicked during shutdown")
+            }
+            Err(error) if error.is_cancelled() => {
+                debug!(?error, "mDNS connection worker cancelled during shutdown")
+            }
+            Err(error) => warn!(?error, "mDNS connection worker failed during shutdown"),
+        }
+    }
     let _ = done.send(());
 }
 
@@ -681,6 +1180,7 @@ struct Shared {
     device_id_validator: DeviceIdValidator,
     alias_provider: Arc<dyn AliasProvider>,
     discovery: Arc<Discovery>,
+    discovery_owner: Arc<Mutex<Option<ErasedOwner>>>,
     registered: AtomicBool,
     /// Peers resolved in our room: device id → exchange endpoint.
     peers: Mutex<PeerOwnership>,
@@ -1172,6 +1672,7 @@ fn reap_connection_tasks(shared: &Shared) {
 }
 
 async fn run_browse(shared: Arc<Shared>, mut browse_rx: mpsc::Receiver<DiscoveryEvent>) {
+    let _discovery_owner = Arc::clone(&shared.discovery_owner);
     // Stream closes when the backend shuts down.
     let mut cancel = shared.cancel.subscribe();
     loop {
@@ -2006,6 +2507,25 @@ async fn run_reannounce(shared: Arc<Shared>) {
 mod tests {
     use super::*;
 
+    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
+    fn start_test_discovery(
+        cfg: &DiscoveryConfig,
+    ) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
+        let plan = super::super::discovery::checked_embedded_custody_plan()
+            .expect("embedded custody plan is valid");
+        let owner = DedicatedTaskCustodian::new(plan.observer_slots)
+            .expect("embedded discovery custodian starts")
+            as Arc<dyn TaskCustodian>;
+        Discovery::start_with_custodian(cfg, owner)
+    }
+
+    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
+    fn start_test_discovery(
+        cfg: &DiscoveryConfig,
+    ) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
+        Discovery::start(cfg)
+    }
+
     fn panicking_task(
         message: &'static str,
     ) -> (
@@ -2165,7 +2685,7 @@ mod tests {
             limits: limits.discovery,
             timing: limits.timing,
         };
-        let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
+        let (discovery, _events) = start_test_discovery(&cfg).expect("embedded discovery start");
         let (in_tx, _in_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             room_handle: "room".into(),
@@ -2177,6 +2697,7 @@ mod tests {
                 refuse_after: None,
             }),
             discovery: Arc::new(discovery),
+            discovery_owner: Arc::new(Mutex::new(None)),
             registered: AtomicBool::new(false),
             peers: Mutex::new(PeerOwnership::with_max_peers(limits.max_discovered_peers)),
             aliases: Mutex::new(AliasOwnership::default()),
@@ -2340,10 +2861,202 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_drop_transfers_final_handles_to_external_custodian() {
+        struct DropMark(Arc<Notify>);
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let cfg = DiscoveryConfig {
+            service_type: wire::SERVICE_TYPE.to_string(),
+            instance: format!("mdns-custodian-{}", std::process::id()),
+            port: 0,
+            txt: Vec::new(),
+            limits: DiscoveryLimits::default(),
+            timing: MdnsTimingProfile::default(),
+        };
+        let (discovery, _events) = start_test_discovery(&cfg).expect("embedded discovery start");
+        let (supervisor_stop, supervisor_stop_rx) = oneshot::channel();
+        let supervisor_done_rx = None;
+        let fallback_reaper_tasks = FallbackReaperTasks::new(0);
+        let (supervisor_reaper, supervisor_reaper_task) =
+            spawn_task_reaper(1, Arc::clone(&fallback_reaper_tasks));
+        let dropped = Arc::new(Notify::new());
+        let dropped_in_supervisor = Arc::clone(&dropped);
+        let supervisor = tokio::spawn(async move {
+            let _mark = DropMark(dropped_in_supervisor);
+            supervisor_stop_rx
+                .await
+                .expect("Drop must signal the supervisor");
+        });
+        let custodian_owner = DedicatedTaskCustodian::new(1).expect("test custodian");
+        let custodian = custodian_owner
+            .reserve(1)
+            .expect("the primary custodian must reserve the supervisor handle");
+        let reaper_custodian_owner = DedicatedTaskCustodian::new(2).expect("reaper custodian");
+        let reaper_custodian = reaper_custodian_owner
+            .reserve(2)
+            .expect("the independent custodian must reserve both final handles");
+        let handle = MdnsDriverHandle {
+            discovery: Arc::new(discovery),
+            stopped: Arc::new(AtomicBool::new(false)),
+            cancel: watch::channel(false).0,
+            supervisor: Some(supervisor),
+            supervisor_reaper: Some(supervisor_reaper),
+            supervisor_reaper_task: Some(supervisor_reaper_task),
+            fallback_reaper_tasks,
+            custodian_owner,
+            custodian: Some(custodian),
+            reaper_custodian_owner,
+            reaper_custodian: Some(reaper_custodian),
+            supervisor_stop: Some(supervisor_stop),
+            supervisor_done: supervisor_done_rx,
+            discovery_owner: Arc::new(Mutex::new(None)),
+        };
+        drop(handle);
+
+        timeout(Duration::from_secs(2), dropped.notified())
+            .await
+            .expect("mDNS Drop must transfer and observe the supervisor externally");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_primary_custody_uses_independent_reaper_owner() {
+        let primary_owner = DedicatedTaskCustodian::new(1).expect("primary custodian");
+        let primary = primary_owner
+            .reserve(1)
+            .expect("primary supervisor reservation");
+        primary_owner.close();
+
+        let reaper_owner = DedicatedTaskCustodian::new(2).expect("reaper custodian");
+        let mut reaper = Some(
+            reaper_owner
+                .reserve(2)
+                .expect("independent reaper reservation"),
+        );
+        let mut primary = Some(primary);
+        let mut progress = reaper_owner.progress();
+        let (panic_task, started) = panicking_task("closed primary custody");
+        started
+            .await
+            .expect("panic terminal starts before transfer");
+        tokio::task::yield_now().await;
+        submit_to_terminal_custody(
+            &mut primary,
+            &mut reaper,
+            panic_task,
+            "mDNS closed-primary control",
+        );
+        timeout(Duration::from_secs(1), progress.changed())
+            .await
+            .expect("independent reaper observes the refused-primary terminal")
+            .expect("reaper progress remains live");
+        assert_eq!(*progress.borrow(), 1);
+
+        let normal_task = tokio::spawn(async {});
+        submit_to_terminal_custody(
+            &mut primary,
+            &mut reaper,
+            normal_task,
+            "mDNS closed-primary second control",
+        );
+        timeout(Duration::from_secs(1), progress.changed())
+            .await
+            .expect("independent reaper observes its second terminal")
+            .expect("reaper progress remains live");
+        assert_eq!(*progress.borrow(), 2);
+        reaper_owner.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_capacity_refusal_returns_exact_panicking_handle() {
+        let fallback = FallbackReaperTasks::new(0);
+        let (task, started) = panicking_task("mDNS fallback capacity refusal");
+        started.await.expect("panic task must start before refusal");
+        let task = fallback
+            .retain(task)
+            .expect_err("zero-capacity custody must return the exact handle");
+        let error = task.await.expect_err("returned panic must be observed");
+        assert!(error.is_panic());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_overflow_transfer_observes_panicking_task() {
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+        let fallback = FallbackReaperTasks::new(0);
+        let (task, started) = panicking_task("mDNS bounded fallback overflow");
+        started
+            .await
+            .expect("panic task must start before transfer");
+        retain_or_overflow(&fallback, task, "mDNS overflow control");
+        reap_fallback_reaper_tasks(&fallback).await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "bounded overflow custody must observe the exact panic"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_final_custody_refusals_observe_each_terminal_once() {
+        struct RefusingReservation;
+
+        impl crate::task_custodian::TaskReservation for RefusingReservation {
+            fn submit(
+                &mut self,
+                task: tokio::task::JoinHandle<()>,
+            ) -> Result<(), tokio::task::JoinHandle<()>> {
+                Err(task)
+            }
+        }
+
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+        for primary_present in [true, false] {
+            let fallback = FallbackReaperTasks::new(0);
+            let filler = tokio::spawn(std::future::pending::<()>());
+            fallback
+                .retain_overflow(filler)
+                .expect("the bounded overflow slot must admit its one filler");
+            let (task, started) = panicking_task("both final custody refusals");
+            started
+                .await
+                .expect("refused child must reach its terminal path");
+            tokio::task::yield_now().await;
+            let mut custodian =
+                primary_present.then(|| Box::new(RefusingReservation) as CustodianReservation);
+            let mut reaper_custodian = None;
+            submit_to_custodian_or_reaper_or_fallback(
+                &mut custodian,
+                &mut reaper_custodian,
+                &fallback,
+                task,
+                "mDNS both-final-custody-refusal",
+            );
+            let filler = fallback
+                .take_all()
+                .pop()
+                .expect("the overflow filler remains explicitly owned");
+            filler.abort();
+            assert!(
+                filler.await.is_err(),
+                "overflow filler terminal is observed"
+            );
+        }
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 2,
+            "both refusal permutations observe the refused terminal exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reaper_full_and_closed_fallbacks_observe_panics_in_and_outside_runtime() {
-        let wake = TEST_REAPED_FALLBACK_WAKE.get_or_init(Notify::new);
         let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
 
+        let fallback_reaper_tasks = FallbackReaperTasks::new(1);
         let (full_sender, mut full_receiver) = mpsc::channel(1);
         full_sender
             .try_send(tokio::spawn(std::future::pending::<()>()))
@@ -2352,8 +3065,8 @@ mod tests {
         started
             .await
             .expect("the full fallback child starts before transfer");
-        join_supervisor(&full_sender, task);
-        wake.notified().await;
+        join_supervisor(&full_sender, task, &fallback_reaper_tasks);
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 1,
@@ -2363,7 +3076,7 @@ mod tests {
             .try_recv()
             .expect("the full-channel filler remains explicitly owned");
         filler.abort();
-        let _ = filler.await;
+        assert!(filler.await.is_err(), "aborted filler must be observed");
 
         let (closed_sender, closed_receiver) = mpsc::channel(1);
         drop(closed_receiver);
@@ -2371,8 +3084,8 @@ mod tests {
         started
             .await
             .expect("the closed fallback child starts before transfer");
-        join_supervisor(&closed_sender, task);
-        wake.notified().await;
+        join_supervisor(&closed_sender, task, &fallback_reaper_tasks);
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 2,
@@ -2388,7 +3101,8 @@ mod tests {
         started
             .await
             .expect("the outside-runtime full child starts before transfer");
-        std::thread::spawn(move || join_supervisor(&full_sender, task))
+        let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
+        std::thread::spawn(move || join_supervisor(&full_sender, task, &fallback_for_thread))
             .join()
             .expect("outside-runtime full fallback returns after joining");
         assert_eq!(
@@ -2400,7 +3114,7 @@ mod tests {
             .try_recv()
             .expect("the no-runtime full filler remains explicitly owned");
         filler.abort();
-        let _ = filler.await;
+        assert!(filler.await.is_err(), "aborted filler must be observed");
 
         let (closed_sender, closed_receiver) = mpsc::channel(1);
         drop(closed_receiver);
@@ -2409,7 +3123,8 @@ mod tests {
         started
             .await
             .expect("the outside-runtime closed child starts before transfer");
-        std::thread::spawn(move || join_supervisor(&closed_sender, task))
+        let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
+        std::thread::spawn(move || join_supervisor(&closed_sender, task, &fallback_for_thread))
             .join()
             .expect("outside-runtime closed fallback returns after joining");
         assert_eq!(
@@ -2609,6 +3324,13 @@ mod tests {
     }
 
     impl AliasProvider for CountingProvider {
+        fn retain_discovery(
+            &self,
+            _retention: DiscoveryRetention,
+        ) -> std::result::Result<ErasedOwner, AliasRefusal> {
+            Ok(Box::new(()))
+        }
+
         fn retain_alias(
             &self,
             _key: &str,
@@ -2647,6 +3369,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn discovery_retention_derives_each_bounded_dimension() {
+        let limits = DiscoveryLimits {
+            max_resolve_owners: 3,
+            event_capacity: 5,
+            max_event_epochs: 7,
+            max_txt_entries: 8,
+            max_txt_bytes: 512,
+            max_resolved_addresses: 4,
+        };
+        let retention = DiscoveryRetention::from_backend(limits, DiscoveryBackend::Embedded)
+            .expect("valid retention");
+        assert_eq!(retention.event_queue_slots, 10);
+        assert_eq!(retention.resolve_owner_slots, 3);
+        assert_eq!(retention.event_epoch_slots, 0);
+        assert_eq!(retention.txt_entry_slots, 24);
+        assert_eq!(
+            retention.txt_bytes,
+            3 * (512 + 4 * std::mem::size_of::<IpAddr>())
+        );
+        assert_eq!(retention.resolved_address_slots, 12);
+        assert_eq!(retention.backend_task_slots, 3);
+        assert_eq!(retention.native_worker_slots, 0);
+        assert_eq!(retention.outer_driver_task_slots, 6);
+        assert_eq!(retention.outer_driver_handle_slots, 5);
+        assert_eq!(retention.outer_driver_stop_signal_slots, 1);
+        assert_eq!(retention.outer_driver_done_signal_slots, 1);
+        assert_eq!(retention.outer_driver_reaper_queue_slots, 1);
+        assert_eq!(retention.outer_driver_external_reaper_slots, 2);
+        assert_eq!(retention.outer_driver_fallback_slots, 2);
+        assert_eq!(retention.outer_driver_fallback_overflow_slots, 1);
+        assert_eq!(retention.outer_driver_cancel_signal_slots, 1);
+        assert_eq!(retention.opaque_dependency_slots, 3);
+        assert_eq!(
+            retention.scratch_bytes,
+            3 * (512 + 4 * std::mem::size_of::<IpAddr>())
+        );
+        let driver_plan = checked_driver_custody_plan(limits, DiscoveryBackend::Embedded)
+            .expect("valid driver custody plan");
+        assert_eq!(driver_plan.outer_driver_handle_slots, 5);
+        assert_eq!(driver_plan.backend_runtime_slots, 1);
+        assert_eq!(driver_plan.backend_observer_slots, 3);
+        assert_eq!(driver_plan.backend_queue_slots, 3);
+        assert_eq!(driver_plan.reaper_observer_runtime_slots, 1);
+        assert_eq!(driver_plan.reaper_observer_task_slots, 2);
+        assert_eq!(driver_plan.reaper_observer_queue_slots, 2);
+
+        let system = DiscoveryRetention::from_backend(limits, DiscoveryBackend::System)
+            .expect("valid system retention");
+        assert_eq!(system.resolve_owner_slots, 3);
+        assert_eq!(system.backend_task_slots, 0);
+        assert_eq!(system.native_worker_slots, 5);
+        assert_eq!(system.outer_driver_task_slots, 6);
+        assert_eq!(system.outer_driver_handle_slots, 4);
+        assert_eq!(system.outer_driver_stop_signal_slots, 1);
+        assert_eq!(system.outer_driver_done_signal_slots, 1);
+        assert_eq!(system.outer_driver_reaper_queue_slots, 1);
+        assert_eq!(system.outer_driver_external_reaper_slots, 2);
+        assert_eq!(system.outer_driver_fallback_slots, 2);
+        assert_eq!(system.outer_driver_fallback_overflow_slots, 1);
+        assert_eq!(system.outer_driver_cancel_signal_slots, 1);
+        assert_eq!(system.opaque_dependency_slots, 5);
+
+        let mut invalid = limits;
+        invalid.event_capacity = 0;
+        assert!(DiscoveryRetention::from_limits(invalid).is_err());
+    }
+
     #[cfg_attr(
         any(target_os = "ios", feature = "system-dnssd"),
         ignore = "requires the system mDNS daemon"
@@ -2677,7 +3467,7 @@ mod tests {
             limits: limits.discovery,
             timing: limits.timing,
         };
-        let (discovery, _events) = Discovery::start(&cfg).expect("embedded discovery start");
+        let (discovery, _events) = start_test_discovery(&cfg).expect("embedded discovery start");
         let (in_tx, _in_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             room_handle: "room".into(),
@@ -2689,6 +3479,7 @@ mod tests {
                 refuse_after: Some(3),
             }),
             discovery: Arc::new(discovery),
+            discovery_owner: Arc::new(Mutex::new(None)),
             registered: AtomicBool::new(false),
             peers: Mutex::new(PeerOwnership::with_max_peers(limits.max_discovered_peers)),
             aliases: Mutex::new(AliasOwnership::default()),

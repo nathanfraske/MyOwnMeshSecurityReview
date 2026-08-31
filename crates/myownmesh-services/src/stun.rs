@@ -13,33 +13,33 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Condvar;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
 use stun::message::{Message, BINDING_REQUEST, BINDING_SUCCESS};
 use stun::xoraddr::XorMappedAddress;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
 use myownmesh_core::config::StunServiceConfig;
+use myownmesh_core::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
 
+use crate::turn::{reserve_final_task_custody, FinalTaskCustody};
 use crate::{Error, Result};
 
-/// A running STUN server. Constructed via [`StunServer::start`].
+/// A running STUN server. Constructed via
+/// [`StunServer::start_with_resource_scope`].
 pub struct StunServer;
-
-type TaskReaperSender = mpsc::Sender<ReapEntry>;
-
-struct ReapEntry {
-    task: JoinHandle<()>,
-    terminal: Arc<TaskTerminal>,
-}
 
 struct TaskTerminal {
     finished: AtomicBool,
     notify: Notify,
+    #[cfg(test)]
+    done: (std::sync::Mutex<bool>, Condvar),
 }
 
 impl TaskTerminal {
@@ -47,24 +47,48 @@ impl TaskTerminal {
         Self {
             finished: AtomicBool::new(false),
             notify: Notify::new(),
+            #[cfg(test)]
+            done: (std::sync::Mutex::new(false), Condvar::new()),
         }
     }
 
     fn mark(&self) {
         self.finished.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        #[cfg(test)]
+        {
+            let (done, wake) = &self.done;
+            *done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_finished(&self) {
+        let (done, wake) = &self.done;
+        let mut done = done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*done {
+            done = wake
+                .wait(done)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
 /// Handle to a running STUN server. Call [`StunServerHandle::stop_and_wait`]
 /// to abort and join the listener. Dropping it aborts the listener and hands
-/// its exact join handle to a bounded runtime-owned reaper for terminal
-/// observation when the owner cannot await.
+/// its exact join handle to the service's explicitly bounded final custodian
+/// for terminal observation when the owner cannot await. The terminal closure
+/// joins the original task directly on the custodian worker.
 pub struct StunServerHandle {
     task: Option<JoinHandle<()>>,
     terminal: Arc<TaskTerminal>,
-    task_reaper: Option<TaskReaperSender>,
-    task_reaper_handle: Option<JoinHandle<()>>,
+    final_task_custody: FinalTaskCustody,
+    service_lease: Option<ResourceLease>,
     local_addr: SocketAddr,
 }
 
@@ -89,12 +113,7 @@ impl StunServerHandle {
             Ok(())
         };
         self.terminal.mark();
-        drop(self.task_reaper.take());
-        if let Some(reaper) = self.task_reaper_handle.take() {
-            reaper
-                .await
-                .map_err(|error| Error::TaskJoin(error.to_string()))?;
-        }
+        drop(self.service_lease.take());
         match task_result {
             Ok(()) => Ok(()),
             Err(error) if error.is_cancelled() => Ok(()),
@@ -105,60 +124,33 @@ impl StunServerHandle {
 
 impl Drop for StunServerHandle {
     fn drop(&mut self) {
+        let final_task_custody = &mut self.final_task_custody;
         let Some(task) = self.task.take() else {
             return;
         };
         task.abort();
-        let entry = ReapEntry {
-            task,
-            terminal: Arc::clone(&self.terminal),
-        };
-        let Some(reaper) = self.task_reaper.take() else {
-            reap_without_runtime(entry);
-            return;
-        };
-        match reaper.try_send(entry) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(entry))
-            | Err(mpsc::error::TrySendError::Closed(entry)) => reap_without_runtime(entry),
-        }
-        // The reaper owns the exact join handle and exits when this sender is
-        // dropped. Async owners should use stop_and_wait to join the reaper
-        // task itself as well.
-        drop(self.task_reaper_handle.take());
+        let terminal = Arc::clone(&self.terminal);
+        let service_lease = self.service_lease.take();
+        submit_final_task(
+            Box::new(move || {
+                if let Err(error) = join_without_runtime(task) {
+                    if !error.is_cancelled() {
+                        warn!("dropped STUN listener did not join normally: {error}");
+                    }
+                }
+                terminal.mark();
+                drop(service_lease);
+            }),
+            final_task_custody,
+        );
     }
 }
 
-fn spawn_task_reaper() -> (TaskReaperSender, JoinHandle<()>) {
-    let (sender, mut receiver) = mpsc::channel(1);
-    let task = tokio::spawn(async move {
-        while let Some(entry) = receiver.recv().await {
-            reap_entry(entry).await;
-        }
-    });
-    (sender, task)
-}
-
-async fn reap_entry(entry: ReapEntry) {
-    if let Err(error) = entry.task.await {
-        if !error.is_cancelled() {
-            warn!("dropped STUN listener did not join normally: {error}");
-        }
-    }
-    entry.terminal.mark();
-}
-
-fn reap_without_runtime(entry: ReapEntry) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(reap_entry(entry));
-    } else {
-        let ReapEntry { task, terminal } = entry;
-        if let Err(error) = join_without_runtime(task) {
-            if !error.is_cancelled() {
-                warn!("dropped STUN listener did not join normally: {error}");
-            }
-        }
-        terminal.mark();
+fn submit_final_task(task: Box<dyn FnOnce() + Send + 'static>, custody: &mut FinalTaskCustody) {
+    if let Err(task) = custody.submit(task) {
+        // Refusal is explicit and nonblocking. The exact owned terminal job
+        // is run here; no fallback thread may detach the observation.
+        task();
     }
 }
 
@@ -189,10 +181,27 @@ fn join_without_runtime(
 }
 
 impl StunServer {
-    /// Bind a UDP socket and start serving Binding requests. Returns
-    /// once the socket is bound; the request loop runs in a spawned
-    /// task.
+    /// The unscoped constructor is intentionally non-binding. Service
+    /// ownership must come from the process owner's resource scope.
     pub async fn start(config: &StunServiceConfig) -> Result<StunServerHandle> {
+        let _ = config;
+        Err(Error::Resource(
+            "owner-selected resource scope required; use start_with_resource_scope".into(),
+        ))
+    }
+
+    /// Bind a UDP socket and start serving Binding requests under exact
+    /// owner-funded custody. The scope is consumed by the service boundary;
+    /// the noncloneable lease remains with the handle until terminal join.
+    pub async fn start_with_resource_scope(
+        config: &StunServiceConfig,
+        scope: LocalApplicationResourceScope,
+    ) -> Result<StunServerHandle> {
+        let service_lease = scope
+            .acquire(stun_startup_claim())
+            .map_err(|error| Error::Resource(error.to_string()))?;
+        let final_task_custody = reserve_final_task_custody(1)
+            .ok_or_else(|| Error::TaskJoin("service final-task custody exhausted".into()))?;
         let addr = format!("{}:{}", config.bind, config.port);
         let socket = UdpSocket::bind(&addr)
             .await
@@ -203,16 +212,23 @@ impl StunServer {
         info!(%local_addr, "STUN server listening");
         let socket = Arc::new(socket);
         let terminal = Arc::new(TaskTerminal::new());
-        let (task_reaper, task_reaper_handle) = spawn_task_reaper();
         let task = tokio::spawn(serve(socket));
         Ok(StunServerHandle {
             task: Some(task),
             terminal,
-            task_reaper: Some(task_reaper),
-            task_reaper_handle: Some(task_reaper_handle),
+            final_task_custody,
+            service_lease: Some(service_lease),
             local_addr,
         })
     }
+}
+
+fn stun_startup_claim() -> ResourceClaim {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::SocketOrHandle, 1),
+        (ResourceClass::WorkerOrTask, 2),
+    ])
+    .expect("fixed STUN startup claim is representable")
 }
 
 async fn serve(socket: Arc<UdpSocket>) {
@@ -279,6 +295,25 @@ mod tests {
     use stun::message::Getter;
     use stun::xoraddr::XorMappedAddress;
 
+    fn test_scope() -> LocalApplicationResourceScope {
+        let grant = ResourceClaim::try_from_entries(
+            ResourceClass::ALL
+                .into_iter()
+                .map(|class| (class, 1_000_000)),
+        )
+        .expect("test provider grant is representable");
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(grant),
+        )
+        .expect("test provider is valid");
+        LocalApplicationResourceScope::transport_lab_child_of(&port)
+            .expect("test application scope is valid")
+    }
+
+    async fn start_with_scope(config: &StunServiceConfig) -> Result<StunServerHandle> {
+        StunServer::start_with_resource_scope(config, test_scope()).await
+    }
+
     #[tokio::test]
     async fn binding_request_gets_reflexive_address_back() {
         let cfg = StunServiceConfig {
@@ -286,7 +321,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port: 0, // ephemeral
         };
-        let server = StunServer::start(&cfg).await.unwrap();
+        let server = start_with_scope(&cfg).await.unwrap();
         let server_addr = server.local_addr();
 
         // A real client socket sends a real Binding request.
@@ -337,12 +372,143 @@ mod tests {
             bind: "127.0.0.1".into(),
             port: 0,
         };
-        let server = StunServer::start(&cfg).await.unwrap();
+        let server = start_with_scope(&cfg).await.unwrap();
         let terminal = Arc::clone(&server.terminal);
 
         server.stop_and_wait().await.unwrap();
 
         assert!(terminal.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn runtime_ended_before_drop_is_reaped_without_runtime_reentry() {
+        let (server, terminal) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("single-thread runtime");
+            runtime.block_on(async {
+                let config = StunServiceConfig {
+                    enabled: true,
+                    bind: "127.0.0.1".into(),
+                    port: 0,
+                };
+                let server = start_with_scope(&config).await.unwrap();
+                let terminal = Arc::clone(&server.terminal);
+                (server, terminal)
+            })
+        };
+
+        drop(server);
+
+        terminal.wait_finished();
+        assert!(terminal.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn current_thread_drop_observes_worker_before_runtime_destruction() {
+        let (terminal, worker_done, port) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("single-thread runtime");
+            runtime.block_on(async {
+                let config = StunServiceConfig {
+                    enabled: true,
+                    bind: "127.0.0.1".into(),
+                    port: 0,
+                };
+                let server = start_with_scope(&config).await.unwrap();
+                let terminal = Arc::clone(&server.terminal);
+                let worker_done = server.final_task_custody.worker_done_witness();
+                let port = server.local_addr().port();
+                drop(server);
+                (terminal, worker_done, port)
+            })
+        };
+
+        assert!(terminal.finished.load(Ordering::Acquire));
+        assert!(worker_done.load(Ordering::Acquire));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("replacement runtime");
+        runtime.block_on(async {
+            let config = StunServiceConfig {
+                enabled: true,
+                bind: "127.0.0.1".into(),
+                port,
+            };
+            start_with_scope(&config)
+                .await
+                .expect("Drop released the exact control port")
+                .stop_and_wait()
+                .await
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn stopped_stun_releases_the_exact_control_port_for_reuse() {
+        let mut config = StunServiceConfig {
+            enabled: true,
+            bind: "127.0.0.1".into(),
+            port: 0,
+        };
+        let first = start_with_scope(&config).await.unwrap();
+        let port = first.local_addr().port();
+        first.stop_and_wait().await.unwrap();
+
+        config.port = port;
+        let second = start_with_scope(&config).await.unwrap();
+        assert_eq!(second.local_addr().port(), port);
+        second.stop_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_startup_grant_rejects_n_plus_one_and_reuses_after_stop() {
+        let insufficient_port =
+            myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(
+                stun_startup_claim()
+                    .checked_sub(ResourceClaim::single(ResourceClass::WorkerOrTask, 1))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let insufficient_scope =
+            LocalApplicationResourceScope::transport_lab_child_of(&insufficient_port).unwrap();
+        let insufficient_config = StunServiceConfig {
+            enabled: true,
+            bind: "127.0.0.1".into(),
+            port: 0,
+        };
+        assert!(matches!(
+            StunServer::start_with_resource_scope(&insufficient_config, insufficient_scope).await,
+            Err(Error::Resource(_))
+        ));
+
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(stun_startup_claim()),
+        )
+        .unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+        let config = StunServiceConfig {
+            enabled: true,
+            bind: "127.0.0.1".into(),
+            port: 0,
+        };
+        let first = StunServer::start_with_resource_scope(&config, scope.clone())
+            .await
+            .unwrap();
+        let refused = StunServer::start_with_resource_scope(&config, scope.clone()).await;
+        assert!(matches!(refused, Err(Error::Resource(_))));
+        first.stop_and_wait().await.unwrap();
+        StunServer::start_with_resource_scope(&config, scope)
+            .await
+            .unwrap()
+            .stop_and_wait()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -352,7 +518,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port: 0,
         };
-        let server = StunServer::start(&cfg).await.unwrap();
+        let server = start_with_scope(&cfg).await.unwrap();
         let terminal = Arc::clone(&server.terminal);
         let notified = terminal.notify.notified();
 
@@ -371,7 +537,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port: 0,
         };
-        let server = StunServer::start(&cfg).await.unwrap();
+        let server = start_with_scope(&cfg).await.unwrap();
         let taken = server.local_addr();
         // Re-binding the now-occupied port must surface as Error::Bind.
         let cfg2 = StunServiceConfig {
@@ -379,7 +545,7 @@ mod tests {
             bind: "127.0.0.1".into(),
             port: taken.port(),
         };
-        let err = StunServer::start(&cfg2).await;
+        let err = start_with_scope(&cfg2).await;
         assert!(matches!(err, Err(Error::Bind(_, _))));
         server.stop_and_wait().await.unwrap();
     }

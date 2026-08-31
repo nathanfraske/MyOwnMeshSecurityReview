@@ -10,10 +10,10 @@ use myownmesh_core::config::{
 };
 use myownmesh_core::resource::ResourceReport;
 use myownmesh_core::semantic::VerifiedBootstrap;
-use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, Role};
+use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, FactGraph, Role, SignedFact};
 use myownmesh_core::{
-    ConnectorCallbackPolicy, FactGraph, FiniteResourceProvider, Identity, Mesh, MeshConfig,
-    ResourceClaim, ResourceClass, ResourceProviderPort, SignedFact, TransportLabCallbackWorkload,
+    ConnectorCallbackPolicy, FiniteResourceProvider, Identity, Mesh, MeshConfig, ResourceClaim,
+    ResourceClass, ResourceProviderPort, TransportLabCallbackWorkload,
     WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 

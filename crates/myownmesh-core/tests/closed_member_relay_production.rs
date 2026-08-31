@@ -17,15 +17,28 @@ use myownmesh_core::{
 };
 use myownmesh_signaling::local::LocalBroker;
 
-const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+// Native ICE gathering and endpoint-auth promotion are intentionally the same
+// production path as the shipped two-daemon runner. Give that path the same
+// bounded window instead of imposing a unit-test-sized deadline.
+const STAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 async fn bounded<T>(
     stage: &'static str,
     future: impl std::future::Future<Output = T>,
 ) -> myownmesh_core::Result<T> {
-    tokio::time::timeout(STAGE_TIMEOUT, future)
-        .await
-        .map_err(|_| myownmesh_core::Error::Network(format!("relay stage timed out: {stage}")))
+    eprintln!("production-relay stage begin: {stage}");
+    match tokio::time::timeout(STAGE_TIMEOUT, future).await {
+        Ok(value) => {
+            eprintln!("production-relay stage complete: {stage}");
+            Ok(value)
+        }
+        Err(_) => {
+            eprintln!("production-relay stage timed out: {stage}");
+            Err(myownmesh_core::Error::Network(format!(
+                "relay stage timed out: {stage}"
+            )))
+        }
+    }
 }
 
 fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
@@ -169,7 +182,10 @@ fn assert_baseline(label: &str, before: &ResourceReport, after: &ResourceReport)
     }
 }
 
-#[tokio::test]
+// Match the shipped daemon's multi-thread Tokio runtime. Native WebRTC owns
+// callbacks and worker threads that are not representative on the macro's
+// default current-thread test runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_members_relay_through_production_local_broker() -> myownmesh_core::Result<()> {
     let home = tempfile::tempdir().expect("temporary mesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());

@@ -249,6 +249,7 @@ impl FactContent {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireFactContent {
     version: u32,
     domain: FactDomain,
@@ -282,6 +283,7 @@ impl<'de> Deserialize<'de> for FactContent {
 
 /// A canonical fact plus a signature over its content-derived FactId.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SignedFact {
     pub content: FactContent,
     pub id: FactId,
@@ -346,6 +348,32 @@ mod tests {
         let fact = SignedFact::sign(content, &key).expect("canonical fact");
         assert!(fact.verify().is_ok());
         assert_eq!(FactId::from_content(&fact.content), fact.id);
+    }
+
+    #[test]
+    fn nested_canonical_fact_fields_reject_unknown_keys() {
+        let key = key();
+        let device = device(&key);
+        let context =
+            VerifiedBootstrap::create_closed("mesh-nested-wire", vec![key.clone()], [0; 32])
+                .expect("bootstrap")
+                .context_id();
+        let content = FactContent::open_participation(context, device, true, Vec::new());
+        let fact = SignedFact::sign(content, &key).expect("canonical fact");
+
+        let mut content_wire = serde_json::to_value(&fact.content).unwrap();
+        content_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FactContent>(content_wire).is_err());
+
+        let mut body_wire = serde_json::to_value(&fact.content.body).unwrap();
+        body_wire["legacy"] = serde_json::json!(true);
+        let mut fact_wire = serde_json::to_value(&fact).unwrap();
+        fact_wire["content"]["body"] = body_wire;
+        assert!(serde_json::from_value::<SignedFact>(fact_wire).is_err());
+
+        let mut signed_wire = serde_json::to_value(&fact).unwrap();
+        signed_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<SignedFact>(signed_wire).is_err());
     }
 
     #[test]

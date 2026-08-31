@@ -24,12 +24,12 @@
 //! synchronous, non-reentrant, and free to hand a value off but not to await.
 
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU64, Ordering},
     Arc, Weak,
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 
 use crate::error::{Error, Result};
 use crate::resource::ResourceMailboxSender;
@@ -73,37 +73,34 @@ pub(crate) struct PeerRegistry {
         parking_lot::RwLock<Option<Weak<super::signaling_ingress::SignalingRuntime>>>,
 }
 
-/// Detached close tasks own their exact peer until transport cleanup settles.
-/// The registry tracks only completion, never a second growable collection of
-/// connection Arcs.
+/// Close tasks own their exact peer until transport cleanup settles.  Their
+/// handles remain here so shutdown observes each terminal result exactly once.
 struct CloseTaskTracker {
-    pending: AtomicUsize,
-    changed: Notify,
+    handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl CloseTaskTracker {
     fn new() -> Self {
         Self {
-            pending: AtomicUsize::new(0),
-            changed: Notify::new(),
+            handles: Mutex::new(Vec::new()),
         }
     }
 
-    fn start(&self) {
-        self.pending.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn complete(&self) {
-        self.pending.fetch_sub(1, Ordering::AcqRel);
-        self.changed.notify_waiters();
+    fn add(&self, handle: JoinHandle<()>) {
+        self.handles.lock().push(handle);
     }
 
     async fn wait(&self) {
         loop {
-            if self.pending.load(Ordering::Acquire) == 0 {
+            let handles = std::mem::take(&mut *self.handles.lock());
+            if handles.is_empty() {
                 return;
             }
-            self.changed.notified().await;
+            for handle in handles {
+                if let Err(error) = handle.await {
+                    tracing::warn!(%error, "replaced peer cleanup task failed");
+                }
+            }
         }
     }
 }
@@ -460,23 +457,11 @@ impl PeerRegistry {
     /// replacement; shutdown drains it rather than guessing which removed
     /// peer tasks still exist.
     pub(super) fn track_replaced_close(&self, peer: Arc<PeerConnection>) {
-        self.close_tasks.start();
-        let tasks = Arc::clone(&self.close_tasks);
-        tokio::spawn(async move {
+        self.close_tasks.add(tokio::spawn(async move {
             if let Err(error) = peer.retire_and_close().await {
                 tracing::warn!(%error, "replaced peer cleanup did not complete successfully");
             }
-            tasks.complete();
-        });
-    }
-
-    pub(super) fn track_removed_close(&self, _peer: Arc<PeerConnection>) {
-        // Terminal operations retain the removed peer until their exact
-        // transport close waiter completes. No registry-level Arc is needed.
-    }
-
-    pub(super) fn complete_removed_close(&self, _peer: &Arc<PeerConnection>) {
-        // The terminal operation owns and releases the peer itself.
+        }));
     }
 
     pub(super) async fn await_replaced_closes(&self) {
@@ -751,7 +736,6 @@ impl PeerRegistry {
             let (_, entry) = self.peers.remove(owner.device_id())?;
             let peer = entry.peer;
             peer.retire_connector();
-            self.track_removed_close(Arc::clone(&peer));
             Some(SpeculativeTerminalCleanup::Promoted { peer, removed })
         } else {
             Some(SpeculativeTerminalCleanup::Promoted {
@@ -1876,7 +1860,6 @@ impl PeerRegistry {
         let peer = entry.peer;
         let worker = peer.current_worker();
         peer.retire_connector();
-        self.track_removed_close(Arc::clone(&peer));
         Some((peer, worker))
     }
 
@@ -1947,7 +1930,6 @@ impl PeerRegistry {
             };
             let peer = entry.peer;
             peer.retire_connector();
-            self.track_removed_close(Arc::clone(&peer));
             return ChannelTerminal::Peer {
                 peer,
                 channel: removed,
@@ -1982,7 +1964,6 @@ impl PeerRegistry {
         };
         let peer = entry.peer;
         peer.retire_connector();
-        self.track_removed_close(Arc::clone(&peer));
         LogicalSessionTerminal::Removed(peer)
     }
 
@@ -2144,7 +2125,6 @@ impl PeerRegistry {
         let (_, entry) = self.peers.remove(owner.device_id())?;
         let peer = entry.peer;
         peer.retire_connector();
-        self.track_removed_close(Arc::clone(&peer));
         Some(peer)
     }
 
@@ -2163,7 +2143,6 @@ impl PeerRegistry {
         let (_, entry) = self.peers.remove(owner.device_id())?;
         let peer = entry.peer;
         peer.retire_connector();
-        self.track_removed_close(Arc::clone(&peer));
         Some(peer)
     }
 

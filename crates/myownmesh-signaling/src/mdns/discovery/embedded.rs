@@ -16,6 +16,9 @@ use super::{
     DiscoveryConfig, DiscoveryEvent, DiscoveryEventAdmission, DiscoveryEventCoalescer,
     MAX_DNS_NAME_BYTES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
 };
+#[cfg(test)]
+use crate::task_custodian::DedicatedTaskCustodian;
+use crate::task_custodian::{CustodianReservation, TaskCustodian};
 use crate::Error;
 
 /// A one-element edge-triggered wakeup channel. It carries no discovery
@@ -23,6 +26,41 @@ use crate::Error;
 /// being drained, so this implementation invariant is independent of the
 /// owner-selected event capacity.
 const PROGRESS_SIGNAL_CAPACITY: usize = 1;
+
+/// Embedded backend custody is separate from its three backend task slots:
+/// one caller-owned observer carries the normal, fallback, and emergency
+/// one-slot reservations established before child tasks are spawned.
+pub const EMBEDDED_CUSTODIAN_RUNTIME_SLOTS: usize = 1;
+pub const EMBEDDED_CUSTODIAN_OBSERVER_SLOTS: usize = 3;
+pub const EMBEDDED_CUSTODIAN_QUEUE_SLOTS: usize = 3;
+
+/// Exact custody required by the embedded backend's pre-spawn terminal
+/// envelope. The observer and queue dimensions are independent of the three
+/// backend task slots reported by [`DiscoveryLimits::checked_residency`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EmbeddedCustodyPlan {
+    pub runtime_slots: usize,
+    pub observer_slots: usize,
+    pub queue_slots: usize,
+}
+
+/// Return the checked embedded custody plan used by `start_with_custodian`.
+/// `None` is reserved for an invalid compile-time plan, so callers cannot
+/// silently underfund the injected owner if these dimensions are changed.
+pub const fn checked_embedded_custody_plan() -> Option<EmbeddedCustodyPlan> {
+    if EMBEDDED_CUSTODIAN_RUNTIME_SLOTS == 0
+        || EMBEDDED_CUSTODIAN_OBSERVER_SLOTS == 0
+        || EMBEDDED_CUSTODIAN_QUEUE_SLOTS == 0
+    {
+        None
+    } else {
+        Some(EmbeddedCustodyPlan {
+            runtime_slots: EMBEDDED_CUSTODIAN_RUNTIME_SLOTS,
+            observer_slots: EMBEDDED_CUSTODIAN_OBSERVER_SLOTS,
+            queue_slots: EMBEDDED_CUSTODIAN_QUEUE_SLOTS,
+        })
+    }
+}
 
 pub struct Discovery {
     daemon: ServiceDaemon,
@@ -32,16 +70,47 @@ pub struct Discovery {
     shutdown_request: watch::Sender<bool>,
     shutdown_ack: Arc<Mutex<Option<mdns_sd::Receiver<mdns_sd::DaemonStatus>>>>,
     stopped: AtomicBool,
+    _custodian_owner: Arc<dyn TaskCustodian>,
+    custodian_reservation: Option<CustodianReservation>,
+    fallback_reservation: Option<CustodianReservation>,
+    /// Caller-funded terminal custody for the supervisor when both normal
+    /// reservations refuse. It is never the queue drained by that supervisor.
+    emergency_reservation: Option<CustodianReservation>,
 }
 
 impl Discovery {
     /// Bring the daemon up, start browsing, and hand back the event stream.
     /// Browse starts before the first [`register`](Self::register) so we never
     /// miss a burst of resolves racing our own announce.
-    pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+    /// Start with caller-owned bounded custody for the supervisor, its
+    /// fallback, and the independent emergency handoff. Reservation failure
+    /// is reported before any backend task is spawned.
+    pub fn start_with_custodian(
+        cfg: &DiscoveryConfig,
+        custodian_owner: Arc<dyn TaskCustodian>,
+    ) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+        Self::start_with_custodian_inner(cfg, custodian_owner)
+    }
+
+    fn start_with_custodian_inner(
+        cfg: &DiscoveryConfig,
+        custodian_owner: Arc<dyn TaskCustodian>,
+    ) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+        let custody_plan = checked_embedded_custody_plan()
+            .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
+        if custody_plan.observer_slots != 3 {
+            return Err(Error::Other(
+                "embedded custody plan does not match terminal reservations".into(),
+            ));
+        }
         if !cfg.validate() || !cfg.limits.validate() || !cfg.timing.validate() {
             return Err(Error::Other("invalid discovery configuration".into()));
         }
+        cfg.limits
+            .checked_residency(crate::mdns::discovery::DiscoveryBackend::Embedded)
+            .map_err(|error| {
+                Error::Other(format!("invalid embedded discovery residency: {error}"))
+            })?;
         let daemon = ServiceDaemon::new().map_err(|e| Error::Other(format!("mdns daemon: {e}")))?;
 
         let host_name = format!("{}.local.", cfg.instance);
@@ -67,6 +136,36 @@ impl Discovery {
         let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_SIGNAL_CAPACITY);
         let (stop, stop_rx) = watch::channel(false);
         let discovery_limits = cfg.limits;
+        // Reserve both the normal and refusal fallback slots before any
+        // backend task is spawned. Direct Drop can therefore transfer the
+        // supervisor without awaiting on the creating runtime.
+        let custodian_reservation = match custodian_owner.reserve(1) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return Err(Error::Other(format!(
+                    "embedded custodian exhausted: {error:?}"
+                )));
+            }
+        };
+        let fallback_reservation = match custodian_owner.reserve(1) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(custodian_reservation);
+                return Err(Error::Other(format!(
+                    "embedded custodian fallback exhausted: {error:?}"
+                )));
+            }
+        };
+        let emergency_reservation = match custodian_owner.reserve(1) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                drop(custodian_reservation);
+                drop(fallback_reservation);
+                return Err(Error::Other(format!(
+                    "embedded emergency custody exhausted: {error:?}"
+                )));
+            }
+        };
         let forwarder = tokio::spawn(async move {
             deliver(forward_rx, tx, progress_tx, stop_rx).await;
         });
@@ -102,6 +201,10 @@ impl Discovery {
                 shutdown_request,
                 shutdown_ack,
                 stopped: AtomicBool::new(false),
+                _custodian_owner: custodian_owner,
+                custodian_reservation: Some(custodian_reservation),
+                fallback_reservation: Some(fallback_reservation),
+                emergency_reservation: Some(emergency_reservation),
             },
             rx,
         ))
@@ -145,14 +248,78 @@ impl Discovery {
     /// and delivery owner can be joined at shutdown. Independent backend users
     /// may retain it; [`shutdown`](Self::shutdown) requests stop and aborts the
     /// delivery owner if it is waiting on a full downstream queue.
-    pub fn take_task(&mut self) -> Option<JoinHandle<()>> {
-        self.pump.take()
+    pub(crate) fn take_task(&mut self) -> Option<JoinHandle<()>> {
+        let task = self.pump.take();
+        if task.is_some() {
+            self.release_custody();
+        }
+        task
+    }
+
+    /// Request stop and join the backend supervisor and both child tasks.
+    /// This is the explicit, fully observed lifecycle path for direct backend
+    /// users; [`Drop`](Self::drop) uses the pre-spawn custodian instead.
+    pub async fn stop_and_join(mut self) {
+        self.shutdown();
+        if let Some(task) = self.pump.take() {
+            let _ = task.await;
+        }
+        self.release_custody();
+    }
+
+    fn release_custody(&mut self) {
+        self.custodian_reservation.take();
+        self.fallback_reservation.take();
+        self.emergency_reservation.take();
     }
 }
 
 impl Drop for Discovery {
     fn drop(&mut self) {
         self.shutdown();
+        let Some(supervisor) = self.pump.take() else {
+            return;
+        };
+
+        if let Err(supervisor) = submit_supervisor(
+            supervisor,
+            self.custodian_reservation.as_mut(),
+            self.fallback_reservation.as_mut(),
+        ) {
+            // Both normal reservations are established before spawning. The
+            // independent emergency observer is deliberately not the queue
+            // drained by `supervisor`, so accepting this handle cannot create
+            // a self-await cycle when primary and fallback both refuse it.
+            if let Some(emergency) = self.emergency_reservation.as_mut() {
+                if let Err(supervisor) = emergency.submit(supervisor) {
+                    // A live DedicatedTaskCustodian cannot refuse a reserved
+                    // slot; if its observer has failed, abort without
+                    // re-entering the creating runtime. This is an unrecoverable
+                    // observer failure after every pre-funded handoff refused.
+                    supervisor.abort();
+                }
+            } else {
+                supervisor.abort();
+            }
+        }
+    }
+}
+
+fn submit_supervisor(
+    supervisor: JoinHandle<()>,
+    primary: Option<&mut CustodianReservation>,
+    fallback: Option<&mut CustodianReservation>,
+) -> Result<(), JoinHandle<()>> {
+    let supervisor = match primary {
+        Some(reservation) => match reservation.submit(supervisor) {
+            Ok(()) => return Ok(()),
+            Err(supervisor) => supervisor,
+        },
+        None => supervisor,
+    };
+    match fallback {
+        Some(reservation) => reservation.submit(supervisor),
+        None => Err(supervisor),
     }
 }
 
@@ -541,5 +708,113 @@ mod tests {
         assert!(shutdown_acknowledged(Some(mdns_sd::DaemonStatus::Shutdown)));
         assert!(!shutdown_acknowledged(Some(mdns_sd::DaemonStatus::Running)));
         assert!(!shutdown_acknowledged(None));
+    }
+
+    #[test]
+    fn embedded_custody_plan_matches_pre_spawn_reservations() {
+        assert_eq!(
+            checked_embedded_custody_plan(),
+            Some(EmbeddedCustodyPlan {
+                runtime_slots: 1,
+                observer_slots: 3,
+                queue_slots: 3,
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bounded_refusal_fallback_observes_every_transferred_task() {
+        let owner = DedicatedTaskCustodian::new(2).expect("custodian starts");
+        let mut primary = owner.reserve(1).expect("primary reservation");
+        let mut fallback = owner.reserve(1).expect("fallback reservation");
+        let mut progress = owner.progress();
+        let baseline = *progress.borrow();
+
+        let first = tokio::spawn(async {});
+        primary
+            .submit(first)
+            .expect("primary reservation accepts its one task");
+        let refused = primary
+            .submit(tokio::spawn(async {}))
+            .expect_err("a reservation cannot accept a second task");
+        submit_supervisor(refused, Some(&mut fallback), None)
+            .expect("the bounded fallback reservation accepts the refused task");
+
+        let target = baseline + 2;
+        while *progress.borrow() < target {
+            progress
+                .changed()
+                .await
+                .expect("custodian remains live while tasks are observed");
+        }
+        drop(primary);
+        drop(fallback);
+        owner.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn both_primary_and_fallback_refusal_uses_external_terminal_custody() {
+        struct DropMark(Arc<AtomicBool>);
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let owner = DedicatedTaskCustodian::new(1).expect("emergency custodian starts");
+        let mut emergency = owner.reserve(1).expect("emergency slot is pre-reserved");
+        let terminal = Arc::new(AtomicBool::new(false));
+        let task_terminal = Arc::clone(&terminal);
+        let task = tokio::spawn(async move {
+            let _mark = DropMark(task_terminal);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "the refusal control hands off a terminal task"
+        );
+        let task = submit_supervisor(task, None, None)
+            .expect_err("the primary and fallback reservations both refuse");
+        emergency
+            .submit(task)
+            .expect("the independent emergency observer accepts the exact handle");
+        drop(emergency);
+        owner.close();
+        assert!(
+            terminal.load(Ordering::Acquire),
+            "emergency custody observes the terminal task before owner close returns"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_drop_does_not_reenter_runtime_for_terminal_observation() {
+        struct DropMark(Arc<AtomicBool>);
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let owner = DedicatedTaskCustodian::new(1).expect("emergency custodian starts");
+        let mut emergency = owner.reserve(1).expect("emergency slot is pre-reserved");
+        let terminal = Arc::new(AtomicBool::new(false));
+        let task_terminal = Arc::clone(&terminal);
+        let task = tokio::spawn(async move {
+            let _mark = DropMark(task_terminal);
+            tokio::task::yield_now().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            task.is_finished(),
+            "the current-thread control hands off a terminal task"
+        );
+        emergency
+            .submit(task)
+            .expect("external custody accepts the task from the current-thread runtime");
+        drop(emergency);
+        owner.close();
+        assert!(terminal.load(Ordering::Acquire));
     }
 }

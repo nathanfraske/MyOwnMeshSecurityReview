@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
@@ -465,6 +466,9 @@ pub struct PeerConnection {
     unpromoted_connector: Mutex<Option<UnpromotedConnector>>,
     speculative: Mutex<AttemptOwnerSet<SpeculativeAttempt>>,
     closing_workers: Mutex<AttemptOwnerSet<ClosingWorker>>,
+    /// One retained observer for each native close owner. The worker itself
+    /// remains terminal custody; this handle observes its result exactly once.
+    closing_waiters: Mutex<Vec<(Weak<WebRtcConnectorWorker>, JoinHandle<()>)>>,
     retired_dedup: Mutex<DetachedDedupSet>,
     signaling_runtime: RwLock<Option<Weak<crate::engine::signaling_ingress::SignalingRuntime>>>,
     /// At most one renegotiation may be in flight for this installation.
@@ -684,17 +688,26 @@ impl PeerConnection {
         let identity = Arc::downgrade(&current);
         current.start_close();
         let waiter = current.close_waiter();
-        drop(current);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return true;
         };
         let peer = Arc::clone(self);
-        handle.spawn(async move {
+        let mut waiters = self.closing_waiters.lock();
+        if waiters
+            .iter()
+            .any(|(identity, _)| identity.as_ptr() == Arc::as_ptr(&current))
+        {
+            return true;
+        }
+        let waiter_handle = handle.spawn(async move {
             if let Err(error) = waiter.await {
                 tracing::warn!(%error, "exact retired connector native close failed");
             }
             peer.complete_closing_worker_if_weak(&identity);
         });
+        waiters.push((Arc::downgrade(&current), waiter_handle));
+        drop(waiters);
+        drop(current);
         true
     }
 
@@ -1452,6 +1465,7 @@ impl PeerConnection {
             unpromoted_connector: Mutex::new(worker.map(|worker| UnpromotedConnector { worker })),
             speculative: Mutex::new(AttemptOwnerSet::new()),
             closing_workers: Mutex::new(AttemptOwnerSet::new()),
+            closing_waiters: Mutex::new(Vec::new()),
             retired_dedup: Mutex::new(DetachedDedupSet::new()),
             signaling_runtime: RwLock::new(None),
             media_renegotiation_worker: Mutex::new(None),
@@ -1640,6 +1654,12 @@ impl PeerConnection {
                 .lock()
                 .for_each(|entry| workers.push(Arc::clone(&entry.worker)));
             if workers.is_empty() {
+                let waiters = std::mem::take(&mut *self.closing_waiters.lock());
+                for (_, waiter) in waiters {
+                    if let Err(error) = waiter.await {
+                        tracing::warn!(%error, "exact retired connector waiter failed");
+                    }
+                }
                 return result;
             }
             for worker in &workers {

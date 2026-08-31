@@ -337,8 +337,11 @@ pub trait DeliveryProvider: Send + Sync {
 }
 
 /// Test-only provider for local delivery-driver controls. Production core
-/// attachment must pass an explicit provider through
-/// [`super::driver::start_with_delivery_provider`].
+/// attachment must pass an explicit provider and both caller-funded terminal
+/// custodians through
+/// [`super::driver::start_with_delivery_provider_and_sinks_with_custodian`];
+/// [`super::driver::derive_task_custody_plan`] supplies the exact observer
+/// reservations for the selected and fallback relay sets.
 #[cfg(test)]
 pub struct UnmeteredDeliveryProvider;
 

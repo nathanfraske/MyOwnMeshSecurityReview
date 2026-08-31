@@ -539,8 +539,7 @@ async fn stream_handler_call(
         }
     };
     let watchdog_registry = registry.downgrade();
-    let watchdog = tokio::spawn(async move {
-        let _task = task;
+    let watchdog = async move {
         tokio::select! {
             () = close_probe.closed() => {}
             () = ticket.cancelled() => {}
@@ -558,10 +557,8 @@ async fn stream_handler_call(
         }
         drop(close_probe);
         drop(ticket);
-    });
-    if let Err((watchdog, reason)) = registry.retain_watchdog(watchdog) {
-        watchdog.abort();
-        let _ = watchdog.await;
+    };
+    if let Err((_task, _watchdog, reason)) = registry.spawn_retained_task(task, watchdog) {
         return Err(format!(
             "inbound streaming RPC watchdog could not be retained: {reason}"
         ));
@@ -912,6 +909,7 @@ mod tests {
     };
     use crate::ipc::clients::{ClientRegistry, HandlerMode, PendingKey, RegistrationError};
     use crate::ipc::wire::ServerOut;
+    use myownmesh_core::ResourceMailboxItemBuilder;
     // The shared real link, at the crate root because the control
     // dispatcher's streaming controls need the same one: two copies of a
     // two-peer handshake are two things free to drift, and a control passing

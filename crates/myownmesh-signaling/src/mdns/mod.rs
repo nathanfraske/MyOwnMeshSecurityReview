@@ -26,5 +26,6 @@ pub mod driver;
 pub mod wire;
 
 pub use driver::{
-    start, AliasOwnership, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
+    start_with_custodian, AliasOwnership, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound,
+    MdnsOutbound,
 };

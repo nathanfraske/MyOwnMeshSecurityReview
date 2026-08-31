@@ -503,6 +503,9 @@ async fn on_network_change(
 /// not timed — if signaling never returns there is nothing to offer into
 /// anyway, and the moment it does, this fires.
 async fn redial_then_fan_out(state: &Arc<NetworkState>) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let mut connected_rx = state.relay_connected_rx();
     if let Some(rx) = connected_rx.as_mut() {
         rx.borrow_and_update();
@@ -517,17 +520,25 @@ async fn redial_then_fan_out(state: &Arc<NetworkState>) {
     // if the redial didn't take, fan out inline as before.
     if redialing {
         if let Some(mut rx) = connected_rx {
-            let state = state.clone();
-            tokio::spawn(async move {
-                // Wakes when a relay establishes a fresh session; errs only if
-                // the driver shut down (nothing left to renegotiate).
-                if rx.changed().await.is_ok() {
-                    debug!(
-                        network = %state.network_id,
-                        "relay reconnected — renegotiating"
-                    );
-                    fan_out_restart(&state).await;
-                }
+            let task_state = state.clone();
+            state.register_shutdown_task(&shutdown_permit, || {
+                tokio::spawn(async move {
+                    // Wakes when a relay establishes a fresh session; errs only if
+                    // the driver shut down (nothing left to renegotiate).
+                    tokio::select! {
+                        biased;
+                        _ = task_state.wait_for_shutdown() => {}
+                        result = rx.changed() => {
+                            if result.is_ok() {
+                                debug!(
+                                    network = %task_state.network_id,
+                                    "relay reconnected — renegotiating"
+                                );
+                                fan_out_restart(&task_state).await;
+                            }
+                        }
+                    }
+                })
             });
             return;
         }

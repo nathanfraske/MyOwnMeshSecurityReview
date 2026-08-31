@@ -5,7 +5,11 @@
 // topology come from config, roles come from the read-only roster, and all
 // role/MFA mutations use named daemon requests.
 
-import { meshClient } from "./mesh-client.svelte";
+import {
+  commandFailure,
+  isOutcomeUnknown,
+  meshClient,
+} from "./mesh-client.svelte";
 import type {
   NetworkConfigInput,
   Role,
@@ -36,6 +40,23 @@ export interface MfaTransaction {
   secret?: string;
   otpauth_uri?: string;
   recovery_codes?: string[];
+}
+
+export interface GovernanceFailure {
+  reason: string;
+  code?: string;
+  data?: Record<string, unknown>;
+  outcomeUnknown?: boolean;
+}
+
+function governanceFailure(error: unknown): GovernanceFailure {
+  const failure = commandFailure(error);
+  return {
+    reason: failure.message,
+    code: typeof failure.data?.code === "string" ? failure.data.code : undefined,
+    data: failure.data,
+    outcomeUnknown: isOutcomeUnknown(error),
+  };
 }
 
 interface GovernanceProjection {
@@ -118,7 +139,7 @@ function createGovernanceStore() {
     peerPubkey: string,
     role: Role,
     mfaCode?: string,
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: true } | ({ ok: false } & GovernanceFailure)> {
     try {
       if (role === "member") {
         await meshClient.governanceProposeRoleRevoke(configId, peerPubkey, mfaCode);
@@ -133,7 +154,7 @@ function createGovernanceStore() {
       await meshClient.refreshRoster(configId);
       return { ok: true };
     } catch (e) {
-      return { ok: false, reason: String(e) };
+      return { ok: false, ...governanceFailure(e) };
     }
   }
 
@@ -150,13 +171,13 @@ function createGovernanceStore() {
     configId: string,
     target: string,
     mfaCode?: string,
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: true } | ({ ok: false } & GovernanceFailure)> {
     try {
       await meshClient.governanceProposeEvict(configId, target, mfaCode);
       await meshClient.refreshRoster(configId);
       return { ok: true };
     } catch (e) {
-      return { ok: false, reason: String(e) };
+      return { ok: false, ...governanceFailure(e) };
     }
   }
 
@@ -169,7 +190,7 @@ function createGovernanceStore() {
   }
 
   async function mfaPrepare(configId: string): Promise<
-    { ok: true; material: MfaMaterial } | { ok: false; reason: string }
+    { ok: true; material: MfaMaterial } | ({ ok: false } & GovernanceFailure)
   > {
     try {
       const r = await meshClient.governanceMfaPrepare(configId);
@@ -183,7 +204,7 @@ function createGovernanceStore() {
         },
       };
     } catch (e) {
-      return { ok: false, reason: String(e) };
+      return { ok: false, ...governanceFailure(e) };
     }
   }
 
@@ -208,7 +229,7 @@ function createGovernanceStore() {
       await meshClient.governanceMfaDisable(configId, code);
       return { ok: true };
     } catch (e) {
-      return { ok: false, reason: String(e) };
+      return { ok: false, ...governanceFailure(e) };
     }
   }
 

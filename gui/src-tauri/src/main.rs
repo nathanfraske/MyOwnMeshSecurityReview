@@ -56,8 +56,78 @@ use tokio::sync::mpsc;
 struct AppState {
     client: Arc<ControlClient>,
     daemon_child: Mutex<Option<daemon_spawn::DaemonChild>>,
+    event_pump: Mutex<Option<EventPump>>,
     daemon_lifecycle: Arc<DaemonLifecycle>,
     last_subscription_status: Mutex<serde_json::Value>,
+}
+
+struct EventPump {
+    cancellation: control_client::EventPumpCancellation,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl EventPump {
+    fn start(app: AppHandle, client: Arc<ControlClient>) -> Self {
+        let cancellation = control_client::EventPumpCancellation::new();
+        let join = tokio::spawn(run_event_pump(app, client, cancellation.clone()));
+        Self { cancellation, join }
+    }
+
+    async fn shutdown(self) {
+        self.cancellation.cancel();
+        if let Err(error) = self.join.await {
+            tracing::error!("GUI event pump did not terminate cleanly: {error:#}");
+        }
+    }
+}
+
+/// Error envelope returned by Tauri commands. Keeping the daemon's response
+/// data beside the human-readable error preserves refusal codes and marks a
+/// lost post-write response as requiring an authoritative refresh.
+#[derive(Debug, serde::Serialize)]
+struct CommandError {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+type CommandResult<T> = std::result::Result<T, CommandError>;
+
+impl CommandError {
+    fn message(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            data: None,
+        }
+    }
+
+    fn outcome_unknown(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            data: Some(serde_json::json!({ "outcome": "unknown" })),
+        }
+    }
+}
+
+impl From<control_client::RequestError> for CommandError {
+    fn from(error: control_client::RequestError) -> Self {
+        match error {
+            control_client::RequestError::OutcomeUnknown => Self::outcome_unknown(
+                "outcome unknown: the daemon may have committed the request; query state before retrying",
+            ),
+            control_client::RequestError::Transport(error) => Self::message(error.to_string()),
+        }
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(error: String) -> Self {
+        if error.starts_with("outcome unknown:") {
+            Self::outcome_unknown(error)
+        } else {
+            Self::message(error)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,8 +265,16 @@ struct DaemonLifecycle {
     publication_gate: Mutex<Option<Arc<PublicationGate>>>,
 }
 
-fn finish_exit(lifecycle: &DaemonLifecycle, child_slot: &Mutex<Option<daemon_spawn::DaemonChild>>) {
+fn finish_exit(
+    lifecycle: &DaemonLifecycle,
+    child_slot: &Mutex<Option<daemon_spawn::DaemonChild>>,
+    event_pump_slot: &Mutex<Option<EventPump>>,
+) {
     let startup = lifecycle.begin_closing();
+    let event_pump = event_pump_slot.lock().take();
+    if let Some(event_pump) = event_pump {
+        tauri::async_runtime::block_on(event_pump.shutdown());
+    }
     let child = child_slot.lock().take();
     if let Some(child) = child {
         if let Err(error) = tauri::async_runtime::block_on(child.terminate_and_wait()) {
@@ -263,6 +341,19 @@ impl DaemonLifecycle {
         Ok(())
     }
 
+    fn publish_event_pump(
+        &self,
+        event_pump_slot: &Mutex<Option<EventPump>>,
+        event_pump: EventPump,
+    ) -> Result<(), EventPump> {
+        let phase = self.phase.lock();
+        if *phase == DaemonLifecyclePhase::Closing {
+            return Err(event_pump);
+        }
+        *event_pump_slot.lock() = Some(event_pump);
+        Ok(())
+    }
+
     #[cfg(test)]
     fn install_publication_gate(&self) -> Arc<PublicationGate> {
         let gate = PublicationGate::new();
@@ -292,16 +383,19 @@ fn update_subscription_status(handle: &AppHandle, value: serde_json::Value) {
 
 /// Helper: turn a daemon `Response` into a result the JS side can
 /// handle. Tauri serialises the Ok branch as the JSON payload and
-/// the Err branch as a string the frontend can show in a toast.
-fn unwrap_response(resp: Response) -> Result<serde_json::Value, String> {
+/// the Err branch as an envelope retaining daemon refusal data.
+fn unwrap_response(resp: Response) -> CommandResult<serde_json::Value> {
     if !resp.ok {
-        return Err(resp.error.unwrap_or_else(|| "(no error message)".into()));
+        return Err(CommandError {
+            error: resp.error.unwrap_or_else(|| "(no error message)".into()),
+            data: resp.data,
+        });
     }
     Ok(resp.data.unwrap_or(serde_json::Value::Null))
 }
 
 #[tauri::command]
-async fn mesh_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::Status)
@@ -311,7 +405,7 @@ async fn mesh_status(state: State<'_, AppState>) -> Result<serde_json::Value, St
 }
 
 #[tauri::command]
-async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_identity(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::IdentityShow)
@@ -324,7 +418,7 @@ async fn mesh_identity(state: State<'_, AppState>) -> Result<serde_json::Value, 
 async fn mesh_identity_set_label(
     state: State<'_, AppState>,
     label: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::IdentitySetLabel { label })
@@ -334,7 +428,7 @@ async fn mesh_identity_set_label(
 }
 
 #[tauri::command]
-async fn mesh_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_networks(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworksList)
@@ -347,7 +441,7 @@ async fn mesh_networks(state: State<'_, AppState>) -> Result<serde_json::Value, 
 async fn mesh_peers(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::PeersList { network })
@@ -360,7 +454,7 @@ async fn mesh_peers(
 async fn mesh_roster_list(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::RosterList { network })
@@ -375,7 +469,7 @@ async fn mesh_topology_set(
     network: String,
     topology: String,
     hub: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::TopologySet {
@@ -389,7 +483,7 @@ async fn mesh_topology_set(
 }
 
 #[tauri::command]
-async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_network_id_generate(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkIdGenerate)
@@ -402,7 +496,7 @@ async fn mesh_network_id_generate(state: State<'_, AppState>) -> Result<serde_js
 async fn mesh_network_id_normalize(
     state: State<'_, AppState>,
     input: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkIdNormalize { input })
@@ -412,7 +506,7 @@ async fn mesh_network_id_normalize(
 }
 
 #[tauri::command]
-async fn mesh_config_show(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_config_show(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ConfigShow)
@@ -425,7 +519,7 @@ async fn mesh_config_show(state: State<'_, AppState>) -> Result<serde_json::Valu
 async fn mesh_network_add(
     state: State<'_, AppState>,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkAdd { config })
@@ -438,7 +532,7 @@ async fn mesh_network_add(
 async fn mesh_network_remove(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkRemove {
@@ -456,7 +550,7 @@ async fn mesh_network_remove(
 /// signed state + roster; keeps the device identity). The daemon exits after
 /// responding so it reloads clean; the caller follows with `restart_app`.
 #[tauri::command]
-async fn mesh_forget_all_networks(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_forget_all_networks(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ForgetAllNetworks)
@@ -469,7 +563,7 @@ async fn mesh_forget_all_networks(state: State<'_, AppState>) -> Result<serde_js
 /// config, all networks). The daemon exits so a fresh one mints a new identity;
 /// the caller follows with `restart_app`.
 #[tauri::command]
-async fn mesh_factory_reset(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_factory_reset(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::FactoryReset)
@@ -483,7 +577,7 @@ async fn mesh_factory_reset(state: State<'_, AppState>) -> Result<serde_json::Va
 /// told to exit), the Tauri backend, and the webview — instead of any of them
 /// serving a stale in-memory cache that would resurrect what was just wiped.
 #[tauri::command]
-async fn restart_app(app: AppHandle) -> Result<(), String> {
+async fn restart_app(app: AppHandle) -> CommandResult<()> {
     let (startup, child, client) = {
         let state = app.state::<AppState>();
         let startup = state.daemon_lifecycle.begin_closing();
@@ -528,7 +622,7 @@ async fn restart_app(app: AppHandle) -> Result<(), String> {
 async fn mesh_network_update(
     state: State<'_, AppState>,
     config: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::NetworkUpdate { config })
@@ -542,7 +636,7 @@ async fn mesh_network_update(
 /// native `<input type="file">` on the renderer side (matches the
 /// MyOwnLLM pattern), so there's no symmetric `mesh_network_import_file`.
 #[tauri::command]
-async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Result<(), String> {
+async fn mesh_network_export_file(path: String, config: serde_json::Value) -> CommandResult<()> {
     let body = serde_json::to_string_pretty(&config).map_err(|e| format!("serialise: {e}"))?;
     std::fs::write(&path, body).map_err(|e| format!("write {path}: {e}"))?;
     Ok(())
@@ -551,7 +645,7 @@ async fn mesh_network_export_file(path: String, config: serde_json::Value) -> Re
 // ---- infrastructure services (relay / signaling / STUN / TURN) --------
 
 #[tauri::command]
-async fn mesh_services_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn mesh_services_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ServicesStatus)
@@ -564,7 +658,7 @@ async fn mesh_services_status(state: State<'_, AppState>) -> Result<serde_json::
 async fn mesh_services_set(
     state: State<'_, AppState>,
     services: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::ServicesSet { services })
@@ -597,7 +691,7 @@ async fn mesh_governance_propose_role_grant(
     target: String,
     role: Role,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceProposeRoleGrant {
@@ -617,7 +711,7 @@ async fn mesh_governance_propose_role_revoke(
     network: String,
     target: String,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceProposeRoleRevoke {
@@ -636,7 +730,7 @@ async fn mesh_governance_propose_evict(
     network: String,
     target: String,
     mfa_code: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceProposeEvict {
@@ -653,7 +747,7 @@ async fn mesh_governance_propose_evict(
 async fn mesh_governance_mfa_prepare(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaPrepare { network })
@@ -667,7 +761,7 @@ async fn mesh_governance_mfa_query(
     state: State<'_, AppState>,
     network: String,
     transaction_id: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaQuery {
@@ -684,7 +778,7 @@ async fn mesh_governance_mfa_redeliver(
     state: State<'_, AppState>,
     network: String,
     transaction_id: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaRedeliver {
@@ -701,7 +795,7 @@ async fn mesh_governance_mfa_commit(
     state: State<'_, AppState>,
     network: String,
     transaction_id: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaCommit {
@@ -718,7 +812,7 @@ async fn mesh_governance_mfa_abort(
     state: State<'_, AppState>,
     network: String,
     transaction_id: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaAbort {
@@ -734,7 +828,7 @@ async fn mesh_governance_mfa_abort(
 async fn mesh_governance_mfa_status(
     state: State<'_, AppState>,
     network: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaStatus { network })
@@ -748,7 +842,7 @@ async fn mesh_governance_mfa_disable(
     state: State<'_, AppState>,
     network: String,
     code: String,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::GovernanceMfaDisable { network, code })
@@ -765,7 +859,7 @@ async fn mesh_governance_mfa_disable(
 // updater crate directly; it just surfaces status and forwards intent.
 
 #[tauri::command]
-async fn update_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_status(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateStatus)
@@ -775,7 +869,7 @@ async fn update_status(state: State<'_, AppState>) -> Result<serde_json::Value, 
 }
 
 #[tauri::command]
-async fn update_check(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_check(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateCheck)
@@ -785,7 +879,7 @@ async fn update_check(state: State<'_, AppState>) -> Result<serde_json::Value, S
 }
 
 #[tauri::command]
-async fn update_apply(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+async fn update_apply(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateApply)
@@ -798,7 +892,7 @@ async fn update_apply(state: State<'_, AppState>) -> Result<serde_json::Value, S
 async fn update_set_prefs(
     state: State<'_, AppState>,
     prefs: serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> CommandResult<serde_json::Value> {
     let resp = state
         .client
         .request(&Request::UpdateSetPrefs { prefs })
@@ -812,17 +906,24 @@ async fn update_set_prefs(
 /// On disconnect we wait a beat and re-subscribe — the daemon may be
 /// restarting or the user may have just started it after launching
 /// the GUI.
-async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
+async fn run_event_pump(
+    app: AppHandle,
+    client: Arc<ControlClient>,
+    cancellation: control_client::EventPumpCancellation,
+) {
     loop {
+        if cancellation.is_cancelled() {
+            break;
+        }
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(256);
-        match client.subscribe_events(tx).await {
-            Ok(()) => {
+        let reader = match tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            result = client.subscribe_events(tx, cancellation.clone()) => result,
+        } {
+            Ok(reader) => {
                 update_subscription_status(&app, serde_json::json!({ "status": "live" }));
-                while let Some(value) = rx.recv().await {
-                    let _ = app.emit("mesh://event", value);
-                }
-                // Subscription channel closed — daemon disconnected.
-                update_subscription_status(&app, serde_json::json!({ "status": "disconnected" }));
+                Some(reader)
             }
             Err(e) => {
                 tracing::warn!("event subscribe failed: {e} — will retry");
@@ -830,9 +931,41 @@ async fn run_event_pump(app: AppHandle, client: Arc<ControlClient>) {
                     &app,
                     serde_json::json!({ "status": "disconnected", "error": e.to_string() }),
                 );
+                None
+            }
+        };
+        let Some(reader) = reader else {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+            }
+            continue;
+        };
+        loop {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => break,
+                value = rx.recv() => match value {
+                    Some(value) => { let _ = app.emit("mesh://event", value); }
+                    None => break,
+                },
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if cancellation.is_cancelled() {
+            let _ = reader.await;
+            break;
+        }
+        if let Err(error) = reader.await {
+            tracing::warn!("event stream task did not terminate cleanly: {error:#}");
+        }
+        // Subscription channel closed — daemon disconnected.
+        update_subscription_status(&app, serde_json::json!({ "status": "disconnected" }));
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => break,
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {},
+        }
     }
 }
 
@@ -900,6 +1033,7 @@ fn main() {
         .manage(AppState {
             client: client.clone(),
             daemon_child: Mutex::new(None),
+            event_pump: Mutex::new(None),
             daemon_lifecycle: DaemonLifecycle::new(),
             last_subscription_status: Mutex::new(serde_json::json!({ "status": "connecting" })),
         })
@@ -955,6 +1089,15 @@ fn main() {
             // waiting, in which case the pump's retry loop takes
             // over).
             tauri::async_runtime::spawn(async move {
+                let event_pump = EventPump::start(handle.clone(), client.clone());
+                let state = handle.state::<AppState>();
+                if let Err(event_pump) =
+                    lifecycle.publish_event_pump(&state.event_pump, event_pump)
+                {
+                    event_pump.shutdown().await;
+                    startup.complete(StartupOutcome::Failed);
+                    return;
+                }
                 match daemon_spawn::ensure_daemon_running(&client).await {
                     Ok(child) => {
                         if let Some(child) = child {
@@ -1000,7 +1143,6 @@ fn main() {
                         );
                     }
                 }
-                run_event_pump(handle, client).await;
             });
             Ok(())
         })
@@ -1021,7 +1163,11 @@ fn main() {
                 // `let` statement the guard drops at the `;`, leaving
                 // a plain `Option<DaemonChild>` for the match.
                 let state = app.state::<AppState>();
-                finish_exit(&state.daemon_lifecycle, &state.daemon_child);
+                finish_exit(
+                    &state.daemon_lifecycle,
+                    &state.daemon_child,
+                    &state.event_pump,
+                );
             }
         });
 }
@@ -1029,6 +1175,23 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_preserves_refusal_data_and_unknown_marker() {
+        let refusal = unwrap_response(Response {
+            ok: false,
+            error: Some("request refused".into()),
+            data: Some(serde_json::json!({ "code": "unauthorized_role" })),
+        })
+        .expect_err("refusal must be an error");
+        let encoded = serde_json::to_value(refusal).expect("error serializes");
+        assert_eq!(encoded["error"], "request refused");
+        assert_eq!(encoded["data"]["code"], "unauthorized_role");
+
+        let unknown = CommandError::from(control_client::RequestError::OutcomeUnknown);
+        let encoded = serde_json::to_value(unknown).expect("unknown serializes");
+        assert_eq!(encoded["data"]["outcome"], "unknown");
+    }
 
     #[tokio::test]
     async fn closing_fences_late_owned_startup_publication() {
@@ -1118,7 +1281,8 @@ mod tests {
             let child_slot = Arc::clone(&child_slot);
             let helper_done = Arc::clone(&helper_done);
             tokio::task::spawn_blocking(move || {
-                finish_exit(&lifecycle, &child_slot);
+                let event_pump_slot = Mutex::new(None);
+                finish_exit(&lifecycle, &child_slot, &event_pump_slot);
                 helper_done.store(true, Ordering::Release);
             })
         };

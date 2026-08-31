@@ -123,10 +123,10 @@ impl<T> AttemptOwnerSet<T> {
 
 /// Resource claim for exactly one connector candidate.
 ///
-/// The opening claim contains only mechanically proven Arc 03 ownership:
-/// one native transport, one worker, one pre-reserved cleanup obligation, and
-/// one opaque native dependency residual. It contains no guessed byte, handle,
-/// codec, or media quantity.
+/// The opening claim contains only mechanically proven ownership: one native
+/// transport, one connector worker, one pre-reserved cleanup obligation, one
+/// bounded late-terminal custodian, and one opaque native dependency residual.
+/// It contains no guessed codec or media quantity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ConnectorCandidateResourceClaim {
     opening: ResourceClaim,
@@ -162,6 +162,12 @@ impl ConnectorCandidateResourceClaim {
                 resource_owner::cleanup_job_claim()
                     .expect("the fixed cleanup-job claim cannot overflow"),
             )
+            .and_then(|claim| {
+                claim.checked_add(
+                    resource_owner::late_transport_custodian_claim()
+                        .expect("the fixed late-transport custodian claim cannot overflow"),
+                )
+            })
             .and_then(|claim| {
                 claim.checked_add(
                     remote_candidate::remote_candidate_attempt_root_claim()

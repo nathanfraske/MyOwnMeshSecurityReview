@@ -295,7 +295,7 @@ fn strict_subset_incomparable_foreign_context_and_stale_route_never_authorize() 
     );
 
     let before = target.clone();
-    let foreign = FactInventory::new(foreign_context, values);
+    let foreign = FactInventory::new(foreign_context, values.iter().copied());
     assert_eq!(
         apply_inventory_page(
             &mut target,

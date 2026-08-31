@@ -88,6 +88,13 @@ impl Default for WakeDetector {
 /// schedule a follow-up sweep after `WAKE_PROBE_DELAY_MS` to see
 /// who responded.
 pub async fn on_wake(state: &Arc<NetworkState>) {
+    // Linearize the entire wake operation before any announce, reconnect,
+    // peer timestamp, ping, or delayed-task registration.  A caller arriving
+    // after shutdown has requested its terminal transition must be silent;
+    // an admitted caller keeps this witness until all wake work is complete.
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let policy = state
         .config
         .read()
@@ -157,49 +164,51 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
             Some(owner.for_worker(worker).downgrade())
         })
         .collect();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(policy.wake_probe_delay_ms)).await;
-        let Some(state) = weak_state.upgrade() else {
-            return;
-        };
-        if shutdown_requested_now(&state).await {
-            return;
-        }
-        let now = Instant::now();
-        let mut any_rebuilt = false;
-        for weak_owner in peers {
-            let Some(owner) = weak_owner.upgrade() else {
-                continue;
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(policy.wake_probe_delay_ms)).await;
+            let Some(state) = weak_state.upgrade() else {
+                return;
             };
-            let peer_id = owner.device_id().to_string();
-            let stale = {
-                let Some(peer) = state.peers.get_if_current(&owner) else {
+            if shutdown_requested_now(&state).await {
+                return;
+            }
+            let now = Instant::now();
+            let mut any_rebuilt = false;
+            for weak_owner in peers {
+                let Some(owner) = weak_owner.upgrade() else {
                     continue;
                 };
-                let data = peer.state.read();
-                data.last_recv_at
-                    .map(|t| now.saturating_duration_since(t).as_millis() as u64)
-                    .unwrap_or(u64::MAX)
-                    > policy.wake_probe_delay_ms
-            };
-            if stale {
-                // The peer didn't answer the wake probe — its transport
-                // didn't survive the suspend. Re-handshaking over a dead
-                // channel can't work; rebuild and let discovery
-                // re-establish it (same reasoning as the heartbeat path).
-                debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
-                super::drop_peer_if_current(
-                    &state,
-                    &owner,
-                    crate::events::DropReason::HeartbeatTimeout,
-                )
-                .await;
-                any_rebuilt = true;
+                let peer_id = owner.device_id().to_string();
+                let stale = {
+                    let Some(peer) = state.peers.get_if_current(&owner) else {
+                        continue;
+                    };
+                    let data = peer.state.read();
+                    data.last_recv_at
+                        .map(|t| now.saturating_duration_since(t).as_millis() as u64)
+                        .unwrap_or(u64::MAX)
+                        > policy.wake_probe_delay_ms
+                };
+                if stale {
+                    // The peer didn't answer the wake probe — its transport
+                    // didn't survive the suspend. Re-handshaking over a dead
+                    // channel can't work; rebuild and let discovery
+                    // re-establish it (same reasoning as the heartbeat path).
+                    debug!(peer = %peer_id, "wake probe — peer silent, rebuilding");
+                    super::drop_peer_if_current(
+                        &state,
+                        &owner,
+                        crate::events::DropReason::HeartbeatTimeout,
+                    )
+                    .await;
+                    any_rebuilt = true;
+                }
             }
-        }
-        if any_rebuilt && !shutdown_requested_now(&state).await {
-            super::maybe_reactive_announce(&state);
-        }
+            if any_rebuilt && !shutdown_requested_now(&state).await {
+                super::maybe_reactive_announce(&state);
+            }
+        })
     });
 }
 
@@ -264,6 +273,48 @@ mod tests {
             rx.has_changed().unwrap(),
             "on_wake must bump the relay-reconnect signal"
         );
+    }
+
+    #[tokio::test]
+    async fn on_wake_after_shutdown_is_silent_and_registers_no_probe() {
+        let state = crate::engine::build_test_state("wake-after-shutdown");
+        let mut outbound = state
+            .take_signaling_outbound_rx()
+            .expect("outbound signaling rx should be available");
+        let peer = std::sync::Arc::new(crate::engine::connection::PeerConnection::new(
+            "wake-shutdown-peer".to_string(),
+            None,
+        ));
+        peer.state.write().status = PeerStatus::Active;
+        peer.state.write().last_ping_t = Some(17);
+        assert!(state.peers.install(peer).is_none());
+        let before = state
+            .peers
+            .get("wake-shutdown-peer")
+            .expect("test peer should be installed")
+            .state
+            .read()
+            .last_ping_t;
+
+        // Closing the state before entry must make the wake a no-op.  The
+        // entry permit is also the witness that prevents a delayed probe
+        // registration; shutdown then drains the registry without a task.
+        state.request_shutdown();
+        on_wake(&state).await;
+
+        let after = state
+            .peers
+            .get("wake-shutdown-peer")
+            .expect("shutdown does not remove this control peer yet")
+            .state
+            .read()
+            .last_ping_t;
+        assert_eq!(after, before, "late wake must not mutate last_ping_t");
+        assert!(
+            outbound.try_recv().is_none(),
+            "late wake must not publish announce or ping traffic"
+        );
+        state.shutdown().await;
     }
 
     #[test]

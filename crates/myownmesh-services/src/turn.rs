@@ -14,20 +14,26 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex as SyncMutex};
+#[cfg(test)]
+use std::sync::{Condvar, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::info;
 use turn::auth::{generate_auth_key, AuthHandler};
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
 use turn::relay::RelayAddressGenerator;
+use turn::resource::{ResourceAdmission, ResourceAdmissionError, ResourceCharge, ResourceKind};
 use turn::server::config::{ConnConfig, ServerConfig};
 use turn::server::Server;
 use turn::Error as TurnError;
@@ -35,6 +41,7 @@ use webrtc_util::vnet::net::Net;
 use webrtc_util::Conn;
 
 use myownmesh_core::config::{TurnCredential, TurnServiceConfig};
+use myownmesh_core::{LocalApplicationResourceScope, ResourceClaim, ResourceClass, ResourceLease};
 
 use crate::{Error, Result};
 
@@ -100,6 +107,146 @@ struct ThrottledConn {
     inner: Arc<dyn Conn + Send + Sync>,
     send_bucket: AsyncMutex<ByteBucket>,
     recv_bucket: AsyncMutex<ByteBucket>,
+}
+
+/// Adapts the dependency-neutral vendored TURN admission port to the
+/// owner-selected core scope. Every returned vendor lease owns exactly one
+/// core lease and is retained by the native object/task it funded.
+struct TurnResourceLease {
+    _lease: Option<ResourceLease>,
+}
+
+impl turn::resource::ResourceLease for TurnResourceLease {}
+
+struct TurnResourceAdmission {
+    scope: LocalApplicationResourceScope,
+}
+
+#[cfg(test)]
+struct AllocationLeaseConn {
+    inner: Arc<dyn Conn + Send + Sync>,
+    lease: SyncMutex<Option<ResourceLease>>,
+}
+
+#[cfg(test)]
+impl AllocationLeaseConn {
+    fn new(inner: Arc<dyn Conn + Send + Sync>, lease: ResourceLease) -> Self {
+        Self {
+            inner,
+            lease: SyncMutex::new(Some(lease)),
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl Conn for AllocationLeaseConn {
+    async fn connect(&self, addr: SocketAddr) -> std::result::Result<(), webrtc_util::Error> {
+        self.inner.connect(addr).await
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> std::result::Result<usize, webrtc_util::Error> {
+        self.inner.recv(buf).await
+    }
+
+    async fn recv_from(
+        &self,
+        buf: &mut [u8],
+    ) -> std::result::Result<(usize, SocketAddr), webrtc_util::Error> {
+        self.inner.recv_from(buf).await
+    }
+
+    async fn send(&self, buf: &[u8]) -> std::result::Result<usize, webrtc_util::Error> {
+        self.inner.send(buf).await
+    }
+
+    async fn send_to(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> std::result::Result<usize, webrtc_util::Error> {
+        self.inner.send_to(buf, target).await
+    }
+
+    fn local_addr(&self) -> std::result::Result<SocketAddr, webrtc_util::Error> {
+        self.inner.local_addr()
+    }
+
+    fn remote_addr(&self) -> Option<SocketAddr> {
+        self.inner.remote_addr()
+    }
+
+    async fn close(&self) -> std::result::Result<(), webrtc_util::Error> {
+        let result = self.inner.close().await;
+        self.lease
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        result
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+impl ResourceAdmission for TurnResourceAdmission {
+    fn acquire(
+        &self,
+        kind: ResourceKind,
+        charge: ResourceCharge,
+    ) -> std::result::Result<Box<dyn turn::resource::ResourceLease>, ResourceAdmissionError> {
+        let units = charge.units;
+        let mut entries = Vec::with_capacity(4);
+        let add = |entries: &mut Vec<(ResourceClass, u64)>, class, amount| {
+            if amount != 0 {
+                entries.push((class, amount));
+            }
+        };
+        match kind {
+            ResourceKind::Allocation => {
+                add(
+                    &mut entries,
+                    ResourceClass::RelayOrProviderAllocation,
+                    units,
+                );
+                add(&mut entries, ResourceClass::SocketOrHandle, units);
+                add(
+                    &mut entries,
+                    ResourceClass::WorkerOrTask,
+                    units.checked_mul(2).ok_or(ResourceAdmissionError)?,
+                );
+                add(&mut entries, ResourceClass::OpaqueDependencyResidual, units);
+            }
+            ResourceKind::ReadLoop
+            | ResourceKind::CommandLoop
+            | ResourceKind::AllocationTimer
+            | ResourceKind::PacketPump => add(&mut entries, ResourceClass::WorkerOrTask, units),
+            ResourceKind::Permission
+            | ResourceKind::ChannelBind
+            | ResourceKind::Reservation
+            | ResourceKind::Nonce => {
+                add(&mut entries, ResourceClass::OpaqueDependencyResidual, units)
+            }
+            ResourceKind::Queue => {
+                add(&mut entries, ResourceClass::OpaqueDependencyResidual, units)
+            }
+            ResourceKind::RelayProbe => add(&mut entries, ResourceClass::SocketOrHandle, units),
+        }
+        add(
+            &mut entries,
+            ResourceClass::QueuedBytes,
+            charge.retained_bytes,
+        );
+        let claim = ResourceClaim::try_from_entries(entries).map_err(|_| ResourceAdmissionError)?;
+        let lease = self
+            .scope
+            .acquire(claim)
+            .map_err(|_| ResourceAdmissionError)?;
+        Ok(Box::new(TurnResourceLease {
+            _lease: Some(lease),
+        }))
+    }
 }
 
 impl ThrottledConn {
@@ -172,6 +319,7 @@ struct ThrottledRelayGenerator {
     /// Round-robin starting point so we don't rescan held low ports on
     /// every allocation — just a spread hint, not load-bearing.
     cursor: std::sync::atomic::AtomicU16,
+    allocation_scope: LocalApplicationResourceScope,
 }
 
 impl ThrottledRelayGenerator {
@@ -211,6 +359,15 @@ impl RelayAddressGenerator for ThrottledRelayGenerator {
         use_ipv4: bool,
         requested_port: u16,
     ) -> std::result::Result<(Arc<dyn Conn + Send + Sync>, SocketAddr), TurnError> {
+        // The generator retains the owner scope for the lifetime of the
+        // server; allocation admission itself is performed by the vendored
+        // Manager immediately before this bind.
+        let _ = &self.allocation_scope;
+        #[cfg(test)]
+        let allocation_lease = self
+            .allocation_scope
+            .acquire(turn_allocation_claim())
+            .map_err(|_| TurnError::ErrTryAgain)?;
         // The TURN server passes 0 for normal allocations. With a fixed
         // window configured (min_port != 0) pick from it so relay traffic
         // lands on a small firewall-able range; otherwise (min_port == 0,
@@ -222,10 +379,29 @@ impl RelayAddressGenerator for ThrottledRelayGenerator {
             self.inner.allocate_conn(use_ipv4, requested_port).await?
         };
         if self.max_bps == 0 {
+            #[cfg(test)]
+            {
+                return Ok((
+                    Arc::new(AllocationLeaseConn::new(conn, allocation_lease)),
+                    addr,
+                ));
+            }
+            #[cfg(not(test))]
             return Ok((conn, addr));
         }
-        let throttled: Arc<dyn Conn + Send + Sync> =
-            Arc::new(ThrottledConn::new(conn, self.max_bps));
+        let throttled: Arc<dyn Conn + Send + Sync> = Arc::new(ThrottledConn::new(
+            {
+                #[cfg(test)]
+                {
+                    Arc::new(AllocationLeaseConn::new(conn, allocation_lease))
+                }
+                #[cfg(not(test))]
+                {
+                    conn
+                }
+            },
+            self.max_bps,
+        ));
         Ok((throttled, addr))
     }
 }
@@ -266,19 +442,164 @@ impl AuthHandler for StaticAuthHandler {
     }
 }
 
-/// A running TURN server. Constructed via [`TurnServer::start`].
+/// A running TURN server. Constructed via
+/// [`TurnServer::start_with_resource_scope`].
 pub struct TurnServer;
-
-type TaskReaperSender = mpsc::Sender<ReapEntry>;
-
-struct ReapEntry {
-    task: JoinHandle<std::result::Result<(), String>>,
-    terminal: Arc<TaskTerminal>,
-}
 
 struct TaskTerminal {
     finished: AtomicBool,
     notify: Notify,
+    #[cfg(test)]
+    done: (SyncMutex<bool>, Condvar),
+}
+
+struct FinalTask {
+    task: Box<dyn FnOnce() + Send + 'static>,
+}
+
+/// One service's final terminal owner. The channel is explicitly bounded by
+/// the slots reserved before that service's tasks are spawned. A worker thread
+/// observes terminal closures without depending on the caller's runtime (or
+/// re-entering a current-thread runtime from Drop).
+struct FinalTaskCustodian {
+    sender: SyncMutex<Option<mpsc::SyncSender<FinalTask>>>,
+    available: Arc<SyncMutex<usize>>,
+    worker: SyncMutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[cfg(test)]
+static TEST_FINAL_TASKS_REAPED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_FINAL_TASK_WAKE: OnceLock<Notify> = OnceLock::new();
+
+fn run_final_task_custodian(
+    receiver: mpsc::Receiver<FinalTask>,
+    available: Arc<SyncMutex<usize>>,
+    worker_done: Arc<AtomicBool>,
+) {
+    while let Ok(item) = receiver.recv() {
+        if std::panic::catch_unwind(AssertUnwindSafe(item.task)).is_err() {
+            tracing::warn!("service final terminal observer panicked");
+        }
+        *available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        #[cfg(test)]
+        {
+            TEST_FINAL_TASKS_REAPED.fetch_add(1, Ordering::AcqRel);
+            if let Some(wake) = TEST_FINAL_TASK_WAKE.get() {
+                wake.notify_waiters();
+            }
+        }
+    }
+    worker_done.store(true, Ordering::Release);
+}
+
+#[cfg(test)]
+fn test_final_task_wake() -> &'static Notify {
+    TEST_FINAL_TASK_WAKE.get_or_init(Notify::new)
+}
+
+/// Exact per-service custody for one final terminal job. The reservation is
+/// finite and taken before the service task is spawned; that task is never
+/// submitted without this explicit slot.
+pub(crate) struct FinalTaskCustody {
+    custodian: Arc<FinalTaskCustodian>,
+    #[cfg(test)]
+    worker_done: Arc<AtomicBool>,
+}
+
+impl FinalTaskCustody {
+    #[cfg(test)]
+    pub(crate) fn worker_done(&self) -> bool {
+        self.worker_done.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn worker_done_witness(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.worker_done)
+    }
+
+    pub(crate) fn submit(
+        &mut self,
+        task: Box<dyn FnOnce() + Send + 'static>,
+    ) -> std::result::Result<(), Box<dyn FnOnce() + Send + 'static>> {
+        {
+            let mut available = self
+                .custodian
+                .available
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *available == 0 {
+                return Err(task);
+            }
+            *available -= 1;
+            let sender = self
+                .custodian
+                .sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(sender) = sender.as_ref() else {
+                *available += 1;
+                return Err(task);
+            };
+            match sender.try_send(FinalTask { task }) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(FinalTask { task }))
+                | Err(mpsc::TrySendError::Disconnected(FinalTask { task })) => {
+                    *available += 1;
+                    return Err(task);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn reserve_final_task_custody(slots: usize) -> Option<FinalTaskCustody> {
+    if slots == 0 {
+        return None;
+    }
+    let (sender, receiver) = mpsc::sync_channel(slots);
+    let available = Arc::new(SyncMutex::new(slots));
+    let worker_available = Arc::clone(&available);
+    let worker_done = Arc::new(AtomicBool::new(false));
+    let worker_done_for_thread = Arc::clone(&worker_done);
+    let worker = std::thread::Builder::new()
+        .name("myownmesh-service-final-custody".into())
+        .spawn(move || run_final_task_custodian(receiver, worker_available, worker_done_for_thread))
+        .ok()?;
+    Some(FinalTaskCustody {
+        custodian: Arc::new(FinalTaskCustodian {
+            sender: SyncMutex::new(Some(sender)),
+            available,
+            worker: SyncMutex::new(Some(worker)),
+        }),
+        #[cfg(test)]
+        worker_done,
+    })
+}
+
+impl Drop for FinalTaskCustodian {
+    fn drop(&mut self) {
+        // Closing the sender lets the owned worker drain every already-funded
+        // terminal job and then finish. Its JoinHandle is retained until this
+        // exact owner is dropped and synchronously observed here.
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            if let Err(error) = worker.join() {
+                tracing::warn!("service final custody worker panicked: {error:?}");
+            }
+        }
+    }
 }
 
 impl TaskTerminal {
@@ -286,24 +607,48 @@ impl TaskTerminal {
         Self {
             finished: AtomicBool::new(false),
             notify: Notify::new(),
+            #[cfg(test)]
+            done: (SyncMutex::new(false), Condvar::new()),
         }
     }
 
     fn mark(&self) {
         self.finished.store(true, Ordering::Release);
         self.notify.notify_waiters();
+        #[cfg(test)]
+        {
+            let (done, wake) = &self.done;
+            *done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    fn wait_finished(&self) {
+        let (done, wake) = &self.done;
+        let mut done = done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*done {
+            done = wake
+                .wait(done)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
 /// Handle to a running TURN server. Call [`TurnServerHandle::stop`] to
 /// request the dependency's close protocol and join its close task; dropping
-/// it sends the same request and hands the exact task to a bounded reaper.
+/// it sends the same request and hands the exact task to the service's bounded
+/// final custodian.
 pub struct TurnServerHandle {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<std::result::Result<(), String>>>,
     terminal: Arc<TaskTerminal>,
-    task_reaper: Option<TaskReaperSender>,
-    task_reaper_handle: Option<JoinHandle<()>>,
+    final_task_custody: FinalTaskCustody,
+    service_lease: Option<ResourceLease>,
     local_addr: SocketAddr,
     relay_ip: IpAddr,
 }
@@ -331,12 +676,7 @@ impl TurnServerHandle {
             Ok(Ok(()))
         };
         self.terminal.mark();
-        drop(self.task_reaper.take());
-        if let Some(reaper) = self.task_reaper_handle.take() {
-            reaper
-                .await
-                .map_err(|error| Error::TaskJoin(error.to_string()))?;
-        }
+        drop(self.service_lease.take());
         match task_result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(Error::Turn(error)),
@@ -351,66 +691,42 @@ impl Drop for TurnServerHandle {
             return;
         };
         let _ = shutdown.send(());
+        let final_task_custody = &mut self.final_task_custody;
         let Some(task) = self.task.take() else {
             return;
         };
-        let entry = ReapEntry {
-            task,
-            terminal: Arc::clone(&self.terminal),
-        };
-        let Some(reaper) = self.task_reaper.take() else {
-            reap_without_runtime(entry);
-            return;
-        };
-        match reaper.try_send(entry) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(entry))
-            | Err(mpsc::error::TrySendError::Closed(entry)) => reap_without_runtime(entry),
-        }
-        drop(self.task_reaper_handle.take());
+        let terminal = Arc::clone(&self.terminal);
+        let service_lease = self.service_lease.take();
+        // A dropped handle must not hand the exact task back to the origin
+        // runtime: that runtime may be torn down immediately after Drop.
+        // Abort makes the terminal observation runtime-independent, while the
+        // close request above remains the first protocol action.
+        task.abort();
+        submit_final_task(
+            Box::new(move || {
+                match join_without_runtime(task) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!("dropped TURN close task returned an error: {error}");
+                    }
+                    Err(error) if error.is_cancelled() => {}
+                    Err(error) => {
+                        tracing::warn!("dropped TURN close task did not join normally: {error}");
+                    }
+                }
+                terminal.mark();
+                drop(service_lease);
+            }),
+            final_task_custody,
+        );
     }
 }
 
-fn spawn_task_reaper() -> (TaskReaperSender, JoinHandle<()>) {
-    let (sender, mut receiver) = mpsc::channel(1);
-    let task = tokio::spawn(async move {
-        while let Some(entry) = receiver.recv().await {
-            reap_entry(entry).await;
-        }
-    });
-    (sender, task)
-}
-
-async fn reap_entry(entry: ReapEntry) {
-    match entry.task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!("dropped TURN close task returned an error: {error}");
-        }
-        Err(error) if error.is_cancelled() => {}
-        Err(error) => warn_join_error(error),
-    }
-    entry.terminal.mark();
-}
-
-fn warn_join_error(error: tokio::task::JoinError) {
-    tracing::warn!("dropped TURN close task did not join normally: {error}");
-}
-
-fn reap_without_runtime(entry: ReapEntry) {
-    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-        runtime.spawn(reap_entry(entry));
-    } else {
-        let ReapEntry { task, terminal } = entry;
-        match join_without_runtime(task) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!("dropped TURN close task returned an error: {error}");
-            }
-            Err(error) if error.is_cancelled() => {}
-            Err(error) => warn_join_error(error),
-        }
-        terminal.mark();
+fn submit_final_task(task: Box<dyn FnOnce() + Send + 'static>, custody: &mut FinalTaskCustody) {
+    if let Err(task) = custody.submit(task) {
+        // Refusal is explicit and nonblocking. The exact owned terminal job
+        // is run here; no fallback thread may detach the observation.
+        task();
     }
 }
 
@@ -446,12 +762,33 @@ impl TurnServer {
     /// public IP to advertise) since a TURN server that can't be
     /// reached or authenticated against is worse than none.
     pub async fn start(config: &TurnServiceConfig) -> Result<TurnServerHandle> {
+        let _ = config;
+        Err(Error::Resource(
+            "owner-selected resource scope required; use start_with_resource_scope".into(),
+        ))
+    }
+
+    /// Bind the control listener and start TURN under exact owner-funded
+    /// custody. The supplied scope is consumed by this service; a clone is
+    /// retained only by the relay generator for independently leased
+    /// allocations.
+    pub async fn start_with_resource_scope(
+        config: &TurnServiceConfig,
+        scope: LocalApplicationResourceScope,
+    ) -> Result<TurnServerHandle> {
         if config.credentials.is_empty() {
             return Err(Error::TurnConfig(
                 "TURN requires at least one username/password credential".into(),
             ));
         }
         let relay_ip = resolve_relay_ip(config)?;
+
+        let allocation_scope = scope.clone();
+        let service_lease = scope
+            .acquire(turn_startup_claim())
+            .map_err(|error| Error::Resource(error.to_string()))?;
+        let final_task_custody = reserve_final_task_custody(1)
+            .ok_or_else(|| Error::TaskJoin("service final-task custody exhausted".into()))?;
 
         let bind_addr = format!("{}:{}", config.bind, config.port);
         let conn = Arc::new(
@@ -471,34 +808,40 @@ impl TurnServer {
         let relay_port_min = config.relay_port_min;
         let relay_port_max = config.relay_port_max.max(config.relay_port_min);
 
-        let server = Server::new(ServerConfig {
-            conn_configs: vec![ConnConfig {
-                conn,
-                // Wrap the static generator so each allocation's relay
-                // socket is drawn from the configured port range and
-                // bandwidth-shaped to the configured cap (a no-op
-                // passthrough when the cap is 0).
-                relay_addr_generator: Box::new(ThrottledRelayGenerator {
-                    inner: RelayAddressGeneratorStatic {
-                        relay_address: relay_ip,
-                        // Interface the relay sockets bind on; the
-                        // wildcard is fine here — relay_address is what
-                        // clients are told to use.
-                        address: "0.0.0.0".to_owned(),
-                        net: Arc::new(Net::new(None)),
-                    },
-                    max_bps: config.max_bps_per_connection,
-                    min_port: relay_port_min,
-                    max_port: relay_port_max,
-                    cursor: std::sync::atomic::AtomicU16::new(0),
-                }),
-            }],
-            realm: config.realm.clone(),
-            auth_handler,
-            // Zero = use the crate's DEFAULT_LIFETIME for channel binds.
-            channel_bind_timeout: Duration::from_secs(0),
-            alloc_close_notify: None,
-        })
+        let server = Server::new_with_resource_admission(
+            ServerConfig {
+                conn_configs: vec![ConnConfig {
+                    conn,
+                    // Wrap the static generator so each allocation's relay
+                    // socket is drawn from the configured port range and
+                    // bandwidth-shaped to the configured cap (a no-op
+                    // passthrough when the cap is 0).
+                    relay_addr_generator: Box::new(ThrottledRelayGenerator {
+                        inner: RelayAddressGeneratorStatic {
+                            relay_address: relay_ip,
+                            // Interface the relay sockets bind on; the
+                            // wildcard is fine here — relay_address is what
+                            // clients are told to use.
+                            address: "0.0.0.0".to_owned(),
+                            net: Arc::new(Net::new(None)),
+                        },
+                        max_bps: config.max_bps_per_connection,
+                        min_port: relay_port_min,
+                        max_port: relay_port_max,
+                        cursor: std::sync::atomic::AtomicU16::new(0),
+                        allocation_scope: allocation_scope.clone(),
+                    }),
+                }],
+                realm: config.realm.clone(),
+                auth_handler,
+                // Zero = use the crate's DEFAULT_LIFETIME for channel binds.
+                channel_bind_timeout: Duration::from_secs(0),
+                alloc_close_notify: None,
+            },
+            Arc::new(TurnResourceAdmission {
+                scope: allocation_scope.clone(),
+            }),
+        )
         .await
         .map_err(|e| Error::Turn(e.to_string()))?;
 
@@ -508,7 +851,6 @@ impl TurnServer {
             server.close().await.map_err(|error| error.to_string())
         });
         let terminal = Arc::new(TaskTerminal::new());
-        let (task_reaper, task_reaper_handle) = spawn_task_reaper();
 
         let relay_ports = if relay_port_min == 0 {
             "OS ephemeral range".to_string()
@@ -528,12 +870,34 @@ impl TurnServer {
             shutdown: Some(shutdown),
             task: Some(task),
             terminal,
-            task_reaper: Some(task_reaper),
-            task_reaper_handle: Some(task_reaper_handle),
+            final_task_custody,
+            service_lease: Some(service_lease),
             local_addr,
             relay_ip,
         })
     }
+}
+
+fn turn_startup_claim() -> ResourceClaim {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::SocketOrHandle, 1),
+        (ResourceClass::WorkerOrTask, 4),
+        // One bounded final-custody channel/worker handoff residual.
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+    .expect("fixed TURN startup claim is representable")
+}
+
+#[cfg(test)]
+fn turn_allocation_claim() -> ResourceClaim {
+    ResourceClaim::try_from_entries([
+        (ResourceClass::RelayOrProviderAllocation, 1),
+        (ResourceClass::SocketOrHandle, 1),
+        (ResourceClass::WorkerOrTask, 2),
+        // Bounded dependency state retained by one relay allocation.
+        (ResourceClass::OpaqueDependencyResidual, 1),
+    ])
+    .expect("fixed TURN allocation claim is representable")
 }
 
 /// Resolve the IP a TURN allocation should advertise. Prefers
@@ -562,6 +926,25 @@ fn resolve_relay_ip(config: &TurnServiceConfig) -> Result<IpAddr> {
 mod tests {
     use super::*;
 
+    fn test_scope() -> LocalApplicationResourceScope {
+        let grant = ResourceClaim::try_from_entries(
+            ResourceClass::ALL
+                .into_iter()
+                .map(|class| (class, 1_000_000)),
+        )
+        .expect("test provider grant is representable");
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(grant),
+        )
+        .expect("test provider is valid");
+        LocalApplicationResourceScope::transport_lab_child_of(&port)
+            .expect("test application scope is valid")
+    }
+
+    async fn start_with_scope(config: &TurnServiceConfig) -> Result<TurnServerHandle> {
+        TurnServer::start_with_resource_scope(config, test_scope()).await
+    }
+
     fn cred(u: &str, p: &str) -> TurnCredential {
         TurnCredential {
             username: u.into(),
@@ -588,7 +971,7 @@ mod tests {
         let mut cfg = loopback_config();
         cfg.credentials.clear();
         assert!(matches!(
-            TurnServer::start(&cfg).await,
+            start_with_scope(&cfg).await,
             Err(Error::TurnConfig(_))
         ));
     }
@@ -607,22 +990,159 @@ mod tests {
             relay_port_max: 50151,
         };
         assert!(matches!(
-            TurnServer::start(&cfg).await,
+            start_with_scope(&cfg).await,
             Err(Error::TurnConfig(_))
         ));
     }
 
     #[tokio::test]
     async fn starts_and_stops_on_loopback() {
-        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let server = start_with_scope(&loopback_config()).await.unwrap();
         assert_ne!(server.local_addr().port(), 0);
         assert_eq!(server.relay_ip().to_string(), "127.0.0.1");
         server.stop().await.unwrap();
     }
 
+    #[test]
+    fn runtime_ended_before_drop_is_reaped_without_runtime_reentry() {
+        let (server, terminal) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("single-thread runtime");
+            runtime.block_on(async {
+                let server = start_with_scope(&loopback_config()).await.unwrap();
+                let terminal = Arc::clone(&server.terminal);
+                (server, terminal)
+            })
+        };
+
+        drop(server);
+
+        terminal.wait_finished();
+        assert!(terminal.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn current_thread_drop_observes_worker_before_runtime_destruction() {
+        let (terminal, worker_done, port) = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("single-thread runtime");
+            runtime.block_on(async {
+                let server = start_with_scope(&loopback_config()).await.unwrap();
+                let terminal = Arc::clone(&server.terminal);
+                let worker_done = server.final_task_custody.worker_done_witness();
+                let port = server.local_addr().port();
+                drop(server);
+                (terminal, worker_done, port)
+            })
+        };
+
+        assert!(terminal.finished.load(Ordering::Acquire));
+        assert!(worker_done.load(Ordering::Acquire));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("replacement runtime");
+        runtime.block_on(async {
+            let mut config = loopback_config();
+            config.port = port;
+            start_with_scope(&config)
+                .await
+                .expect("Drop released the exact control port")
+                .stop()
+                .await
+                .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn failed_final_submission_runs_the_owned_job_without_detach() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let available = Arc::new(SyncMutex::new(1));
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let worker_done_for_thread = Arc::clone(&worker_done);
+        let worker = std::thread::spawn(move || {
+            worker_done_for_thread.store(true, Ordering::Release);
+        });
+        let worker_done_witness = Arc::clone(&worker_done);
+        let mut custody = FinalTaskCustody {
+            custodian: Arc::new(FinalTaskCustodian {
+                sender: SyncMutex::new(Some(sender)),
+                available,
+                worker: SyncMutex::new(Some(worker)),
+            }),
+            worker_done,
+        };
+        let (joined, joined_result) = oneshot::channel();
+        let task: tokio::task::JoinHandle<std::result::Result<(), String>> =
+            tokio::spawn(async { Ok::<(), String>(()) });
+        let job = Box::new(move || {
+            let result = join_without_runtime(task).is_ok();
+            let _ = joined.send(result);
+        });
+        submit_final_task(job, &mut custody);
+        assert!(joined_result.await.expect("fallback observer completed"));
+        drop(custody);
+        assert!(worker_done_witness.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stopped_turn_releases_the_exact_control_port_for_reuse() {
+        let mut config = loopback_config();
+        let first = start_with_scope(&config).await.unwrap();
+        let port = first.local_addr().port();
+        first.stop().await.unwrap();
+
+        config.port = port;
+        let second = start_with_scope(&config).await.unwrap();
+        assert_eq!(second.local_addr().port(), port);
+        second.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_startup_grant_rejects_n_plus_one_and_reuses_after_stop() {
+        let insufficient_port =
+            myownmesh_core::ResourceProviderPort::new(myownmesh_core::FiniteResourceProvider::new(
+                turn_startup_claim()
+                    .checked_sub(ResourceClaim::single(ResourceClass::WorkerOrTask, 1))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let insufficient_scope =
+            LocalApplicationResourceScope::transport_lab_child_of(&insufficient_port).unwrap();
+        assert!(matches!(
+            TurnServer::start_with_resource_scope(&loopback_config(), insufficient_scope).await,
+            Err(Error::Resource(_))
+        ));
+
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(turn_startup_claim()),
+        )
+        .unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+        let config = loopback_config();
+        let first = TurnServer::start_with_resource_scope(&config, scope.clone())
+            .await
+            .unwrap();
+        let refused = TurnServer::start_with_resource_scope(&config, scope.clone()).await;
+        assert!(matches!(refused, Err(Error::Resource(_))));
+        first.stop().await.unwrap();
+        TurnServer::start_with_resource_scope(&config, scope)
+            .await
+            .unwrap()
+            .stop()
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn active_stop_observes_turn_close_terminal() {
-        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let server = start_with_scope(&loopback_config()).await.unwrap();
         let terminal = Arc::clone(&server.terminal);
 
         server.stop().await.unwrap();
@@ -631,8 +1151,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn final_task_custody_observes_exact_reaper_handle() {
+        let before = TEST_FINAL_TASKS_REAPED.load(Ordering::Acquire);
+        let mut custody = reserve_final_task_custody(1).expect("final custody is available");
+        let task = tokio::spawn(async { Ok::<(), String>(()) });
+        submit_final_task(
+            Box::new(move || {
+                assert!(join_without_runtime(task).is_ok());
+            }),
+            &mut custody,
+        );
+        while TEST_FINAL_TASKS_REAPED.load(Ordering::Acquire) == before {
+            let notified = test_final_task_wake().notified();
+            if TEST_FINAL_TASKS_REAPED.load(Ordering::Acquire) != before {
+                break;
+            }
+            notified.await;
+        }
+        assert_eq!(
+            TEST_FINAL_TASKS_REAPED.load(Ordering::Acquire),
+            before + 1,
+            "the final reaper handle is observed by the bounded custodian"
+        );
+        assert!(!custody.worker_done());
+    }
+
+    #[tokio::test]
     async fn drop_outside_runtime_is_reaped_by_runtime_owner() {
-        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let server = start_with_scope(&loopback_config()).await.unwrap();
         let terminal = Arc::clone(&server.terminal);
         let notified = terminal.notify.notified();
 
@@ -658,6 +1204,7 @@ mod tests {
             min_port: 50500,
             max_port: 50519,
             cursor: std::sync::atomic::AtomicU16::new(0),
+            allocation_scope: test_scope(),
         };
         match generator.allocate_conn(true, 0).await {
             Ok((_conn, addr)) => assert!(
@@ -692,6 +1239,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_allocation_grant_rejects_n_plus_one_and_reuses_after_close() {
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(turn_allocation_claim()),
+        )
+        .unwrap();
+        let generator = ThrottledRelayGenerator {
+            inner: RelayAddressGeneratorStatic {
+                relay_address: "127.0.0.1".parse().unwrap(),
+                address: "127.0.0.1".to_owned(),
+                net: Arc::new(Net::new(None)),
+            },
+            max_bps: 0,
+            min_port: 0,
+            max_port: 0,
+            cursor: std::sync::atomic::AtomicU16::new(0),
+            allocation_scope: LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap(),
+        };
+        let (first, _) = generator.allocate_conn(true, 0).await.unwrap();
+        assert!(matches!(
+            generator.allocate_conn(true, 0).await,
+            Err(TurnError::ErrTryAgain)
+        ));
+        first.close().await.unwrap();
+        let (reused, _) = generator.allocate_conn(true, 0).await.unwrap();
+        reused.close().await.unwrap();
+    }
+
+    #[test]
+    fn vendor_admission_charges_exact_subtree_before_publication() {
+        let port = myownmesh_core::ResourceProviderPort::new(
+            myownmesh_core::FiniteResourceProvider::new(turn_allocation_claim()),
+        )
+        .unwrap();
+        let scope = LocalApplicationResourceScope::transport_lab_child_of(&port).unwrap();
+        let admission = TurnResourceAdmission {
+            scope: scope.clone(),
+        };
+
+        let first = admission
+            .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
+            .expect("the exact allocation subtree is funded");
+        assert!(
+            admission
+                .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
+                .is_err(),
+            "a second allocation must refuse before relay bind"
+        );
+        drop(first);
+        admission
+            .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
+            .expect("dropping the exact lease restores the allocation grant");
+    }
+
+    #[test]
+    fn vendor_admission_refuses_each_allocation_dimension_before_bind() {
+        for dimension in [
+            ResourceClass::RelayOrProviderAllocation,
+            ResourceClass::SocketOrHandle,
+            ResourceClass::WorkerOrTask,
+            ResourceClass::OpaqueDependencyResidual,
+        ] {
+            let grant = myownmesh_core::ResourceProviderPort::new(
+                myownmesh_core::FiniteResourceProvider::new(
+                    turn_allocation_claim()
+                        .checked_sub(ResourceClaim::single(dimension, 1))
+                        .unwrap(),
+                ),
+            )
+            .unwrap();
+            let scope = LocalApplicationResourceScope::transport_lab_child_of(&grant).unwrap();
+            let admission = TurnResourceAdmission { scope };
+            assert!(
+                admission
+                    .acquire(ResourceKind::Allocation, ResourceCharge::units(1))
+                    .is_err(),
+                "allocation must refuse when {dimension:?} is one below its exact grant"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unbounded_range_falls_back_to_os_ephemeral() {
         // min_port == 0 is the default: no fixed window, allocation still
         // succeeds on an OS-assigned port (just not constrained).
@@ -705,6 +1333,7 @@ mod tests {
             min_port: 0,
             max_port: 0,
             cursor: std::sync::atomic::AtomicU16::new(0),
+            allocation_scope: test_scope(),
         };
         let (_conn, addr) = generator.allocate_conn(true, 0).await.unwrap();
         assert_ne!(addr.port(), 0);
@@ -746,7 +1375,7 @@ mod tests {
         // A configured cap must not break startup or allocation wiring.
         let mut cfg = loopback_config();
         cfg.max_bps_per_connection = 256_000;
-        let server = TurnServer::start(&cfg).await.unwrap();
+        let server = start_with_scope(&cfg).await.unwrap();
         assert_ne!(server.local_addr().port(), 0);
         server.stop().await.unwrap();
     }
@@ -768,7 +1397,7 @@ mod tests {
     async fn answers_binding_request_through_turn_listener() {
         use turn::client::{Client, ClientConfig};
 
-        let server = TurnServer::start(&loopback_config()).await.unwrap();
+        let server = start_with_scope(&loopback_config()).await.unwrap();
         let server_port = server.local_addr().port();
 
         let conn = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

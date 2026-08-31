@@ -44,27 +44,189 @@ use super::event::{
 };
 use super::handle::derive_room_handle;
 use super::shuffle::select_top_n;
+#[cfg(test)]
+use crate::task_custodian::DedicatedTaskCustodian;
+use crate::task_custodian::{CustodianReservation, TaskCustodian};
+#[cfg(test)]
+use crate::task_custodian::{TaskCustodyError, TaskReservation};
 use crate::upstream::{ANNOUNCE_BACKOFF_MS, ANNOUNCE_STEADY_MS, PRESENCE_REPLAY_WINDOW_SECS};
 use crate::{
-    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierAttribution,
-    ErasedOwner, ErasedSource, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
+    AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierAttribution, ErasedOwner,
+    ErasedSource, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
 };
 
+#[cfg(test)]
 struct UnmeteredAttemptRefusalSink;
 
+#[cfg(test)]
 impl AttemptRefusalSink for UnmeteredAttemptRefusalSink {
     fn refused(&self, _refusal: AttemptRefusal) {}
-}
-
-struct UnmeteredAttemptOutcomeSink;
-
-impl AttemptOutcomeSink for UnmeteredAttemptOutcomeSink {
-    fn outcome(&self, _outcome: AttemptOutcome) {}
 }
 
 const INBOUND_SINK_CLOSED: &str = "inbound sink closed";
 const MAX_INBOUND_FRAME_BYTES: usize = 256 * 1024;
 type TaskReaperSender = mpsc::Sender<tokio::task::JoinHandle<()>>;
+
+/// Owner-scoped custody for handles that synchronous `Drop` could not return
+/// to the bounded channel reaper. Its capacity is derived from the exact
+/// task set for this driver, so fallback retention cannot grow with process
+/// lifetime or with unrelated driver instances.
+#[cfg(test)]
+struct FallbackReaperTasks {
+    capacity: usize,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    overflow: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[cfg(test)]
+impl FallbackReaperTasks {
+    fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            tasks: Mutex::new(Vec::with_capacity(capacity)),
+            supervisors: Mutex::new(Vec::with_capacity(2)),
+            overflow: Mutex::new(None),
+        })
+    }
+
+    fn retain(&self, task: tokio::task::JoinHandle<()>) -> Result<(), tokio::task::JoinHandle<()>> {
+        let mut tasks = self.tasks.lock();
+        if tasks
+            .len()
+            .checked_add(1)
+            .is_none_or(|len| len > self.capacity)
+        {
+            return Err(task);
+        }
+        tasks.push(task);
+        Ok(())
+    }
+
+    fn retain_supervisor(
+        &self,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Result<(), tokio::task::JoinHandle<()>> {
+        let mut supervisors = self.supervisors.lock();
+        if supervisors.len() >= 2 {
+            return Err(task);
+        }
+        supervisors.push(task);
+        Ok(())
+    }
+
+    fn retain_overflow(
+        &self,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Result<(), tokio::task::JoinHandle<()>> {
+        let mut overflow = self.overflow.lock();
+        if overflow.is_some() {
+            Err(task)
+        } else {
+            *overflow = Some(task);
+            Ok(())
+        }
+    }
+
+    fn take_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = self.tasks.lock().drain(..).collect::<Vec<_>>();
+        if let Some(task) = self.overflow.lock().take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    fn take_all(
+        &self,
+    ) -> (
+        Vec<tokio::task::JoinHandle<()>>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        (
+            self.take_tasks(),
+            self.supervisors.lock().drain(..).collect(),
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DriverTaskCounts {
+    selected_relays: usize,
+    fallback_relays: usize,
+    fallback_supervisors: usize,
+    outbound: usize,
+    announcer: usize,
+    driver_tasks: usize,
+    cancellers: usize,
+    cancel_wakes: usize,
+}
+
+impl DriverTaskCounts {
+    /// Derive every driver-owned task/coordination slot before any task is
+    /// created. The two always-on pumps are explicit so later insertions can
+    /// stay within preallocated, configuration-derived capacities.
+    fn derive(selected_relays: usize, fallback_relays: usize) -> Option<Self> {
+        let fallback_supervisors = usize::from(fallback_relays != 0);
+        let outbound = 1;
+        let announcer = 1;
+        let driver_tasks = selected_relays
+            .checked_add(outbound)?
+            .checked_add(announcer)?;
+        let cancellers = driver_tasks.checked_add(fallback_supervisors)?;
+        let cancel_wakes = selected_relays.checked_add(fallback_supervisors)?;
+        Some(Self {
+            selected_relays,
+            fallback_relays,
+            fallback_supervisors,
+            outbound,
+            announcer,
+            driver_tasks,
+            cancellers,
+            cancel_wakes,
+        })
+    }
+}
+
+/// Exact terminal observer capacity required by one Nostr driver.
+///
+/// The primary reservation covers every driver task that can miss the
+/// runtime reaper plus the optional fallback supervisor. The independent
+/// reservation additionally covers the reaper handle itself, so a lifecycle
+/// owner can fund both reservations before startup without reproducing the
+/// relay-count arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NostrTaskCustodyPlan {
+    pub primary_observer_slots: usize,
+    pub reaper_observer_slots: usize,
+}
+
+/// The two independent lifecycle owners required before a Nostr driver can
+/// spawn. `primary` owns ordinary task/fallback submissions; `reaper` owns
+/// the reaper itself and is the non-self terminal route when primary custody
+/// refuses a handle.
+pub struct NostrTaskCustodyOwners {
+    pub primary: Arc<dyn TaskCustodian>,
+    pub reaper: Arc<dyn TaskCustodian>,
+}
+
+/// Derive exact terminal custody from the selected and fallback relay counts.
+/// Returns `None` if any count or reservation would overflow platform
+/// capacity. This is the single algebraic source used by driver startup and
+/// by lifecycle owners planning the injected custodians.
+pub fn derive_task_custody_plan(
+    selected_relays: usize,
+    fallback_relays: usize,
+) -> Option<NostrTaskCustodyPlan> {
+    let counts = DriverTaskCounts::derive(selected_relays, fallback_relays)?;
+    let primary_observer_slots = counts
+        .driver_tasks
+        .checked_add(counts.fallback_supervisors)?;
+    let reaper_observer_slots = primary_observer_slots.checked_add(1)?;
+    Some(NostrTaskCustodyPlan {
+        primary_observer_slots,
+        reaper_observer_slots,
+    })
+}
 
 /// Operator-supplied timing for socket recovery and fallback.
 /// Presence cadence remains the dependency-owned schedule in `upstream.rs`;
@@ -249,68 +411,55 @@ pub enum NostrOutbound {
     },
 }
 
-/// Start with the provider that funds each exact attempt and relay-session
-/// delivery.  Attempt custody is acquired before the event enters the live
-/// map; relay custody is acquired before a frame is encoded.
-pub fn start_with_delivery_provider<S>(
-    config: NostrDriverConfig,
-    outbound: S,
-    inbound_tx: InboundSink<NostrInbound>,
-    provider: Arc<dyn DeliveryProvider>,
-) -> Result<NostrDriverHandle, crate::Error>
-where
-    S: OutboundSource<NostrOutbound> + Send + 'static,
-    S::Owner: Sync + 'static,
-{
-    start_with_delivery_provider_and_refusal_sink(
-        config,
-        outbound,
-        inbound_tx,
-        provider,
-        Arc::new(UnmeteredAttemptRefusalSink),
-    )
-}
-
-/// Start with provider custody and a consumer-owned sink for typed refusal
-/// records. The sink receives each exact attempt/event record immediately;
-/// the driver never retains a refusal queue.
-pub fn start_with_delivery_provider_and_refusal_sink<S>(
-    config: NostrDriverConfig,
-    outbound: S,
-    inbound_tx: InboundSink<NostrInbound>,
-    provider: Arc<dyn DeliveryProvider>,
-    refusal_sink: Arc<dyn AttemptRefusalSink>,
-) -> Result<NostrDriverHandle, crate::Error>
-where
-    S: OutboundSource<NostrOutbound> + Send + 'static,
-    S::Owner: Sync + 'static,
-{
-    start_with_delivery_provider_and_sinks(
-        config,
-        outbound,
-        inbound_tx,
-        provider,
-        refusal_sink,
-        Arc::new(UnmeteredAttemptOutcomeSink),
-    )
-}
-
-/// Start with provider custody and consumer-owned refusal/outcome sinks.
-/// Relay ACKs, typed refusals, disconnects, and reconnects are folded by the
-/// delivery store's per-event carrier aggregate before an outcome reaches
-/// this sink; relay order is not an authority signal.
-pub fn start_with_delivery_provider_and_sinks<S>(
+/// Start with lifecycle-owned bounded custody for final driver handles.
+/// Callers must derive the exact relay population with
+/// [`derive_task_custody_plan`] and reserve both supplied custodians for at
+/// least those returned observer-slot counts before calling this function.
+/// `custody_owners.primary` funds every bounded fallback slot, while
+/// `custody_owners.reaper` independently funds the task reaper and the same
+/// fallback population. Both reservations are consumed before any task is
+/// spawned; no driver-owned fallback queue or runtime is created here.
+pub fn start_with_delivery_provider_and_sinks_with_custodian<S>(
     config: NostrDriverConfig,
     outbound: S,
     inbound_tx: InboundSink<NostrInbound>,
     provider: Arc<dyn DeliveryProvider>,
     refusal_sink: Arc<dyn AttemptRefusalSink>,
     outcome_sink: Arc<dyn AttemptOutcomeSink>,
+    custody_owners: NostrTaskCustodyOwners,
 ) -> Result<NostrDriverHandle, crate::Error>
 where
     S: OutboundSource<NostrOutbound> + Send + 'static,
     S::Owner: Sync + 'static,
 {
+    start_with_delivery_provider_and_sinks_inner(
+        config,
+        outbound,
+        inbound_tx,
+        provider,
+        refusal_sink,
+        outcome_sink,
+        custody_owners,
+    )
+}
+
+fn start_with_delivery_provider_and_sinks_inner<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound_tx: InboundSink<NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+    refusal_sink: Arc<dyn AttemptRefusalSink>,
+    outcome_sink: Arc<dyn AttemptOutcomeSink>,
+    custody_owners: NostrTaskCustodyOwners,
+) -> Result<NostrDriverHandle, crate::Error>
+where
+    S: OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
+    let NostrTaskCustodyOwners {
+        primary: custodian_owner,
+        reaper: reaper_custodian_owner,
+    } = custody_owners;
     config.timing.validate()?;
     let identity = NostrIdentity::generate();
     let room_handle = derive_room_handle(&config.app_id, &config.network_id);
@@ -352,6 +501,32 @@ where
     } else {
         Vec::new()
     };
+    let custody_plan =
+        derive_task_custody_plan(selected.len(), fallback_urls.len()).ok_or_else(|| {
+            crate::Error::Other("Nostr task custody plan overflows platform capacity".into())
+        })?;
+    let counts =
+        DriverTaskCounts::derive(selected.len(), fallback_urls.len()).ok_or_else(|| {
+            crate::Error::Other("Nostr relay task count overflows platform capacity".into())
+        })?;
+    debug_assert_eq!(counts.selected_relays, selected.len());
+    debug_assert_eq!(counts.fallback_relays, fallback_urls.len());
+    debug_assert_eq!(counts.outbound, 1);
+    debug_assert_eq!(counts.announcer, 1);
+    // Reserve every possible fallback handle before the first task exists.
+    // The primary owner covers the normal fallback route; the independent
+    // reaper owner covers the task reaper itself and is also the non-self
+    // terminal route if the primary reservation refuses a handle.
+    let custodian = custodian_owner
+        .reserve(custody_plan.primary_observer_slots)
+        .map_err(|error| {
+            crate::Error::Other(format!("Nostr fallback custodian exhausted: {error:?}"))
+        })?;
+    let reaper_custodian = reaper_custodian_owner
+        .reserve(custody_plan.reaper_observer_slots)
+        .map_err(|error| {
+            crate::Error::Other(format!("Nostr reaper custodian exhausted: {error:?}"))
+        })?;
 
     let delivery = DeliveryStore::new_with_outcome_sink(provider, outcome_sink);
     let (presence_tx, _) =
@@ -388,10 +563,13 @@ where
         relay_connected: relay_connected.clone(),
         shutdown: shutdown.clone(),
     });
-    let mut cancellers = Vec::new();
-    let mut cancel_wakes = Vec::new();
-    let mut tasks = Vec::new();
-
+    // These registries are exact driver cardinalities: one primary entry per
+    // selected relay, optionally one fallback supervisor, and one each for
+    // outbound/announce. Reserve them before the first spawn so every later
+    // insertion remains owned without container growth.
+    let mut cancellers = Vec::with_capacity(counts.cancellers);
+    let mut cancel_wakes = Vec::with_capacity(counts.cancel_wakes);
+    let mut tasks = Vec::with_capacity(counts.driver_tasks);
     // Count of primary relays with a live session; the fallback
     // supervisor watches this to decide when to step in.
     let primary_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -422,7 +600,7 @@ where
 
     // Spawn the public-relay fallback supervisor (no-op unless the pool is
     // non-empty, i.e. `public_fallback` is on and there are relays to use).
-    if !fallback_urls.is_empty() {
+    let fallback_supervisor_task = if !fallback_urls.is_empty() {
         let shared = shared.clone();
         let inbound_tx = inbound_tx.clone();
         let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -432,7 +610,7 @@ where
         let cancel_wake_for_task = cancel_wake.clone();
         cancel_wakes.push(cancel_wake);
         let primary_live = primary_live.clone();
-        tasks.push(tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             run_fallback_supervisor(
                 fallback_urls,
                 shared,
@@ -442,8 +620,10 @@ where
                 primary_live,
             )
             .await;
-        }));
-    }
+        }))
+    } else {
+        None
+    };
 
     // Spawn the outbound pump.
     let shared_for_outbound = shared.clone();
@@ -466,13 +646,27 @@ where
         run_announcer(shared_for_announce, cancel_token_for_task).await;
     }));
 
-    let (task_reaper, task_reaper_handle) = spawn_task_reaper(tasks.len().max(1));
+    debug_assert_eq!(tasks.len(), counts.driver_tasks);
+    debug_assert_eq!(cancellers.len(), counts.cancellers);
+    debug_assert_eq!(cancel_wakes.len(), counts.cancel_wakes);
+    #[cfg(test)]
+    let fallback_reaper_tasks = FallbackReaperTasks::new(counts.driver_tasks);
+    let (task_reaper, task_reaper_handle) = spawn_task_reaper(
+        counts.driver_tasks,
+        #[cfg(test)]
+        Arc::clone(&fallback_reaper_tasks),
+    );
     Ok(NostrDriverHandle {
         cancellers,
         cancel_wakes,
         tasks: Arc::new(Mutex::new(Some(tasks))),
+        fallback_supervisor_task: Mutex::new(fallback_supervisor_task),
         task_reaper: Mutex::new(Some(task_reaper)),
         task_reaper_handle: Mutex::new(Some(task_reaper_handle)),
+        custodian_owner,
+        custodian: Some(custodian),
+        reaper_custodian_owner,
+        reaper_custodian: Some(reaper_custodian),
         force_reconnect,
         relay_connected,
         delivery,
@@ -480,15 +674,21 @@ where
     })
 }
 
-/// Handle returned by [`start_with_delivery_provider`]. Drop or call
-/// [`Self::stop`] to
-/// signal every spawned task to exit.
+/// Handle returned by [`start_with_delivery_provider_and_sinks_with_custodian`].
+/// Drop or call [`Self::stop_and_join`] to signal every spawned task to exit.
 pub struct NostrDriverHandle {
     cancellers: Vec<Arc<std::sync::atomic::AtomicBool>>,
     cancel_wakes: Vec<Arc<Notify>>,
     tasks: Arc<Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>>,
+    fallback_supervisor_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     task_reaper: Mutex<Option<TaskReaperSender>>,
     task_reaper_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    custodian_owner: Arc<dyn TaskCustodian>,
+    custodian: Option<CustodianReservation>,
+    /// Independent custody for the reaper handle itself. It cannot be the
+    /// fallback drained by that reaper without creating a self-await cycle.
+    reaper_custodian_owner: Arc<dyn TaskCustodian>,
+    reaper_custodian: Option<CustodianReservation>,
     force_reconnect: Arc<watch::Sender<u64>>,
     relay_connected: Arc<watch::Sender<u64>>,
     delivery: Arc<DeliveryStore>,
@@ -528,21 +728,28 @@ impl NostrDriverHandle {
     /// Signal shutdown and join every driver-owned task. This is the
     /// lifecycle boundary for callers that hold the shared driver handle;
     /// Dropping the handle remains a non-blocking signal operation; the
-    /// reaper still owns the transferred tasks and observes their terminals.
+    /// injected terminal custodians own the transferred tasks and observe
+    /// their terminals independently of the caller's runtime.
     /// The task list is consumed exactly once, so concurrent shutdown callers
     /// cannot double-join or lose ownership of a task.
     pub async fn stop_and_join(&self) {
         self.request_stop();
+        let fallback_supervisor = { self.fallback_supervisor_task.lock().take() };
         let tasks = self.tasks.lock().take().unwrap_or_default();
         for task in tasks {
-            let _ = task.await;
+            observe_nostr_task(task, "Nostr driver task").await;
+        }
+        if let Some(supervisor) = fallback_supervisor {
+            observe_nostr_task(supervisor, "Nostr fallback supervisor").await;
         }
         let reaper_sender = self.task_reaper.lock().take();
         drop(reaper_sender);
         let reaper = { self.task_reaper_handle.lock().take() };
         if let Some(reaper) = reaper {
-            let _ = reaper.await;
+            observe_nostr_task(reaper, "Nostr task reaper").await;
         }
+        self.custodian_owner.close();
+        self.reaper_custodian_owner.close();
     }
 
     /// Clone of the force-reconnect signal. The engine stashes this
@@ -566,58 +773,155 @@ impl NostrDriverHandle {
 impl Drop for NostrDriverHandle {
     fn drop(&mut self) {
         self.request_stop();
-        let tasks = self.tasks.lock().take().unwrap_or_default();
-        let reaper = self.task_reaper.lock().take();
-        for task in tasks {
-            if let Some(reaper) = reaper.as_ref() {
-                abort_and_join(reaper, task);
-            } else {
-                task.abort();
-                let _ = futures::executor::block_on(task);
-            }
+        let mut custodian = self.custodian.take();
+        let mut fallback_supervisor = { self.fallback_supervisor_task.lock().take() };
+        let reaper_task = { self.task_reaper_handle.lock().take() };
+        if let Some(supervisor) = fallback_supervisor.take() {
+            submit_to_terminal_custody(
+                &mut custodian,
+                &mut self.reaper_custodian,
+                supervisor,
+                "Nostr fallback supervisor",
+            );
         }
-        drop(reaper);
+        let tasks = self.tasks.lock().take().unwrap_or_default();
+        drop(self.task_reaper.lock().take());
+        for task in tasks {
+            task.abort();
+            submit_to_terminal_custody(
+                &mut custodian,
+                &mut self.reaper_custodian,
+                task,
+                "Nostr driver task",
+            );
+        }
+        if let Some(reaper_task) = reaper_task {
+            // The reaper is always submitted last to its independent owner.
+            // Its reservation includes every bounded fallback slot, so a
+            // primary-owner refusal cannot create a self-await cycle.
+            submit_to_terminal_custody(
+                &mut self.reaper_custodian,
+                &mut custodian,
+                reaper_task,
+                "Nostr task reaper",
+            );
+        }
     }
 }
 
-fn spawn_task_reaper(capacity: usize) -> (TaskReaperSender, tokio::task::JoinHandle<()>) {
+fn spawn_task_reaper(
+    capacity: usize,
+    #[cfg(test)] fallback: Arc<FallbackReaperTasks>,
+) -> (TaskReaperSender, tokio::task::JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(capacity);
     let task = tokio::spawn(async move {
+        #[cfg(test)]
+        reap_owned_tasks(receiver, fallback).await;
+        #[cfg(not(test))]
         reap_owned_tasks(receiver).await;
     });
     (sender, task)
 }
 
-fn abort_and_join(reaper: &TaskReaperSender, task: tokio::task::JoinHandle<()>) {
+fn submit_to_terminal_custody(
+    primary: &mut Option<CustodianReservation>,
+    independent: &mut Option<CustodianReservation>,
+    task: tokio::task::JoinHandle<()>,
+    context: &str,
+) {
+    let task = if let Some(primary) = primary.as_mut() {
+        match primary.submit(task) {
+            Ok(()) => return,
+            Err(task) => task,
+        }
+    } else {
+        task
+    };
+    if let Some(independent) = independent.as_mut() {
+        if independent.submit(task).is_ok() {
+            return;
+        }
+    }
+    // Reservations are exact and established before spawn. Reaching this
+    // branch means an injected lifecycle owner violated that contract; keep
+    // the failure explicit instead of silently aborting or dropping a handle.
+    panic!("{context} terminal custody refused after exact pre-reservation");
+}
+
+#[cfg(test)]
+fn abort_and_join(
+    reaper: &TaskReaperSender,
+    task: tokio::task::JoinHandle<()>,
+    fallback: &Arc<FallbackReaperTasks>,
+) {
     task.abort();
     match reaper.try_send(task) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(task))
         | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = task.await;
-                    #[cfg(test)]
-                    record_reaped_fallback();
-                });
-            } else {
-                let _ = futures::executor::block_on(task);
-                #[cfg(test)]
-                record_reaped_fallback();
-            }
+            retain_or_overflow(fallback, task, "Nostr test fallback");
         }
     }
 }
 
+#[cfg(test)]
+fn retain_or_overflow(
+    fallback: &Arc<FallbackReaperTasks>,
+    task: tokio::task::JoinHandle<()>,
+    context: &str,
+) {
+    if let Err(task) = fallback.retain(task) {
+        fallback
+            .retain_overflow(task)
+            .unwrap_or_else(|_| panic!("{context} exceeded its funded test capacity"));
+    }
+}
+
+#[cfg(test)]
+async fn reap_fallback_reaper_tasks(fallback: &Arc<FallbackReaperTasks>) {
+    let (tasks, supervisors) = fallback.take_all();
+    for task in tasks {
+        observe_nostr_task(task, "Nostr fallback reaper").await;
+        #[cfg(test)]
+        record_reaped_fallback();
+    }
+    for task in supervisors {
+        observe_nostr_task(task, "Nostr fallback reaper").await;
+        #[cfg(test)]
+        record_reaped_fallback();
+    }
+}
+
+async fn observe_nostr_task(task: tokio::task::JoinHandle<()>, context: &str) {
+    match task.await {
+        Ok(()) => trace!(%context, "task joined normally"),
+        Err(error) if error.is_cancelled() => {
+            debug!(%context, ?error, "task was cancelled")
+        }
+        Err(error) if error.is_panic() => warn!(%context, ?error, "task panicked"),
+        Err(error) => warn!(%context, ?error, "task failed to join"),
+    }
+}
+
+#[cfg(not(test))]
 async fn reap_owned_tasks(mut receiver: mpsc::Receiver<tokio::task::JoinHandle<()>>) {
     while let Some(task) = receiver.recv().await {
-        if let Err(error) = task.await {
-            if !error.is_cancelled() {
-                warn!("nostr task did not join normally: {error}");
-            }
-        }
-        #[cfg(test)]
+        observe_nostr_task(task, "Nostr driver task").await;
+    }
+}
+
+#[cfg(test)]
+async fn reap_owned_tasks(
+    mut receiver: mpsc::Receiver<tokio::task::JoinHandle<()>>,
+    fallback: Arc<FallbackReaperTasks>,
+) {
+    while let Some(task) = receiver.recv().await {
+        observe_nostr_task(task, "Nostr driver task").await;
         TEST_REAPED_TASKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    for task in fallback.take_tasks() {
+        observe_nostr_task(task, "Nostr fallback task").await;
+        TEST_REAPED_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
 
@@ -1023,7 +1327,7 @@ async fn run_fallback_supervisor(
         Arc<std::sync::atomic::AtomicBool>,
         Arc<Notify>,
         tokio::task::JoinHandle<()>,
-    )> = Vec::new();
+    )> = Vec::with_capacity(urls.len());
     let mut down_since: Option<Instant> = None;
     let mut shutdown_rx = shared.shutdown.subscribe();
 
@@ -1034,7 +1338,7 @@ async fn run_fallback_supervisor(
                 wake.notify_waiters();
             }
             while let Some((_, _, task)) = active.pop() {
-                let _ = task.await;
+                observe_nostr_task(task, "fallback relay task").await;
             }
             return;
         }
@@ -1072,6 +1376,7 @@ async fn run_fallback_supervisor(
                         )
                         .await;
                     });
+                    debug_assert!(active.len() < active.capacity());
                     active.push((task_cancel, task_wake, task));
                 }
             }
@@ -1082,7 +1387,7 @@ async fn run_fallback_supervisor(
                     wake.notify_waiters();
                 }
                 while let Some((_, _, task)) = active.pop() {
-                    let _ = task.await;
+                    observe_nostr_task(task, "fallback relay task").await;
                 }
             }
             FallbackAction::Hold => {}
@@ -1097,7 +1402,7 @@ async fn run_fallback_supervisor(
                 }
                 cancel_wake.notify_waiters();
                 while let Some((_, _, task)) = active.pop() {
-                    let _ = task.await;
+                    observe_nostr_task(task, "fallback relay task").await;
                 }
                 return;
             }
@@ -1827,6 +2132,30 @@ mod tests {
         released: AtomicBool,
     }
 
+    struct RefusingReservation;
+
+    impl TaskReservation for RefusingReservation {
+        fn submit(
+            &mut self,
+            task: tokio::task::JoinHandle<()>,
+        ) -> Result<(), tokio::task::JoinHandle<()>> {
+            Err(task)
+        }
+    }
+
+    struct RefusingCustodian;
+
+    impl TaskCustodian for RefusingCustodian {
+        fn reserve(&self, _slots: usize) -> Result<Box<dyn TaskReservation>, TaskCustodyError> {
+            Ok(Box::new(RefusingReservation))
+        }
+
+        fn progress(&self) -> tokio::sync::watch::Receiver<u64> {
+            let (_sender, receiver) = tokio::sync::watch::channel(0u64);
+            receiver
+        }
+    }
+
     impl ParkedWriteGate {
         fn release(&self) {
             self.released.store(true, Ordering::SeqCst);
@@ -1894,6 +2223,71 @@ mod tests {
             ),
             FallbackAction::Hold
         );
+    }
+
+    #[test]
+    fn driver_task_counts_refuse_overflow_before_startup() {
+        let counts = DriverTaskCounts::derive(3, 2).expect("bounded counts fit");
+        assert_eq!(counts.selected_relays, 3);
+        assert_eq!(counts.fallback_relays, 2);
+        assert_eq!(counts.fallback_supervisors, 1);
+        assert_eq!(counts.outbound, 1);
+        assert_eq!(counts.announcer, 1);
+        assert_eq!(counts.driver_tasks, 5);
+        assert_eq!(counts.cancellers, 6);
+        assert_eq!(counts.cancel_wakes, 4);
+        assert!(
+            DriverTaskCounts::derive(usize::MAX - 1, 1).is_none(),
+            "overflow must refuse before any task is created"
+        );
+        assert!(
+            derive_task_custody_plan(usize::MAX - 1, 1).is_none(),
+            "custody-plan overflow must refuse before any task is created"
+        );
+    }
+
+    #[test]
+    fn terminal_custody_requires_every_fallback_slot_plus_reaper() {
+        let counts = DriverTaskCounts::derive(3, 2).expect("bounded counts fit");
+        let plan = derive_task_custody_plan(3, 2).expect("custody plan fits");
+        assert_eq!(plan.primary_observer_slots, 6);
+        assert_eq!(plan.reaper_observer_slots, 7);
+        assert_eq!(
+            plan.primary_observer_slots,
+            counts.driver_tasks + counts.fallback_supervisors
+        );
+        assert_eq!(plan.reaper_observer_slots, plan.primary_observer_slots + 1);
+        let owner =
+            DedicatedTaskCustodian::new(plan.reaper_observer_slots - 1).expect("short owner");
+        assert!(
+            owner.reserve(plan.reaper_observer_slots).is_err(),
+            "grant-minus-one must refuse before any task can be spawned"
+        );
+        owner.close();
+    }
+
+    #[tokio::test]
+    async fn fallback_registry_refuses_n_plus_one_and_returns_exact_handle() {
+        let counts = DriverTaskCounts::derive(2, 1).expect("bounded counts fit");
+        let fallback = FallbackReaperTasks::new(counts.driver_tasks);
+        for _ in 0..counts.driver_tasks {
+            fallback
+                .retain(tokio::spawn(async {}))
+                .expect("each funded fallback slot accepts one handle");
+        }
+        let extra = tokio::spawn(async { panic!("N+1 fallback task") });
+        let extra = fallback
+            .retain(extra)
+            .expect_err("N+1 must be refused without dropping its handle");
+        assert!(extra
+            .await
+            .expect_err("returned handle must observe panic")
+            .is_panic());
+        let retained = fallback.take_tasks();
+        assert_eq!(retained.len(), counts.driver_tasks);
+        for task in retained {
+            task.await.expect("funded fallback task must terminate");
+        }
     }
 
     #[test]
@@ -2200,7 +2594,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn outside_runtime_driver_drop_transfers_task_to_reaper() {
         let before = TEST_REAPED_TASKS.load(Ordering::Acquire);
-        let (reaper_sender, reaper_task) = spawn_task_reaper(1);
+        let fallback_reaper_tasks = FallbackReaperTasks::new(2);
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1, Arc::clone(&fallback_reaper_tasks));
         let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             armed_tx
@@ -2210,7 +2605,8 @@ mod tests {
         });
         armed_rx.await.expect("reaper control task must be running");
 
-        std::thread::spawn(move || abort_and_join(&reaper_sender, task))
+        let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
+        std::thread::spawn(move || abort_and_join(&reaper_sender, task, &fallback_for_thread))
             .join()
             .expect("outside-runtime owner drop must return");
 
@@ -2225,10 +2621,226 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fallback_capacity_refusal_returns_exact_panicking_handle() {
+        let fallback = FallbackReaperTasks::new(0);
+        let (task, started) = panicking_task("Nostr fallback capacity refusal");
+        started.await.expect("panic task must start before refusal");
+        let task = fallback
+            .retain(task)
+            .expect_err("zero-capacity custody must return the exact handle");
+        let error = task.await.expect_err("returned panic must be observed");
+        assert!(error.is_panic());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_overflow_transfer_observes_panicking_task() {
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+        let fallback = FallbackReaperTasks::new(0);
+        let (task, started) = panicking_task("Nostr bounded fallback overflow");
+        started
+            .await
+            .expect("panic task must start before transfer");
+        retain_or_overflow(&fallback, task, "Nostr overflow control");
+        reap_fallback_reaper_tasks(&fallback).await;
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "bounded overflow custody must observe the exact panic"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_order_transfers_unaborted_reaper_with_active_nested_task() {
+        let fallback = FallbackReaperTasks::new(1);
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1, Arc::clone(&fallback));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let nested = tokio::spawn(async move {
+            release_rx
+                .await
+                .expect("nested relay task release remains live");
+        });
+        reaper_sender
+            .send(nested)
+            .await
+            .expect("reaper accepts the nested relay task");
+        drop(reaper_sender);
+        fallback
+            .retain_supervisor(reaper_task)
+            .expect("owner capacity reserves the reaper supervisor");
+        release_tx
+            .send(())
+            .expect("nested relay task remains active until release");
+        let (tasks, mut supervisors) = fallback.take_all();
+        assert!(
+            tasks.is_empty(),
+            "nested relay task was joined by its reaper"
+        );
+        let supervisor = supervisors
+            .pop()
+            .expect("unaborted reaper supervisor remains joinable");
+        supervisor
+            .await
+            .expect("transferred reaper observes nested relay completion");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn current_thread_drop_uses_independent_terminal_custody() {
+        let observer_owner = DedicatedTaskCustodian::new(1).expect("terminal observer");
+        let observer = observer_owner
+            .reserve(1)
+            .expect("terminal observer reservation");
+        let mut primary: Option<CustodianReservation> = Some(Box::new(RefusingReservation));
+        let mut independent = Some(observer);
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        std::thread::spawn(move || {
+            submit_to_terminal_custody(
+                &mut primary,
+                &mut independent,
+                task,
+                "Nostr current-thread refusal",
+            );
+        })
+        .join()
+        .expect("current-thread Drop transfer must not block on its origin runtime");
+        observer_owner.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refusing_primary_custody_never_routes_reaper_to_its_fallback() {
+        let fallback = FallbackReaperTasks::new(1);
+        let (reaper_sender, reaper_receiver) = mpsc::channel(1);
+        let reaper_done = Arc::new(Notify::new());
+        let reaper_done_for_task = Arc::clone(&reaper_done);
+        let fallback_for_task = Arc::clone(&fallback);
+        let reaper_task = tokio::spawn(async move {
+            let mut receiver = reaper_receiver;
+            while let Some(task) = receiver.recv().await {
+                observe_nostr_task(task, "Nostr control reaper").await;
+            }
+            for task in fallback_for_task.take_tasks() {
+                observe_nostr_task(task, "Nostr fallback reaper").await;
+            }
+            reaper_done_for_task.notify_one();
+        });
+        let reaper_custodian_owner = DedicatedTaskCustodian::new(1).expect("reaper custodian");
+        let reaper_custodian = reaper_custodian_owner
+            .reserve(1)
+            .expect("the reaper custodian must reserve its own handle");
+        let reaper_owner_for_control = Arc::clone(&reaper_custodian_owner);
+        let handle = NostrDriverHandle {
+            cancellers: Vec::new(),
+            cancel_wakes: Vec::new(),
+            tasks: Arc::new(Mutex::new(Some(Vec::new()))),
+            fallback_supervisor_task: Mutex::new(None),
+            task_reaper: Mutex::new(Some(reaper_sender)),
+            task_reaper_handle: Mutex::new(Some(reaper_task)),
+            custodian_owner: Arc::new(RefusingCustodian),
+            custodian: Some(Box::new(RefusingReservation)),
+            reaper_custodian_owner,
+            reaper_custodian: Some(reaper_custodian),
+            force_reconnect: Arc::new(watch::channel(0u64).0),
+            relay_connected: Arc::new(watch::channel(0u64).0),
+            delivery: DeliveryStore::new(Arc::new(UnmeteredDeliveryProvider)),
+            shutdown: watch::channel(false).0,
+        };
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(2), reaper_done.notified())
+            .await
+            .expect("an independently observed reaper must reach terminal");
+        reaper_owner_for_control.close();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn driver_drop_transfers_active_nested_task_with_full_overflow() {
+        struct DropMark(Arc<AtomicBool>, Arc<Notify>);
+
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+                self.1.notify_one();
+            }
+        }
+
+        let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
+        let fallback = FallbackReaperTasks::new(0);
+        let (filler, filler_started) = panicking_task("Nostr full overflow filler");
+        filler_started
+            .await
+            .expect("overflow filler must start before Drop");
+        fallback
+            .retain_overflow(filler)
+            .expect("the bounded overflow slot must accept one exact filler");
+
+        let (reaper_sender, reaper_task) = spawn_task_reaper(1, Arc::clone(&fallback));
+        let custodian_owner = DedicatedTaskCustodian::new(2).expect("test custodian");
+        let custodian = custodian_owner
+            .reserve(2)
+            .expect("the external custodian must reserve both final supervisors");
+        let reaper_custodian_owner = DedicatedTaskCustodian::new(1).expect("reaper custodian");
+        let reaper_custodian = reaper_custodian_owner
+            .reserve(1)
+            .expect("the reaper custodian must reserve its own handle");
+        let (fallback_shutdown, mut fallback_shutdown_rx) = watch::channel(false);
+        let fallback_supervisor = tokio::spawn(async move {
+            fallback_shutdown_rx
+                .changed()
+                .await
+                .expect("Drop shutdown reaches the fallback supervisor");
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_task = Arc::clone(&dropped);
+        let dropped_wake = Arc::new(Notify::new());
+        let dropped_wake_for_task = Arc::clone(&dropped_wake);
+        let nested = tokio::spawn(async move {
+            let _mark = DropMark(dropped_for_task, dropped_wake_for_task);
+            std::future::pending::<()>().await;
+        });
+        let handle = NostrDriverHandle {
+            cancellers: vec![Arc::new(AtomicBool::new(false))],
+            cancel_wakes: vec![Arc::new(Notify::new())],
+            tasks: Arc::new(Mutex::new(Some(vec![nested]))),
+            fallback_supervisor_task: Mutex::new(Some(fallback_supervisor)),
+            task_reaper: Mutex::new(Some(reaper_sender)),
+            task_reaper_handle: Mutex::new(Some(reaper_task)),
+            custodian_owner,
+            custodian: Some(custodian),
+            reaper_custodian_owner,
+            reaper_custodian: Some(reaper_custodian),
+            force_reconnect: Arc::new(watch::channel(0u64).0),
+            relay_connected: Arc::new(watch::channel(0u64).0),
+            delivery: DeliveryStore::new(Arc::new(UnmeteredDeliveryProvider)),
+            shutdown: fallback_shutdown,
+        };
+        drop(handle);
+
+        tokio::time::timeout(Duration::from_secs(2), dropped_wake.notified())
+            .await
+            .expect("external custody path must observe nested task cancellation");
+        let supervisors = fallback.supervisors.lock().drain(..).collect::<Vec<_>>();
+        assert_eq!(
+            supervisors.len(),
+            0,
+            "final supervisors must leave the dropped handle graph"
+        );
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "Drop must abort and observe the active nested relay task"
+        );
+        assert_eq!(
+            TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
+            before + 1,
+            "the full overflow filler must be terminal-observed"
+        );
+        assert!(fallback.take_tasks().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reaper_full_and_closed_fallbacks_observe_panics_in_and_outside_runtime() {
-        let wake = TEST_REAPED_FALLBACK_WAKE.get_or_init(Notify::new);
         let before = TEST_REAPED_FALLBACKS.load(Ordering::Acquire);
 
+        let fallback_reaper_tasks = FallbackReaperTasks::new(1);
         let (full_sender, mut full_receiver) = mpsc::channel(1);
         full_sender
             .try_send(tokio::spawn(std::future::pending::<()>()))
@@ -2237,8 +2849,8 @@ mod tests {
         started
             .await
             .expect("the full fallback child starts before transfer");
-        abort_and_join(&full_sender, task);
-        wake.notified().await;
+        abort_and_join(&full_sender, task, &fallback_reaper_tasks);
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 1,
@@ -2248,7 +2860,7 @@ mod tests {
             .try_recv()
             .expect("the full-channel filler remains explicitly owned");
         filler.abort();
-        let _ = filler.await;
+        assert!(filler.await.is_err(), "aborted filler must be observed");
 
         let (closed_sender, closed_receiver) = mpsc::channel(1);
         drop(closed_receiver);
@@ -2256,8 +2868,8 @@ mod tests {
         started
             .await
             .expect("the closed fallback child starts before transfer");
-        abort_and_join(&closed_sender, task);
-        wake.notified().await;
+        abort_and_join(&closed_sender, task, &fallback_reaper_tasks);
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 2,
@@ -2273,19 +2885,21 @@ mod tests {
         started
             .await
             .expect("the outside-runtime full child starts before transfer");
-        std::thread::spawn(move || abort_and_join(&full_sender, task))
+        let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
+        std::thread::spawn(move || abort_and_join(&full_sender, task, &fallback_for_thread))
             .join()
             .expect("outside-runtime full fallback returns after joining");
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 3,
-            "a full no-runtime transfer synchronously observes the child"
+            "a full no-runtime transfer remains owned until the explicit observer joins it"
         );
         let filler = full_receiver
             .try_recv()
             .expect("the no-runtime full filler remains explicitly owned");
         filler.abort();
-        let _ = filler.await;
+        assert!(filler.await.is_err(), "aborted filler must be observed");
 
         let (closed_sender, closed_receiver) = mpsc::channel(1);
         drop(closed_receiver);
@@ -2294,13 +2908,15 @@ mod tests {
         started
             .await
             .expect("the outside-runtime closed child starts before transfer");
-        std::thread::spawn(move || abort_and_join(&closed_sender, task))
+        let fallback_for_thread = Arc::clone(&fallback_reaper_tasks);
+        std::thread::spawn(move || abort_and_join(&closed_sender, task, &fallback_for_thread))
             .join()
             .expect("outside-runtime closed fallback returns after joining");
+        reap_fallback_reaper_tasks(&fallback_reaper_tasks).await;
         assert_eq!(
             TEST_REAPED_FALLBACKS.load(Ordering::Acquire),
             before + 4,
-            "a closed no-runtime transfer synchronously observes the child"
+            "a closed no-runtime transfer remains owned until the explicit observer joins it"
         );
     }
 

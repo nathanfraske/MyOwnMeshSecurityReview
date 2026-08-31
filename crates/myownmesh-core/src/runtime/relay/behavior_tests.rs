@@ -630,6 +630,9 @@ fn closed_relay_epoch_allows_bounded_reuse_after_exact_settlement() {
                 .expect("reused relay endpoints"),
         )
         .expect("same session id is reusable with a fresh epoch");
+    assert_eq!(replacement.settle(), ClosedRelayTerminal::Settled);
+    assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(2));
+    assert_eq!(provider.in_use(), baseline);
     let delayed_duplicate_permit =
         RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
             .expect("delayed duplicate is independently funded before admission");
@@ -643,8 +646,8 @@ fn closed_relay_epoch_allows_bounded_reuse_after_exact_settlement() {
         ),
         Err(ClosedRelayRefusal::OwnerMismatch)
     ));
-    assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(1));
-    assert_eq!(replacement.settle(), ClosedRelayTerminal::Settled);
+    assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(2));
+    assert_eq!(provider.in_use(), baseline);
     drop(relay);
     assert_eq!(provider.in_use(), baseline);
 }

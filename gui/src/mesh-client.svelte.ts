@@ -33,6 +33,38 @@ import type {
 const POLL_INTERVAL_MS = 2000;
 const MAX_DIAG_ENTRIES = 200;
 
+export interface CommandFailure {
+  readonly message: string;
+  readonly data?: Record<string, unknown>;
+}
+
+/** Decode both the current Tauri error envelope and older string errors. */
+export function commandFailure(error: unknown): CommandFailure {
+  let value: unknown = error;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return { message: value };
+    }
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const data = record.data;
+    return {
+      message: typeof record.error === "string" ? record.error : String(error),
+      data: data && typeof data === "object" ? (data as Record<string, unknown>) : undefined,
+    };
+  }
+  return { message: String(error) };
+}
+
+export function isOutcomeUnknown(error: unknown): boolean {
+  const failure = commandFailure(error);
+  return failure.data?.outcome === "unknown" ||
+    failure.message.startsWith("outcome unknown:");
+}
+
 function createMeshClient() {
   // ---- reactive state -------------------------------------------------
 
@@ -70,6 +102,28 @@ function createMeshClient() {
   let unsubEvent: UnlistenFn | null = null;
   let unsubStatus: UnlistenFn | null = null;
 
+  // Mutations are serialized behind this tail. If a response is lost after
+  // the daemon may have committed, the gate refreshes authoritative state
+  // before allowing the next mutation to begin.
+  let mutationTail: Promise<void> = Promise.resolve();
+
+  async function runMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = mutationTail;
+    let release!: () => void;
+    mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } catch (error) {
+      if (isOutcomeUnknown(error)) await refreshAll();
+      throw error;
+    } finally {
+      release();
+    }
+  }
+
   // ---- one-shot fetchers ----------------------------------------------
 
   async function refreshStatus() {
@@ -94,7 +148,9 @@ function createMeshClient() {
     // copy in one shot and echoes the resulting IdentityInfo back,
     // so we can replace the cached value without a follow-up
     // refresh.
-    identity = (await invoke("mesh_identity_set_label", { label })) as IdentityInfo;
+    identity = (await runMutation(() =>
+      invoke("mesh_identity_set_label", { label }),
+    )) as IdentityInfo;
   }
 
   async function refreshNetworks() {
@@ -187,7 +243,9 @@ function createMeshClient() {
     topology: "ring" | "star" | "full_mesh",
     hub?: string,
   ) {
-    await invoke("mesh_topology_set", { network, topology, hub: hub ?? null });
+    await runMutation(() =>
+      invoke("mesh_topology_set", { network, topology, hub: hub ?? null }),
+    );
     await refreshNetworks();
     await refreshPeers(network);
   }
@@ -205,7 +263,7 @@ function createMeshClient() {
   }
 
   async function networkAdd(config: NetworkConfigInput) {
-    await invoke("mesh_network_add", { config });
+    await runMutation(() => invoke("mesh_network_add", { config }));
     await refreshNetworks();
     // Refresh peers for the new network so its sidebar row populates
     // immediately rather than waiting on the next poll tick.
@@ -213,7 +271,7 @@ function createMeshClient() {
   }
 
   async function networkRemove(network: string) {
-    await invoke("mesh_network_remove", { network });
+    await runMutation(() => invoke("mesh_network_remove", { network }));
     await refreshNetworks();
   }
 
@@ -224,14 +282,26 @@ function createMeshClient() {
    *  stale cache that would resurrect what was wiped. `restart_app` never
    *  resolves (the app is replaced), so this call ends by relaunching. */
   async function forgetAllNetworksAndRestart() {
-    await invoke("mesh_forget_all_networks");
-    await invoke("restart_app");
+    await resetAndRestart("mesh_forget_all_networks");
   }
 
   /** Danger Zone: factory reset — wipe this device's entire state (identity,
    *  config, every network) and reboot into a brand-new identity. */
   async function factoryResetAndRestart() {
-    await invoke("mesh_factory_reset");
+    await resetAndRestart("mesh_factory_reset");
+  }
+
+  async function resetAndRestart(command: "mesh_forget_all_networks" | "mesh_factory_reset") {
+    try {
+      await runMutation(() => invoke(command));
+    } catch (error) {
+      if (!isOutcomeUnknown(error)) throw error;
+      // The daemon may already have applied the reset and closed its
+      // listener. Restarting the Tauri shell is the only safe recovery;
+      // never retry the ambiguous reset request itself.
+      await invoke("restart_app");
+      throw error;
+    }
     await invoke("restart_app");
   }
 
@@ -240,7 +310,7 @@ function createMeshClient() {
    *  transport for signaling/STUN/TURN edits; the roster is preserved
    *  either way. */
   async function networkUpdate(config: NetworkConfigInput) {
-    await invoke("mesh_network_update", { config });
+    await runMutation(() => invoke("mesh_network_update", { config }));
     await refreshNetworks();
     await refreshAllPeers();
   }
@@ -258,12 +328,12 @@ function createMeshClient() {
     role: "member" | "controller" | "owner",
     mfa_code?: string,
   ): Promise<string> {
-    const resp = (await invoke("mesh_governance_propose_role_grant", {
+    const resp = (await runMutation(() => invoke("mesh_governance_propose_role_grant", {
       network,
       target,
       role,
       mfa_code: mfa_code,
-    })) as { proposal_id: string };
+    }))) as { proposal_id: string };
     return resp.proposal_id;
   }
 
@@ -272,11 +342,11 @@ function createMeshClient() {
     target: string,
     mfa_code?: string,
   ): Promise<string> {
-    const resp = (await invoke("mesh_governance_propose_role_revoke", {
+    const resp = (await runMutation(() => invoke("mesh_governance_propose_role_revoke", {
       network,
       target,
       mfa_code: mfa_code,
-    })) as { proposal_id: string };
+    }))) as { proposal_id: string };
     return resp.proposal_id;
   }
 
@@ -285,11 +355,11 @@ function createMeshClient() {
     target: string,
     mfa_code?: string,
   ): Promise<string> {
-    const resp = (await invoke("mesh_governance_propose_evict", {
+    const resp = (await runMutation(() => invoke("mesh_governance_propose_evict", {
       network,
       target,
       mfa_code: mfa_code,
-    })) as { proposal_id: string };
+    }))) as { proposal_id: string };
     await refreshRoster(network);
     return resp.proposal_id;
   }
@@ -302,7 +372,7 @@ function createMeshClient() {
     otpauth_uri: string;
     recovery_codes: string[];
   }> {
-    return (await invoke("mesh_governance_mfa_prepare", { network })) as {
+    return (await runMutation(() => invoke("mesh_governance_mfa_prepare", { network }))) as {
       transaction_id: string;
       secret: string;
       otpauth_uri: string;
@@ -327,24 +397,24 @@ function createMeshClient() {
   }
 
   async function governanceMfaRedeliver(network: string, transaction_id: string) {
-    return (await invoke("mesh_governance_mfa_redeliver", {
+    return (await runMutation(() => invoke("mesh_governance_mfa_redeliver", {
       network,
       transaction_id: transaction_id,
-    })) as MfaTransaction;
+    }))) as MfaTransaction;
   }
 
   async function governanceMfaCommit(network: string, transaction_id: string) {
-    return (await invoke("mesh_governance_mfa_commit", {
+    return (await runMutation(() => invoke("mesh_governance_mfa_commit", {
       network,
       transaction_id: transaction_id,
-    })) as MfaTransaction;
+    }))) as MfaTransaction;
   }
 
   async function governanceMfaAbort(network: string, transaction_id: string) {
-    return (await invoke("mesh_governance_mfa_abort", {
+    return (await runMutation(() => invoke("mesh_governance_mfa_abort", {
       network,
       transaction_id: transaction_id,
-    })) as MfaTransaction;
+    }))) as MfaTransaction;
   }
 
   async function governanceMfaStatus(network: string): Promise<boolean> {
@@ -355,7 +425,7 @@ function createMeshClient() {
   }
 
   async function governanceMfaDisable(network: string, code: string) {
-    await invoke("mesh_governance_mfa_disable", { network, code });
+    await runMutation(() => invoke("mesh_governance_mfa_disable", { network, code }));
   }
 
   // ---- self-update ----------------------------------------------------
@@ -369,15 +439,15 @@ function createMeshClient() {
   }
 
   async function updateCheck(): Promise<UpdateCheckOutcome> {
-    return (await invoke("update_check")) as UpdateCheckOutcome;
+    return (await runMutation(() => invoke("update_check"))) as UpdateCheckOutcome;
   }
 
   async function updateApply(): Promise<{ applied: string | null }> {
-    return (await invoke("update_apply")) as { applied: string | null };
+    return (await runMutation(() => invoke("update_apply"))) as { applied: string | null };
   }
 
   async function updateSetPrefs(prefs: UpdatePrefs): Promise<UpdateStatus> {
-    return (await invoke("update_set_prefs", { prefs })) as UpdateStatus;
+    return (await runMutation(() => invoke("update_set_prefs", { prefs }))) as UpdateStatus;
   }
 
   // ---- infrastructure services (signaling / STUN / TURN) -------------
@@ -397,7 +467,7 @@ function createMeshClient() {
    *  config + live running state (a service can be enabled but fail to
    *  start, e.g. a port in use). */
   async function servicesSet(config: ServicesConfig) {
-    await invoke("mesh_services_set", { services: config });
+    await runMutation(() => invoke("mesh_services_set", { services: config }));
     await refreshServices();
   }
 

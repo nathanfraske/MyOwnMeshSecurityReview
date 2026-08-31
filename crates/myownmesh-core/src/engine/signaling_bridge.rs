@@ -42,12 +42,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex as StdMutex, OnceLock};
 
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
-use myownmesh_signaling::mdns::discovery::{
-    MdnsTimingProfile, MAX_RESOLVED_ADDRESSES, MAX_TXT_BYTES, MAX_TXT_ENTRIES,
-};
+use myownmesh_signaling::mdns::discovery::{DiscoveryBackend, MdnsTimingProfile};
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
-    MdnsLimits, PeerRetention,
+    DiscoveryRetention, MdnsLimits, PeerRetention,
 };
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
@@ -63,6 +61,7 @@ use myownmesh_signaling::nostr::driver::{
 use myownmesh_signaling::{
     AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, CarrierCommit,
     CarrierCommitUnit, InboundOutcome, InboundSink, OutboundSource, OwnedSignal, SignalingMessage,
+    TaskCustodian,
 };
 use tokio::sync::mpsc;
 use tracing::{trace, warn};
@@ -81,23 +80,11 @@ use super::state::{
     CarrierEmissionAdmission, CarrierEmissionRecord, NetworkCmd, NetworkState,
     RecoveryCarrierInstance, RecoveryPublishId, SignalingEmissionId, SignalingOutbound,
 };
+#[cfg(test)]
+use crate::runtime::signaling::SIGNALING_TASK_SLOTS;
+use crate::runtime::signaling::{MdnsTaskCustodian, NostrTaskCustodians, SignalingTaskCustodian};
 
 type FanoutReaperSender = mpsc::Sender<tokio::task::JoinHandle<()>>;
-
-#[cfg(test)]
-static TEST_REAPED_FANOUTS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_REAPED_FANOUT_FALLBACKS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static TEST_REAPED_FANOUT_FALLBACK_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
-
-#[cfg(test)]
-fn record_fanout_fallback() {
-    TEST_REAPED_FANOUT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    TEST_REAPED_FANOUT_FALLBACK_WAKE
-        .get_or_init(tokio::sync::Notify::new)
-        .notify_one();
-}
 
 /// One driver's outbound side: the engine's admitted values, translated on the
 /// driver's own pull.
@@ -1068,9 +1055,9 @@ fn mdns_limits_from_policy(policy: &crate::config::MdnsPolicyConfig) -> Option<M
             max_resolve_owners: usize::try_from(policy.max_resolve_owners).ok()?,
             event_capacity: usize::try_from(policy.event_capacity).ok()?,
             max_event_epochs: usize::try_from(policy.max_event_epochs).ok()?,
-            max_txt_entries: MAX_TXT_ENTRIES,
-            max_txt_bytes: MAX_TXT_BYTES,
-            max_resolved_addresses: MAX_RESOLVED_ADDRESSES,
+            max_txt_entries: usize::try_from(policy.max_txt_entries).ok()?,
+            max_txt_bytes: usize::try_from(policy.max_txt_bytes).ok()?,
+            max_resolved_addresses: usize::try_from(policy.max_resolved_addresses).ok()?,
         },
         timing: MdnsTimingProfile {
             dial_timeout: mdns_duration(policy.dial_timeout_ms)?,
@@ -1083,6 +1070,59 @@ fn mdns_limits_from_policy(policy: &crate::config::MdnsPolicyConfig) -> Option<M
     })
 }
 
+fn nostr_timing_from_policy(
+    policy: &crate::config::NostrTimingPolicyConfig,
+) -> Option<NostrTimingConfig> {
+    if !policy.validate() {
+        return None;
+    }
+    Some(NostrTimingConfig {
+        reconnect_initial: Duration::from_millis(policy.reconnect_initial_ms),
+        reconnect_max: Duration::from_millis(policy.reconnect_max_ms),
+        reconnect_max_attempts: policy.reconnect_max_attempts,
+        jitter_percent: policy.jitter_percent,
+        fallback_poll: Duration::from_millis(policy.fallback_poll_ms),
+        fallback_activation_grace: Duration::from_millis(policy.fallback_activation_grace_ms),
+        session_close_timeout: Duration::from_millis(policy.session_close_timeout_ms),
+        announcer_cancel_quantum: Duration::from_millis(policy.announcer_cancel_quantum_ms),
+    })
+}
+
+/// Derive the selected/fallback relay cardinalities using the signaling
+/// crate's public pool and shuffle helpers, then delegate all task arithmetic
+/// to its checked custody-plan source of truth.
+fn nostr_task_custody_plan(
+    config: &NostrDriverConfig,
+) -> Option<myownmesh_signaling::nostr::driver::NostrTaskCustodyPlan> {
+    let configured: Vec<&str> = config.servers.iter().map(String::as_str).collect();
+    let pool: Vec<&str> = if configured.is_empty() {
+        myownmesh_signaling::nostr::defaults::DEFAULT_RELAY_URLS.to_vec()
+    } else {
+        configured
+    };
+    let filtered: Vec<&str> = pool
+        .into_iter()
+        .filter(|url| !myownmesh_signaling::nostr::denylist::is_denied(url, &config.denylist))
+        .collect();
+    let selected = myownmesh_signaling::nostr::shuffle::select_top_n(
+        &config.app_id,
+        &filtered,
+        config.redundancy,
+    );
+    let fallback = if config.public_fallback {
+        myownmesh_signaling::nostr::defaults::FALLBACK_RELAY_URLS
+            .iter()
+            .filter(|url| {
+                !myownmesh_signaling::nostr::denylist::is_denied(url, &config.denylist)
+                    && !selected.iter().any(|candidate| candidate == *url)
+            })
+            .count()
+    } else {
+        0
+    };
+    nostr_driver::derive_task_custody_plan(selected.len(), fallback)
+}
+
 fn mdns_duration(milliseconds: u64) -> Option<Duration> {
     let seconds = milliseconds / 1_000;
     let nanos = (milliseconds % 1_000).checked_mul(1_000_000)?;
@@ -1091,6 +1131,93 @@ fn mdns_duration(milliseconds: u64) -> Option<Duration> {
 
 struct CoreMdnsAliasProvider {
     scope: LocalApplicationResourceScope,
+}
+
+fn mdns_discovery_claim(
+    retention: DiscoveryRetention,
+) -> std::result::Result<ResourceClaim, AliasRefusal> {
+    let worker_tasks = retention
+        .backend_task_slots
+        .checked_add(retention.native_worker_slots)
+        .and_then(|count| count.checked_add(retention.outer_driver_task_slots))
+        .ok_or_else(|| AliasRefusal::Arithmetic("discovery worker count overflow".into()))?;
+    let outer_residual = retention
+        .outer_driver_handle_slots
+        .checked_add(retention.outer_driver_stop_signal_slots)
+        .and_then(|count| count.checked_add(retention.outer_driver_done_signal_slots))
+        .and_then(|count| count.checked_add(retention.outer_driver_reaper_queue_slots))
+        .and_then(|count| count.checked_add(retention.outer_driver_external_reaper_slots))
+        .and_then(|count| count.checked_add(retention.outer_driver_fallback_slots))
+        .and_then(|count| count.checked_add(retention.outer_driver_fallback_overflow_slots))
+        .and_then(|count| count.checked_add(retention.outer_driver_cancel_signal_slots))
+        .ok_or_else(|| AliasRefusal::Arithmetic("discovery outer residual overflow".into()))?;
+    ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            retention.scratch_bytes.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery scratch bytes exceed u64".into())
+            })?,
+        ),
+        (
+            crate::resource::ResourceClass::ParsingOrCpuWork,
+            retention.txt_bytes.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery parser bytes exceed u64".into())
+            })?,
+        ),
+        (
+            crate::resource::ResourceClass::WorkerOrTask,
+            worker_tasks.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery worker count exceeds u64".into())
+            })?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention
+                .event_queue_slots
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("discovery event slots exceed u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention
+                .resolve_owner_slots
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("discovery owner slots exceed u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention
+                .event_epoch_slots
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("discovery epoch slots exceed u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention
+                .txt_entry_slots
+                .try_into()
+                .map_err(|_| AliasRefusal::Arithmetic("discovery TXT slots exceed u64".into()))?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention.resolved_address_slots.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery address slots exceed u64".into())
+            })?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            retention.opaque_dependency_slots.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery dependency slots exceed u64".into())
+            })?,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            outer_residual.try_into().map_err(|_| {
+                AliasRefusal::Arithmetic("discovery outer residual exceeds u64".into())
+            })?,
+        ),
+    ])
+    .map_err(|error| AliasRefusal::Provider(error.to_string()))
 }
 
 fn mdns_connection_claim(
@@ -1175,6 +1302,17 @@ pub fn mdns_connection_identity_planning_claim(
 }
 
 impl AliasProvider for CoreMdnsAliasProvider {
+    fn retain_discovery(
+        &self,
+        retention: DiscoveryRetention,
+    ) -> std::result::Result<myownmesh_signaling::ErasedOwner, AliasRefusal> {
+        let claim = mdns_discovery_claim(retention)?;
+        self.scope
+            .acquire(claim)
+            .map(|lease| Box::new(lease) as myownmesh_signaling::ErasedOwner)
+            .map_err(|error| AliasRefusal::Provider(error.to_string()))
+    }
+
     fn retain_alias(
         &self,
         _key: &str,
@@ -1576,6 +1714,7 @@ fn attach_nostr_with(
 ) -> Option<NostrDriverHandle> {
     let guard = attach.guard();
     let cfg = state.config.read();
+    let nostr_timing = nostr_timing_from_policy(&cfg.signaling.nostr_timing)?;
     let nostr_cfg = NostrDriverConfig {
         app_id: resolve_app_id(),
         network_id: cfg.network_id.clone(),
@@ -1584,19 +1723,20 @@ fn attach_nostr_with(
         denylist: cfg.signaling.denylist.clone(),
         redundancy: cfg.signaling.redundancy as usize,
         public_fallback: cfg.signaling.public_fallback,
-        timing: NostrTimingConfig {
-            reconnect_initial: Duration::from_secs(2),
-            reconnect_max: Duration::from_secs(60),
-            reconnect_max_attempts: 6,
-            jitter_percent: 15,
-            fallback_poll: Duration::from_secs(3),
-            fallback_activation_grace: Duration::from_secs(20),
-            session_close_timeout: Duration::from_secs(1),
-            announcer_cancel_quantum: Duration::from_secs(1),
-        },
+        timing: nostr_timing,
     };
     let redundancy = nostr_cfg.redundancy;
     drop(cfg);
+
+    let scope = local_scope(state, "nostr")?;
+    let custody_plan = nostr_task_custody_plan(&nostr_cfg)?;
+    let nostr_custodians = match NostrTaskCustodians::reserve(scope.clone(), custody_plan) {
+        Ok(custodians) => custodians,
+        Err(error) => {
+            warn!(?error, "Nostr task custody unavailable");
+            return None;
+        }
+    };
 
     let room_handle = myownmesh_signaling::nostr::handle::derive_room_handle(
         &nostr_cfg.app_id,
@@ -1622,7 +1762,6 @@ fn attach_nostr_with(
     // receiver-side dedup wouldn't collapse it) — wasted relay bandwidth for no
     // benefit.
     let device_id_for_out = device_id.clone();
-    let scope = local_scope(state, "nostr")?;
     let provider = nostr_delivery_provider(scope.clone(), Arc::clone(&guard));
     let outbound: Box<dyn OutboundSource<NostrOutbound, Owner = CoreOutboundOwner>> =
         Box::new(TranslatedOutbound {
@@ -1686,7 +1825,9 @@ fn attach_nostr_with(
 
     // Inbound: NostrInbound → engine SignalingInbound on the driver's own task,
     // through this carrier's attach on the shared runtime.
-    let handle = match nostr_driver::start_with_delivery_provider_and_sinks(
+    let primary_owner = Arc::clone(&nostr_custodians.primary) as Arc<dyn TaskCustodian>;
+    let reaper_owner = Arc::clone(&nostr_custodians.reaper) as Arc<dyn TaskCustodian>;
+    let handle = match nostr_driver::start_with_delivery_provider_and_sinks_with_custodian(
         nostr_cfg,
         outbound,
         carrier_sink(attach),
@@ -1701,9 +1842,15 @@ fn attach_nostr_with(
             instance: recovery_instance,
             guard: Arc::clone(&guard),
         }),
+        nostr_driver::NostrTaskCustodyOwners {
+            primary: primary_owner,
+            reaper: reaper_owner,
+        },
     ) {
         Ok(handle) => handle,
         Err(error) => {
+            TaskCustodian::close(nostr_custodians.primary.as_ref());
+            TaskCustodian::close(nostr_custodians.reaper.as_ref());
             warn!(?error, "Nostr driver timing configuration refused");
             return None;
         }
@@ -1770,6 +1917,29 @@ fn attach_mdns_with(
         };
         (config.network_id.clone(), limits)
     };
+    let backend = mdns_driver::driver::configured_discovery_backend();
+    let retention = match DiscoveryRetention::from_backend(limits.discovery, backend) {
+        Ok(retention) => retention,
+        Err(refusal) => {
+            warn!(
+                network = %state.network_id,
+                "mDNS driver not attached: invalid retention plan: {refusal:?}"
+            );
+            return None;
+        }
+    };
+    let driver_plan =
+        match mdns_driver::driver::checked_driver_custody_plan(limits.discovery, backend) {
+            Ok(plan) => plan,
+            Err(refusal) => {
+                warn!(
+                    network = %state.network_id,
+                    "mDNS driver not attached: invalid custody plan: {refusal:?}"
+                );
+                return None;
+            }
+        };
+    let outer_driver_task_slots = retention.outer_driver_task_slots;
     let mdns_cfg = MdnsDriverConfig {
         app_id: resolve_app_id(),
         network_id,
@@ -1781,6 +1951,32 @@ fn attach_mdns_with(
         }),
         limits,
     };
+
+    // The mDNS driver receives an application-owned terminal custodian before
+    // it can reserve or spawn its supervisor/reaper handles. This keeps the
+    // dedicated observer runtime, primary/backend/reaper reservations, and
+    // its bounded queue/semaphore/watch/ready structures funded by the local
+    // scope.
+    let task_custodian = match MdnsTaskCustodian::reserve_with_plan(
+        scope.clone(),
+        outer_driver_task_slots,
+        Some(driver_plan),
+    ) {
+        Ok(custodian) => custodian,
+        Err(error) => {
+            warn!(
+                network = %state.network_id,
+                "mDNS terminal custody unavailable: {error:?}"
+            );
+            return None;
+        }
+    };
+    let backend_custodian_owner: Option<Arc<dyn TaskCustodian>> =
+        if matches!(backend, DiscoveryBackend::Embedded) {
+            Some(Arc::clone(&task_custodian) as Arc<dyn TaskCustodian>)
+        } else {
+            None
+        };
 
     let device_id = state.identity.public_id().to_string();
 
@@ -1851,9 +2047,21 @@ fn attach_mdns_with(
     // unlike Nostr's lazy socket dials, so it starts here and a failure returns
     // before anything else is consumed. Reports in both directions ride the
     // driver's own task; there is no queue on either side.
-    let handle = match mdns_driver::start(mdns_cfg, outbound, carrier_sink(attach)) {
+    let task_custodian_for_error = Arc::clone(&task_custodian);
+    let handle = match mdns_driver::start_with_custodian(
+        mdns_cfg,
+        outbound,
+        carrier_sink(attach),
+        Arc::clone(&task_custodian) as Arc<dyn TaskCustodian>,
+        backend_custodian_owner,
+        Arc::clone(&task_custodian) as Arc<dyn TaskCustodian>,
+    ) {
         Ok(h) => h,
         Err(e) => {
+            // No driver handle owns this injected observer on setup failure;
+            // close it explicitly so its thread joins before the core lease
+            // can be released.
+            myownmesh_signaling::TaskCustodian::close(task_custodian_for_error.as_ref());
             warn!(network = %state.network_id, "mdns signaling unavailable: {e}");
             return None;
         }
@@ -1871,13 +2079,15 @@ fn attach_mdns_with(
 /// Every signaling driver attached to one network, plus the fan-out
 /// task feeding them. The owning lifecycle calls [`Self::shutdown`] and
 /// awaits it so fan-out and driver tasks are joined before the network entry
-/// is released. `Drop` remains a signal-only compatibility boundary.
+/// is released. `Drop` transfers the exact final handles to the independent
+/// signaling task custodian when cooperative shutdown is unavailable.
 pub struct SignalingDrivers {
     nostr: Option<Arc<NostrDriverHandle>>,
     mdns: Option<MdnsDriverHandle>,
     fanout: Option<tokio::task::JoinHandle<()>>,
     fanout_reaper: Mutex<Option<FanoutReaperSender>>,
     fanout_reaper_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    task_custodian: SignalingTaskCustodian,
 }
 
 impl SignalingDrivers {
@@ -1940,24 +2150,91 @@ impl SignalingDrivers {
         }
         let reaper_sender = self.fanout_reaper.lock().take();
         drop(reaper_sender);
-        if let Some(reaper) = self.fanout_reaper_task.lock().take() {
+        let reaper_task = { self.fanout_reaper_task.lock().take() };
+        if let Some(reaper) = reaper_task {
             let _ = reaper.await;
         }
+        self.task_custodian.close();
     }
 }
 
 impl Drop for SignalingDrivers {
     fn drop(&mut self) {
-        if let Some(fanout) = self.fanout.take() {
-            if let Some(reaper) = self.fanout_reaper.lock().as_ref() {
-                abort_and_join(reaper, fanout);
-            } else {
-                fanout.abort();
-                let _ = futures::executor::block_on(fanout);
+        let reaper_sender = self.fanout_reaper.lock().take();
+        let mut reaper = self.fanout_reaper_task.lock().take();
+        let mut fanout = self.fanout.take();
+        let mut fanout_queued = false;
+        if reaper.is_some() {
+            if let (Some(sender), Some(task)) = (reaper_sender.as_ref(), fanout.take()) {
+                match sender.try_send(task) {
+                    Ok(()) => fanout_queued = true,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(task))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
+                        fanout = Some(task);
+                    }
+                }
             }
+        }
+        drop(reaper_sender);
+
+        // Keep the bridge charge with the last task that can prove fanout
+        // terminality. In the usual path the reaper awaits the queued fanout;
+        // when its channel is already closed, the terminal owner observes the
+        // fanout directly and then the already-terminal reaper.
+        let bridge_lease = self.task_custodian.take_lease();
+        if fanout_queued {
+            if let Some(reaper) = reaper.take() {
+                if let Some(bridge_lease) = bridge_lease {
+                    submit_terminal_with_lease_or_invariant(
+                        &self.task_custodian,
+                        reaper,
+                        bridge_lease,
+                    );
+                } else {
+                    submit_terminal_or_invariant(&self.task_custodian, reaper);
+                }
+            } else {
+                unreachable!("fanout reaper sender cannot outlive its task")
+            }
+        } else if let Some(fanout) = fanout {
+            if let Some(bridge_lease) = bridge_lease {
+                submit_terminal_with_lease_or_invariant(&self.task_custodian, fanout, bridge_lease);
+            } else {
+                submit_terminal_or_invariant(&self.task_custodian, fanout);
+            }
+            if let Some(reaper) = reaper {
+                submit_terminal_or_invariant(&self.task_custodian, reaper);
+            }
+        } else if let Some(reaper) = reaper {
+            if let Some(bridge_lease) = bridge_lease {
+                submit_terminal_with_lease_or_invariant(&self.task_custodian, reaper, bridge_lease);
+            } else {
+                submit_terminal_or_invariant(&self.task_custodian, reaper);
+            }
+        } else {
+            drop(bridge_lease);
         }
         // nostr / mdns handles stop via their own Drop impls; Nostr's Drop
         // transfers its exact task list to its runtime-owned reaper.
+    }
+}
+
+fn submit_terminal_or_invariant(
+    custodian: &SignalingTaskCustodian,
+    task: tokio::task::JoinHandle<()>,
+) {
+    if custodian.submit_terminal(task).is_err() {
+        unreachable!("bounded terminal queue must accept the final signaling task")
+    }
+}
+
+fn submit_terminal_with_lease_or_invariant(
+    custodian: &SignalingTaskCustodian,
+    task: tokio::task::JoinHandle<()>,
+    lease: ResourceLease,
+) {
+    if custodian.submit_with_lease(task, lease).is_err() {
+        unreachable!("bounded terminal queue must accept the leased signaling task")
     }
 }
 
@@ -1975,27 +2252,6 @@ fn spawn_task_reaper(capacity: usize) -> (FanoutReaperSender, tokio::task::JoinH
         }
     });
     (sender, task)
-}
-
-fn abort_and_join(reaper: &FanoutReaperSender, task: tokio::task::JoinHandle<()>) {
-    task.abort();
-    match reaper.try_send(task) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(task))
-        | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = task.await;
-                    #[cfg(test)]
-                    record_fanout_fallback();
-                });
-            } else {
-                let _ = futures::executor::block_on(task);
-                #[cfg(test)]
-                record_fanout_fallback();
-            }
-        }
-    }
 }
 
 /// Attach the signaling driver(s) a network's `SignalingConfig`
@@ -2018,10 +2274,25 @@ fn abort_and_join(reaper: &FanoutReaperSender, task: tokio::task::JoinHandle<()>
 /// outbound queue so it can't grow unboundedly — the network is
 /// simply unreachable, and warnings say so.
 pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<SignalingDrivers>> {
-    let (strategy, mdns_on) = {
+    let (strategy, mdns_on, mdns_policy_valid, nostr_timing_valid) = {
         let cfg = state.config.read();
-        (cfg.signaling.strategy.clone(), cfg.signaling.mdns)
+        (
+            cfg.signaling.strategy.clone(),
+            cfg.signaling.mdns,
+            cfg.signaling.mdns_policy.validate(),
+            nostr_timing_from_policy(&cfg.signaling.nostr_timing).is_some(),
+        )
     };
+    if mdns_on && !mdns_policy_valid {
+        return Err(crate::Error::Config(
+            "mDNS owner-selected policy contains zero, overflow, or unsupported values".into(),
+        ));
+    }
+    if matches!(strategy.as_str(), "" | "nostr") && !nostr_timing_valid {
+        return Err(crate::Error::Config(
+            "Nostr timing policy contains zero or inconsistent values".into(),
+        ));
+    }
     let want_nostr = match strategy.as_str() {
         "" | "nostr" => true,
         "none" => false,
@@ -2039,6 +2310,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
     let Some(outbound_rx) = state.take_signaling_outbound_rx() else {
         return Ok(None);
     };
+    let task_custodian = SignalingTaskCustodian::reserve(state.local_application_resource_scope()?)
+        .map_err(|error| crate::Error::Network(format!("signaling task custody: {error}")))?;
     // One runtime for the network, one attach per carrier. Sharing it is what
     // makes cross-carrier de-duplication possible at all: two runtimes would
     // each see half the traffic and each swallow nothing.
@@ -2081,7 +2354,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                     (mdns_instance, mdns_tx, mdns_attach.guard()),
                 ],
             );
-            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
+            let (fanout_reaper, fanout_reaper_task) =
+                spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
             let nostr = attach_nostr_shared(state, nostr_rx, nostr_attach, nostr_instance, false);
             let mdns = attach_mdns_with(state, mdns_rx, mdns_attach, mdns_instance, false);
             SignalingDrivers {
@@ -2090,6 +2364,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 fanout: Some(fanout),
                 fanout_reaper: Mutex::new(Some(fanout_reaper)),
                 fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
+                task_custodian,
             }
         }
         (true, false) => {
@@ -2109,13 +2384,15 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 outbound_rx,
                 vec![(recovery_instance, nostr_tx, attach.guard())],
             );
-            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
+            let (fanout_reaper, fanout_reaper_task) =
+                spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
             SignalingDrivers {
                 nostr: attach_nostr_shared(state, nostr_rx, attach, recovery_instance, false),
                 mdns: None,
                 fanout: Some(fanout),
                 fanout_reaper: Mutex::new(Some(fanout_reaper)),
                 fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
+                task_custodian,
             }
         }
         (false, true) => {
@@ -2135,7 +2412,8 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 outbound_rx,
                 vec![(recovery_instance, mdns_tx, attach.guard())],
             );
-            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
+            let (fanout_reaper, fanout_reaper_task) =
+                spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
             let mdns = attach_mdns_with(state, mdns_rx, attach, recovery_instance, false);
             if mdns.is_none() {
                 warn!(
@@ -2150,6 +2428,7 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
                 fanout: Some(fanout),
                 fanout_reaper: Mutex::new(Some(fanout_reaper)),
                 fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
+                task_custodian,
             }
         }
         (false, false) => {
@@ -2160,13 +2439,15 @@ pub fn attach_signaling(state: &Arc<NetworkState>) -> crate::Result<Option<Signa
             );
             // Drain the engine's outbound queue so it can't grow
             // unboundedly against a receiver nobody holds.
-            let (fanout_reaper, fanout_reaper_task) = spawn_task_reaper(1);
+            let (fanout_reaper, fanout_reaper_task) =
+                spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
             SignalingDrivers {
                 nostr: None,
                 mdns: None,
                 fanout: Some(spawn_fanout(state.clone(), outbound_rx, Vec::new())),
                 fanout_reaper: Mutex::new(Some(fanout_reaper)),
                 fanout_reaper_task: Mutex::new(Some(fanout_reaper_task)),
+                task_custodian,
             }
         }
     };
@@ -2485,133 +2766,403 @@ struct FanoutTestGate {
 static FANOUT_AFTER_ADMISSION: OnceLock<StdMutex<Option<Arc<FanoutTestGate>>>> = OnceLock::new();
 
 #[cfg(test)]
+static TEST_REAPED_FANOUTS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::signaling_ingress::{self, EphemeralSignal};
     use std::sync::atomic::Ordering;
 
-    fn panicking_task(
-        message: &'static str,
-    ) -> (
-        tokio::task::JoinHandle<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    ) {
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            started_tx
-                .send(())
-                .expect("the panic child start barrier remains live");
-            panic!("{message}");
+    const TEST_OUTER_DRIVER_TASK_SLOTS: usize = 6;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_reaper_observes_panic_and_releases_provider_custody() {
+        let before = TEST_REAPED_FANOUTS.load(Ordering::Acquire);
+        let (_root, scope, accountant) = scoped(|_| 10);
+        let baseline = accountant.in_use();
+        let lease = scope
+            .acquire(ResourceClaim::single(
+                crate::resource::ResourceClass::WorkerOrTask,
+                2,
+            ))
+            .expect("test reaper has exact provider custody");
+        let (sender, reaper) = spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
+        let panic_task = tokio::spawn(async { panic!("injected fanout panic") });
+        sender
+            .send(panic_task)
+            .await
+            .expect("the reaper accepts the exact fanout handle");
+        drop(sender);
+        reaper
+            .await
+            .expect("the reaper joins after channel closure");
+        drop(lease);
+        assert_eq!(
+            TEST_REAPED_FANOUTS.load(Ordering::Acquire),
+            before + 1,
+            "the reaper observes the exact panic terminal"
+        );
+        assert_eq!(accountant.in_use(), baseline);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn signaling_drivers_drop_keeps_bridge_lease_until_fanout_terminal() {
+        let bridge = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::bridge_claim(),
+        )
+        .expect("signaling bridge reservation charge is representable");
+        let observer = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::observer_claim()
+                .expect("signaling observer claim is representable"),
+        )
+        .expect("signaling observer reservation charge is representable");
+        let charged = bridge
+            .checked_add(observer)
+            .expect("split signaling reservation charges are representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let custodian = SignalingTaskCustodian::reserve(scope.clone())
+            .expect("the provider admits the complete signaling custody envelope");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let parked_gate = Arc::clone(&gate);
+        let fanout = tokio::spawn(async move {
+            parked_gate.notified().await;
         });
-        (task, started_rx)
+        let (reaper_sender, reaper_task) =
+            spawn_task_reaper(SignalingTaskCustodian::REAPER_QUEUE_SLOTS);
+        let before_reaped = TEST_REAPED_FANOUTS.load(Ordering::Acquire);
+        let drivers = SignalingDrivers {
+            nostr: None,
+            mdns: None,
+            fanout: Some(fanout),
+            fanout_reaper: Mutex::new(Some(reaper_sender)),
+            fanout_reaper_task: Mutex::new(Some(reaper_task)),
+            task_custodian: custodian,
+        };
+
+        drop(drivers);
+        assert_ne!(
+            accountant.in_use(),
+            baseline,
+            "bridge custody remains charged while the parked fanout is live"
+        );
+        assert!(
+            scope.acquire(bridge).is_err(),
+            "a successor cannot acquire the bridge charge before fanout terminality"
+        );
+
+        gate.notify_waiters();
+        for _ in 0..1_000 {
+            if accountant.in_use() == baseline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            accountant.in_use(),
+            baseline,
+            "bridge and observer custody release only after fanout/reaper settlement"
+        );
+        assert!(
+            TEST_REAPED_FANOUTS.load(Ordering::Acquire) > before_reaped,
+            "reaper reaches EOF only after observing the parked fanout"
+        );
+    }
+
+    #[test]
+    fn signaling_task_custody_reserves_exact_population_and_returns_baseline() {
+        let bridge = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::bridge_claim(),
+        )
+        .expect("signaling bridge reservation charge is representable");
+        let observer = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::observer_claim()
+                .expect("signaling observer claim is representable"),
+        )
+        .expect("signaling observer reservation charge is representable");
+        let charged = bridge
+            .checked_add(observer)
+            .expect("split signaling reservation charges are representable");
+        let raw = SignalingTaskCustodian::provider_claim()
+            .expect("combined signaling planning claim is representable");
+        assert_eq!(
+            raw,
+            SignalingTaskCustodian::bridge_claim()
+                .checked_add(
+                    SignalingTaskCustodian::observer_claim()
+                        .expect("signaling observer claim is representable"),
+                )
+                .expect("combined signaling claim is representable")
+        );
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let mut custodian = SignalingTaskCustodian::reserve(scope)
+            .expect("the provider admits the complete signaling custody envelope");
+        let in_use = accountant.in_use();
+        for dimension in crate::resource::ResourceClass::ALL {
+            assert_eq!(
+                in_use.amount(dimension) - baseline.amount(dimension),
+                charged.amount(dimension),
+                "signaling custody charges every declared dimension exactly once"
+            );
+        }
+        custodian.close();
+        assert_eq!(accountant.in_use(), baseline);
+    }
+
+    #[test]
+    fn signaling_task_custody_refuses_grant_minus_one_before_observer_creation() {
+        let bridge = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::bridge_claim(),
+        )
+        .expect("signaling bridge reservation charge is representable");
+        let observer = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::observer_claim()
+                .expect("signaling observer claim is representable"),
+        )
+        .expect("signaling observer reservation charge is representable");
+        let charged = bridge
+            .checked_add(observer)
+            .expect("split signaling reservation charges are representable");
+        let short_claim = charged
+            .checked_sub(ResourceClaim::single(
+                crate::resource::ResourceClass::OpaqueDependencyResidual,
+                1,
+            ))
+            .expect("the one-unit-short custody grant is representable");
+        let (_root, scope, accountant) = scoped(|dimension| short_claim.amount(dimension));
+        let baseline = accountant.in_use();
+
+        let result = SignalingTaskCustodian::reserve(scope);
+
+        assert!(matches!(
+            result,
+            Err(crate::resource::ResourceUnavailable::Pressure(_))
+        ));
+        assert_eq!(
+            accountant.in_use(),
+            baseline,
+            "insufficient custody refuses before observer/runtime construction"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn outside_runtime_fanout_drop_transfers_task_to_reaper() {
-        let before = TEST_REAPED_FANOUTS.load(std::sync::atomic::Ordering::Acquire);
-        let (reaper_sender, reaper_task) = spawn_task_reaper(1);
-        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            armed_tx
-                .send(())
-                .expect("fanout reaper control task must arm before drop");
-            std::future::pending::<()>().await;
-        });
-        armed_rx
-            .await
-            .expect("fanout reaper control task must be running");
-
-        std::thread::spawn(move || abort_and_join(&reaper_sender, task))
-            .join()
-            .expect("outside-runtime fanout owner drop must return");
-
-        reaper_task
-            .await
-            .expect("fanout reaper must terminate after its sender closes");
+    async fn signaling_task_custody_drop_keeps_parked_observer_funded_until_terminal() {
+        let bridge = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::bridge_claim(),
+        )
+        .expect("signaling bridge reservation charge is representable");
+        let observer = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::observer_claim()
+                .expect("signaling observer claim is representable"),
+        )
+        .expect("signaling observer reservation charge is representable");
+        let charged = bridge
+            .checked_add(observer)
+            .expect("split signaling reservation charges are representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let mut custodian = SignalingTaskCustodian::reserve(scope)
+            .expect("the provider admits the split signaling envelope");
+        let progress = TaskCustodian::progress(custodian.observer_for_test().as_ref());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            let gate = Arc::clone(&gate);
+            custodian
+                .reservation_for_test()
+                .submit(tokio::spawn(async move { gate.notified().await }))
+                .expect("the observer accepts each parked signaling handle");
+        }
+        drop(custodian);
+        assert_ne!(
+            accountant.in_use(),
+            baseline,
+            "drop keeps observer custody while parked handles remain live"
+        );
+        gate.notify_waiters();
+        let mut progress = progress;
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            progress
+                .changed()
+                .await
+                .expect("each parked signaling handle reaches terminal observation");
+        }
+        for _ in 0..100 {
+            if accountant.in_use() == baseline {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert_eq!(
-            TEST_REAPED_FANOUTS.load(std::sync::atomic::Ordering::Acquire),
-            before + 1,
-            "the exact aborted fanout must be awaited by the runtime reaper"
+            accountant.in_use(),
+            baseline,
+            "non-runtime terminal owner releases observer custody after join"
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn fanout_full_and_closed_reaper_fallbacks_observe_panics_in_and_outside_runtime() {
-        let wake = TEST_REAPED_FANOUT_FALLBACK_WAKE.get_or_init(tokio::sync::Notify::new);
-        let before = TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire);
-
-        let (full_sender, mut full_receiver) = mpsc::channel(1);
-        full_sender
-            .try_send(tokio::spawn(std::future::pending::<()>()))
-            .expect("the first handle fills the bounded reaper channel");
-        let (task, started) = panicking_task("injected fanout panic through full fallback");
-        started
-            .await
-            .expect("the full fallback child starts before transfer");
-        abort_and_join(&full_sender, task);
-        wake.notified().await;
+    async fn signaling_task_custody_refusal_routes_handles_to_terminal_owner() {
+        let bridge = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::bridge_claim(),
+        )
+        .expect("signaling bridge reservation charge is representable");
+        let observer = crate::resource::FiniteResourceProvider::reservation_planning_charge(
+            SignalingTaskCustodian::observer_claim()
+                .expect("signaling observer claim is representable"),
+        )
+        .expect("signaling observer reservation charge is representable");
+        let charged = bridge
+            .checked_add(observer)
+            .expect("split signaling reservation charges are representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let mut custodian = SignalingTaskCustodian::reserve(scope)
+            .expect("the provider admits the split signaling envelope");
+        custodian.observer_for_test().close();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = Vec::new();
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            let gate = Arc::clone(&gate);
+            tasks.push(tokio::spawn(async move { gate.notified().await }));
+        }
+        custodian
+            .submit(tasks)
+            .expect("refused handles are retained by the terminal owner");
+        assert_ne!(accountant.in_use(), baseline);
+        gate.notify_waiters();
+        custodian.close();
         assert_eq!(
-            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
-            before + 1,
-            "a full active-runtime transfer joins the exact panicking child"
+            accountant.in_use(),
+            baseline,
+            "terminal owner observes every refused handle before release"
         );
-        let filler = full_receiver
-            .try_recv()
-            .expect("the full-channel filler remains explicitly owned");
-        filler.abort();
-        let _ = filler.await;
+    }
 
-        let (closed_sender, closed_receiver) = mpsc::channel(1);
-        drop(closed_receiver);
-        let (task, started) = panicking_task("injected fanout panic through closed fallback");
-        started
-            .await
-            .expect("the closed fallback child starts before transfer");
-        abort_and_join(&closed_sender, task);
-        wake.notified().await;
+    #[test]
+    fn mdns_task_custody_reserves_exact_population_and_returns_baseline() {
+        let claim = MdnsTaskCustodian::provider_claim(TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("mDNS task custody claim is representable");
+        let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("mDNS task reservation charge is representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("the provider admits the complete mDNS custody envelope");
+        let in_use = accountant.in_use();
+        for dimension in crate::resource::ResourceClass::ALL {
+            assert_eq!(
+                in_use.amount(dimension) - baseline.amount(dimension),
+                charged.amount(dimension),
+                "mDNS custody charges every declared dimension exactly once"
+            );
+        }
+        myownmesh_signaling::TaskCustodian::close(custodian.as_ref());
+        assert_eq!(accountant.in_use(), baseline);
+    }
+
+    #[test]
+    fn mdns_task_custody_refuses_each_grant_minus_one_before_observer_creation() {
+        let claim = MdnsTaskCustodian::provider_claim(TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("mDNS task custody claim is representable");
+        let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("mDNS task reservation charge is representable");
+        for dimension in crate::resource::ResourceClass::ALL {
+            if charged.amount(dimension) == 0 {
+                continue;
+            }
+            let short_claim = charged
+                .checked_sub(ResourceClaim::single(dimension, 1))
+                .expect("the one-unit-short mDNS grant is representable");
+            let (_root, scope, accountant) = scoped(|class| short_claim.amount(class));
+            let baseline = accountant.in_use();
+            let result = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS);
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::resource::ResourceUnavailable::Pressure(_))
+                ),
+                "mDNS custody refuses a short {dimension:?} grant",
+            );
+            assert_eq!(
+                accountant.in_use(),
+                baseline,
+                "mDNS short {dimension:?} grant creates no observer/runtime",
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mdns_task_custody_closes_after_both_observers_terminal() {
+        let claim = MdnsTaskCustodian::provider_claim(TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("mDNS task custody claim is representable");
+        let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("mDNS task reservation charge is representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("the provider admits the complete mDNS custody envelope");
+        let mut reservation =
+            myownmesh_signaling::TaskCustodian::reserve(custodian.as_ref(), SIGNALING_TASK_SLOTS)
+                .expect("the injected owner reserves both terminal handles");
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            reservation
+                .submit(tokio::spawn(async {}))
+                .expect("the injected observer accepts each terminal handle");
+        }
+        drop(reservation);
+        myownmesh_signaling::TaskCustodian::close(custodian.as_ref());
         assert_eq!(
-            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
-            before + 2,
-            "a closed active-runtime transfer joins the exact panicking child"
+            accountant.in_use(),
+            baseline,
+            "provider custody returns only after both observers have joined"
         );
+    }
 
-        let (full_sender, mut full_receiver) = mpsc::channel(1);
-        full_sender
-            .try_send(tokio::spawn(std::future::pending::<()>()))
-            .expect("the no-runtime full channel is deterministically occupied");
-        let (task, started) =
-            panicking_task("injected fanout panic through outside-runtime full fallback");
-        started
-            .await
-            .expect("the outside-runtime full child starts before transfer");
-        std::thread::spawn(move || abort_and_join(&full_sender, task))
-            .join()
-            .expect("outside-runtime full fallback returns after joining");
-        assert_eq!(
-            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
-            before + 3,
-            "a full no-runtime transfer synchronously observes the child"
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mdns_task_custody_drop_keeps_lease_through_blocked_terminals() {
+        let claim = MdnsTaskCustodian::provider_claim(TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("mDNS task custody claim is representable");
+        let charged = crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+            .expect("mDNS task reservation charge is representable");
+        let (_root, scope, accountant) = scoped(|dimension| charged.amount(dimension));
+        let baseline = accountant.in_use();
+        let custodian = MdnsTaskCustodian::reserve(scope, TEST_OUTER_DRIVER_TASK_SLOTS)
+            .expect("the provider admits the complete mDNS custody envelope");
+        let mut progress = myownmesh_signaling::TaskCustodian::progress(custodian.as_ref());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut reservation =
+            myownmesh_signaling::TaskCustodian::reserve(custodian.as_ref(), SIGNALING_TASK_SLOTS)
+                .expect("the injected owner reserves both terminal handles");
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            let gate = Arc::clone(&gate);
+            reservation
+                .submit(tokio::spawn(async move { gate.notified().await }))
+                .expect("the injected observer accepts each terminal handle");
+        }
+        drop(custodian);
+        assert_ne!(
+            accountant.in_use(),
+            baseline,
+            "drop-time blocked handles keep the provider lease live"
         );
-        let filler = full_receiver
-            .try_recv()
-            .expect("the no-runtime full filler remains explicitly owned");
-        filler.abort();
-        let _ = filler.await;
-
-        let (closed_sender, closed_receiver) = mpsc::channel(1);
-        drop(closed_receiver);
-        let (task, started) =
-            panicking_task("injected fanout panic through outside-runtime closed fallback");
-        started
-            .await
-            .expect("the outside-runtime closed child starts before transfer");
-        std::thread::spawn(move || abort_and_join(&closed_sender, task))
-            .join()
-            .expect("outside-runtime closed fallback returns after joining");
+        gate.notify_waiters();
+        for _ in 0..SIGNALING_TASK_SLOTS {
+            progress
+                .changed()
+                .await
+                .expect("each submitted handle reaches observer terminal");
+        }
+        assert_ne!(
+            accountant.in_use(),
+            baseline,
+            "reservation keepalive retains lease until its close/join boundary"
+        );
+        drop(reservation);
         assert_eq!(
-            TEST_REAPED_FANOUT_FALLBACKS.load(Ordering::Acquire),
-            before + 4,
-            "a closed no-runtime transfer synchronously observes the child"
+            accountant.in_use(),
+            baseline,
+            "drop-time lease releases after both observer terminals"
         );
     }
 
@@ -2624,6 +3175,9 @@ mod tests {
             max_resolve_owners: 11,
             event_capacity: 13,
             max_event_epochs: 17,
+            max_txt_entries: 43,
+            max_txt_bytes: 47,
+            max_resolved_addresses: 53,
             dial_timeout_ms: 19,
             connection_idle_timeout_ms: 23,
             inbound_idle_timeout_ms: 29,
@@ -2639,6 +3193,9 @@ mod tests {
         assert_eq!(limits.discovery.max_resolve_owners, 11);
         assert_eq!(limits.discovery.event_capacity, 13);
         assert_eq!(limits.discovery.max_event_epochs, 17);
+        assert_eq!(limits.discovery.max_txt_entries, 43);
+        assert_eq!(limits.discovery.max_txt_bytes, 47);
+        assert_eq!(limits.discovery.max_resolved_addresses, 53);
         assert_eq!(limits.timing.dial_timeout, Duration::from_millis(19));
         assert_eq!(
             limits.timing.connection_idle_timeout,
@@ -2660,6 +3217,35 @@ mod tests {
             ..policy
         };
         assert!(mdns_limits_from_policy(&invalid_policy).is_none());
+    }
+
+    #[test]
+    fn nostr_timing_translation_preserves_owner_values_and_rejects_zero() {
+        let policy = crate::config::NostrTimingPolicyConfig {
+            reconnect_initial_ms: 19,
+            reconnect_max_ms: 23,
+            reconnect_max_attempts: 29,
+            jitter_percent: 31,
+            fallback_poll_ms: 37,
+            fallback_activation_grace_ms: 41,
+            session_close_timeout_ms: 43,
+            announcer_cancel_quantum_ms: 47,
+        };
+        let timing = nostr_timing_from_policy(&policy).expect("sentinel timing translates");
+        assert_eq!(timing.reconnect_initial, Duration::from_millis(19));
+        assert_eq!(timing.reconnect_max, Duration::from_millis(23));
+        assert_eq!(timing.reconnect_max_attempts, 29);
+        assert_eq!(timing.jitter_percent, 31);
+        assert_eq!(timing.fallback_poll, Duration::from_millis(37));
+        assert_eq!(timing.fallback_activation_grace, Duration::from_millis(41));
+        assert_eq!(timing.session_close_timeout, Duration::from_millis(43));
+        assert_eq!(timing.announcer_cancel_quantum, Duration::from_millis(47));
+
+        let invalid = crate::config::NostrTimingPolicyConfig {
+            session_close_timeout_ms: 0,
+            ..policy
+        };
+        assert!(nostr_timing_from_policy(&invalid).is_none());
     }
 
     /// A scope on an isolated provider whose per-dimension grant is `budget`,
@@ -2912,6 +3498,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn core_mdns_provider_accounts_discovery_envelope_dimensions_once() {
+        let (_root, scope, accountant) = scoped(|dimension| match dimension {
+            crate::resource::ResourceClass::AccountedMemoryBytes => 1_000_000,
+            _ => 10_000,
+        });
+        let provider = CoreMdnsAliasProvider { scope };
+        let retention = DiscoveryRetention {
+            event_queue_slots: 2,
+            resolve_owner_slots: 3,
+            event_epoch_slots: 4,
+            txt_entry_slots: 5,
+            txt_bytes: 41,
+            resolved_address_slots: 6,
+            backend_task_slots: 7,
+            native_worker_slots: 11,
+            outer_driver_task_slots: 6,
+            outer_driver_handle_slots: 5,
+            outer_driver_stop_signal_slots: 1,
+            outer_driver_done_signal_slots: 1,
+            outer_driver_reaper_queue_slots: 1,
+            outer_driver_external_reaper_slots: 2,
+            outer_driver_fallback_slots: 2,
+            outer_driver_fallback_overflow_slots: 1,
+            outer_driver_cancel_signal_slots: 1,
+            opaque_dependency_slots: 8,
+            scratch_bytes: 73,
+        };
+        let baseline = accountant.in_use();
+        let owner = provider
+            .retain_discovery(retention)
+            .expect("discovery envelope is funded before backend start");
+
+        let in_use = accountant.in_use();
+        assert_eq!(
+            in_use.amount(crate::resource::ResourceClass::AccountedMemoryBytes)
+                - baseline.amount(crate::resource::ResourceClass::AccountedMemoryBytes),
+            73
+        );
+        assert_eq!(
+            in_use.amount(crate::resource::ResourceClass::ParsingOrCpuWork)
+                - baseline.amount(crate::resource::ResourceClass::ParsingOrCpuWork),
+            41
+        );
+        assert_eq!(
+            in_use.amount(crate::resource::ResourceClass::WorkerOrTask)
+                - baseline.amount(crate::resource::ResourceClass::WorkerOrTask),
+            18
+        );
+        assert_eq!(
+            in_use.amount(crate::resource::ResourceClass::OpaqueDependencyResidual)
+                - baseline.amount(crate::resource::ResourceClass::OpaqueDependencyResidual),
+            41
+        );
+
+        drop(owner);
+        assert_eq!(accountant.in_use(), baseline);
+    }
+
+    #[test]
+    fn core_mdns_provider_refuses_underfunded_discovery_before_allocation() {
+        let (_root, scope, accountant) = scoped(|dimension| match dimension {
+            crate::resource::ResourceClass::AccountedMemoryBytes => 72,
+            _ => 10_000,
+        });
+        let provider = CoreMdnsAliasProvider { scope };
+        let retention = DiscoveryRetention {
+            event_queue_slots: 2,
+            resolve_owner_slots: 3,
+            event_epoch_slots: 4,
+            txt_entry_slots: 5,
+            txt_bytes: 41,
+            resolved_address_slots: 6,
+            backend_task_slots: 7,
+            native_worker_slots: 11,
+            outer_driver_task_slots: 6,
+            outer_driver_handle_slots: 5,
+            outer_driver_stop_signal_slots: 1,
+            outer_driver_done_signal_slots: 1,
+            outer_driver_reaper_queue_slots: 1,
+            outer_driver_external_reaper_slots: 2,
+            outer_driver_fallback_slots: 2,
+            outer_driver_fallback_overflow_slots: 1,
+            outer_driver_cancel_signal_slots: 1,
+            opaque_dependency_slots: 8,
+            scratch_bytes: 73,
+        };
+        let baseline = accountant.in_use();
+        let result = provider.retain_discovery(retention);
+
+        assert!(matches!(result, Err(AliasRefusal::Provider(_))));
+        assert_eq!(accountant.in_use(), baseline);
     }
 
     #[test]

@@ -61,18 +61,6 @@ use signaling_ingress::{CarrierAttribution, EphemeralIngress};
 #[cfg(test)]
 use state::SignalingEmissionId;
 
-/// Test-only compatibility values for the configured policy tests. Production
-/// announce decisions read the owning network's checked scheduler policy.
-///
-/// Minimum gap between announces we publish in response to a peer's
-/// announce. The engine fires one reflected announce per inbound
-/// announce; this floor coalesces a burst of inbound announces (a
-/// new joiner triggering N existing peers to all react at once)
-/// into a single outbound publish per N-peer wave so we don't put
-/// quadratic load on the relay pool.
-#[cfg(test)]
-const REACTIVE_ANNOUNCE_MIN_INTERVAL_MS: u64 = 1_000;
-
 /// Minimum gap between re-offers we send to the same peer while
 /// their session is stuck at `Sighted` (PC created, data channel
 /// never opened). Coalesces REQ-replay announce bursts into one
@@ -2128,6 +2116,9 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
 /// than wedging webrtc-rs with a mid-negotiation offer. Single-flighted per
 /// peer via `media_reneg_inflight`.
 pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     if state.is_offline() {
         return;
     }
@@ -2166,7 +2157,9 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         ) else {
             continue;
         };
-        tokio::spawn(run_media_renegotiation(state.clone(), renegotiation));
+        state.register_shutdown_task(&shutdown_permit, || {
+            tokio::spawn(run_media_renegotiation(state.clone(), renegotiation))
+        });
     }
 }
 
@@ -2607,7 +2600,16 @@ async fn start_speculative_local_offer(
             reason: "the owner has no promoted session",
         });
     }
-    let cfg = state.config.read().clone();
+    let cfg = {
+        let config = state.config.read();
+        if config.validate_ice_servers().is_err() {
+            return Err(SpeculativeLocalOfferStartError {
+                correlation,
+                reason: "configured ICE servers rejected",
+            });
+        }
+        config.clone()
+    };
     let construction = tokio::time::timeout(
         Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
@@ -2707,7 +2709,14 @@ async fn start_speculative_local_offer(
     let device_id = owner.device_id().to_string();
     let task_observation = session.observe_owned_task();
     let pump_correlation = correlation.clone();
-    tokio::spawn(async move {
+    if !state.begin_peer_event_pump_registration() {
+        session.retire();
+        return Err(SpeculativeLocalOfferStartError {
+            correlation,
+            reason: "network shutdown began before speculative pump registration",
+        });
+    }
+    let pump = tokio::spawn(async move {
         let _task_observation = task_observation;
         while let Some(event) = rx.recv().await {
             let handled = match connector_state.peers.speculative_worker_route(
@@ -2747,6 +2756,7 @@ async fn start_speculative_local_offer(
         retire_speculative_terminal(&connector_state, &exact_owner, &pump_correlation, &session)
             .await;
     });
+    state.finish_peer_event_pump_registration(pump).await;
     Ok(correlation)
 }
 
@@ -2768,7 +2778,14 @@ async fn start_speculative_offer(
         forget_dedup_owned(state, dedup.take());
         return;
     }
-    let cfg = state.config.read().clone();
+    let cfg = {
+        let config = state.config.read();
+        if config.validate_ice_servers().is_err() {
+            forget_dedup_owned(state, dedup.take());
+            return;
+        }
+        config.clone()
+    };
     let construction = tokio::time::timeout(
         Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
@@ -2990,6 +3007,9 @@ async fn retire_speculative_terminal(
     correlation: &str,
     candidate: &Arc<crate::transport::WebRtcConnectorWorker>,
 ) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     let recovery = prepare_answerer_recovery(state, owner, &DropReason::IceFailed);
     match state
         .peers
@@ -3019,7 +3039,6 @@ async fn retire_speculative_terminal(
                 None
             };
             if removed.session_empty {
-                state.peers.track_removed_close(Arc::clone(&peer));
                 peer.retire_connector();
             }
             let started = owner.connection().start_exact_retired_worker(
@@ -3033,17 +3052,20 @@ async fn retire_speculative_terminal(
             if removed.session_empty {
                 peer.start_all_retired_workers();
                 let state = Arc::clone(state);
+                let task_state = Arc::clone(&state);
                 let device_id = owner.device_id().to_string();
-                tokio::spawn(async move {
-                    finish_drop_peer_started_with_recovery(
-                        &state,
-                        &device_id,
-                        DropReason::IceFailed,
-                        peer,
-                        opened_as,
-                        recovery,
-                    )
-                    .await;
+                state.register_shutdown_task(&shutdown_permit, || {
+                    tokio::spawn(async move {
+                        finish_drop_peer_started_with_recovery(
+                            &task_state,
+                            &device_id,
+                            DropReason::IceFailed,
+                            peer,
+                            opened_as,
+                            recovery,
+                        )
+                        .await;
+                    })
                 });
             }
         }
@@ -3361,7 +3383,22 @@ async fn ensure_peer_session(state: &Arc<NetworkState>, device_id: &str, role: R
     // one line per peer per attempt is fine when connects are rare and a flood
     // when they aren't. Restored by `MYOWNMESH_LOG_EXTRA=myownmesh_core=debug`.
     debug!(peer = %short_peer(device_id), ?role, "ensure_peer_session: opening transport session");
-    let cfg = state.config.read().clone();
+    let cfg = {
+        let config = state.config.read();
+        if config.validate_ice_servers().is_err() {
+            state.log_diag_with(
+                crate::events::DiagLevel::Warn,
+                "transport",
+                format!(
+                    "rejecting invalid ICE configuration for {}",
+                    short_peer(device_id)
+                ),
+                serde_json::json!({ "peer": device_id }),
+            );
+            return;
+        }
+        config.clone()
+    };
     let construction = tokio::time::timeout(
         Duration::from_millis(scheduler_policy(state).data_channel_open_timeout_ms),
         state.transport.open_connector_peer(
@@ -6284,7 +6321,9 @@ async fn on_rpc_request(
         witness,
         _task_lease,
     } = admitted;
-    let state = state.clone();
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     match handler {
         PreparedRpcHandler::Single(h) => {
             // The witness the run sends against. Cloned rather than borrowed
@@ -6292,37 +6331,42 @@ async fn on_rpc_request(
             // the other: the same value names the session a send failure retires
             // and the session whose revocation cancels the run.
             let mut send_operation = Some(operation);
-            tokio::spawn(async move {
-                // **Declared before the lease so it is dropped after it.**
-                // Locals unwind in reverse declaration order, which is what
-                // makes this an observation of "the task ended and stopped
-                // costing its owner" rather than of "the run stopped running".
-                // Does not exist in a production build.
-                #[cfg(test)]
-                let _run_epilogue =
-                    crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
-                // Released when this task ends, whichever arm ends it.
-                let _task_lease = _task_lease;
-                // **The run's start, and the only thing that decides it.**
-                //
-                // The select below is a race, and a biased race answers
-                // revocation first at every poll — including a poll that
-                // happens an instant after a start this fence had already
-                // authorized. Leaving the decision to that bias would let a
-                // scheduling artefact erase a logically started run. So the
-                // start is committed here instead: synchronously, under the
-                // same mutation fence governance revocation must take before it
-                // can invalidate this session, and against the exact captured
-                // installation rather than a re-resolved device id.
-                //
-                // A revocation that lands before this refuses the run outright
-                // and the embedder's closure is entered zero times. The hook
-                // argument is that "before" made reachable: it runs inside
-                // `begin`, after the early read and before the fence, and is
-                // empty in a production build.
-                let started =
-                    match peer_registry::AdmittedHandlerRun::new(owner.clone(), witness.clone())
-                        .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
+            let task_state = Arc::clone(state);
+            state.register_shutdown_task(&shutdown_permit, || {
+                tokio::spawn(async move {
+                    let state = task_state;
+                    // **Declared before the lease so it is dropped after it.**
+                    // Locals unwind in reverse declaration order, which is what
+                    // makes this an observation of "the task ended and stopped
+                    // costing its owner" rather than of "the run stopped running".
+                    // Does not exist in a production build.
+                    #[cfg(test)]
+                    let _run_epilogue =
+                        crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
+                    // Released when this task ends, whichever arm ends it.
+                    let _task_lease = _task_lease;
+                    // **The run's start, and the only thing that decides it.**
+                    //
+                    // The select below is a race, and a biased race answers
+                    // revocation first at every poll — including a poll that
+                    // happens an instant after a start this fence had already
+                    // authorized. Leaving the decision to that bias would let a
+                    // scheduling artefact erase a logically started run. So the
+                    // start is committed here instead: synchronously, under the
+                    // same mutation fence governance revocation must take before it
+                    // can invalidate this session, and against the exact captured
+                    // installation rather than a re-resolved device id.
+                    //
+                    // A revocation that lands before this refuses the run outright
+                    // and the embedder's closure is entered zero times. The hook
+                    // argument is that "before" made reachable: it runs inside
+                    // `begin`, after the early read and before the fence, and is
+                    // empty in a production build.
+                    let started = match peer_registry::AdmittedHandlerRun::new(
+                        owner.clone(),
+                        witness.clone(),
+                    )
+                    .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
                     {
                         Ok(started) => started,
                         // Nothing is sent. The session that authorized this run
@@ -6331,205 +6375,212 @@ async fn on_rpc_request(
                         // ends with its lease.
                         Err(_revoked) => return,
                     };
-                // Inert unless a control has armed it; see
-                // `NetworkState::reach_rpc_handler_start_boundary`. A revocation
-                // delivered here is a revocation of a run that has already
-                // started, and the next line runs anyway — which is the whole
-                // point of having committed.
-                state.reach_rpc_handler_start_boundary().await;
-                // **The synchronous body, once, outside every lock.** `invoke`
-                // calls the embedder's `Fn` to obtain its future, and a valid
-                // handler may do work in that body before returning one. It
-                // happens here rather than inside the raced future because the
-                // start is already committed: a revocation from this point on
-                // may cancel every await that follows, but it cannot retract the
-                // fact that the closure was called.
-                let invoked = h.invoke(call);
-                let run = async move {
-                    // Held for the whole run, so the authority to have started
-                    // and the work it authorized end together.
-                    let _started: peer_registry::StartedHandlerRun = started;
-                    let resp = invoked.await;
-                    let frame = match resp {
-                        Ok(r) => RpcResponseMessage {
-                            request_id,
-                            ok: Some(r.body),
-                            error: None,
-                        },
-                        Err(e) => RpcResponseMessage {
-                            request_id,
-                            ok: None,
-                            error: Some(e),
-                        },
-                    };
-                    // The last point at which this run is still take-back-able.
                     // Inert unless a control has armed it; see
-                    // `NetworkState::reach_rpc_send_boundary`.
-                    state.reach_rpc_send_boundary().await;
-                    send_rpc_frame_or_retire(
-                        &state,
-                        &mut send_operation,
-                        &MeshMessage::RpcResponse(frame),
-                        "RPC response",
-                    )
-                    .await;
-                };
-                // No timer on either arm. A handler that never finishes is not a
-                // slow handler to be given a deadline — it is work whose
-                // authority may end, and the only thing that ends it is that
-                // authority ending. `biased` so the order is stated rather than
-                // drawn: revocation is asked first at every poll, including the
-                // first.
-                //
-                // The revoked arm sends nothing. The session that authorized
-                // this run is gone and its replacement did not ask for this, so
-                // the terminal frame it would address has no owner to go to.
-                // Dropping `run` here releases the handler future, and the task
-                // ends with its lease — a revoked run stops costing the owner at
-                // the moment it stops being authorized, including mid-send.
-                tokio::select! {
-                    biased;
-                    () = witness.revoked() => {}
-                    () = run => {}
-                }
+                    // `NetworkState::reach_rpc_handler_start_boundary`. A revocation
+                    // delivered here is a revocation of a run that has already
+                    // started, and the next line runs anyway — which is the whole
+                    // point of having committed.
+                    state.reach_rpc_handler_start_boundary().await;
+                    // **The synchronous body, once, outside every lock.** `invoke`
+                    // calls the embedder's `Fn` to obtain its future, and a valid
+                    // handler may do work in that body before returning one. It
+                    // happens here rather than inside the raced future because the
+                    // start is already committed: a revocation from this point on
+                    // may cancel every await that follows, but it cannot retract the
+                    // fact that the closure was called.
+                    let invoked = h.invoke(call);
+                    let run = async move {
+                        // Held for the whole run, so the authority to have started
+                        // and the work it authorized end together.
+                        let _started: peer_registry::StartedHandlerRun = started;
+                        let resp = invoked.await;
+                        let frame = match resp {
+                            Ok(r) => RpcResponseMessage {
+                                request_id,
+                                ok: Some(r.body),
+                                error: None,
+                            },
+                            Err(e) => RpcResponseMessage {
+                                request_id,
+                                ok: None,
+                                error: Some(e),
+                            },
+                        };
+                        // The last point at which this run is still take-back-able.
+                        // Inert unless a control has armed it; see
+                        // `NetworkState::reach_rpc_send_boundary`.
+                        state.reach_rpc_send_boundary().await;
+                        send_rpc_frame_or_retire(
+                            &state,
+                            &mut send_operation,
+                            &MeshMessage::RpcResponse(frame),
+                            "RPC response",
+                        )
+                        .await;
+                    };
+                    // No timer on either arm. A handler that never finishes is not a
+                    // slow handler to be given a deadline — it is work whose
+                    // authority may end, and the only thing that ends it is that
+                    // authority ending. `biased` so the order is stated rather than
+                    // drawn: revocation is asked first at every poll, including the
+                    // first.
+                    //
+                    // The revoked arm sends nothing. The session that authorized
+                    // this run is gone and its replacement did not ask for this, so
+                    // the terminal frame it would address has no owner to go to.
+                    // Dropping `run` here releases the handler future, and the task
+                    // ends with its lease — a revoked run stops costing the owner at
+                    // the moment it stops being authorized, including mid-send.
+                    tokio::select! {
+                        biased;
+                        () = witness.revoked() => {}
+                        () = run => {}
+                    }
+                })
             });
         }
         PreparedRpcHandler::Stream(h) => {
             // As in the unary arm.
             let mut send_operation = Some(operation);
-            tokio::spawn(async move {
-                // Before the lease, for the reason given in the unary arm.
-                #[cfg(test)]
-                let _run_epilogue =
-                    crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
-                let _task_lease = _task_lease;
-                // The same start point as the unary arm, and for the same
-                // reasons — see there. A stream's closure is entered exactly
-                // once too, and revoking after that cancels the open, the
-                // receive loop and every send rather than un-starting it.
-                let started =
-                    match peer_registry::AdmittedHandlerRun::new(owner.clone(), witness.clone())
-                        .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
+            let task_state = Arc::clone(state);
+            state.register_shutdown_task(&shutdown_permit, || {
+                tokio::spawn(async move {
+                    let state = task_state;
+                    // Before the lease, for the reason given in the unary arm.
+                    #[cfg(test)]
+                    let _run_epilogue =
+                        crate::engine::state::RpcRunEpilogue::new(std::sync::Arc::clone(&state));
+                    let _task_lease = _task_lease;
+                    // The same start point as the unary arm, and for the same
+                    // reasons — see there. A stream's closure is entered exactly
+                    // once too, and revoking after that cancels the open, the
+                    // receive loop and every send rather than un-starting it.
+                    let started = match peer_registry::AdmittedHandlerRun::new(
+                        owner.clone(),
+                        witness.clone(),
+                    )
+                    .begin(&state.peers, || state.reach_rpc_handler_precommit_point())
                     {
                         Ok(started) => started,
                         Err(_revoked) => return,
                     };
-                state.reach_rpc_handler_start_boundary().await;
-                let invoked = h.invoke(call);
-                // The same shape as the unary arm, and for the same reasons:
-                // the open, every chunk send and every terminal send are one
-                // future, raced once against the witness. Selecting per loop
-                // iteration instead would leave the sends between iterations
-                // outside the race — a revoked session could still be spending
-                // this task's lease inside `send_to_peer_owner` until the
-                // transport returned.
-                let run = async move {
-                    let _started: peer_registry::StartedHandlerRun = started;
-                    let opened = invoked.await;
-                    let mut rx = match opened {
-                        Ok(rx) => rx,
-                        Err(e) => {
-                            // A terminal send, and so the same boundary as the
-                            // chunk one below. Inert unless armed.
-                            state.reach_rpc_send_boundary().await;
-                            send_rpc_frame_or_retire(
+                    state.reach_rpc_handler_start_boundary().await;
+                    let invoked = h.invoke(call);
+                    // The same shape as the unary arm, and for the same reasons:
+                    // the open, every chunk send and every terminal send are one
+                    // future, raced once against the witness. Selecting per loop
+                    // iteration instead would leave the sends between iterations
+                    // outside the race — a revoked session could still be spending
+                    // this task's lease inside `send_to_peer_owner` until the
+                    // transport returned.
+                    let run = async move {
+                        let _started: peer_registry::StartedHandlerRun = started;
+                        let opened = invoked.await;
+                        let mut rx = match opened {
+                            Ok(rx) => rx,
+                            Err(e) => {
+                                // A terminal send, and so the same boundary as the
+                                // chunk one below. Inert unless armed.
+                                state.reach_rpc_send_boundary().await;
+                                send_rpc_frame_or_retire(
+                                    &state,
+                                    &mut send_operation,
+                                    &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                                        request_id,
+                                        error: Some(e),
+                                    }),
+                                    "RPC stream open failure",
+                                )
+                                .await;
+                                return;
+                            }
+                        };
+                        let mut seq = 0u64;
+                        // And the receive loop, which is where a stream actually spends
+                        // its life. It does not race the witness itself: the whole of
+                        // this future is one arm of the select below, so revocation ends
+                        // the receive, the chunk send and the terminal send alike.
+                        // Dropping this future drops the receiver, which ends the
+                        // handler's side of the stream too, and no terminal frame is
+                        // sent — the session it would have been owner-bound to no longer
+                        // exists.
+                        let mut terminal = false;
+                        loop {
+                            let Some(delivery) = rx.recv().await else {
+                                break;
+                            };
+                            // Nothing is taken out of the delivery and nothing is
+                            // built from it: the frame borrows the delivered
+                            // payload and the task's own request id, so it is the
+                            // borrow checker, not a convention, that keeps the
+                            // delivery — and the retention inside it — alive across
+                            // the send `.await` below. The frame owns no bytes of
+                            // its own, so there is nothing here for a claim to have
+                            // missed.
+                            let frame = match delivery.value() {
+                                crate::rpc::RpcStreamItem::Chunk(payload) => {
+                                    seq += 1;
+                                    OutboundStreamFrame::RpcStreamChunk {
+                                        request_id: &request_id,
+                                        seq,
+                                        payload,
+                                    }
+                                }
+                                crate::rpc::RpcStreamItem::End(result) => {
+                                    terminal = true;
+                                    OutboundStreamFrame::RpcStreamEnd {
+                                        request_id: &request_id,
+                                        error: result.as_ref().err().map(String::as_str),
+                                    }
+                                }
+                            };
+                            if !terminal {
+                                // The chunk half of the same boundary. Inert unless
+                                // a control has armed it.
+                                state.reach_rpc_send_boundary().await;
+                            }
+                            // A chunk that fails has already taken its sequence
+                            // position, so continuing would leave the remote stream
+                            // with a gap it cannot recover from. The session that
+                            // owned it is retired by the send, and this loop stops
+                            // rather than sending into what it just ended.
+                            if !send_rpc_stream_frame_or_retire(
                                 &state,
                                 &mut send_operation,
-                                &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
-                                    request_id,
-                                    error: Some(e),
-                                }),
-                                "RPC stream open failure",
+                                &frame,
+                                if terminal {
+                                    "RPC stream terminal"
+                                } else {
+                                    "RPC stream chunk"
+                                },
                             )
-                            .await;
-                            return;
-                        }
-                    };
-                    let mut seq = 0u64;
-                    // And the receive loop, which is where a stream actually spends
-                    // its life. It does not race the witness itself: the whole of
-                    // this future is one arm of the select below, so revocation ends
-                    // the receive, the chunk send and the terminal send alike.
-                    // Dropping this future drops the receiver, which ends the
-                    // handler's side of the stream too, and no terminal frame is
-                    // sent — the session it would have been owner-bound to no longer
-                    // exists.
-                    let mut terminal = false;
-                    loop {
-                        let Some(delivery) = rx.recv().await else {
-                            break;
-                        };
-                        // Nothing is taken out of the delivery and nothing is
-                        // built from it: the frame borrows the delivered
-                        // payload and the task's own request id, so it is the
-                        // borrow checker, not a convention, that keeps the
-                        // delivery — and the retention inside it — alive across
-                        // the send `.await` below. The frame owns no bytes of
-                        // its own, so there is nothing here for a claim to have
-                        // missed.
-                        let frame = match delivery.value() {
-                            crate::rpc::RpcStreamItem::Chunk(payload) => {
-                                seq += 1;
-                                OutboundStreamFrame::RpcStreamChunk {
-                                    request_id: &request_id,
-                                    seq,
-                                    payload,
-                                }
+                            .await
+                            {
+                                return;
                             }
-                            crate::rpc::RpcStreamItem::End(result) => {
-                                terminal = true;
-                                OutboundStreamFrame::RpcStreamEnd {
-                                    request_id: &request_id,
-                                    error: result.as_ref().err().map(String::as_str),
-                                }
+                            if terminal {
+                                return;
                             }
-                        };
-                        if !terminal {
-                            // The chunk half of the same boundary. Inert unless
-                            // a control has armed it.
-                            state.reach_rpc_send_boundary().await;
                         }
-                        // A chunk that fails has already taken its sequence
-                        // position, so continuing would leave the remote stream
-                        // with a gap it cannot recover from. The session that
-                        // owned it is retired by the send, and this loop stops
-                        // rather than sending into what it just ended.
-                        if !send_rpc_stream_frame_or_retire(
+                        send_rpc_frame_or_retire(
                             &state,
                             &mut send_operation,
-                            &frame,
-                            if terminal {
-                                "RPC stream terminal"
-                            } else {
-                                "RPC stream chunk"
-                            },
+                            &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
+                                request_id,
+                                error: Some(
+                                    "RPC stream handler disappeared without terminal state".into(),
+                                ),
+                            }),
+                            "RPC stream handler-disappeared terminal",
                         )
-                        .await
-                        {
-                            return;
-                        }
-                        if terminal {
-                            return;
-                        }
+                        .await;
+                    };
+                    tokio::select! {
+                        biased;
+                        () = witness.revoked() => {}
+                        () = run => {}
                     }
-                    send_rpc_frame_or_retire(
-                        &state,
-                        &mut send_operation,
-                        &MeshMessage::RpcStreamEnd(RpcStreamEndMessage {
-                            request_id,
-                            error: Some(
-                                "RPC stream handler disappeared without terminal state".into(),
-                            ),
-                        }),
-                        "RPC stream handler-disappeared terminal",
-                    )
-                    .await;
-                };
-                tokio::select! {
-                    biased;
-                    () = witness.revoked() => {}
-                    () = run => {}
-                }
+                })
             });
         }
     }
@@ -7834,6 +7885,9 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
             "stale_inbound_ms": scheduler::STALE_INBOUND_MS,
         }),
     );
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
     heartbeat::send_ping_to_owner(state, &owner).await;
 
     // Confirm by inbound traffic after the probe delay. Pointer identity
@@ -7846,44 +7900,47 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
     // weak witness; no worker ownership crosses the configured delay.
     let weak_owner = owner.for_worker(probed_worker).downgrade();
     let device_id = device_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        let Some(state) = weak_state.upgrade() else {
-            return;
-        };
-        let Some(owner) = weak_owner.upgrade() else {
-            return;
-        };
-        if shutdown_requested_now(&state).await {
-            return;
-        }
-        // `get_if_current` rederives the installed peer under the stamped
-        // owner fence, including the exact worker witness. A replacement W1
-        // therefore cannot inherit this delayed W0 decision.
-        let still_silent = state.peers.get_if_current(&owner).is_some_and(|peer| {
-            peer.state
-                .read()
-                .last_recv_at
-                .map(|t| t.elapsed().as_millis() as u64 > delay_ms)
-                .unwrap_or(true)
-        });
-        if still_silent {
-            state.log_diag_with(
-                crate::events::DiagLevel::Warn,
-                "signaling",
-                format!(
-                    "{} didn't answer the announce-driven probe — rebuilding",
-                    short_peer(&device_id)
-                ),
-                serde_json::json!({ "peer": device_id }),
-            );
-            drop_peer_if_current(&state, &owner, crate::events::DropReason::HeartbeatTimeout).await;
-            // Re-seed discovery so the rebuilt peer reconnects on the next
-            // round-trip rather than waiting for its own announce schedule.
-            if !shutdown_requested_now(&state).await {
-                maybe_reactive_announce(&state);
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            let Some(owner) = weak_owner.upgrade() else {
+                return;
+            };
+            if shutdown_requested_now(&state).await {
+                return;
             }
-        }
+            // `get_if_current` rederives the installed peer under the stamped
+            // owner fence, including the exact worker witness. A replacement W1
+            // therefore cannot inherit this delayed W0 decision.
+            let still_silent = state.peers.get_if_current(&owner).is_some_and(|peer| {
+                peer.state
+                    .read()
+                    .last_recv_at
+                    .map(|t| t.elapsed().as_millis() as u64 > delay_ms)
+                    .unwrap_or(true)
+            });
+            if still_silent {
+                state.log_diag_with(
+                    crate::events::DiagLevel::Warn,
+                    "signaling",
+                    format!(
+                        "{} didn't answer the announce-driven probe — rebuilding",
+                        short_peer(&device_id)
+                    ),
+                    serde_json::json!({ "peer": device_id }),
+                );
+                drop_peer_if_current(&state, &owner, crate::events::DropReason::HeartbeatTimeout)
+                    .await;
+                // Re-seed discovery so the rebuilt peer reconnects on the next
+                // round-trip rather than waiting for its own announce schedule.
+                if !shutdown_requested_now(&state).await {
+                    maybe_reactive_announce(&state);
+                }
+            }
+        })
     });
 }
 
@@ -7998,7 +8055,6 @@ async fn finish_drop_peer_inner_with_recovery(
         }
 
         if !already_started {
-            state.peers.track_removed_close(Arc::clone(&peer));
             // Retire synchronously to move every exact channel/candidate into
             // native-close custody before the close supervisor begins. The
             // connection owns dedup custody until each native close settles.
@@ -8008,7 +8064,6 @@ async fn finish_drop_peer_inner_with_recovery(
         if let Err(error) = peer.retire_and_close().await {
             warn!(%error, "peer cleanup did not complete successfully");
         }
-        state.peers.complete_removed_close(&peer);
         state.settle_stale_closed_relay_owners();
         // Policy can change while native close is in flight.  Revalidate at
         // the terminal boundary and detach the exact provider-owned cohort;
@@ -8209,7 +8264,6 @@ async fn drop_peer_if_current_with_correlation(
                 peer_registry::ChannelTerminal::Peer { peer, channel } => {
                     let opened_as = Some(OpenedAs::of(&channel.worker));
                     let recovery = publish_terminal_recovery(state, recovery);
-                    state.peers.track_removed_close(Arc::clone(&peer));
                     peer.retire_connector();
                     let started = owner.connection().start_exact_retired_worker(
                         &channel.worker,
@@ -8221,12 +8275,20 @@ async fn drop_peer_if_current_with_correlation(
                     }
                     peer.start_all_retired_workers();
                     let state = Arc::clone(state);
+                    let task_state = Arc::clone(&state);
                     let device_id = owner.device_id().to_string();
-                    tokio::spawn(async move {
-                        finish_drop_peer_started_with_recovery(
-                            &state, &device_id, reason, peer, opened_as, recovery,
-                        )
-                        .await;
+                    state.register_shutdown_task(&_shutdown_permit, || {
+                        tokio::spawn(async move {
+                            finish_drop_peer_started_with_recovery(
+                                &task_state,
+                                &device_id,
+                                reason,
+                                peer,
+                                opened_as,
+                                recovery,
+                            )
+                            .await;
+                        })
                     });
                     return;
                 }
@@ -8257,7 +8319,6 @@ async fn drop_peer_if_current_with_correlation(
                     None
                 };
                 if removed.session_empty {
-                    state.peers.track_removed_close(Arc::clone(&peer));
                     peer.retire_connector();
                 }
                 let started = owner.connection().start_exact_retired_worker(
@@ -8271,12 +8332,20 @@ async fn drop_peer_if_current_with_correlation(
                 if removed.session_empty {
                     peer.start_all_retired_workers();
                     let state = Arc::clone(state);
+                    let task_state = Arc::clone(&state);
                     let device_id = owner.device_id().to_string();
-                    tokio::spawn(async move {
-                        finish_drop_peer_started_with_recovery(
-                            &state, &device_id, reason, peer, opened_as, recovery,
-                        )
-                        .await;
+                    state.register_shutdown_task(&_shutdown_permit, || {
+                        tokio::spawn(async move {
+                            finish_drop_peer_started_with_recovery(
+                                &task_state,
+                                &device_id,
+                                reason,
+                                peer,
+                                opened_as,
+                                recovery,
+                            )
+                            .await;
+                        })
                     });
                 }
             }
@@ -8368,7 +8437,6 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                 if let Err(error) = peer.retire_and_close().await {
                     warn!(%error, "carrier promoted cleanup did not complete");
                 }
-                state.peers.complete_removed_close(&peer);
                 state.settle_stale_closed_relay_owners();
                 if recovery.is_none() {
                     state.clear_reconnect_intent(owner.device_id());
@@ -8393,7 +8461,6 @@ pub(super) async fn drop_carrier_if_current_with_correlation(
                     if let Err(error) = peer.retire_and_close().await {
                         warn!(%error, "carrier current-worker cleanup did not complete");
                     }
-                    state.peers.complete_removed_close(&peer);
                     state.settle_stale_closed_relay_owners();
                     if recovery.is_none() {
                         state.clear_reconnect_intent(owner.device_id());
@@ -8482,12 +8549,18 @@ pub(super) fn drop_carrier_if_current_now(
             if exact_current && !owner.connection().holds_promoted_session() {
                 if let Some(peer) = state.peers.remove_if_current_unpromoted(owner) {
                     let recovery = publish_terminal_recovery(state, recovery);
-                    state.peers.track_removed_close(Arc::clone(&peer));
                     peer.retire_connector();
                     peer.start_all_retired_workers();
                     if recovery.is_none() {
                         state.clear_reconnect_intent(owner.device_id());
                     }
+                    state.register_shutdown_task(&_shutdown_permit, || {
+                        tokio::spawn(async move {
+                            if let Err(error) = peer.retire_and_close().await {
+                                warn!(%error, "carrier current-worker cleanup did not complete");
+                            }
+                        })
+                    });
                     return;
                 }
             }
@@ -8611,13 +8684,20 @@ fn install_peer_for_state(
     state: &Arc<NetworkState>,
     peer: Arc<PeerConnection>,
 ) -> Option<connection::AttemptDisplacement> {
+    let shutdown_permit = state.try_admit_shutdown_mutation()?;
     let displaced = state.peers.install_with_displaced_owner(peer)?;
     let replaced = displaced.peer;
     state.settle_displaced_owner_emissions(&displaced.owner);
     let mut attempt = replaced.take_attempt_displacement();
     replaced.retire_connector();
     attempt.retired_dedup = replaced.take_retired_dedup();
-    state.peers.track_replaced_close(replaced);
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(async move {
+            if let Err(error) = replaced.retire_and_close().await {
+                warn!(%error, "replaced peer cleanup did not complete successfully");
+            }
+        })
+    });
     Some(attempt)
 }
 
@@ -17389,54 +17469,59 @@ mod tests {
         let installed_runtime = state
             .signaling_runtime()
             .expect("the runtime is published before shutdown");
-        let pre_shutdown = state
-            .try_admit_shutdown_mutation()
-            .expect("the pre-shutdown operation gets the linearization witness");
+        {
+            let _pre_shutdown = state
+                .try_admit_shutdown_mutation()
+                .expect("the pre-shutdown operation gets the linearization witness");
 
-        state.request_shutdown();
+            state.request_shutdown();
 
-        assert!(
-            state.try_admit_shutdown_mutation().is_none(),
-            "the shutdown transition rejects every later peer effect"
-        );
-        assert!(
-            !maybe_reactive_announce(&state),
-            "a delayed probe cannot publish after shutdown"
-        );
-        let reconnect_generation = *reconnect_rx.borrow();
-        assert!(
-            !state.request_relay_reconnect(),
-            "a post-shutdown reconnect cannot mutate the relay generation"
-        );
-        assert_eq!(*reconnect_rx.borrow(), reconnect_generation);
-        let replacement_runtime = signaling_ingress::SignalingRuntime::new(
-            state.signaling_inbound_tx.clone(),
-            state
-                .local_application_resource_scope()
-                .expect("the replacement runtime control has a local resource scope"),
-        );
-        state.publish_signaling_runtime(&replacement_runtime);
-        assert!(
-            Arc::ptr_eq(
-                &state
-                    .signaling_runtime()
-                    .expect("the pre-shutdown runtime remains published"),
-                &installed_runtime,
-            ),
-            "a post-shutdown runtime publish cannot replace the installed owner"
-        );
-        assert!(
-            !drop_unpromoted_offer_if_current(&state, &owner, "", DropReason::HeartbeatTimeout,)
+            assert!(
+                state.try_admit_shutdown_mutation().is_none(),
+                "the shutdown transition rejects every later peer effect"
+            );
+            assert!(
+                !maybe_reactive_announce(&state),
+                "a delayed probe cannot publish after shutdown"
+            );
+            let reconnect_generation = *reconnect_rx.borrow();
+            assert!(
+                !state.request_relay_reconnect(),
+                "a post-shutdown reconnect cannot mutate the relay generation"
+            );
+            assert_eq!(*reconnect_rx.borrow(), reconnect_generation);
+            let replacement_runtime = signaling_ingress::SignalingRuntime::new(
+                state.signaling_inbound_tx.clone(),
+                state
+                    .local_application_resource_scope()
+                    .expect("the replacement runtime control has a local resource scope"),
+            );
+            state.publish_signaling_runtime(&replacement_runtime);
+            assert!(
+                Arc::ptr_eq(
+                    &state
+                        .signaling_runtime()
+                        .expect("the pre-shutdown runtime remains published"),
+                    &installed_runtime,
+                ),
+                "a post-shutdown runtime publish cannot replace the installed owner"
+            );
+            assert!(
+                !drop_unpromoted_offer_if_current(
+                    &state,
+                    &owner,
+                    "",
+                    DropReason::HeartbeatTimeout,
+                )
                 .await,
-            "a post-shutdown offer cleanup cannot remove the peer"
-        );
-        drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
-        assert!(
-            state.peers.get("peer-shutdown-fence").is_some(),
-            "a delayed probe cannot retire a peer after shutdown"
-        );
-
-        drop(pre_shutdown);
+                "a post-shutdown offer cleanup cannot remove the peer"
+            );
+            drop_peer_if_current(&state, &owner, DropReason::HeartbeatTimeout).await;
+            assert!(
+                state.peers.get("peer-shutdown-fence").is_some(),
+                "a delayed probe cannot retire a peer after shutdown"
+            );
+        }
         state.shutdown().await;
     }
 

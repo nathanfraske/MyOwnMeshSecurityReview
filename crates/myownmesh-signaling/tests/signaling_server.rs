@@ -23,8 +23,24 @@ use myownmesh_signaling::nostr::delivery::{
     DeliveryLease, DeliveryProvider, DeliveryRefusal, DeliveryRetention, DeliveryTerminal,
     RelaySessionId, SessionRetention,
 };
+use myownmesh_signaling::nostr::driver::{derive_task_custody_plan, NostrDriverConfig};
 use myownmesh_signaling::server::{Limits, SignalingServer};
-use myownmesh_signaling::{InboundSink, UnboundedSource};
+use myownmesh_signaling::{
+    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, DedicatedTaskCustodian,
+    InboundSink, TaskCustodian, UnboundedSource,
+};
+
+struct NoopAttemptRefusalSink;
+
+impl AttemptRefusalSink for NoopAttemptRefusalSink {
+    fn refused(&self, _refusal: AttemptRefusal) {}
+}
+
+struct NoopAttemptOutcomeSink;
+
+impl AttemptOutcomeSink for NoopAttemptOutcomeSink {
+    fn outcome(&self, _outcome: AttemptOutcome) {}
+}
 
 const SIGNALLING_TEST_DELIVERY_CAPACITY: usize = 256;
 
@@ -39,6 +55,61 @@ fn test_nostr_timing() -> myownmesh_signaling::nostr::driver::NostrTimingConfig 
         session_close_timeout: Duration::from_secs(1),
         announcer_cancel_quantum: Duration::from_secs(1),
     }
+}
+
+fn test_task_custodians(
+    config: &NostrDriverConfig,
+) -> (Arc<dyn TaskCustodian>, Arc<dyn TaskCustodian>) {
+    assert!(
+        !config.public_fallback,
+        "fixture fallback count is explicitly zero"
+    );
+    assert!(
+        config.denylist.is_empty(),
+        "fixture denylist is explicitly empty"
+    );
+    let pool = config
+        .servers
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let selected =
+        myownmesh_signaling::nostr::shuffle::select_top_n(&config.app_id, &pool, config.redundancy);
+    let plan = derive_task_custody_plan(selected.len(), 0)
+        .expect("fixture relay counts produce a finite custody plan");
+    (
+        DedicatedTaskCustodian::new(plan.primary_observer_slots).expect("primary fixture custodian")
+            as Arc<dyn TaskCustodian>,
+        DedicatedTaskCustodian::new(plan.reaper_observer_slots).expect("reaper fixture custodian")
+            as Arc<dyn TaskCustodian>,
+    )
+}
+
+fn start_test_driver<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound: InboundSink<myownmesh_signaling::nostr::driver::NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+) -> Result<myownmesh_signaling::nostr::driver::NostrDriverHandle, myownmesh_signaling::Error>
+where
+    S: myownmesh_signaling::OutboundSource<myownmesh_signaling::nostr::driver::NostrOutbound>
+        + Send
+        + 'static,
+    S::Owner: Sync + 'static,
+{
+    let (custodian_owner, reaper_custodian_owner) = test_task_custodians(&config);
+    myownmesh_signaling::nostr::driver::start_with_delivery_provider_and_sinks_with_custodian(
+        config,
+        outbound,
+        inbound,
+        provider,
+        Arc::new(NoopAttemptRefusalSink),
+        Arc::new(NoopAttemptOutcomeSink),
+        myownmesh_signaling::nostr::driver::NostrTaskCustodyOwners {
+            primary: custodian_owner,
+            reaper: reaper_custodian_owner,
+        },
+    )
 }
 
 struct FiniteTestProvider {
@@ -356,9 +427,7 @@ async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
 // place of Nostr" with zero driver changes.
 #[tokio::test]
 async fn two_drivers_discover_via_self_hosted_relay() {
-    use myownmesh_signaling::nostr::driver::{
-        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
-    };
+    use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
     let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
@@ -384,7 +453,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // test — dropping either tears the driver down.
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start_with_delivery_provider(
+    let driver_a = start_test_driver(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
@@ -394,7 +463,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start_with_delivery_provider(
+    let driver_b = start_test_driver(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
@@ -421,6 +490,8 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     // Hold the senders/handles until here.
     drop(out_tx_a);
     drop(out_tx_b);
+    driver_a.stop_and_join().await;
+    driver_b.stop_and_join().await;
     server
         .stop_and_wait()
         .await
@@ -434,9 +505,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
 // relays, which never synthesise a leave for us.
 #[tokio::test]
 async fn driver_self_announced_leave_reaches_peer() {
-    use myownmesh_signaling::nostr::driver::{
-        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
-    };
+    use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
     let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
@@ -458,7 +527,7 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_a = start_with_delivery_provider(
+    let driver_a = start_test_driver(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
@@ -468,7 +537,7 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start_with_delivery_provider(
+    let driver_b = start_test_driver(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
@@ -510,6 +579,8 @@ async fn driver_self_announced_leave_reaches_peer() {
 
     drop(out_tx_a);
     drop(out_tx_b);
+    driver_a.stop_and_join().await;
+    driver_b.stop_and_join().await;
     server
         .stop_and_wait()
         .await
@@ -581,9 +652,7 @@ async fn relay_emits_leave_when_member_disconnects() {
 // this flaky on the macOS / Windows CI runners.)
 #[tokio::test]
 async fn driver_gets_peer_left_when_peer_disconnects() {
-    use myownmesh_signaling::nostr::driver::{
-        start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound,
-    };
+    use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
     let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
@@ -605,7 +674,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let (out_tx_a, out_rx_a) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_a, _in_rx_a) = mpsc::unbounded_channel::<NostrInbound>();
-    let driver_a = start_with_delivery_provider(
+    let driver_a = start_test_driver(
         mk("device-aaa"),
         Box::new(UnboundedSource::new(out_rx_a)),
         InboundSink::from_unbounded(in_tx_a),
@@ -615,7 +684,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
 
     let (out_tx_b, out_rx_b) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx_b, mut in_rx_b) = mpsc::unbounded_channel::<NostrInbound>();
-    let _driver_b = start_with_delivery_provider(
+    let driver_b = start_test_driver(
         mk("device-bbb"),
         Box::new(UnboundedSource::new(out_rx_b)),
         InboundSink::from_unbounded(in_tx_b),
@@ -654,6 +723,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
     assert!(saw_leave, "B never saw A's departure");
 
     drop(out_tx_b);
+    driver_b.stop_and_join().await;
     server
         .stop_and_wait()
         .await

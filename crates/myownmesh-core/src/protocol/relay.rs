@@ -50,6 +50,7 @@ pub const fn closed_relay_worst_case_json_bytes(ciphertext_len: u64) -> Option<u
 /// except `signature`, including both endpoint identities and the session
 /// nonce, so a visible relay cannot substitute an endpoint or session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RelayKeyShare {
     pub version: u8,
     pub mesh: String,
@@ -105,6 +106,7 @@ impl RelayKeyShare {
 /// `from`, `to`, `mesh`, and `session_id` are routing/binding metadata only;
 /// they are authenticated by the endpoint key-share exchange and AEAD AAD.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct OpaqueRelayPacket {
     pub version: u8,
     pub mesh: String,
@@ -613,6 +615,29 @@ mod tests {
             ciphertext: vec![1],
         };
         assert!(packet.validate(16).is_err());
+    }
+
+    #[test]
+    fn relay_data_wrappers_reject_unknown_fields() {
+        let (context, requester, _relay, target, session_id) = route();
+        let mut share_wire =
+            serde_json::to_value(share(&context, session_id, &requester, &target, 4)).unwrap();
+        share_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RelayKeyShare>(share_wire).is_err());
+
+        let packet = OpaqueRelayPacket {
+            version: OPAQUE_RELAY_VERSION,
+            mesh: context.to_string(),
+            session_id,
+            from: requester.base32(),
+            to: target.base32(),
+            sequence: 1,
+            nonce: [3; OPAQUE_RELAY_NONCE_BYTES],
+            ciphertext: vec![9],
+        };
+        let mut packet_wire = serde_json::to_value(packet).unwrap();
+        packet_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<OpaqueRelayPacket>(packet_wire).is_err());
     }
 
     fn route() -> (MeshContextId, DeviceId, DeviceId, DeviceId, [u8; 16]) {

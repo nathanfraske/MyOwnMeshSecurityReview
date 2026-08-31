@@ -18,6 +18,9 @@ path = "src/lib.rs"
 [features]
 default = []
 transport-lab = []
+# Select the platform DNS-SD backend through the signaling crate. Kept
+# explicit so the default and no-default release boundaries remain unchanged.
+system-dnssd = ["myownmesh-signaling/system-dnssd"]
 
 [[example]]
 name = "spin_min"

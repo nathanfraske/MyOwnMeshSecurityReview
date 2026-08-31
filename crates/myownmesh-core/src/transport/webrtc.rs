@@ -635,6 +635,9 @@ pub(crate) struct RealtimeOutboundTrack {
     pc: Arc<RTCPeerConnection>,
     /// The exact connector this track was negotiated on.
     incarnation: Arc<WebRtcConnectorIncarnation>,
+    /// The connector cleanup owner retains the pump until it has observed its
+    /// terminal result and the native sender has been removed.
+    close_owner: Arc<ConnectorCloseOwner>,
 }
 
 impl RealtimeOutboundTrack {
@@ -695,6 +698,13 @@ pub(super) struct RealtimeSessionTracks {
     /// "recorded" and "one funded allocation" the same event, and makes removal
     /// a release the provider can be told about truthfully.
     negotiated: SyncMutex<crate::resource::LeasedQueue<RealtimeNegotiatedTrack>>,
+    /// Runtime-owned observation for every task retained by a negotiated
+    /// record or supersession sweep.
+    #[cfg(any(test, feature = "transport-lab"))]
+    task_reaper: SyncMutex<Option<TaskReaper>>,
+    /// The connector owner for production task custody.  A weak reference is
+    /// intentional: this table must not keep the connector alive after close.
+    cleanup_owner: SyncMutex<Option<Weak<ConnectorCloseOwner>>>,
 }
 
 /// One transceiver this side created for a realtime flow.
@@ -777,6 +787,9 @@ struct RealtimeNegotiatedTrack {
     /// right to stop it, so there is no path that releases a claim for a
     /// transceiver it did not retire.
     native: Option<crate::resource::ResourceLease>,
+    /// The callback pump's exact task handle, retained until the same
+    /// retirement owner observes its terminal result.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// What the **native half** of one negotiated inbound transceiver costs, for
@@ -979,6 +992,7 @@ struct RealtimeTrackClaim {
     /// its lease — and which is therefore a release of nothing rather than a
     /// branch anyone has to reason about.
     native: Option<crate::resource::ResourceLease>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RealtimeRetirement {
@@ -1189,11 +1203,63 @@ impl Default for RealtimeSessionTracks {
         Self {
             bindings: SyncMutex::new(std::sync::Weak::new()),
             negotiated: SyncMutex::new(crate::resource::LeasedQueue::new()),
+            #[cfg(any(test, feature = "transport-lab"))]
+            task_reaper: SyncMutex::new(None),
+            cleanup_owner: SyncMutex::new(None),
         }
     }
 }
 
 impl RealtimeSessionTracks {
+    #[cfg(any(test, feature = "transport-lab"))]
+    fn with_task_reaper(task_reaper: TaskReaper) -> Self {
+        Self {
+            bindings: SyncMutex::new(std::sync::Weak::new()),
+            negotiated: SyncMutex::new(crate::resource::LeasedQueue::new()),
+            task_reaper: SyncMutex::new(Some(task_reaper)),
+            cleanup_owner: SyncMutex::new(None),
+        }
+    }
+
+    fn bind_cleanup_owner(&self, owner: &Arc<ConnectorCloseOwner>) {
+        *self.cleanup_owner.lock() = Some(Arc::downgrade(owner));
+    }
+
+    fn submit_tasks(&self, tasks: Vec<tokio::task::JoinHandle<()>>) {
+        if tasks.is_empty() {
+            return;
+        }
+        #[cfg(not(any(test, feature = "transport-lab")))]
+        {
+            let owner = self
+                .cleanup_owner
+                .lock()
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .expect("production realtime tracks are bound to their close owner");
+            for task in tasks {
+                owner.retain_transport_task(task);
+            }
+        }
+        #[cfg(any(test, feature = "transport-lab"))]
+        {
+            if let Some(owner) = self.cleanup_owner.lock().as_ref().and_then(Weak::upgrade) {
+                for task in tasks {
+                    owner.retain_transport_task(task);
+                }
+                return;
+            }
+            let reaper = self.task_reaper.lock();
+            let reaper = reaper
+                .as_ref()
+                .expect("raw transport tracks require pre-existing task custody");
+            let sender = reaper
+                .sender()
+                .expect("raw transport task custody is still open while submitting");
+            submit_task_batch(sender, tasks);
+        }
+    }
+
     /// Point at a newly promoted session's table, replacing any previous one,
     /// and retire everything the old session left behind.
     ///
@@ -1237,6 +1303,7 @@ impl RealtimeSessionTracks {
                         // sweep that wins the claim is the party that will
                         // answer for this charge.
                         native: track.native.take(),
+                        task: track.task.take(),
                     })
                 })
                 .collect()
@@ -1245,14 +1312,14 @@ impl RealtimeSessionTracks {
             return;
         }
         let tracks = Arc::clone(self);
-        // Fire and forget, and only here. Nobody is acknowledging a superseded
-        // session's teardown, so there is no answer whose truthfulness depends
-        // on waiting; an explicit close is the opposite and awaits.
-        tokio::spawn(async move {
+        // Nobody acknowledges a superseded session's teardown, so the bounded
+        // reaper observes this sweep instead of making the install await it.
+        let sweep = tokio::spawn(async move {
             for claim in superseded {
                 tracks.stop_owned(claim).await;
             }
         });
+        self.submit_tasks(vec![sweep]);
     }
 
     /// The current table, if its session is still alive.
@@ -1292,9 +1359,32 @@ impl RealtimeSessionTracks {
                 transceiver,
                 retirement: RealtimeRetirement::new(signal),
                 native: Some(native),
+                task: None,
             },
             record,
         );
+    }
+
+    /// Attach the callback task to the same bounded record that owns its
+    /// transceiver. A claimed or missing record returns the handle so the
+    /// caller can abort and route it through the reaper rather than dropping it.
+    fn attach_task(
+        &self,
+        identity: &Arc<RealtimeTrackIdentity>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> std::result::Result<(), tokio::task::JoinHandle<()>> {
+        let mut negotiated = self.negotiated.lock();
+        let Some(track) = negotiated
+            .iter_mut()
+            .find(|track| Arc::ptr_eq(&track.identity, identity))
+        else {
+            return Err(task);
+        };
+        if track.retirement.claimed || track.task.is_some() {
+            return Err(task);
+        }
+        track.task = Some(task);
+        Ok(())
     }
 
     /// The token a track arriving on `transceiver` was negotiated against.
@@ -1431,6 +1521,7 @@ impl RealtimeSessionTracks {
                     // that can release or retain it. A loser waits for the
                     // winner's announcement and holds nothing.
                     native: track.native.take(),
+                    task: track.task.take(),
                 }),
                 Err(waiting) => Err(waiting),
             }
@@ -1480,8 +1571,14 @@ impl RealtimeSessionTracks {
             // here to retain and nothing here to say.
             return;
         };
+        let task = track.task.take();
         if let Some(native) = track.native.take() {
             let _ = native.retain_after_failed_cleanup();
+        }
+        drop(negotiated);
+        if let Some(task) = task {
+            task.abort();
+            self.submit_tasks(vec![task]);
         }
         done.finish();
     }
@@ -1508,7 +1605,12 @@ impl RealtimeSessionTracks {
             transceiver,
             done,
             native,
+            task,
         } = claim;
+        if let Some(task) = task {
+            task.abort();
+            join_task_batch(vec![task]).await;
+        }
         let stopped = transceiver.stop().await;
         match stopped {
             // The stop returned, so the native object it named is gone and its
@@ -1542,6 +1644,72 @@ impl RealtimeSessionTracks {
             // of the stop — and permanently if the stop refused.
             self.forget(&identity);
         }
+    }
+
+    /// Extract every callback pump before the connector close owner is allowed
+    /// to publish terminal status. The operation fence is drained by the
+    /// caller first, so no callback can attach a successor after this pass.
+    fn prepare_for_close(&self) {
+        let tasks = {
+            let mut negotiated = self.negotiated.lock();
+            negotiated
+                .iter_mut()
+                .filter_map(|track| track.task.take())
+                .collect::<Vec<_>>()
+        };
+        self.submit_tasks(tasks);
+    }
+
+    /// Seal production task admission after the operation fence and record
+    /// extraction have completed. This is the final barrier before native
+    /// close; a task arriving afterwards is a diagnosed invariant violation,
+    /// never silently detached.
+    fn seal_for_close(&self) {
+        if let Some(owner) = self.cleanup_owner.lock().as_ref().and_then(Weak::upgrade) {
+            owner.seal_transport_tasks();
+        }
+    }
+
+    /// Close the task handoff and await its runtime-owned reaper. The sender
+    /// is taken before the await, so no registry lock crosses a suspension
+    /// point and no later callback can enqueue after the fence closes.
+    async fn wait_for_tasks(&self) {
+        #[cfg(not(any(test, feature = "transport-lab")))]
+        return;
+        #[cfg(any(test, feature = "transport-lab"))]
+        let Some(reaper) = self.task_reaper.lock().take() else {
+            return;
+        };
+        #[cfg(any(test, feature = "transport-lab"))]
+        reaper.wait().await;
+    }
+}
+
+impl Drop for RealtimeSessionTracks {
+    fn drop(&mut self) {
+        let tasks = {
+            let mut negotiated = self.negotiated.lock();
+            negotiated
+                .iter_mut()
+                .filter_map(|track| track.task.take())
+                .collect::<Vec<_>>()
+        };
+        if !tasks.is_empty() {
+            for task in &tasks {
+                task.abort();
+            }
+            self.submit_tasks(tasks);
+        }
+        // A worker dropped without an async close still has to close the
+        // production admission window.  The owner will already have fenced
+        // operations; sealing here publishes the exact end of this registry's
+        // task custody before the owner performs its final join/native close.
+        if let Some(owner) = self.cleanup_owner.lock().as_ref().and_then(Weak::upgrade) {
+            owner.seal_transport_tasks();
+        }
+        // Sender drop closes the reaper after the moved batch has been joined.
+        #[cfg(any(test, feature = "transport-lab"))]
+        self.task_reaper.lock().take();
     }
 }
 
@@ -1620,7 +1788,8 @@ fn spawn_outbound_realtime_pump(
     track: RealtimeOutboundTrack,
     retired: tokio::sync::oneshot::Sender<()>,
 ) {
-    tokio::spawn(async move {
+    let close_owner = Arc::clone(&track.close_owner);
+    let task = tokio::spawn(async move {
         // One exit point, so "retire on every exit" is structural rather than a
         // rule each `return` has to remember. The inner block produces nothing;
         // everything after it runs however it ended.
@@ -1670,6 +1839,7 @@ fn spawn_outbound_realtime_pump(
         // and that is why the error is discarded.
         let _ = retired.send(());
     });
+    close_owner.retain_transport_task(task);
 }
 
 /// Exact process-local identity for one WebRTC connector worker.
@@ -4949,6 +5119,7 @@ impl WebRtcConnectorWorker {
             // because the pump that ends up owning this has no worker to ask.
             pc: Arc::clone(&self.session.pc),
             incarnation: Arc::clone(&self.ownership.incarnation),
+            close_owner: Arc::clone(&self.close_owner),
         })
     }
 
@@ -5778,7 +5949,13 @@ impl WebRtcConnectorWorker {
     /// retirement. The local proof is limited to requesting and awaiting the
     /// dependency's idempotent peer-connection close operation.
     pub(crate) async fn retire_and_close(&self) -> Result<()> {
-        self.close_owner.wait().await
+        self.close_owner.start();
+        self.ownership.operation_fence.wait_for_operations().await;
+        self.session.realtime_tracks.prepare_for_close();
+        self.session.realtime_tracks.seal_for_close();
+        let result = self.close_owner.wait().await;
+        self.session.realtime_tracks.wait_for_tasks().await;
+        result
     }
 
     /// Return an owned waiter for the connector's existing close owner.
@@ -5788,12 +5965,29 @@ impl WebRtcConnectorWorker {
     /// worker identity so a concurrent direct close join can release the
     /// worker-owned resource observations immediately on completion.
     pub(crate) fn close_waiter(&self) -> impl Future<Output = Result<()>> + Send + 'static {
-        self.close_owner.close_waiter()
+        let close_owner = Arc::clone(&self.close_owner);
+        let operation_fence = Arc::clone(&self.ownership.operation_fence);
+        let realtime_tracks = Arc::clone(&self.session.realtime_tracks);
+        async move {
+            close_owner.start();
+            operation_fence.wait_for_operations().await;
+            realtime_tracks.prepare_for_close();
+            realtime_tracks.seal_for_close();
+            close_owner.wait().await
+        }
     }
 }
 
 impl Drop for WebRtcConnectorWorker {
     fn drop(&mut self) {
+        // Drop is synchronous, so commit the operation fence and task seal
+        // before starting the asynchronous owner. The native peer keeps the
+        // callback closures alive until its close completes; waiting for the
+        // tracks' Drop to publish this seal would therefore deadlock the
+        // owner before it could reach native close.
+        self.close_owner.retire_local();
+        self.session.realtime_tracks.prepare_for_close();
+        self.session.realtime_tracks.seal_for_close();
         self.close_owner.start();
     }
 }
@@ -5849,6 +6043,10 @@ struct PeerOpenOwnership {
     /// could invent on its behalf: the fixture names its own numbers.
     #[cfg(any(test, feature = "transport-lab"))]
     local_lab_callback_grant: Option<callback::TransportLabCallbackGrant>,
+    /// Raw lab construction has no connector owner, so it must create its
+    /// close custodian before entering the native constructor.
+    #[cfg(any(test, feature = "transport-lab"))]
+    construction_custodian: Option<Arc<PeerConstructionCloseCustodian>>,
     operation_fence: Arc<ConnectorOperationFence>,
     /// The application's registered codecs, carried through to the session so
     /// a flow set can resolve framing without re-reading the connector profile.
@@ -5966,11 +6164,27 @@ struct ConstructedConnectorResult {
 /// Cancels connector construction when the awaiting caller is dropped. Any
 /// native object already returned to the task is then retired by its
 /// `PeerConstructionGuard` during future cancellation.
-struct AbortConstructionOnDrop<T>(tokio::task::JoinHandle<T>);
+struct AbortConstructionOnDrop {
+    task: Option<tokio::task::JoinHandle<()>>,
+    close_owner: Arc<ConnectorCloseOwner>,
+}
 
-impl<T> Drop for AbortConstructionOnDrop<T> {
+impl AbortConstructionOnDrop {
+    fn new(task: tokio::task::JoinHandle<()>, close_owner: Arc<ConnectorCloseOwner>) -> Self {
+        Self {
+            task: Some(task),
+            close_owner,
+        }
+    }
+}
+
+impl Drop for AbortConstructionOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        task.abort();
+        self.close_owner.retain_transport_task(task);
     }
 }
 
@@ -6381,6 +6595,16 @@ impl Transport {
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .map_err(|error| Error::Transport(error.to_string()))?;
+        candidate
+            .prepare_late_transport_custodian()
+            .map_err(Error::from)?;
+        let late_transport_lease = candidate.take_late_transport_lease();
+        let late_transport_custodian =
+            LateTransportCustodian::new(late_transport_lease).map_err(|error| {
+                Error::Transport(format!(
+                    "late transport terminal custodian could not start: {error}"
+                ))
+            })?;
         let liveness = candidate.liveness();
         let work_resource_scope = candidate.work_resource_scope();
         let construction_work_resource_scope = work_resource_scope.clone();
@@ -6405,6 +6629,7 @@ impl Transport {
             resource_owner.clone(),
             cleanup_capability,
             Some(transport_observation),
+            late_transport_custodian,
         );
         let mut outer_cleanup = StartConnectorCleanupOnDrop::new(Arc::clone(&close_owner));
         let construction_close_owner = Arc::clone(&close_owner);
@@ -6417,46 +6642,51 @@ impl Transport {
         // crosses into the task, and the codec list is registration data the
         // session keeps for the lifetime of the connection anyway.
         let construction_realtime_profile = webrtc_profile.realtime().cloned();
-        let construction_task = AbortConstructionOnDrop(tokio::spawn(async move {
-            let construction = transport.open_peer_with_config_observed(
-                role,
-                config,
-                PeerOpenOwnership {
-                    resource_scope: Some(construction_scope),
-                    work_resource_scope: Some(construction_work_resource_scope),
-                    attempt_liveness: Some(construction_liveness),
-                    candidate_promoted: construction_candidate_promoted,
-                    callback_gate: construction_incarnation,
-                    callback_policy: construction_callback_policy,
-                    #[cfg(any(test, feature = "transport-lab"))]
-                    local_lab_callback_grant: None,
-                    operation_fence,
-                    realtime_profile: construction_realtime_profile,
-                    close_owner: Some(Arc::clone(&construction_close_owner)),
-                },
-            );
-            let result = construction.await;
-            match result {
-                Ok((session, events)) if result_liveness.is_active() => {
-                    let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
-                        session,
-                        events,
-                        construction_close_owner,
-                    )));
+        let construction_task = AbortConstructionOnDrop::new(
+            tokio::spawn(async move {
+                let construction = transport.open_peer_with_config_observed(
+                    role,
+                    config,
+                    PeerOpenOwnership {
+                        resource_scope: Some(construction_scope),
+                        work_resource_scope: Some(construction_work_resource_scope),
+                        attempt_liveness: Some(construction_liveness),
+                        candidate_promoted: construction_candidate_promoted,
+                        callback_gate: construction_incarnation,
+                        callback_policy: construction_callback_policy,
+                        #[cfg(any(test, feature = "transport-lab"))]
+                        local_lab_callback_grant: None,
+                        #[cfg(any(test, feature = "transport-lab"))]
+                        construction_custodian: None,
+                        operation_fence,
+                        realtime_profile: construction_realtime_profile,
+                        close_owner: Some(Arc::clone(&construction_close_owner)),
+                    },
+                );
+                let result = construction.await;
+                match result {
+                    Ok((session, events)) if result_liveness.is_active() => {
+                        let _ = construction_tx.send(Ok(ConstructedConnectorResult::new(
+                            session,
+                            events,
+                            construction_close_owner,
+                        )));
+                    }
+                    Ok((session, events)) => {
+                        drop(events);
+                        drop(session);
+                        construction_close_owner.start();
+                        let _ = construction_tx.send(Err(Error::Transport(
+                            "connector attempt retired during construction".to_string(),
+                        )));
+                    }
+                    Err(error) => {
+                        let _ = construction_tx.send(Err(error));
+                    }
                 }
-                Ok((session, events)) => {
-                    drop(events);
-                    drop(session);
-                    construction_close_owner.start();
-                    let _ = construction_tx.send(Err(Error::Transport(
-                        "connector attempt retired during construction".to_string(),
-                    )));
-                }
-                Err(error) => {
-                    let _ = construction_tx.send(Err(error));
-                }
-            }
-        }));
+            }),
+            Arc::clone(&close_owner),
+        );
         let constructed = construction_rx
             .await
             .map_err(|_| Error::Transport("connector construction owner stopped".to_string()))??;
@@ -6503,6 +6733,11 @@ impl Transport {
         callback_policy: ConnectorCallbackPolicy,
         callback_grant: callback::TransportLabCallbackGrant,
     ) -> Result<(PeerSession, TransportEventReceiver)> {
+        let construction_custodian = PeerConstructionCloseCustodian::new().map_err(|error| {
+            Error::Transport(format!(
+                "lab native close custodian could not start: {error}"
+            ))
+        })?;
         self.open_peer_with_config_observed(
             role,
             config,
@@ -6514,6 +6749,7 @@ impl Transport {
                 callback_gate: Arc::new(WebRtcConnectorIncarnation::new()),
                 callback_policy,
                 local_lab_callback_grant: Some(callback_grant),
+                construction_custodian: Some(construction_custodian),
                 operation_fence: Arc::new(ConnectorOperationFence::default()),
                 realtime_profile: None,
                 close_owner: None,
@@ -6537,6 +6773,8 @@ impl Transport {
             callback_policy,
             #[cfg(any(test, feature = "transport-lab"))]
             local_lab_callback_grant,
+            #[cfg(any(test, feature = "transport-lab"))]
+            mut construction_custodian,
             operation_fence,
             realtime_profile,
             close_owner,
@@ -6565,7 +6803,8 @@ impl Transport {
             }
         };
         let pc = Arc::new(pc);
-        let attached_close_owner = match close_owner {
+        let realtime_close_owner = close_owner.as_ref().map(Arc::clone);
+        let construction_owner = match close_owner {
             Some(owner)
                 if {
                     #[cfg(test)]
@@ -6586,23 +6825,42 @@ impl Transport {
                     }
                 } =>
             {
-                Some(owner)
+                PeerConstructionOwner::Connector(owner)
             }
             Some(owner) => {
-                let mut rejected =
-                    PeerConstructionGuard::new(Arc::clone(&pc), Arc::clone(&callback_gate), None);
-                rejected.close().await;
+                callback_gate.retire();
+                let _ = pc.close().await;
                 owner.start();
                 return Err(Error::Transport(
                     "native peer installation into close owner was refused".to_string(),
                 ));
             }
-            None => None,
+            None => {
+                #[cfg(any(test, feature = "transport-lab"))]
+                {
+                    let custodian = construction_custodian
+                        .take()
+                        .expect("raw lab construction has pre-existing close custody");
+                    if !custodian.attach_native(Arc::clone(&pc)) {
+                        callback_gate.retire();
+                        let _ = pc.close().await;
+                        return Err(Error::Transport(
+                            "lab native peer installation into close custodian was refused"
+                                .to_string(),
+                        ));
+                    }
+                    PeerConstructionOwner::Lab(custodian)
+                }
+                #[cfg(not(any(test, feature = "transport-lab")))]
+                {
+                    unreachable!("a non-lab raw peer cannot omit its close owner")
+                }
+            }
         };
         let mut construction = PeerConstructionGuard::new(
             Arc::clone(&pc),
             Arc::clone(&callback_gate),
-            attached_close_owner,
+            construction_owner,
         );
         let result = async {
             #[cfg(test)]
@@ -6723,7 +6981,17 @@ impl Transport {
 
             // Built before the callbacks so the `on_track` handler and the
             // session share one object rather than two that could diverge.
+            #[cfg(any(test, feature = "transport-lab"))]
+            let realtime_tracks = if realtime_close_owner.is_none() {
+                Arc::new(RealtimeSessionTracks::with_task_reaper(TaskReaper::new()))
+            } else {
+                Arc::new(RealtimeSessionTracks::default())
+            };
+            #[cfg(not(any(test, feature = "transport-lab")))]
             let realtime_tracks = Arc::new(RealtimeSessionTracks::default());
+            if let Some(owner) = realtime_close_owner.as_ref() {
+                realtime_tracks.bind_cleanup_owner(owner);
+            }
 
             register_callbacks(
                 &pc,
@@ -6768,8 +7036,11 @@ impl Transport {
                 realtime_profile,
                 realtime_tracks,
                 _events_tx: event_sink,
+                operation_fence,
                 callback_gate,
                 role,
+                #[cfg(any(test, feature = "transport-lab"))]
+                raw_close_owner: None,
                 _resource_scope: resource_scope,
                 work_resource_scope,
             };
@@ -6791,9 +7062,19 @@ impl Transport {
         .await;
 
         match result {
-            Ok(result) => {
-                construction.disarm();
-                Ok(result)
+            Ok((mut session, events)) => {
+                let owner = construction.take_owner().ok_or_else(|| {
+                    Error::Transport(
+                        "native construction owner was lost before handoff".to_string(),
+                    )
+                })?;
+                #[cfg(any(test, feature = "transport-lab"))]
+                if let PeerConstructionOwner::Lab(custodian) = owner {
+                    session.raw_close_owner = Some(custodian);
+                }
+                #[cfg(not(any(test, feature = "transport-lab")))]
+                drop(owner);
+                Ok((session, events))
             }
             Err(error) => {
                 construction.close().await;
@@ -6803,77 +7084,77 @@ impl Transport {
     }
 }
 
+enum PeerConstructionOwner {
+    Connector(Arc<ConnectorCloseOwner>),
+    #[cfg(any(test, feature = "transport-lab"))]
+    Lab(Arc<PeerConstructionCloseCustodian>),
+}
+
+impl PeerConstructionOwner {
+    fn start(&self) {
+        match self {
+            Self::Connector(owner) => owner.start(),
+            #[cfg(any(test, feature = "transport-lab"))]
+            Self::Lab(custodian) => custodian.start(),
+        }
+    }
+
+    async fn wait(&self) -> Result<()> {
+        match self {
+            Self::Connector(owner) => owner.wait().await,
+            #[cfg(any(test, feature = "transport-lab"))]
+            Self::Lab(custodian) => custodian.wait().await,
+        }
+    }
+}
+
 /// Closes a native peer connection when construction errors or its owned task
 /// is cancelled after the dependency returned the object but before the
-/// complete `PeerSession` can be handed to its connector owner.
+/// complete `PeerSession` can be handed to its connector owner. The owner is
+/// mandatory: production uses the connector close owner and raw lab use has a
+/// pre-existing [`PeerConstructionCloseCustodian`].
 struct PeerConstructionGuard {
     pc: Option<Arc<RTCPeerConnection>>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
-    close_owner: Option<Arc<ConnectorCloseOwner>>,
+    owner: Option<PeerConstructionOwner>,
 }
 
 impl PeerConstructionGuard {
     fn new(
         pc: Arc<RTCPeerConnection>,
         callback_gate: Arc<WebRtcConnectorIncarnation>,
-        close_owner: Option<Arc<ConnectorCloseOwner>>,
+        owner: PeerConstructionOwner,
     ) -> Self {
         Self {
             pc: Some(pc),
             callback_gate,
-            close_owner,
+            owner: Some(owner),
         }
     }
 
-    fn disarm(&mut self) {
+    fn take_owner(&mut self) -> Option<PeerConstructionOwner> {
         self.pc = None;
-        self.close_owner = None;
+        self.owner.take()
     }
 
     async fn close(&mut self) {
-        if let Some(owner) = self.close_owner.as_ref() {
-            self.pc = None;
-            let _ = owner.wait().await;
-            return;
-        }
-        let Some(pc) = self.pc.take() else {
+        let Some(owner) = self.owner.as_ref() else {
             return;
         };
+        self.pc = None;
         self.callback_gate.retire();
-        let _ = pc.close().await;
+        owner.start();
+        let _ = owner.wait().await;
     }
 }
 
 impl Drop for PeerConstructionGuard {
     fn drop(&mut self) {
-        if let Some(owner) = self.close_owner.as_ref() {
+        if let Some(owner) = self.owner.take() {
             self.pc = None;
+            self.callback_gate.retire();
             owner.start();
-            return;
         }
-        let Some(pc) = self.pc.take() else {
-            return;
-        };
-        self.callback_gate.retire();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = pc.close().await;
-            });
-            return;
-        }
-        let _ = std::thread::Builder::new()
-            .name("myownmesh-webrtc-construction-close".to_string())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                runtime.block_on(async move {
-                    let _ = pc.close().await;
-                });
-            });
     }
 }
 
@@ -7148,7 +7429,7 @@ fn register_callbacks(
                 // one active-flow lease it is entitled to; taking a second for
                 // the same flow would halve the configured capacity and let a
                 // refusal land on a flow whose open had already succeeded.
-                tokio::spawn(pump_session_flow_track(
+                let task = tokio::spawn(pump_session_flow_track(
                     track,
                     tx,
                     SessionInboundTrackOwner {
@@ -7156,11 +7437,15 @@ fn register_callbacks(
                         port: attachment.port,
                         end: attachment.end,
                         tracks: Arc::clone(&session_tracks),
-                        identity,
+                        identity: Arc::clone(&identity),
                         label: attachment.label,
                         policy: attachment.policy,
                     },
                 ));
+                if let Err(task) = session_tracks.attach_task(&identity, task) {
+                    task.abort();
+                    session_tracks.submit_tasks(vec![task]);
+                }
             })
         }));
     }
@@ -8279,8 +8564,18 @@ pub struct PeerSession {
     /// that fires while its owner is being torn down must find a live sink to
     /// be refused by, not a freed one.
     _events_tx: ConnectorEventSink,
+    /// The operation fence is part of the session's close custody.  Raw
+    /// sessions do not have a connector worker to retire this fence for them;
+    /// retaining it here lets close drain callback admission before the native
+    /// peer owner is terminalized.
+    operation_fence: Arc<ConnectorOperationFence>,
     callback_gate: Arc<WebRtcConnectorIncarnation>,
     role: Role,
+    /// Raw/test peers retain the exact native close owner for their complete
+    /// successful lifetime. Production peers are owned by their connector
+    /// close owner instead.
+    #[cfg(any(test, feature = "transport-lab"))]
+    raw_close_owner: Option<Arc<PeerConstructionCloseCustodian>>,
     /// The observation scope this session's pre-authentication measurements are
     /// attributed to. Held rather than read: the accountant is reference
     /// counted, so keeping a clone for exactly the session's lifetime is what
@@ -8654,12 +8949,25 @@ impl PeerSession {
     /// callback queue cannot deadlock shutdown.
     pub async fn close(&self) -> Result<()> {
         debug!("closing peer connection");
+        self.operation_fence.begin_close();
         self.callback_gate.retire();
-        self.pc
+        self.operation_fence.wait_for_operations().await;
+        self.realtime_tracks.prepare_for_close();
+        self.realtime_tracks.seal_for_close();
+        #[cfg(any(test, feature = "transport-lab"))]
+        if let Some(owner) = self.raw_close_owner.as_ref() {
+            owner.start();
+            let result = owner.wait().await;
+            self.realtime_tracks.wait_for_tasks().await;
+            return result;
+        }
+        let result = self
+            .pc
             .close()
             .await
-            .map_err(|e| Error::Transport(format!("close: {e}")))?;
-        Ok(())
+            .map_err(|e| Error::Transport(format!("close: {e}")));
+        self.realtime_tracks.wait_for_tasks().await;
+        result.map(|_| ())
     }
 }
 
@@ -9183,11 +9491,11 @@ mod tests {
         )
     }
 
-    fn test_resource_owner_with_additional(
+    fn test_resource_owner_with_provider(
         max_active_candidates: usize,
         callback_capacity: usize,
         additional: crate::resource::ResourceClaim,
-    ) -> MeshConnectorResourceScope {
+    ) -> (FiniteResourceProvider, MeshConnectorResourceScope) {
         let max_active_candidates = std::num::NonZeroUsize::new(max_active_candidates)
             .expect("fixture has a nonzero candidate bound");
         let profiles = vec![test_webrtc_profile(callback_capacity); max_active_candidates.get()];
@@ -9201,11 +9509,21 @@ mod tests {
         .expect("fixture connector and callback claims are representable")
         .checked_add(additional)
         .expect("fixture connector additional claim is representable");
-        let provider = ResourceProviderPort::new(FiniteResourceProvider::new(connector_grant))
+        let provider = FiniteResourceProvider::new(connector_grant);
+        let port = ResourceProviderPort::new(provider.clone())
             .expect("fixture provider accounts for its process scope");
-        crate::runtime::attempt::ConnectorResourceOwnerPort::new(provider)
+        let owner = ConnectorResourceOwnerPort::new(port)
             .issue_mesh_scope()
-            .expect("fixture process owner issues one explicit Mesh scope")
+            .expect("fixture process owner issues one explicit Mesh scope");
+        (provider, owner)
+    }
+
+    fn test_resource_owner_with_additional(
+        max_active_candidates: usize,
+        callback_capacity: usize,
+        additional: crate::resource::ResourceClaim,
+    ) -> MeshConnectorResourceScope {
+        test_resource_owner_with_provider(max_active_candidates, callback_capacity, additional).1
     }
 
     fn test_webrtc_profile(_callback_capacity: usize) -> WebRtcConnectorProfile {
@@ -9241,6 +9559,12 @@ mod tests {
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .expect("fixture candidate issues one cleanup capability");
+        candidate
+            .prepare_late_transport_custodian()
+            .expect("fixture candidate reserves late terminal custodian");
+        let late_transport_lease = candidate.take_late_transport_lease();
+        let late_transport_custodian = LateTransportCustodian::new(late_transport_lease)
+            .expect("fixture late terminal custodian starts");
         let ownership = admitted_ownership(candidate);
         let transport_observation = observation_scope
             .map(|scope| observe_inexact_item(scope, PreAuthResourceFamily::TransportObject, 1, 0));
@@ -9250,6 +9574,7 @@ mod tests {
                 owner.clone(),
                 cleanup_capability,
                 transport_observation,
+                late_transport_custodian,
             ),
             lifetime,
         )
@@ -18659,6 +18984,70 @@ mod tests {
                 .await
                 .expect("native peer closes through its exact owner");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "opens a native peer connection; run explicitly in the isolated WSL harness"]
+    async fn v4_arc03_production_worker_drop_joins_sole_cleanup_owner() {
+        let (provider, owner) =
+            test_resource_owner_with_provider(1, 4, crate::resource::ResourceClaim::ZERO);
+        let baseline = provider.in_use();
+        let process = ProcessResourceRoot::isolated();
+        let scope = process
+            .mesh_runtime_scope()
+            .network_instance_scope()
+            .peer_connection_scope();
+        let transport = Transport::new()
+            .expect("test transport")
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
+        let (worker, events) = transport
+            .open_connector_peer(Role::Answerer, &[], &[], scope)
+            .await
+            .expect("the provider-funded connector is constructed");
+        let native = Arc::clone(&worker.session.pc);
+        let mut retirement = worker.ownership.incarnation.subscribe_retirement();
+        let (task_started_tx, task_started_rx) = oneshot::channel();
+        let task_finished = Arc::new(AtomicBool::new(false));
+        let task_finished_in_task = Arc::clone(&task_finished);
+        let task = tokio::spawn(async move {
+            task_started_tx
+                .send(())
+                .expect("the Drop control still owns its start witness");
+            retirement
+                .changed()
+                .await
+                .expect("the worker retirement signal remains live through Drop");
+            task_finished_in_task.store(true, Ordering::Release);
+        });
+        task_started_rx
+            .await
+            .expect("the retained task started before the worker was dropped");
+        assert!(
+            !task_finished.load(Ordering::Acquire),
+            "non-vacuity: the retained task is parked on the worker retirement signal"
+        );
+        worker.close_owner.retain_transport_task(task);
+
+        // The waiter owns the cleanup observation while the worker is the sole
+        // public owner. Dropping the worker must therefore start exactly this
+        // close path rather than detaching the native peer or its task.
+        let waiter = worker.close_waiter();
+        drop(worker);
+        tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("hang guard: Drop must signal and join the retained task")
+            .expect("the dropped worker's native close is observed");
+        drop(events);
+
+        assert_eq!(native.connection_state(), RTCPeerConnectionState::Closed);
+        assert!(
+            task_finished.load(Ordering::Acquire),
+            "the close owner sealed and joined the retained transport task"
+        );
+        let report = owner.report();
+        assert_eq!(report.active_candidates, 0);
+        assert_eq!(report.failed_cleanup_candidates, 0);
+        assert_eq!(provider.in_use(), baseline);
     }
 
     #[tokio::test]

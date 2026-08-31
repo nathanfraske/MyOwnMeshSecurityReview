@@ -7,6 +7,72 @@ pub(super) struct ConnectorCandidateReservation {
 }
 
 impl ConnectorCandidateReservation {
+    fn split_late_transport_custodian(
+        &mut self,
+    ) -> Result<crate::resource::ResourceLease, crate::resource::ResourceUnavailable> {
+        let custodian = super::resource_owner::late_transport_custodian_claim().map_err(
+            |error| crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: match error {
+                    crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                    | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                        dimension
+                    }
+                },
+            },
+        )?;
+        let full = {
+            let lease = self
+                .state
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lease
+                .as_ref()
+                .expect("a live connector candidate owns one resource lease")
+                .claim()
+        };
+        let base = full.checked_sub(custodian).map_err(|error| {
+            crate::resource::ResourceUnavailable::ProviderInvariant {
+                dimension: match error {
+                    crate::resource::ResourceClaimArithmeticError::Overflow { dimension }
+                    | crate::resource::ResourceClaimArithmeticError::Underflow { dimension } => {
+                        dimension
+                    }
+                },
+            }
+        })?;
+        {
+            let mut lease = self
+                .state
+                .lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lease
+                .as_mut()
+                .expect("a live connector candidate owns one resource lease")
+                .transition(base)?;
+        }
+        match self.state.work_scope.acquire(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            custodian,
+        ) {
+            Ok(lease) => Ok(lease),
+            Err(error) => {
+                let mut lease = self
+                    .state
+                    .lease
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                lease
+                    .as_mut()
+                    .expect("a live connector candidate owns one resource lease")
+                    .transition(full)
+                    .expect("candidate claim split rollback remains funded");
+                Err(error)
+            }
+        }
+    }
+
     fn release_after_cleanup_success(&mut self) {
         let mut cleanup = self
             .state
@@ -75,16 +141,12 @@ impl ConnectorCandidateReservation {
             .lease
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lease.is_none() {
+        let Some(lease_ref) = lease.as_mut() else {
             return;
-        }
-        if lease.as_ref().is_some_and(|lease| {
-            lease.authority() != crate::resource::ResourceAuthorityClass::Cleanup
-        }) {
-            let claim = lease.as_ref().expect("checked above").claim();
-            if lease
-                .as_mut()
-                .expect("checked above")
+        };
+        if lease_ref.authority() != crate::resource::ResourceAuthorityClass::Cleanup {
+            let claim = lease_ref.claim();
+            if lease_ref
                 .transition_to(crate::resource::ResourceAuthorityClass::Cleanup, claim)
                 .is_err()
             {
@@ -94,9 +156,7 @@ impl ConnectorCandidateReservation {
                 );
             }
         }
-        let lease = lease
-            .take()
-            .expect("the cleanup failure still owns its exact lease");
+        let Some(lease) = lease.take() else { return };
         retain_failed_reservation(
             lease,
             &self.state.process_diagnostics,
@@ -260,6 +320,7 @@ impl PreAuthAttemptPermit {
             attempt: Arc::clone(&self.attempt),
             reservation,
             connected_claim: claim.connected,
+            late_transport_lease: None,
         }))
     }
 }
@@ -299,6 +360,7 @@ pub struct ConnectorCandidateCapability {
     attempt: Arc<AttemptOwnership>,
     reservation: ConnectorCandidateReservation,
     connected_claim: crate::resource::ResourceClaim,
+    late_transport_lease: Option<crate::resource::ResourceLease>,
 }
 
 impl ConnectorCandidateCapability {
@@ -312,12 +374,28 @@ impl ConnectorCandidateCapability {
         }
     }
 
+    pub(crate) fn prepare_late_transport_custodian(
+        &mut self,
+    ) -> Result<(), crate::resource::ResourceUnavailable> {
+        if self.late_transport_lease.is_none() {
+            self.late_transport_lease = Some(self.reservation.split_late_transport_custodian()?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_late_transport_lease(&mut self) -> crate::resource::ResourceLease {
+        self.late_transport_lease
+            .take()
+            .expect("candidate reserves one late-transport custodian lease")
+    }
+
     /// Resource authority for callback, parsing, queue, and other work owned
     /// by this exact connector candidate.
     pub(crate) fn work_resource_scope(&self) -> ConnectorWorkResourceScope {
         self.reservation.state.work_scope.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn is_live(&self) -> bool {
         let Ok(_transition) = self.attempt.transition.lock() else {
             return false;

@@ -49,7 +49,7 @@ async fn shutdown_joins_a_late_peer_event_pump() {
 
     assert!(state.begin_peer_event_pump_registration_for_lab());
     state.request_shutdown();
-    let driver = tokio::spawn(async move { driver.await });
+    let driver = tokio::spawn(driver);
     state.wait_peer_event_pump_shutdown_for_lab().await;
 
     let (start_tx, start_rx) = tokio::sync::oneshot::channel();

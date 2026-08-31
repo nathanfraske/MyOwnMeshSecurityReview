@@ -71,17 +71,20 @@ artifact exists.
 
 ### Artifact evidence
 
-The packaging jobs write a SHA-256 sidecar for each portable daemon and GUI
-archive. `scripts/verify-release-artifact.py` checks the release workflow and
-manifest boundary, and scans the daemon binary and portable archive members for
-the `transport-lab` seam. That scanner does not attest the opaque Tauri
-platform installers; their build and publication are separate workflow steps.
+Every release payload is recorded with an exact SHA-256 digest in the
+build-owned asset manifest and receives a detached minisign signature. Portable
+daemon and GUI archives additionally publish their `.sha256` sidecars. The
+artifact verifier checks the workflow and manifest boundary, scans the daemon
+binary and portable archive members for the `transport-lab` seam, and verifies
+the complete payload/signature set; the opaque Tauri installers are included in
+that same manifest and signature set.
 
-The optional `sign` job applies detached minisign signatures to portable
-archives only when `MINISIGN_SECRET_KEY` is configured. Without that secret,
-the workflow explicitly ships SHA-256 integrity sidecars without claiming
-signature provenance. A release is not considered closed by this document
-without the corresponding hosted build, artifact, and signature evidence.
+The `sign` job is mandatory. It requires both `MINISIGN_SECRET_KEY` and
+`MINISIGN_PUBLIC_KEY`, refuses missing or stale payloads, and verifies every
+signature before upload. It then downloads the uploaded assets again and
+re-verifies their bytes, digests, signatures, tag, repository, and draft state.
+The release remains a draft until the final exact-tag/preflight check succeeds;
+there is no unsigned, no-op, or SHA-only publication path.
 
 ## Versioning
 

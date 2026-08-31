@@ -8,6 +8,7 @@ members = [
     "crates/myownmesh",
 ]
 exclude = [
+    "vendor/turn-0.10.0",
     "vendor/webrtc-0.13.0",
     "vendor/webrtc-ice-0.13.0",
 ]
@@ -172,5 +173,6 @@ opt-level = 3
 opt-level = 3
 
 [patch.crates-io]
+turn = { path = "vendor/turn-0.10.0" }
 webrtc = { path = "vendor/webrtc-0.13.0" }
 webrtc-ice = { path = "vendor/webrtc-ice-0.13.0" }

@@ -419,6 +419,12 @@ pub struct MdnsPolicyConfig {
     pub max_resolve_owners: u64,
     pub event_capacity: u64,
     pub max_event_epochs: u64,
+    /// Maximum TXT records retained from one resolved service.
+    pub max_txt_entries: u64,
+    /// Maximum encoded TXT bytes retained from one resolved service.
+    pub max_txt_bytes: u64,
+    /// Maximum unique addresses retained from one resolved service.
+    pub max_resolved_addresses: u64,
     pub dial_timeout_ms: u64,
     pub connection_idle_timeout_ms: u64,
     pub inbound_idle_timeout_ms: u64,
@@ -554,6 +560,10 @@ impl Default for MdnsPolicyConfig {
             max_resolve_owners: 256,
             event_capacity: 128,
             max_event_epochs: 1024,
+            max_txt_entries: myownmesh_signaling::mdns::discovery::MAX_TXT_ENTRIES as u64,
+            max_txt_bytes: myownmesh_signaling::mdns::discovery::MAX_TXT_BYTES as u64,
+            max_resolved_addresses: myownmesh_signaling::mdns::discovery::MAX_RESOLVED_ADDRESSES
+                as u64,
             dial_timeout_ms: 5_000,
             connection_idle_timeout_ms: 30_000,
             inbound_idle_timeout_ms: 120_000,
@@ -576,6 +586,10 @@ impl MdnsPolicyConfig {
             && self.max_resolve_owners > 0
             && self.event_capacity > 0
             && self.max_event_epochs > 0
+            && self.max_txt_entries > 0
+            && self.max_txt_bytes > 0
+            && self.max_txt_bytes <= u16::MAX as u64
+            && self.max_resolved_addresses > 0
             && self.dial_timeout_ms > 0
             && self.connection_idle_timeout_ms > 0
             && self.inbound_idle_timeout_ms > 0
@@ -591,6 +605,9 @@ impl MdnsPolicyConfig {
             && usize::try_from(self.max_resolve_owners).is_ok()
             && usize::try_from(self.event_capacity).is_ok()
             && usize::try_from(self.max_event_epochs).is_ok()
+            && usize::try_from(self.max_txt_entries).is_ok()
+            && usize::try_from(self.max_txt_bytes).is_ok()
+            && usize::try_from(self.max_resolved_addresses).is_ok()
     }
 }
 
@@ -637,6 +654,9 @@ pub struct SignalingConfig {
     /// Finite owner-selected mDNS workload and timing policy.
     #[serde(default)]
     pub mdns_policy: MdnsPolicyConfig,
+    /// Finite owner-selected Nostr recovery and shutdown timing policy.
+    #[serde(default)]
+    pub nostr_timing: NostrTimingPolicyConfig,
 }
 
 impl Default for SignalingConfig {
@@ -649,7 +669,52 @@ impl Default for SignalingConfig {
             denylist: default_signaling_denylist(),
             public_fallback: true,
             mdns_policy: MdnsPolicyConfig::default(),
+            nostr_timing: NostrTimingPolicyConfig::default(),
         }
+    }
+}
+
+/// Persisted owner policy for Nostr reconnect, fallback, and cancellation.
+/// Millisecond fields are converted to the signaling driver's `Duration`
+/// shape only after this policy has passed validation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct NostrTimingPolicyConfig {
+    pub reconnect_initial_ms: u64,
+    pub reconnect_max_ms: u64,
+    pub reconnect_max_attempts: u32,
+    pub jitter_percent: u64,
+    pub fallback_poll_ms: u64,
+    pub fallback_activation_grace_ms: u64,
+    pub session_close_timeout_ms: u64,
+    pub announcer_cancel_quantum_ms: u64,
+}
+
+impl Default for NostrTimingPolicyConfig {
+    fn default() -> Self {
+        Self {
+            reconnect_initial_ms: 2_000,
+            reconnect_max_ms: 60_000,
+            reconnect_max_attempts: 6,
+            jitter_percent: 15,
+            fallback_poll_ms: 3_000,
+            fallback_activation_grace_ms: 20_000,
+            session_close_timeout_ms: 1_000,
+            announcer_cancel_quantum_ms: 1_000,
+        }
+    }
+}
+
+impl NostrTimingPolicyConfig {
+    pub fn validate(&self) -> bool {
+        self.reconnect_initial_ms > 0
+            && self.reconnect_max_ms >= self.reconnect_initial_ms
+            && self.reconnect_max_attempts > 0
+            && self.jitter_percent <= 100
+            && self.fallback_poll_ms > 0
+            && self.fallback_activation_grace_ms >= self.fallback_poll_ms
+            && self.session_close_timeout_ms > 0
+            && self.announcer_cancel_quantum_ms > 0
     }
 }
 
@@ -711,8 +776,6 @@ pub struct SchedulerPolicyConfig {
     pub relay_rescue_min_interval_ms: u64,
     pub network_change_restart_cooldown_ms: u64,
     pub reconnecting_grace_ms: u64,
-    pub signaling_diag_heartbeat_ms: u64,
-    pub diag_max: u64,
 }
 
 impl Default for SchedulerPolicyConfig {
@@ -748,8 +811,6 @@ impl SchedulerPolicyConfig {
         relay_rescue_min_interval_ms: 30_000,
         network_change_restart_cooldown_ms: 5_000,
         reconnecting_grace_ms: 90_000,
-        signaling_diag_heartbeat_ms: 5 * 60 * 1000,
-        diag_max: 80,
     };
 
     /// Validate before any engine, task, or transport side effect.
@@ -777,8 +838,6 @@ impl SchedulerPolicyConfig {
             self.relay_rescue_min_interval_ms,
             self.network_change_restart_cooldown_ms,
             self.reconnecting_grace_ms,
-            self.signaling_diag_heartbeat_ms,
-            self.diag_max,
         ]
         .into_iter()
         .all(|value| value > 0);
@@ -804,7 +863,6 @@ impl SchedulerPolicyConfig {
             && self.skew_warn_ticks > 0
             && self.restart_traffic_grace_ms <= self.data_channel_open_timeout_ms
             && self.relay_rescue_min_interval_ms >= self.data_channel_open_timeout_ms
-            && usize::try_from(self.diag_max).is_ok()
     }
 
     pub(crate) fn checked(self) -> Result<Self> {
@@ -899,6 +957,59 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
+    /// Validate the complete local ICE configuration before a transport can
+    /// clone its vectors and credential strings. The bound is the exact
+    /// platform-safe allocation ceiling already used by Tokio broadcasters;
+    /// it is not a product limit or a silently substituted server count.
+    pub(crate) fn validate_ice_servers(&self) -> Result<()> {
+        let mut server_count = 0usize;
+        let mut url_count = 0usize;
+        let mut retained_bytes = 0usize;
+        for server in &self.stun_servers {
+            server_count = server_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("network STUN server count overflows".into()))?;
+            url_count = url_count
+                .checked_add(server.urls.len())
+                .ok_or_else(|| Error::Config("network STUN URL count overflows".into()))?;
+            if server_count > MAX_NETWORK_BROADCAST_CAPACITY
+                || url_count > MAX_NETWORK_BROADCAST_CAPACITY
+            {
+                return Err(Error::Config(
+                    "network STUN workload exceeds the platform allocation limit".into(),
+                ));
+            }
+            for url in &server.urls {
+                validate_ice_text("STUN URL", url, &mut retained_bytes)?;
+            }
+        }
+        for server in &self.turn_servers {
+            server_count = server_count
+                .checked_add(1)
+                .ok_or_else(|| Error::Config("network TURN server count overflows".into()))?;
+            url_count = url_count
+                .checked_add(server.urls.len())
+                .ok_or_else(|| Error::Config("network TURN URL count overflows".into()))?;
+            if server_count > MAX_NETWORK_BROADCAST_CAPACITY
+                || url_count > MAX_NETWORK_BROADCAST_CAPACITY
+            {
+                return Err(Error::Config(
+                    "network TURN workload exceeds the platform allocation limit".into(),
+                ));
+            }
+            for url in &server.urls {
+                validate_ice_text("TURN URL", url, &mut retained_bytes)?;
+            }
+            if let Some(username) = &server.username {
+                validate_ice_text("TURN username", username, &mut retained_bytes)?;
+            }
+            if let Some(credential) = &server.credential {
+                validate_ice_text("TURN credential", credential, &mut retained_bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Return this network's finite event-history choice in the platform
     /// representation required by its broadcaster.
     pub(crate) fn event_capacity_usize(&self) -> Result<usize> {
@@ -941,6 +1052,7 @@ impl NetworkConfig {
     /// effects. Callers must pass this value through rather than substituting
     /// process-wide timing constants.
     pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
+        self.validate_ice_servers()?;
         self.scheduler.checked()
     }
 }
@@ -1608,6 +1720,23 @@ impl PreparedConfigLoad {
     }
 }
 
+fn validate_ice_text(field: &str, value: &str, retained_bytes: &mut usize) -> Result<()> {
+    if value.len() > MAX_NETWORK_BROADCAST_CAPACITY {
+        return Err(Error::Config(format!(
+            "network {field} exceeds the platform allocation limit"
+        )));
+    }
+    *retained_bytes = (*retained_bytes)
+        .checked_add(value.len())
+        .ok_or_else(|| Error::Config("network ICE text workload overflows".into()))?;
+    if *retained_bytes > MAX_NETWORK_BROADCAST_CAPACITY {
+        return Err(Error::Config(
+            "network ICE text workload exceeds the platform allocation limit".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn checked_network_capacity(value: u64, field: &str) -> Result<usize> {
     let capacity = usize::try_from(value)
         .map_err(|_| Error::Config(format!("mesh {field} does not fit this platform")))?;
@@ -2073,6 +2202,40 @@ mod tests {
         assert_eq!(s.strategy, "nostr");
         assert_eq!(s.redundancy, DEFAULT_SIGNALING_REDUNDANCY);
         assert!(s.denylist.iter().any(|h| h == "relay.damus.io"));
+        assert!(s.nostr_timing.validate());
+        assert_eq!(s.nostr_timing.reconnect_initial_ms, 2_000);
+        assert_eq!(s.nostr_timing.reconnect_max_ms, 60_000);
+    }
+
+    #[test]
+    fn nostr_timing_policy_rejects_zero_and_inconsistent_values() {
+        let valid = NostrTimingPolicyConfig::default();
+        assert!(valid.validate());
+        assert!(!NostrTimingPolicyConfig {
+            reconnect_initial_ms: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!NostrTimingPolicyConfig {
+            reconnect_max_ms: valid.reconnect_initial_ms - 1,
+            ..valid
+        }
+        .validate());
+        assert!(!NostrTimingPolicyConfig {
+            reconnect_max_attempts: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!NostrTimingPolicyConfig {
+            jitter_percent: 101,
+            ..valid
+        }
+        .validate());
+        assert!(!NostrTimingPolicyConfig {
+            fallback_activation_grace_ms: valid.fallback_poll_ms - 1,
+            ..valid
+        }
+        .validate());
     }
 
     #[test]
@@ -2090,6 +2253,9 @@ mod tests {
             max_resolve_owners: 11,
             event_capacity: 13,
             max_event_epochs: 17,
+            max_txt_entries: 43,
+            max_txt_bytes: 47,
+            max_resolved_addresses: 53,
             dial_timeout_ms: 19,
             connection_idle_timeout_ms: 23,
             inbound_idle_timeout_ms: 29,
@@ -2137,12 +2303,61 @@ mod tests {
         };
         assert!(!over_events.validate());
 
+        for (field, policy) in [
+            (
+                "max_txt_entries",
+                MdnsPolicyConfig {
+                    max_txt_entries: 0,
+                    ..MdnsPolicyConfig::default()
+                },
+            ),
+            (
+                "max_txt_bytes",
+                MdnsPolicyConfig {
+                    max_txt_bytes: 0,
+                    ..MdnsPolicyConfig::default()
+                },
+            ),
+            (
+                "max_resolved_addresses",
+                MdnsPolicyConfig {
+                    max_resolved_addresses: 0,
+                    ..MdnsPolicyConfig::default()
+                },
+            ),
+        ] {
+            assert!(!policy.validate(), "zero {field} must be rejected");
+        }
+        let over_txt_bytes = MdnsPolicyConfig {
+            max_txt_bytes: u16::MAX as u64 + 1,
+            ..MdnsPolicyConfig::default()
+        };
+        assert!(!over_txt_bytes.validate());
+
         if usize::BITS < 64 {
             let overflow = MdnsPolicyConfig {
                 max_event_epochs: u64::MAX,
                 ..MdnsPolicyConfig::default()
             };
             assert!(!overflow.validate());
+            for (field, policy) in [
+                (
+                    "max_txt_entries",
+                    MdnsPolicyConfig {
+                        max_txt_entries: u64::MAX,
+                        ..MdnsPolicyConfig::default()
+                    },
+                ),
+                (
+                    "max_resolved_addresses",
+                    MdnsPolicyConfig {
+                        max_resolved_addresses: u64::MAX,
+                        ..MdnsPolicyConfig::default()
+                    },
+                ),
+            ] {
+                assert!(!policy.validate(), "overflow {field} must be rejected");
+            }
         }
     }
 

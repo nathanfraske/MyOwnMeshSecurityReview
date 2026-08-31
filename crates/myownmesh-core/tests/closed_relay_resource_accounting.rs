@@ -8,7 +8,7 @@
 use myownmesh_core::config::ClosedRelayPolicyConfig;
 use myownmesh_core::identity::Identity;
 use myownmesh_core::protocol::relay::{
-    closed_relay_worst_case_json_bytes, OpaqueRelayPacket, OPAQUE_RELAY_MAX_PLAINTEXT_BYTES,
+    closed_relay_worst_case_json_bytes, OpaqueRelayPacket, CLOSED_RELAY_MAX_PLAINTEXT_BYTES,
     OPAQUE_RELAY_NONCE_BYTES, OPAQUE_RELAY_SESSION_BYTES, OPAQUE_RELAY_VERSION,
 };
 use myownmesh_core::resource::{FiniteResourceProvider, ResourceClaim};
@@ -39,7 +39,7 @@ fn closed_relay_public_sizing_rejects_max_plus_one_and_preserves_baseline() {
     );
     assert_eq!(mesh_id.len(), 52, "canonical mesh strings are bounded");
 
-    let max_plaintext = usize::try_from(OPAQUE_RELAY_MAX_PLAINTEXT_BYTES)
+    let max_plaintext = usize::try_from(CLOSED_RELAY_MAX_PLAINTEXT_BYTES)
         .expect("protocol plaintext ceiling fits usize");
     let max_ciphertext = max_plaintext
         .checked_add(16)
@@ -71,7 +71,7 @@ fn closed_relay_public_sizing_rejects_max_plus_one_and_preserves_baseline() {
     assert!(over_packet.validate(max_ciphertext).is_err());
 
     let mut over_plaintext_profile = profile.clone();
-    over_plaintext_profile.max_frame_ciphertext_bytes = OPAQUE_RELAY_MAX_PLAINTEXT_BYTES + 1;
+    over_plaintext_profile.max_frame_ciphertext_bytes = CLOSED_RELAY_MAX_PLAINTEXT_BYTES + 1;
     assert!(
         !over_plaintext_profile.validate(),
         "plaintext ceiling max+1 must be refused"

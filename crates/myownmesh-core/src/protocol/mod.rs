@@ -318,7 +318,7 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
 /// cancellation resolve the departure; no alternate acknowledgement framework
 /// is introduced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionControl {
     /// This endpoint is leaving deliberately: a graceful network leave, a
     /// network removal, or a daemon shutdown. **Not** sent by a reconnect,
@@ -357,7 +357,7 @@ pub enum SessionControl {
 /// no longer offers. Frames are discrete, so refusing one costs
 /// nothing but that frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MeshMessage {
     Hello(HelloMessage),
     AuthResponse(AuthResponseMessage),
@@ -682,6 +682,12 @@ mod tests {
     }
 
     #[test]
+    fn mesh_message_rejects_unknown_fields_at_the_outer_wire_layer() {
+        let raw = r#"{"kind":"channel","channel":"control","payload":null,"legacy":true}"#;
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
+    }
+
+    #[test]
     fn hello_round_trips() {
         let msg = MeshMessage::Hello(HelloMessage {
             protocol: crate::PROTOCOL_VERSION,
@@ -714,6 +720,31 @@ mod tests {
             }
             _ => panic!("did not round-trip as FactBundle"),
         }
+    }
+
+    #[test]
+    fn non_empty_fact_round_trips_and_rejects_outer_or_nested_unknown_fields() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let device =
+            crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+                .unwrap();
+        let context = crate::semantic::MeshContextId::from_bytes([12; 32]);
+        let content =
+            crate::semantic::FactContent::open_participation(context, device, true, Vec::new());
+        let fact = crate::semantic::SignedFact::sign(content, &key).unwrap();
+        let message = MeshMessage::Fact(fact.clone());
+
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let decoded: MeshMessage = serde_json::from_slice(&encoded).unwrap();
+        assert!(matches!(decoded, MeshMessage::Fact(actual) if actual == fact));
+
+        let mut outer_wire = serde_json::to_value(&message).unwrap();
+        outer_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(outer_wire).is_err());
+
+        let mut nested_wire = serde_json::to_value(&message).unwrap();
+        nested_wire["content"]["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(nested_wire).is_err());
     }
 
     #[test]
@@ -813,6 +844,9 @@ mod tests {
             r#"{{"kind":"session_control","op":"depart","correlation":"{too_long}"}}"#
         ))
         .is_err());
+        let with_unknown =
+            encoded.replacen(r#""correlation""#, r#""legacy":true,"correlation""#, 1);
+        assert!(serde_json::from_str::<MeshMessage>(&with_unknown).is_err());
     }
 
     #[test]

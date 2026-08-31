@@ -687,13 +687,13 @@ async fn serve_with_hooks(
         crate::ipc::ClientRegistry::new(
             mesh.local_application_resource_scope()
                 .context("issue the IPC registry's local application resource scope")?,
-        )
+        )?
     };
     #[cfg(not(test))]
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .context("issue the IPC registry's local application resource scope")?,
-    );
+    )?;
     #[cfg(test)]
     let hooks = {
         if let Some(publish) = hooks.registry.take() {
@@ -894,7 +894,8 @@ async fn serve_with_hooks(
     if let Some(barrier) = &state.before_begin_closing {
         barrier.pass().await;
     }
-    if state.clients.begin_closing() {
+    let owns_closing = state.clients.begin_closing();
+    if owns_closing {
         // One client at a time, released before the next is taken, and asked for
         // one at a time too. The registry answers an id rather than a record for
         // exactly this reason: a record carries the client's retired routes and
@@ -933,16 +934,23 @@ async fn serve_with_hooks(
     // and waiting on it is what makes that a checked fact rather than an
     // assumption.
     state.clients.wait_for_tasks().await;
-    // Answers the state rather than asserting one, so a second `serve` over the
-    // same registry — which drained nothing — cannot publish `Closed` on the
-    // strength of having waited. Logged rather than panicked: a daemon on its
-    // way out should say what it found, not abort on it.
-    match state.clients.finish_closed() {
-        crate::ipc::Lifecycle::Closed => info!("control surface closed"),
-        other => warn!(?other, "control surface did not reach Closed"),
+    // Only the caller that won the lifecycle transition may publish a clean
+    // close. A concurrent or late `serve` therefore cannot report success on
+    // the strength of having waited for its own handles.
+    if !owns_closing {
+        return Err(anyhow::anyhow!(
+            "control surface close was already claimed by another owner"
+        ));
     }
-
-    Ok(())
+    match state.clients.finish_closed() {
+        crate::ipc::Lifecycle::Closed => {
+            info!("control surface closed");
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!(
+            "control surface did not reach Closed: {other:?}"
+        )),
+    }
 }
 
 /// Join every accepted connection that has already finished.
@@ -1109,7 +1117,8 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
     let clients = crate::ipc::ClientRegistry::new(
         mesh.local_application_resource_scope()
             .expect("the fixture grant issues the registry's scope"),
-    );
+    )
+    .expect("the fixture starts the IPC final watchdog custodian");
     Arc::new(ControlState {
         finished: tokio::sync::Notify::new(),
         ended: std::sync::atomic::AtomicUsize::new(0),
@@ -3644,6 +3653,31 @@ mod terminal_shutdown_tests {
         crate::ipc::ClientRegistry::over_grant(grant)
     }
 
+    /// Exact private funding for the real streaming-RPC race below: one event
+    /// client, three accepted/retained task owners (event socket, command
+    /// socket and the post-response stream forwarder), and their three join
+    /// nodes. The forwarder is intentionally funded even though the test makes
+    /// it lose the provisional-settle race; admission of that owner is what
+    /// makes the refusal observable rather than an accidental undergrant.
+    fn parked_rpc_stream_registry() -> crate::ipc::ClientRegistry {
+        let registry = crate::ipc::clients::registry_fixture_claim(1, 0, 0)
+            .expect("the streaming-RPC registry scope claim is representable");
+        let tasks = crate::ipc::clients::task_cohort_reservation_planning_charge_for_test(3)
+            .expect("the streaming-RPC task cohort is representable");
+        let join_node = crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim()
+            .expect("the streaming-RPC join node claim is representable");
+        let join_nodes =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(join_node)
+                .expect("the streaming-RPC join-node reservation is representable")
+                .checked_scale(3)
+                .expect("the streaming-RPC join-node cohort is representable");
+        let grant = registry
+            .checked_add(tasks)
+            .and_then(|grant| grant.checked_add(join_nodes))
+            .expect("the streaming-RPC exact registry grant is representable");
+        crate::ipc::ClientRegistry::over_grant(grant)
+    }
+
     #[tokio::test]
     async fn v4_r2_daemon_a_parked_rpc_is_withdrawn_before_socket_shutdown_completes() {
         let _fixture = crate::exclusive_connector_fixture().await;
@@ -3836,6 +3870,282 @@ mod terminal_shutdown_tests {
             assert!(!response.ok, "a cancelled parked RPC cannot report success");
         }
         let _ = networks.shutdown_all().await;
+        let _ = link.retire().await;
+        drop(far);
+    }
+
+    /// A delivered streaming-RPC setup cannot strand its forwarder when the
+    /// runtime closes at the exact provisional handoff. This uses both real
+    /// control sockets: `EventsSubscribe` supplies the authenticated client,
+    /// while `RpcCallStream` writes its setup response before the production
+    /// `before_provisional_settle` barrier. The remote handler queues a real
+    /// chunk before that barrier is released; closing then makes the retained
+    /// forwarder lose admission, so the event socket closes without forwarding
+    /// that chunk and the registry/provider return to their exact baselines.
+    #[tokio::test]
+    async fn v4_r6_daemon_a_real_stream_settle_race_closes_without_forwarder() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let near_mesh = connector_mesh().await;
+        let far_mesh = connector_mesh().await;
+        let near = near_mesh
+            .join(network_config("near-stream-race", "terminal-stream-race"))
+            .await
+            .expect("near network joins");
+        let far = far_mesh
+            .join(network_config("far-stream-race", "terminal-stream-race"))
+            .await
+            .expect("far network joins");
+        let mut near_events = near_mesh.events();
+        let mut far_events = far_mesh.events();
+        let _local_broker = myownmesh_signaling::local::LocalBroker::new();
+        near.attach_local(&_local_broker);
+        far.attach_local(&_local_broker);
+        let near_device = near_mesh.device_id();
+        let far_device = far_mesh.device_id();
+        crate::test_link::wait_for_approval(&mut near_events, &far_device).await;
+        crate::test_link::wait_for_approval(&mut far_events, &near_device).await;
+        let link = near.install_promoted_peer_over_real_link(&far).await;
+        let peer = link.peer_device_id().to_string();
+
+        let (remote_ready_tx, remote_ready_rx) = tokio::sync::oneshot::channel();
+        let remote_ready = Arc::new(std::sync::Mutex::new(Some(remote_ready_tx)));
+        let _stream_handler = far
+            .rpc()
+            .prepare_serve_stream("race-stream", {
+                let remote_ready = Arc::clone(&remote_ready);
+                move |_call| {
+                    let remote_ready = Arc::clone(&remote_ready);
+                    async move {
+                        let scope = crate::test_application_scope();
+                        let (tx, rx) = myownmesh_core::resource_mailbox(scope)
+                            .map_err(|_| "stream fixture mailbox was refused".to_owned())?;
+                        tx.send(myownmesh_core::rpc::RpcStreamItem::Chunk(
+                            serde_json::json!("must-not-forward"),
+                        ))
+                        .map_err(|_| "stream fixture chunk was refused".to_owned())?;
+                        tx.send(myownmesh_core::rpc::RpcStreamItem::End(Ok(())))
+                            .map_err(|_| "stream fixture end was refused".to_owned())?;
+                        if let Some(ready) = remote_ready
+                            .lock()
+                            .expect("the stream-ready witness is not poisoned")
+                            .take()
+                        {
+                            ready
+                                .send(())
+                                .expect("the stream-ready witness remains observed");
+                        }
+                        Ok(rx)
+                    }
+                }
+            })
+            .expect("the far gateway prepares the streaming handler")
+            .commit()
+            .into_result()
+            .expect("the far gateway installs the streaming handler");
+
+        let directory = tempfile::tempdir().expect("temporary control root");
+        let socket = directory.path().join("private").join("control.sock");
+        let (settle_barrier, settle_entered, settle_release) = DispatchBarrier::paired();
+        let (registry_tx, registry_rx) = tokio::sync::oneshot::channel();
+        let supervisor = crate::supervisor::RuntimeSupervisor::new();
+        let registry = parked_rpc_stream_registry();
+        let registry_baseline = registry
+            .in_use()
+            .expect("the isolated streaming registry exposes its baseline");
+        let networks = NetworkRegistry::new();
+        assert!(
+            networks.insert(near, None).into_refusal().is_none(),
+            "the near network is reachable by the streaming control registry"
+        );
+        let networks_for_cleanup = networks.clone();
+        let services = ServiceManager::new(near_mesh.clone(), networks.clone());
+        let serving = tokio::spawn(serve_with_hooks(
+            ControlSurface {
+                mesh: near_mesh,
+                registry: networks,
+                services,
+                realtime: RealtimeAdvert {
+                    supported: false,
+                    encodings: Vec::new(),
+                },
+                supervisor: supervisor.clone(),
+            },
+            Some(socket.clone()),
+            ControlHooks {
+                before_events_subscribe_commit: None,
+                registry: Some(registry_tx),
+                registry_override: Some(registry.clone()),
+                at_events_stream_entry: None,
+                before_rpc_call: None,
+                before_begin_closing: None,
+                before_provisional_settle: Some(settle_barrier),
+                before_mfa_response_write: None,
+            },
+        ));
+        let clients = guarded("serve publishes its streaming registry", registry_rx)
+            .await
+            .expect("serve publishes the isolated streaming registry");
+
+        let name = socket
+            .as_path()
+            .to_fs_name::<GenericFilePath>()
+            .expect("the streaming control socket path is valid");
+        let event_stream = guarded("event client connects", async {
+            loop {
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (event_reader, mut event_writer) = event_stream.split();
+        let mut event_reader = BufReader::new(event_reader);
+        event_writer
+            .write_all(b"{\"op\":\"events_subscribe\"}\n")
+            .await
+            .expect("the event client sends its subscribe");
+        let mut event_ack = String::new();
+        guarded(
+            "the event subscription is acked",
+            event_reader.read_line(&mut event_ack),
+        )
+        .await
+        .expect("the event subscription answer arrives");
+        let event_ack: Response =
+            serde_json::from_str(event_ack.trim()).expect("the event ack is a response");
+        assert!(
+            event_ack.ok,
+            "the event subscription succeeds: {:?}",
+            event_ack.error
+        );
+        let event_data = event_ack.data.expect("the event ack carries data");
+        let client_id: crate::ipc::ClientId = serde_json::from_value(
+            event_data
+                .get("client_id")
+                .cloned()
+                .expect("the event ack carries the client id"),
+        )
+        .expect("the event client id has its wire shape");
+        let client_capability = event_data
+            .get("client_capability")
+            .and_then(serde_json::Value::as_str)
+            .expect("the event ack carries the client capability")
+            .to_owned();
+        assert_eq!(clients.residue().clients, 1, "the event client is live");
+
+        let command_stream = guarded("stream command client connects", async {
+            loop {
+                match LocalSocketStream::connect(name.clone()).await {
+                    Ok(stream) => return stream,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        let (command_reader, mut command_writer) = command_stream.split();
+        let mut command_reader = BufReader::new(command_reader);
+        let request = Request::RpcCallStream {
+            client_id,
+            client_capability,
+            network: "near-stream-race".to_owned(),
+            peer,
+            method: "race-stream".to_owned(),
+            payload: serde_json::Value::Null,
+        };
+        let mut encoded = serde_json::to_vec(&request).expect("the streaming request encodes");
+        encoded.push(b'\n');
+        command_writer
+            .write_all(&encoded)
+            .await
+            .expect("the command client sends the streaming request");
+
+        let mut setup_line = String::new();
+        guarded(
+            "the streaming setup response arrives",
+            command_reader.read_line(&mut setup_line),
+        )
+        .await
+        .expect("the setup response is delivered before provisional settle");
+        let setup: Response = serde_json::from_str(setup_line.trim())
+            .expect("the streaming setup line is a response");
+        assert!(setup.ok, "the stream setup succeeds: {:?}", setup.error);
+        let request_id = setup
+            .data
+            .as_ref()
+            .and_then(|data| data.get("rpc_stream_started"))
+            .and_then(|data| data.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the setup response carries the stream request id");
+        assert!(request_id.starts_with("ipc-stream-"));
+
+        guarded(
+            "the production provisional-settle barrier arrives",
+            settle_entered,
+        )
+        .await
+        .expect("the stream setup reaches the exact settle edge");
+        guarded("the remote stream queues its real chunk", remote_ready_rx)
+            .await
+            .expect("the remote handler queues the chunk before shutdown");
+        assert_eq!(
+            clients.residue().clients,
+            1,
+            "the exact event client remains filed"
+        );
+        assert_eq!(
+            clients.residue().live_tasks,
+            3,
+            "the two accepted socket tasks and the unsettled forwarder task are filed"
+        );
+        assert!(
+            supervisor.request_shutdown(),
+            "the runtime shutdown is requested exactly once here"
+        );
+        guarded("the streaming registry enters closing", clients.closing()).await;
+        settle_release
+            .send(())
+            .expect("the provisional-settle barrier is still waiting");
+        guarded("the real streaming control returns", serving)
+            .await
+            .expect("the streaming control task did not panic")
+            .expect("the streaming control returns without error");
+        assert_eq!(
+            clients.residue(),
+            crate::ipc::RegistryResidue::empty(crate::ipc::Lifecycle::Closed),
+            "the real stream race leaves no registry residue"
+        );
+        assert_eq!(
+            registry
+                .in_use()
+                .expect("the isolated registry remains readable"),
+            registry_baseline,
+            "the real stream race releases every isolated registry lease"
+        );
+
+        drop(command_writer);
+        let mut command_tail = Vec::new();
+        guarded(
+            "the command socket closes after setup",
+            tokio::io::AsyncReadExt::read_to_end(&mut command_reader, &mut command_tail),
+        )
+        .await
+        .expect("the command socket reaches EOF");
+        drop(event_writer);
+        let mut event_tail = Vec::new();
+        guarded(
+            "the event socket closes without forwarding a chunk",
+            tokio::io::AsyncReadExt::read_to_end(&mut event_reader, &mut event_tail),
+        )
+        .await
+        .expect("the event socket reaches EOF");
+        assert!(
+            !String::from_utf8_lossy(&event_tail).contains("rpc_call_stream_chunk"),
+            "the queued chunk is not forwarded after Closing: {}",
+            String::from_utf8_lossy(&event_tail)
+        );
+
+        let _ = networks_for_cleanup.shutdown_all().await;
         let _ = link.retire().await;
         drop(far);
     }

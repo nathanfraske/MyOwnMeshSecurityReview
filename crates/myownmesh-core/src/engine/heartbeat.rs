@@ -405,15 +405,17 @@ mod tests {
         let scope = process
             .issue_local_application_scope()
             .expect("heartbeat control issues its local scope");
-        let mut peer = super::super::connection::PeerStateData::default();
-        peer.hello_retention = Some(
-            scope
-                .acquire(crate::resource::ResourceClaim::single(
-                    crate::resource::ResourceClass::StorageObject,
-                    1,
-                ))
-                .expect("heartbeat peer fixture retains one funded marker"),
-        );
+        let mut peer = super::super::connection::PeerStateData {
+            hello_retention: Some(
+                scope
+                    .acquire(crate::resource::ResourceClaim::single(
+                        crate::resource::ResourceClass::StorageObject,
+                        1,
+                    ))
+                    .expect("heartbeat peer fixture retains one funded marker"),
+            ),
+            ..Default::default()
+        };
         let resource_before = observed.in_use();
         for sample in [900, 100, 700, 300, 500, 1_100] {
             let _ = peer.record_clock_skew_sample(sample);

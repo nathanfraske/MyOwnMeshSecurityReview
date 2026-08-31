@@ -43,6 +43,7 @@ pub struct DeviceId(String);
 /// predecessor list is part of FactContent (and therefore of FactId), so a
 /// receiver cannot silently substitute a later or unrelated role head.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorityUse {
     pub subject: DeviceId,
     pub predecessors: Vec<FactId>,
@@ -227,7 +228,7 @@ pub enum AttestationDecision {
 /// Closed typed union of semantic cells.  The subject type is fixed by the
 /// variant, so a free-form `(subject, field)` pair cannot alias authority.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum ExclusiveCell {
     Role { subject: DeviceId },
     Membership { subject: DeviceId },
@@ -288,7 +289,7 @@ impl fmt::Display for ExclusiveCell {
 /// The adopted V4 durable semantic union.  Context selection, topology, and
 /// compaction evidence are outside this ordinary fact graph.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum FactBody {
     RoleGrant {
         target: DeviceId,
@@ -652,6 +653,24 @@ mod tests {
         assert!(DeviceId::from_canonical_str(&canonical.to_uppercase()).is_err());
         assert!(DeviceId::from_canonical_str(&format!("{canonical}-label")).is_err());
         assert!(DeviceId::from_canonical_str(&format!("{canonical}=")).is_err());
+    }
+
+    #[test]
+    fn authority_use_and_resolution_reject_unknown_nested_wire_fields() {
+        let authority = AuthorityUse::new(device(), vec![FactId::from_bytes([1; 32])]);
+        let mut authority_wire = serde_json::to_value(&authority).unwrap();
+        authority_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<AuthorityUse>(authority_wire).is_err());
+
+        let proposal = FactId::from_bytes([2; 32]);
+        let mut resolution_wire = serde_json::to_value(FactBody::Resolution {
+            cell: ExclusiveCell::decision(proposal),
+            cited_heads: vec![proposal],
+            selected_head: proposal,
+        })
+        .unwrap();
+        resolution_wire["cell"]["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FactBody>(resolution_wire).is_err());
     }
 
     #[test]

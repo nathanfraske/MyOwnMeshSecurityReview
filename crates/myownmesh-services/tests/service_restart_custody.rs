@@ -1,5 +1,22 @@
 use myownmesh_core::config::{StunServiceConfig, TurnCredential, TurnServiceConfig};
+use myownmesh_core::{
+    FiniteResourceProvider, LocalApplicationResourceScope, ResourceClaim, ResourceClass,
+    ResourceProviderPort,
+};
 use myownmesh_services::{StunServer, TurnServer};
+
+fn service_scope() -> LocalApplicationResourceScope {
+    let grant = ResourceClaim::try_from_entries(
+        ResourceClass::ALL
+            .into_iter()
+            .map(|class| (class, 1_000_000)),
+    )
+    .expect("service fixture grant is representable");
+    let port = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("service fixture provider is valid");
+    LocalApplicationResourceScope::transport_lab_child_of(&port)
+        .expect("service fixture scope is valid")
+}
 
 fn stun_config(port: u16) -> StunServiceConfig {
     StunServiceConfig {
@@ -28,7 +45,7 @@ fn turn_config(port: u16) -> TurnServiceConfig {
 
 #[tokio::test]
 async fn awaited_stun_stop_releases_exact_listener_for_immediate_restart() {
-    let first = StunServer::start(&stun_config(0))
+    let first = StunServer::start_with_resource_scope(&stun_config(0), service_scope())
         .await
         .expect("initial STUN listener starts");
     let exact_addr = first.local_addr();
@@ -38,9 +55,10 @@ async fn awaited_stun_stop_releases_exact_listener_for_immediate_restart() {
         .await
         .expect("STUN listener task reaches terminal state");
 
-    let replacement = StunServer::start(&stun_config(exact_addr.port()))
-        .await
-        .expect("same STUN address is immediately reusable");
+    let replacement =
+        StunServer::start_with_resource_scope(&stun_config(exact_addr.port()), service_scope())
+            .await
+            .expect("same STUN address is immediately reusable");
     assert_eq!(replacement.local_addr(), exact_addr);
     replacement
         .stop_and_wait()
@@ -50,7 +68,7 @@ async fn awaited_stun_stop_releases_exact_listener_for_immediate_restart() {
 
 #[tokio::test]
 async fn awaited_turn_stop_releases_exact_listener_for_immediate_restart() {
-    let first = TurnServer::start(&turn_config(0))
+    let first = TurnServer::start_with_resource_scope(&turn_config(0), service_scope())
         .await
         .expect("initial TURN listener starts");
     let exact_addr = first.local_addr();
@@ -60,9 +78,10 @@ async fn awaited_turn_stop_releases_exact_listener_for_immediate_restart() {
         .await
         .expect("TURN close task reaches terminal state");
 
-    let replacement = TurnServer::start(&turn_config(exact_addr.port()))
-        .await
-        .expect("same TURN address is immediately reusable");
+    let replacement =
+        TurnServer::start_with_resource_scope(&turn_config(exact_addr.port()), service_scope())
+            .await
+            .expect("same TURN address is immediately reusable");
     assert_eq!(replacement.local_addr(), exact_addr);
     replacement
         .stop()

@@ -111,6 +111,29 @@ struct PeerEventPumpRegistry {
     closed: bool,
 }
 
+/// Joinable tasks admitted by an exact shutdown mutation witness.  The
+/// witness keeps shutdown from closing this registry between the producer's
+/// admission check and its handle registration; once shutdown has drained
+/// those witnesses, `closed` makes the registry a permanent refusal point.
+struct ShutdownTaskRegistry {
+    handles: Vec<JoinHandle<()>>,
+    closed: bool,
+}
+
+impl ShutdownTaskRegistry {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+            closed: false,
+        }
+    }
+
+    fn take_for_shutdown(&mut self) -> Vec<JoinHandle<()>> {
+        self.closed = true;
+        std::mem::take(&mut self.handles)
+    }
+}
+
 impl PeerEventPumpRegistry {
     fn new() -> Self {
         Self {
@@ -692,8 +715,6 @@ pub struct NetworkState {
     /// matching pending value's cancellation or expires it. Shutdown takes
     /// this registry before awaiting, so no expiry task is detached.
     closed_relay_pending_expiries: Mutex<Option<Vec<JoinHandle<()>>>>,
-    /// Finished handles remain owned until their result or panic is observed.
-    closed_relay_pending_expiry_observations: Mutex<Option<Vec<JoinHandle<()>>>>,
     /// Serializes expiry registration with shutdown's handle extraction.
     closed_relay_pending_expiry_lifecycle: Mutex<()>,
     /// Production per-peer event pumps are retained by the network owner until
@@ -775,6 +796,12 @@ pub struct NetworkState {
     #[cfg(test)]
     parked_command_receiver: Mutex<Option<ResourceMailboxReceiver<NetworkCmd>>>,
     shutdown_requested: std::sync::atomic::AtomicBool,
+    /// Counts mutation witnesses which may still be registering a task.  The
+    /// shutdown path waits for this count before closing `shutdown_tasks`, so
+    /// an admitted producer cannot lose its JoinHandle at the handoff.
+    shutdown_mutations: Mutex<usize>,
+    shutdown_mutations_ready: Notify,
+    shutdown_tasks: Mutex<Option<ShutdownTaskRegistry>>,
     /// Set only after the shutdown path has released the durable writer
     /// owner. This is stronger than `shutdown_requested`: callers must not
     /// purge while teardown is still draining live state.
@@ -832,7 +859,8 @@ pub struct NetworkState {
     /// own. Rate-limited so a room with N peers all reacting to
     /// each other's announces doesn't degenerate into a publish
     /// storm — one outbound reactive announce per
-    /// [`REACTIVE_ANNOUNCE_MIN_INTERVAL_MS`] coalesces any number
+    /// [`crate::config::SchedulerPolicyConfig::reactive_announce_min_interval_ms`]
+    /// coalesces any number
     /// of inbound announces in that window. See the comment on
     /// the call site in `engine::mod::handle_signaling_inbound`
     /// for the discovery rationale.
@@ -1004,7 +1032,19 @@ pub struct NetworkState {
 /// can enter the operation.  It carries no lock and is therefore safe to hold
 /// across an async cleanup await.
 pub(crate) struct ShutdownMutationPermit<'a> {
-    _state: &'a NetworkState,
+    state: &'a NetworkState,
+}
+
+impl Drop for ShutdownMutationPermit<'_> {
+    fn drop(&mut self) {
+        let mut admitted = self.state.shutdown_mutations.lock();
+        *admitted = admitted
+            .checked_sub(1)
+            .expect("shutdown mutation permit released twice");
+        if *admitted == 0 {
+            self.state.shutdown_mutations_ready.notify_waiters();
+        }
+    }
 }
 
 impl NetworkState {
@@ -1341,9 +1381,6 @@ impl NetworkState {
             closed_relay_pending_expiries: Mutex::new(Some(Vec::with_capacity(
                 closed_relay_pending_expiry_capacity,
             ))),
-            closed_relay_pending_expiry_observations: Mutex::new(Some(Vec::with_capacity(
-                closed_relay_pending_expiry_capacity,
-            ))),
             closed_relay_pending_expiry_lifecycle: Mutex::new(()),
             peer_event_pumps: Mutex::new(PeerEventPumpRegistry::new()),
             peer_event_pump_ready: Notify::new(),
@@ -1379,6 +1416,9 @@ impl NetworkState {
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_mutations: Mutex::new(0),
+            shutdown_mutations_ready: Notify::new(),
+            shutdown_tasks: Mutex::new(Some(ShutdownTaskRegistry::new())),
             shutdown_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_ready: tokio::sync::Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
@@ -1413,7 +1453,7 @@ impl NetworkState {
         // Rebuild the compatibility roster from the restored canonical graph
         // before the state becomes observable. The roster is UI metadata only;
         // no admission decision may depend on its persisted bytes.
-        super::governance::apply_canonical_projection(&state);
+        super::governance::apply_canonical_projection_checked(&state)?;
         // A restored canonical eviction must be visible before this state can
         // escape to callers.  The driver repeats this refresh before any
         // announce or dial, but it is spawned asynchronously; deferring the
@@ -1621,21 +1661,31 @@ impl NetworkState {
         }
     }
 
-    /// Forward one packet through the exact allocation and direction. The
-    /// registry lock is held only while taking and restoring the synchronous
-    /// handle; runtime packet validation and queue accounting remain bounded
-    /// and exact.
+    /// Forward one packet through the exact allocation generation and
+    /// direction. The generation and allocation epoch are checked while the
+    /// registry lock is held, so a successor cannot be substituted between
+    /// the caller's route validation and the synchronous queue operation.
     pub(crate) fn forward_closed_relay(
         &self,
         session_id: [u8; 16],
+        generation: &super::closed_relay::ClosedRelayGeneration,
+        allocation_epoch: u64,
         direction: crate::runtime::relay::RelayDirection,
         packet: crate::protocol::OpaqueRelayPacket,
     ) -> std::result::Result<(), crate::runtime::relay::ClosedRelayRefusal> {
-        self.closed_relay_allocations
-            .lock()
+        let mut allocations = self.closed_relay_allocations.lock();
+        let registry = allocations
             .as_mut()
-            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .forward(session_id, direction, packet)
+            .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?;
+        let Some((_, _, _, _, current_epoch)) =
+            registry.route_if_generation(session_id, generation)
+        else {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+        };
+        if current_epoch != allocation_epoch {
+            return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+        }
+        registry.forward(session_id, direction, packet)
     }
 
     /// Receive from one direction without holding the state mutex across the
@@ -1838,12 +1888,18 @@ impl NetworkState {
             .pending_handshake_timeout()
             .map_err(|_| crate::runtime::relay::ClosedRelayRefusal::InvalidProfile)?;
         let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
+        let allocation_epoch = match self.closed_relay_pending_epoch(session_id) {
+            Some(epoch) => epoch,
+            None => {
+                expiry.cancel();
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            }
+        };
         let mut finished = Vec::new();
-        let result = {
+        {
             let mut tasks = self.closed_relay_pending_expiries.lock();
             let Some(tasks) = tasks.as_mut() else {
                 expiry.cancel();
-                let _ = self.take_closed_relay_pending(session_id);
                 return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
             };
             let mut index = 0;
@@ -1854,9 +1910,26 @@ impl NetworkState {
                     index += 1;
                 }
             }
-            if tasks.len() >= tasks.capacity() {
+        }
+        let mut pending = Vec::new();
+        pending.extend(self.observe_closed_relay_pending_expiries(finished));
+
+        let result = {
+            let mut tasks = self.closed_relay_pending_expiries.lock();
+            let Some(tasks) = tasks.as_mut() else {
                 expiry.cancel();
-                let _ = self.take_closed_relay_pending(session_id);
+                return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
+            };
+            tasks.extend(pending);
+            if self.closed_relay_pending_epoch(session_id) != Some(allocation_epoch)
+                || self
+                    .shutdown_requested
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                expiry.cancel();
+                Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)
+            } else if tasks.len() >= tasks.capacity() {
+                expiry.cancel();
                 Err(crate::runtime::relay::ClosedRelayRefusal::QueueFull)
             } else {
                 let state = Arc::downgrade(self);
@@ -1873,7 +1946,7 @@ impl NetworkState {
                         _ = &mut deadline => {
                             if !expiry.is_cancelled() {
                                 if let Some(state) = state.upgrade() {
-                                    state.expire_closed_relay_pending(session_id);
+                                    state.expire_closed_relay_pending(session_id, allocation_epoch);
                                 }
                             }
                         }
@@ -1884,7 +1957,9 @@ impl NetworkState {
                 Ok(())
             }
         };
-        self.observe_closed_relay_pending_expiries(finished);
+        if result.is_err() {
+            let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
+        }
         result
     }
 
@@ -1892,7 +1967,10 @@ impl NetworkState {
     /// finished Tokio handle is expected to poll Ready; retaining a Pending
     /// handle keeps the ownership invariant intact if that observation races
     /// the runtime's final wake-up.
-    fn observe_closed_relay_pending_expiries(&self, finished: Vec<JoinHandle<()>>) {
+    fn observe_closed_relay_pending_expiries(
+        &self,
+        finished: Vec<JoinHandle<()>>,
+    ) -> Vec<JoinHandle<()>> {
         let mut pending = Vec::new();
         for mut task in finished {
             let waker = std::task::Waker::noop();
@@ -1905,17 +1983,24 @@ impl NetworkState {
                 std::task::Poll::Pending => pending.push(task),
             }
         }
-        if !pending.is_empty() {
-            self.closed_relay_pending_expiry_observations
-                .lock()
-                .as_mut()
-                .expect("expiry observations remain live with the registry")
-                .extend(pending);
-        }
+        pending
     }
 
-    fn expire_closed_relay_pending(&self, session_id: [u8; 16]) {
-        let _ = self.take_closed_relay_pending(session_id);
+    fn expire_closed_relay_pending(&self, session_id: [u8; 16], allocation_epoch: u64) {
+        let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
+    }
+
+    fn take_closed_relay_pending_if_epoch(
+        &self,
+        session_id: [u8; 16],
+        allocation_epoch: u64,
+    ) -> Option<super::closed_relay::ClosedRelayPending> {
+        let mut pending = self.closed_relay_pending.lock();
+        let registry = pending.as_mut()?;
+        if registry.epoch(session_id) != Some(allocation_epoch) {
+            return None;
+        }
+        registry.take(session_id)
     }
 
     pub(crate) fn insert_closed_relay_pending(
@@ -2081,19 +2166,6 @@ impl NetworkState {
         if abandonments.len() < abandonments.capacity() {
             abandonments.push(abandonment);
         }
-    }
-
-    pub(crate) fn cancel_unpulled_closed_relay(&self, session_id: [u8; 16]) -> bool {
-        let session = self
-            .closed_relay_target_accepts
-            .lock()
-            .as_mut()
-            .and_then(|registry| registry.take_unpulled_for_cancel(session_id));
-        let Some(session) = session else {
-            return false;
-        };
-        session.cancel_consumer();
-        true
     }
 
     pub(crate) fn cancel_all_unpulled_closed_relay(&self) -> usize {
@@ -3932,18 +4004,68 @@ impl NetworkState {
         self.signaling_tx.close();
     }
 
+    async fn await_shutdown_mutations(&self) {
+        loop {
+            let notified = self.shutdown_mutations_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if *self.shutdown_mutations.lock() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Admit one peer mutation or reactive announcement at the shutdown
     /// linearization point.  Callers must retain the returned witness until
     /// the admitted operation has completed; it is an ownership marker, not a
     /// mutex, so no lock is held across async cleanup.
     pub(crate) fn try_admit_shutdown_mutation(&self) -> Option<ShutdownMutationPermit<'_>> {
+        let mut admitted = self.shutdown_mutations.lock();
         if self
             .shutdown_requested
             .load(std::sync::atomic::Ordering::SeqCst)
         {
             None
         } else {
-            Some(ShutdownMutationPermit { _state: self })
+            *admitted = admitted
+                .checked_add(1)
+                .expect("shutdown mutation admission count exhausted");
+            Some(ShutdownMutationPermit { state: self })
+        }
+    }
+
+    /// Register one spawned task while holding a shutdown mutation witness.
+    /// The witness makes the registry's close transition wait until this
+    /// synchronous registration has completed.
+    pub(crate) fn register_shutdown_task(
+        &self,
+        _permit: &ShutdownMutationPermit<'_>,
+        start: impl FnOnce() -> JoinHandle<()>,
+    ) -> bool {
+        let mut tasks = self.shutdown_tasks.lock();
+        let Some(tasks) = tasks.as_mut() else {
+            return false;
+        };
+        if tasks.closed {
+            return false;
+        }
+        tasks.handles.push(start());
+        true
+    }
+
+    async fn await_shutdown_tasks(&self) {
+        let handles = {
+            let mut tasks = self.shutdown_tasks.lock();
+            let Some(mut tasks) = tasks.take() else {
+                return;
+            };
+            tasks.take_for_shutdown()
+        };
+        for handle in handles {
+            if let Err(error) = handle.await {
+                tracing::warn!(%error, "engine shutdown task failed");
+            }
         }
     }
 
@@ -5331,6 +5453,13 @@ impl NetworkState {
     /// transition any active session — call
     /// It never emits a transport approval frame.
     pub(super) fn refresh_roster_projection(&self, device_id: &str, label: &str) -> Result<()> {
+        self.refresh_roster_projection_with(device_id, label, crate::roster::save)
+    }
+
+    fn refresh_roster_projection_with<F>(&self, device_id: &str, label: &str, save: F) -> Result<()>
+    where
+        F: FnOnce(&crate::roster::Roster) -> Result<()>,
+    {
         let graph = self.fact_graph.read();
         let target = crate::semantic::DeviceId::from_canonical_str(device_id)
             .map_err(|error| Error::Network(format!("noncanonical roster projection: {error}")))?;
@@ -5344,9 +5473,14 @@ impl NetworkState {
                 "canonical projection does not admit roster projection".into(),
             ));
         }
+        // Save a detached candidate before publishing it in memory.  A failed
+        // atomic write must not leave this process claiming a projection that
+        // a restart cannot recover.
         let mut roster = self.roster.write();
-        crate::roster::add_peer_in(&mut roster, device_id, label);
-        crate::roster::save(&roster)?;
+        let mut candidate = roster.clone();
+        crate::roster::add_peer_in(&mut candidate, device_id, label);
+        save(&candidate)?;
+        *roster = candidate;
         Ok(())
     }
 
@@ -5458,23 +5592,17 @@ impl NetworkState {
         self.cancel_all_unpulled_closed_relay();
         self.drain_closed_relay_abandonments().await;
         self.request_shutdown();
+        self.await_shutdown_mutations().await;
         self.settle_stale_closed_relay_owners();
         self.cancel_all_closed_relay_pending();
-        let (expiry_tasks, expiry_observations) = {
+        let expiry_tasks = {
             let _lifecycle = self.closed_relay_pending_expiry_lifecycle.lock();
-            let tasks = self
-                .closed_relay_pending_expiries
+            self.closed_relay_pending_expiries
                 .lock()
                 .take()
-                .unwrap_or_default();
-            let observations = self
-                .closed_relay_pending_expiry_observations
-                .lock()
-                .take()
-                .unwrap_or_default();
-            (tasks, observations)
+                .unwrap_or_default()
         };
-        for task in expiry_tasks.into_iter().chain(expiry_observations) {
+        for task in expiry_tasks {
             if let Err(error) = task.await {
                 tracing::warn!(%error, "closed relay pending expiry task failed during shutdown");
             }
@@ -5512,6 +5640,7 @@ impl NetworkState {
             }
         }
         self.peers.await_replaced_closes().await;
+        self.await_shutdown_tasks().await;
         self.peer_event_pump_shutdown_started
             .store(true, Ordering::Release);
         self.peer_event_pump_shutdown_waiting.notify_waiters();
@@ -5853,6 +5982,74 @@ pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
+}
+
+#[cfg(test)]
+mod shutdown_task_registry_tests {
+    use super::ShutdownTaskRegistry;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn v4_shutdown_task_registry_joins_and_observes_each_terminal_result() {
+        let finished = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = ShutdownTaskRegistry::new();
+        let first = Arc::clone(&finished);
+        registry.handles.push(tokio::spawn(async move {
+            first.lock().expect("test witness lock").push("completed");
+        }));
+        registry
+            .handles
+            .push(tokio::spawn(async { panic!("test panic is observed") }));
+
+        let handles = registry.take_for_shutdown();
+        assert!(registry.closed);
+        assert!(registry.handles.is_empty());
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.await);
+        }
+        assert!(outcomes[0].is_ok());
+        assert!(outcomes[1]
+            .as_ref()
+            .expect_err("panic must be observed")
+            .is_panic());
+        assert_eq!(*finished.lock().expect("test witness lock"), ["completed"]);
+    }
+}
+
+#[cfg(test)]
+mod roster_projection_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    #[test]
+    fn v4_projection_save_failure_does_not_publish_memory_candidate() {
+        let state =
+            crate::engine::build_test_closed_state("projection-save-before-commit", [0x2b; 32]);
+        let device_id = state.identity.public_id().to_string();
+        state.roster.write().authorized_devices.clear();
+        let attempted = Arc::new(AtomicBool::new(false));
+        let attempted_by_save = Arc::clone(&attempted);
+        let expected_device_id = device_id.clone();
+
+        let error = state
+            .refresh_roster_projection_with(&device_id, "owner", move |candidate| {
+                attempted_by_save.store(true, Ordering::SeqCst);
+                assert!(candidate
+                    .authorized_devices
+                    .iter()
+                    .any(|entry| entry.device_id == expected_device_id));
+                Err(Error::Roster("injected projection save failure".into()))
+            })
+            .expect_err("failed persistence must refuse the projection");
+
+        assert!(attempted.load(Ordering::SeqCst));
+        assert!(matches!(error, Error::Roster(_)));
+        assert!(state.roster.read().authorized_devices.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -21,7 +21,12 @@ pub mod local;
 pub mod mdns;
 pub mod nostr;
 pub mod server;
+pub mod task_custodian;
 pub mod upstream;
+
+pub use task_custodian::{
+    DedicatedTaskCustodian, TaskCustodian, TaskCustodyError, TaskReservation,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

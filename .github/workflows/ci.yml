@@ -280,6 +280,90 @@ jobs:
           run_exact_relay closed_member_opaque_relay \
             closed_members_exchange_opaque_payloads_only_through_relay
 
+  # Exercise the opt-in system DNS-SD backend separately from the embedded
+  # default and the no-default release boundary.  The compatibility package
+  # supplies Avahi's reviewed libdns_sd shim; the focused selectors cover both
+  # the feature-gated signaling fixture and the backend's checked ownership
+  # and stale-worker controls, followed by live signaling/core paths against
+  # the installed daemon.
+  system-dnssd:
+    name: system-dnssd / Avahi compatibility backend
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Avahi DNS-SD compatibility library
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y avahi-daemon libavahi-compat-libdnssd-dev
+
+      - name: Start Avahi daemon
+        run: sudo systemctl start avahi-daemon
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: system-dnssd
+
+      - name: System-dnssd signaling fixture
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --test mdns_driver discovery_retention_maps_each_backend_and_refusal_is_pre_backend \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd backend formula control (supplemental)
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::tests::backend_residency_is_distinct_checked_and_bounded \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd live signaling daemon
+        run: |
+          cargo test -p myownmesh-signaling --locked --no-default-features \
+            --features system-dnssd --lib \
+            mdns::discovery::system::tests::registers_and_browses_via_the_system_daemon \
+            -- --exact --ignored --test-threads=1
+
+      - name: System-dnssd core feature compile
+        run: |
+          cargo check -p myownmesh-core --locked --no-default-features \
+            --features system-dnssd
+
+      - name: System-dnssd core envelope formula control
+        run: |
+          cargo test -p myownmesh-core --locked --no-default-features \
+            --features "system-dnssd transport-lab" --test mdns_signaling \
+            mdns_core_budget_checks_full_resolve_envelope_before_backend_start \
+            -- --exact --test-threads=1
+
+      - name: System-dnssd live core mDNS path
+        run: |
+          cargo test -p myownmesh-core --locked --no-default-features \
+            --features "system-dnssd transport-lab" --test mdns_signaling \
+            two_peers_handshake_over_mdns_only \
+            -- --exact --ignored --test-threads=1
+
+      - name: System-dnssd daemon feature compile
+        run: |
+          cargo check -p myownmesh --locked --no-default-features \
+            --features system-dnssd
+
+      - name: System-dnssd stale-worker controls
+        run: |
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::system::tests::worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty \
+            -- --exact --test-threads=1
+          cargo test -p myownmesh-signaling --locked --features system-dnssd \
+            --lib mdns::discovery::system::tests::worker_registry_reaps_stale_terminal_full_before_admitting_successor \
+            -- --exact --test-threads=1
+
   # Validate the static-musl appliance daemons actually cross-compile on every
   # PR, not just at release time. Both riscv64 (NanoKVM) and aarch64-musl
   # (NanoKVM-Pro) are the exact `cargo zigbuild` invocations release.yml ships,

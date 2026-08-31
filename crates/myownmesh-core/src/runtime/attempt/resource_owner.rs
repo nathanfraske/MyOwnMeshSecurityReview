@@ -487,6 +487,34 @@ pub(crate) fn cleanup_job_claim(
     ])
 }
 
+/// Exact finite claim for the one late-transport terminal custodian retained
+/// by each connector.  The custodian owns one bounded command slot, one OS
+/// worker, and the opaque platform/thread state that Rust cannot size.
+pub(crate) fn late_transport_custodian_claim(
+) -> Result<ResourceClaim, crate::resource::ResourceClaimArithmeticError> {
+    let bytes = std::mem::size_of::<std::sync::mpsc::SyncSender<()>>()
+        .checked_add(std::mem::size_of::<std::thread::JoinHandle<()>>())
+        .and_then(|value| {
+            value.checked_add(std::mem::size_of::<Vec<tokio::task::JoinHandle<()>>>())
+        })
+        .and_then(|value| value.checked_add(std::mem::size_of::<std::sync::Arc<()>>()))
+        .ok_or(crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        })?;
+    let bytes = u64::try_from(bytes).map_err(|_| {
+        crate::resource::ResourceClaimArithmeticError::Overflow {
+            dimension: ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    ResourceClaim::try_from_entries([
+        (ResourceClass::AccountedMemoryBytes, bytes),
+        (ResourceClass::WorkerOrTask, 1),
+        // Command enum payload, thread stack, and platform channel state are
+        // dependency-owned and remain explicit opaque residuals.
+        (ResourceClass::OpaqueDependencyResidual, 3),
+    ])
+}
+
 /// What funds one queued cleanup job for as long as it is queued or running.
 ///
 /// Two shapes, because there are two kinds of cleanup and collapsing them would

@@ -654,21 +654,6 @@ impl ClosedRelayTargetAcceptedRegistry {
         self.ready.pop_front().map(EndpointSession::into_public)
     }
 
-    /// Remove an accepted session that has not yet been claimed by a
-    /// consumer. The caller must invoke `EndpointSession::cancel_consumer`
-    /// after releasing its registry lock; returning the exact node keeps the
-    /// cancellation path from guessing at Arc counts or a timer.
-    pub(crate) fn take_unpulled_for_cancel(
-        &mut self,
-        session_id: [u8; 16],
-    ) -> Option<EndpointSession> {
-        let index = self.ready.iter().position(|session| {
-            session.0.session_id == session_id
-                && session.0.consumer_state.load(Ordering::Acquire) == ENDPOINT_CONSUMER_UNCLAIMED
-        })?;
-        self.ready.remove(index)
-    }
-
     pub(crate) fn take_all_unpulled_for_cancel(&mut self) -> Vec<EndpointSession> {
         let mut unpulled = Vec::with_capacity(self.ready.len());
         let mut remaining = VecDeque::with_capacity(self.ready.len());
@@ -718,6 +703,16 @@ impl ClosedRelayTargetAcceptedRegistry {
 
 fn invalid(reason: impl Into<String>) -> ClosedRelayRefusal {
     ClosedRelayRefusal::InvalidEndpoints(reason.into())
+}
+
+fn validate_session_id(session_id: [u8; 16]) -> Result<(), ClosedRelayRefusal> {
+    if session_id.iter().all(|byte| *byte == 0) {
+        Err(ClosedRelayRefusal::InvalidPacket(
+            "closed relay session id must be nonzero".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// One exact remote peer installation and the promoted session that
@@ -991,13 +986,6 @@ impl ClosedRelayRegistry {
 
     pub(crate) fn contains(&self, session_id: [u8; 16]) -> bool {
         self.slots.iter().any(|slot| slot.session_id == session_id)
-    }
-
-    pub(crate) fn epoch(&self, session_id: [u8; 16]) -> Option<u64> {
-        self.slots
-            .iter()
-            .find(|slot| slot.session_id == session_id)
-            .map(|slot| slot.terminal.allocation_epoch)
     }
 
     pub(crate) fn generation(&self, session_id: [u8; 16]) -> Option<ClosedRelayGeneration> {
@@ -1412,19 +1400,19 @@ impl ClosedRelayCloseRecord {
             &self.opposite,
             &self.opposite_witness,
         );
-        owners_current
-            && self.allocation_epoch != 0
-            && state
+        let exact_lifecycle = if let Some(generation) = self.allocation_generation.as_ref() {
+            state
                 .closed_relay_route(self.session_id)
                 .is_some_and(|(_, _, _, _, epoch)| epoch == self.allocation_epoch)
-            && self
-                .allocation_generation
-                .as_ref()
-                .is_none_or(|generation| {
-                    state
-                        .closed_relay_generation(self.session_id)
-                        .is_some_and(|current| Arc::ptr_eq(&current, generation))
-                })
+                && state
+                    .closed_relay_generation(self.session_id)
+                    .is_some_and(|current| Arc::ptr_eq(&current, generation))
+        } else {
+            state
+                .closed_relay_pending_epoch(self.session_id)
+                .is_some_and(|epoch| epoch == self.allocation_epoch)
+        };
+        owners_current && self.allocation_epoch != 0 && exact_lifecycle
     }
 }
 
@@ -1533,7 +1521,7 @@ impl ClosedRelayAuthorization {
         }
         let lease = self
             .state
-            .acquire_closed_relay_lease(allocation_lease_claim(&self)?)
+            .acquire_closed_relay_lease(allocation_lease_claim(self)?)
             .map_err(|_| ClosedRelayRefusal::QueueFull)?;
         let permit = RelayAllocationPermit::try_new(self.requester.session.clone(), profile)?;
         let endpoints = ClosedRelayEndpoints::new(
@@ -1543,7 +1531,7 @@ impl ClosedRelayAuthorization {
             session_id,
             allocation_epoch,
         )?;
-        let terminal = self.into_terminal(session_id, allocation_epoch);
+        let terminal = self.terminal_witness(session_id, allocation_epoch);
         runtime
             .admit_closed_relay(
                 permit,
@@ -1587,7 +1575,7 @@ impl ClosedRelayAuthorization {
     /// exact terminal state.  No new authority is minted here; the returned
     /// state is only the engine-side witness needed by a runtime settlement
     /// hook.
-    pub(crate) fn into_terminal(
+    pub(crate) fn terminal_witness(
         &self,
         session_id: [u8; 16],
         allocation_epoch: u64,
@@ -1933,7 +1921,7 @@ async fn handle_close(
                 .closed_relay_route(*session_id)
                 .map(|(_, _, _, _, epoch)| epoch)
                 .or_else(|| state.closed_relay_pending_epoch(*session_id));
-            if current_epoch != Some(allocation_epoch) {
+            if current_epoch.is_some_and(|epoch| epoch != allocation_epoch) {
                 return Err(ClosedRelayRefusal::OwnerNotLive);
             }
         }
@@ -1962,6 +1950,13 @@ async fn handle_close(
             let record_current = record.is_current(state);
             if let Some(generation) = record.allocation_generation.as_ref() {
                 let _ = state.settle_closed_relay_exact(*session_id, generation);
+            } else {
+                // A pending Open has no allocation generation yet. Its
+                // handshake custody is nevertheless exact and must be
+                // consumed once this close record is consumed, even when the
+                // captured owner witness has gone stale; dropping a stale
+                // pending record cannot touch a successor installation.
+                let _ = state.take_closed_relay_pending(*session_id);
             }
             if !record_current {
                 // A delayed Close may still match the opposite endpoint's
@@ -2021,12 +2016,17 @@ async fn handle_close(
             return Ok(());
         };
         let metadata = session.metadata();
+        let epoch_matches = metadata.allocation_epoch == allocation_epoch
+            || (metadata.allocation_epoch == 0
+                && state
+                    .closed_relay_pending_epoch(*session_id)
+                    .is_some_and(|pending_epoch| pending_epoch == allocation_epoch));
         if metadata.context != *context
             || metadata.requester != *requester
             || metadata.relay != *relay
             || metadata.target != *target
             || metadata.session_id != *session_id
-            || metadata.allocation_epoch != allocation_epoch
+            || !epoch_matches
             || (local != metadata.requester && local != metadata.target)
         {
             return Err(ClosedRelayRefusal::OwnerMismatch);
@@ -2203,11 +2203,12 @@ fn pending_lease_claim(
     authorization: &ClosedRelayAuthorization,
     requester_share: &RelayKeyShare,
 ) -> Result<ResourceClaim, ClosedRelayRefusal> {
+    // These fields are retained String buffers; charge their capacities, not
+    // only their visible lengths. The share has one mesh buffer; charging it
+    // twice would create a false refusal without funding any additional
+    // retained object.
     let route_bytes = retained_route_bytes(authorization)?
         .checked_add(requester_share.mesh.capacity())
-        // These fields are retained String buffers; charge their capacities,
-        // not only their visible lengths.
-        .and_then(|bytes| bytes.checked_add(requester_share.mesh.capacity()))
         .and_then(|bytes| bytes.checked_add(requester_share.from.capacity()))
         .and_then(|bytes| bytes.checked_add(requester_share.to.capacity()))
         .and_then(|bytes| bytes.checked_add(requester_share.signature.capacity()))
@@ -2297,6 +2298,7 @@ pub(crate) fn begin_closed_relay_open(
     target: DeviceId,
     session_id: [u8; 16],
 ) -> Result<(PendingEndpointKeyAgreement, ClosedRelayControl), ClosedRelayRefusal> {
+    validate_session_id(session_id)?;
     let requester = DeviceId::from_canonical_str(state.identity.public_id())
         .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
     canonical_route_admitted(state, &requester, &relay, &target)?;
@@ -2337,6 +2339,7 @@ pub(crate) async fn open_endpoint(
     target: DeviceId,
     session_id: [u8; 16],
 ) -> Result<EndpointSession, ClosedRelayRefusal> {
+    validate_session_id(session_id)?;
     state.drain_closed_relay_abandonments().await;
     let requester = DeviceId::from_canonical_str(state.identity.public_id())
         .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
@@ -2637,15 +2640,15 @@ pub(crate) async fn handle_control(
                 if *context_id != state.mesh_context_id() || *target == local {
                     return Err(invalid("Accept is not bound to this requester"));
                 }
-                canonical_route_admitted(state, &requester, relay, target)?;
+                canonical_route_admitted(state, requester, relay, target)?;
                 let _ = current_owner_witness(state, owner, relay)?;
                 let session = state
                     .closed_relay_endpoint(session_id)
                     .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-                if !endpoint_matches_route(
+                if !endpoint_matches_pending_accept(
                     &session,
                     context_id,
-                    &requester,
+                    requester,
                     relay,
                     target,
                     &session_id,
@@ -2653,11 +2656,24 @@ pub(crate) async fn handle_control(
                 ) {
                     return Err(ClosedRelayRefusal::OwnerMismatch);
                 }
-                let session = state.complete_closed_relay_endpoint(
+                let session = match state.complete_closed_relay_endpoint(
                     session_id,
                     &control.route(),
                     target_share,
-                )?;
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        // A malformed or stale target share transitions the
+                        // exact requester endpoint to terminal state. Do not
+                        // leave its lease and registry node behind while the
+                        // caller's open future waits for a wake-up.
+                        if let Some(session) = state.closed_relay_endpoint(session_id) {
+                            state.remove_closed_relay_endpoint(&session);
+                            session.mark_closed();
+                        }
+                        return Err(error);
+                    }
+                };
                 return Ok(Some(session));
             }
             let response = on_control(state, owner, control)?;
@@ -2829,6 +2845,30 @@ fn endpoint_matches_route(
         && metadata.allocation_epoch == allocation_epoch
 }
 
+/// Match the requester endpoint against the exact Accept route while allowing
+/// its pre-admission epoch.  A requester installs its endpoint before relay
+/// allocation, so its metadata carries epoch zero until this Accept completes
+/// it; the control itself has already passed `ClosedRelayControl::validate`,
+/// which requires the incoming allocation epoch to be nonzero.  Data delivery
+/// continues to use the strict `endpoint_matches_route` predicate below.
+fn endpoint_matches_pending_accept(
+    session: &EndpointSession,
+    context: &MeshContextId,
+    requester: &DeviceId,
+    relay: &DeviceId,
+    target: &DeviceId,
+    session_id: &[u8; 16],
+    allocation_epoch: u64,
+) -> bool {
+    let metadata = session.metadata();
+    metadata.context == *context
+        && metadata.requester == *requester
+        && metadata.relay == *relay
+        && metadata.target == *target
+        && metadata.session_id == *session_id
+        && (metadata.allocation_epoch == 0 || metadata.allocation_epoch == allocation_epoch)
+}
+
 /// Validate and enqueue one opaque data frame from the exact requester or
 /// target owner. The runtime performs the final packet/queue/bandwidth checks.
 pub(crate) fn on_data(
@@ -2844,6 +2884,9 @@ pub(crate) fn on_data(
     }
     let (context_id, requester, relay, target, allocation_epoch) = state
         .closed_relay_route(data.session_id)
+        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+    let generation = state
+        .closed_relay_generation(data.session_id)
         .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
     let expected_route = crate::protocol::relay::ClosedRelayRoute::with_epoch(
         context_id,
@@ -2872,7 +2915,13 @@ pub(crate) fn on_data(
             &data.target
         },
     )?;
-    state.forward_closed_relay(data.session_id, direction, data.packet)
+    state.forward_closed_relay(
+        data.session_id,
+        &generation,
+        allocation_epoch,
+        direction,
+        data.packet,
+    )
 }
 
 /// Async dispatch spelling for engine message loops. The actual admission is
@@ -3047,6 +3096,16 @@ mod tests {
             validate_route(&requester, &relay, &target, &target),
             Err(ClosedRelayRefusal::InvalidEndpoints(_))
         ));
+    }
+
+    #[test]
+    fn session_coordinate_must_be_nonzero_before_engine_admission() {
+        assert!(matches!(
+            validate_session_id([0; 16]),
+            Err(ClosedRelayRefusal::InvalidPacket(reason))
+                if reason == "closed relay session id must be nonzero"
+        ));
+        assert!(validate_session_id([1; 16]).is_ok());
     }
 
     #[test]

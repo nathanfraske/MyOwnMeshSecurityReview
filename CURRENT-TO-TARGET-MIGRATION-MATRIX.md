@@ -78,3 +78,27 @@ accepted, pending, closing, and allocation custody, and joins owned tasks.
 | daemon control socket | Deployment and administration surface | Application Gateway / local-principal boundary | Authenticated local-principal transport | Every privileged operation uses an authenticated principal capability |
 | GUI | Existing operator UX | Application client | Client of the application gateway | GUI never constructs raw signaling or authority proofs |
 | updater, installer, service manager, release packaging | Operational product infrastructure | Existing operational crates | Operational infrastructure | Deployment lifecycle remains separate from mesh authority |
+
+## Executable production migration contract
+
+The architecture is exercised through public production process and control
+boundaries, not by a second architecture embedded in a fixture. The maintained
+full-process entry point is [`scripts/run-production-e2e.py`](scripts/run-production-e2e.py).
+It intentionally covers one finite path; other advertised carriers and platform
+profiles retain their own qualification matrices.
+
+| Sequence | Current production entry or owner | Target contract exercised by the runner | Harness observation |
+|---|---|---|---|
+| 1. Admit two processes | `crates/myownmesh/src/main.rs` -> `cli/serve.rs` | two isolated daemon owners, each supplied the complete finite `MYOWNMESH_RESOURCE_GRANT` and explicit connector realtime policy | control `status` answers from both exact local-principal sockets |
+| 2. Discover and exchange control | `myownmesh-signaling/src/mdns/driver.rs` plus selected discovery backend; `engine/signaling_bridge.rs` | typed LAN signaling only; no Nostr, `LocalBroker`, public STUN, or TURN substitute | daemon logs and the peer snapshots retained after both peers are sighted |
+| 3. Construct a channel | `engine/connection.rs`, `transport/ice.rs`, `transport/webrtc.rs` | bounded production ICE/WebRTC connector work creates the channel that actually carries the proof | each peer snapshot retains its selected candidate pair |
+| 4. Authenticate and promote | `endpoint_auth/{task,transcript}.rs`, `engine/handshake.rs`, `runtime/session_broker/mod.rs` | fresh channel-bound Device proof followed by bilateral Open auto-approval and exact current-session promotion | both snapshots report the opposite Device as authenticated and `active` |
+| 5. Bind the local consumer | `control.rs`, `ipc/clients.rs`, `control/dispatch/channel.rs` | an `EventsSubscribe` capability owns B's exact channel subscription | subscription acknowledgement is consumed in memory; its bearer capability is not persisted |
+| 6. Deliver application data | `application_gateway/channels.rs`, `ipc/bridge.rs` | A uses `ChannelSendReliable`; B receives the exact `ChannelInbound` frame through its promoted session | redacted request response, B event JSONL, and exact token match |
+| 7. Settle owners | daemon shutdown plus connector/session/control owners | event socket closes; both child process groups receive bounded graceful shutdown and a child-only kill backstop | process terminal codes and timestamps in the neutral run manifest |
+
+A zero harness exit states only that this executable contract reached its
+declared terminal. It is not, by itself, a platform, performance, packaging, or
+release claim. The harness never manufactures resource amounts, installs a
+dependency, builds a binary, edits a user's normal home, or deletes the
+preserved run directory.

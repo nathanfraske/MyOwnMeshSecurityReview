@@ -15,13 +15,28 @@ use myownmesh_signaling::nostr::delivery::{
     DeliveryRetention, DeliveryStore, DeliveryTerminal, RelaySessionId, SessionRetention,
 };
 use myownmesh_signaling::nostr::driver::{
-    start_with_delivery_provider, NostrDriverConfig, NostrInbound, NostrOutbound, NostrTimingConfig,
+    derive_task_custody_plan, start_with_delivery_provider_and_sinks_with_custodian,
+    NostrDriverConfig, NostrInbound, NostrOutbound, NostrTaskCustodyOwners, NostrTimingConfig,
 };
 use myownmesh_signaling::nostr::handle::derive_room_handle;
 use myownmesh_signaling::nostr::shuffle::select_top_n;
 use myownmesh_signaling::server::{Limits, SignalingServer};
-use myownmesh_signaling::AttemptRefusal;
-use myownmesh_signaling::{ErasedOwner, InboundSink, OwnedSignal, UnboundedSource};
+use myownmesh_signaling::{
+    AttemptOutcome, AttemptOutcomeSink, AttemptRefusal, AttemptRefusalSink, DedicatedTaskCustodian,
+    ErasedOwner, InboundSink, OwnedSignal, TaskCustodian, UnboundedSource,
+};
+
+struct NoopAttemptRefusalSink;
+
+impl AttemptRefusalSink for NoopAttemptRefusalSink {
+    fn refused(&self, _refusal: AttemptRefusal) {}
+}
+
+struct NoopAttemptOutcomeSink;
+
+impl AttemptOutcomeSink for NoopAttemptOutcomeSink {
+    fn outcome(&self, _outcome: AttemptOutcome) {}
+}
 
 fn test_nostr_timing() -> NostrTimingConfig {
     NostrTimingConfig {
@@ -34,6 +49,58 @@ fn test_nostr_timing() -> NostrTimingConfig {
         session_close_timeout: Duration::from_secs(1),
         announcer_cancel_quantum: Duration::from_secs(1),
     }
+}
+
+fn test_task_custodians(
+    config: &NostrDriverConfig,
+) -> (Arc<dyn TaskCustodian>, Arc<dyn TaskCustodian>) {
+    assert!(
+        !config.public_fallback,
+        "fixture fallback count is explicitly zero"
+    );
+    assert!(
+        config.denylist.is_empty(),
+        "fixture denylist is explicitly empty"
+    );
+    let pool = config
+        .servers
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let selected = select_top_n(&config.app_id, &pool, config.redundancy);
+    let plan = derive_task_custody_plan(selected.len(), 0)
+        .expect("fixture relay counts produce a finite custody plan");
+    (
+        DedicatedTaskCustodian::new(plan.primary_observer_slots).expect("primary fixture custodian")
+            as Arc<dyn TaskCustodian>,
+        DedicatedTaskCustodian::new(plan.reaper_observer_slots).expect("reaper fixture custodian")
+            as Arc<dyn TaskCustodian>,
+    )
+}
+
+fn start_test_driver<S>(
+    config: NostrDriverConfig,
+    outbound: S,
+    inbound: InboundSink<NostrInbound>,
+    provider: Arc<dyn DeliveryProvider>,
+) -> Result<myownmesh_signaling::nostr::driver::NostrDriverHandle, myownmesh_signaling::Error>
+where
+    S: myownmesh_signaling::OutboundSource<NostrOutbound> + Send + 'static,
+    S::Owner: Sync + 'static,
+{
+    let (custodian_owner, reaper_custodian_owner) = test_task_custodians(&config);
+    start_with_delivery_provider_and_sinks_with_custodian(
+        config,
+        outbound,
+        inbound,
+        provider,
+        Arc::new(NoopAttemptRefusalSink),
+        Arc::new(NoopAttemptOutcomeSink),
+        NostrTaskCustodyOwners {
+            primary: custodian_owner,
+            reaper: reaper_custodian_owner,
+        },
+    )
 }
 
 fn open_test_session(store: &DeliveryStore) -> (RelaySessionId, Vec<AttemptRefusal>) {
@@ -543,17 +610,18 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
         cancelled: AtomicUsize::new(0),
         shutdown: AtomicUsize::new(0),
     });
-    let driver = start_with_delivery_provider(
-        NostrDriverConfig {
-            app_id: "nostr-delivery-controls".into(),
-            network_id: "relay-separation".into(),
-            device_id: "device-a".into(),
-            servers: vec![url_a.clone(), url_b.clone()],
-            denylist: Vec::new(),
-            redundancy: 2,
-            public_fallback: false,
-            timing: test_nostr_timing(),
-        },
+    let config = NostrDriverConfig {
+        app_id: "nostr-delivery-controls".into(),
+        network_id: "relay-separation".into(),
+        device_id: "device-a".into(),
+        servers: vec![url_a.clone(), url_b.clone()],
+        denylist: Vec::new(),
+        redundancy: 2,
+        public_fallback: false,
+        timing: test_nostr_timing(),
+    };
+    let driver = start_test_driver(
+        config,
         Box::new(UnboundedSource::new(out_rx)),
         InboundSink::from_unbounded(in_tx),
         Arc::new(CountingProvider {
@@ -561,7 +629,7 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
             source_live: Arc::new(AtomicUsize::new(0)),
         }),
     )
-    .expect("valid Nostr timing configuration");
+    .expect("valid Nostr timing and task-custody configuration");
     let reconnect = driver.reconnect_signal();
     let mut reconnect_seen = reconnect.subscribe();
     let previous_generation = *reconnect_seen.borrow();
@@ -641,22 +709,23 @@ async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
     let first_refusal = provider.refused.notified();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<NostrOutbound>();
     let (in_tx, _in_rx) = mpsc::unbounded_channel::<NostrInbound>();
-    let driver = start_with_delivery_provider(
-        NostrDriverConfig {
-            app_id: "nostr-session-refusal-control".into(),
-            network_id: "session-refusal-control".into(),
-            device_id: "device-refusal".into(),
-            servers: vec![url],
-            denylist: Vec::new(),
-            redundancy: 1,
-            public_fallback: false,
-            timing: test_nostr_timing(),
-        },
+    let config = NostrDriverConfig {
+        app_id: "nostr-session-refusal-control".into(),
+        network_id: "session-refusal-control".into(),
+        device_id: "device-refusal".into(),
+        servers: vec![url],
+        denylist: Vec::new(),
+        redundancy: 1,
+        public_fallback: false,
+        timing: test_nostr_timing(),
+    };
+    let driver = start_test_driver(
+        config,
         Box::new(UnboundedSource::new(out_rx)),
         InboundSink::from_unbounded(in_tx),
         provider.clone(),
     )
-    .expect("valid Nostr timing configuration");
+    .expect("valid Nostr timing and task-custody configuration");
 
     tokio::time::timeout(Duration::from_secs(10), first_refusal)
         .await

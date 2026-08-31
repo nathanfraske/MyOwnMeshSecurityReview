@@ -8,10 +8,9 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::info;
 
 use crate::channels::Channel;
@@ -53,6 +52,21 @@ struct MeshInner {
     events_tx: broadcast::Sender<MeshEvent>,
 }
 
+/// The complete configuration classification used by network replacement.
+/// Fields are named so callers cannot mistake a capacity or policy change for
+/// an ordinary hot update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ReconcileStatus {
+    pub needs_restart: bool,
+    pub network_id_changed: bool,
+    pub signaling_changed: bool,
+    pub closed_relay_changed: bool,
+    pub scheduler_changed: bool,
+    pub event_capacity_changed: bool,
+    pub connection_trace_capacity_changed: bool,
+}
+
 struct JoinedNetworkLifecycle {
     /// The async mutex is intentionally held across the join: concurrent
     /// shutdown callers then wait for the same exact driver completion instead
@@ -62,7 +76,7 @@ struct JoinedNetworkLifecycle {
     /// wait for the same driver lock and then observe this exact outcome
     /// rather than treating an already-consumed handle as success.
     shutdown_result: tokio::sync::Mutex<Option<std::result::Result<(), String>>>,
-    fanout: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fanout: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Mesh {
@@ -229,7 +243,11 @@ impl MeshHandle {
         .await?;
         if let Err(error) = join_open_participation(&state).await {
             state.request_shutdown();
-            let _ = driver.await;
+            if let Err(join_error) = driver.await {
+                return Err(Error::Other(format!(
+                    "{error}; network driver cleanup failed: {join_error}"
+                )));
+            }
             return Err(error);
         }
         self.finish_joined_network(config, state, driver).await
@@ -306,8 +324,12 @@ impl MeshHandle {
             Ok(rpc) => rpc,
             Err(error) => {
                 state.request_shutdown();
-                let _ = driver.await;
-                return Err(error.into());
+                return match driver.await {
+                    Ok(()) => Err(error.into()),
+                    Err(join_error) => Err(Error::Other(format!(
+                        "{error}; network driver cleanup failed: {join_error}"
+                    ))),
+                };
             }
         };
 
@@ -334,7 +356,7 @@ impl MeshHandle {
             lifecycle: Arc::new(JoinedNetworkLifecycle {
                 driver: tokio::sync::Mutex::new(Some(driver)),
                 shutdown_result: tokio::sync::Mutex::new(None),
-                fanout: Mutex::new(Some(fanout)),
+                fanout: AsyncMutex::new(Some(fanout)),
             }),
         })
     }
@@ -511,16 +533,22 @@ impl JoinedNetwork {
         crate::engine::attach_signaling(&self.state)
     }
 
-    /// Return the restart decision and the two config dimensions used by the
-    /// daemon's lifecycle log without exposing the engine state.
+    /// Return the restart decision and every construction-time config
+    /// dimension used by the daemon's lifecycle log without exposing the
+    /// engine state.
     #[doc(hidden)]
-    pub fn reconcile_status(&self, next: &NetworkConfig) -> (bool, bool, bool) {
+    pub fn reconcile_status(&self, next: &NetworkConfig) -> ReconcileStatus {
         let current = self.state.config.read();
-        (
-            crate::engine::reconcile::requires_restart(&current, next),
-            current.signaling != next.signaling,
-            current.network_id != next.network_id,
-        )
+        ReconcileStatus {
+            needs_restart: crate::engine::reconcile::requires_restart(&current, next),
+            network_id_changed: current.network_id != next.network_id,
+            signaling_changed: current.signaling != next.signaling,
+            closed_relay_changed: current.closed_relay != next.closed_relay,
+            scheduler_changed: current.scheduler != next.scheduler,
+            event_capacity_changed: current.event_capacity != next.event_capacity,
+            connection_trace_capacity_changed: current.connection_trace_capacity
+                != next.connection_trace_capacity,
+        }
     }
 
     /// Snapshot the exact live configuration owned by this handle.
@@ -998,30 +1026,47 @@ impl JoinedNetwork {
     /// retirement before it returns.
     pub async fn shutdown(&self) -> Result<()> {
         self.state.request_shutdown();
-        // Cancel the mesh-wide event fan-out before waiting for the driver.
-        // A departure or terminal peer event can otherwise keep this
+        // Cancel and join the mesh-wide event fan-out before waiting for the
+        // driver. A departure or terminal peer event can otherwise keep this
         // lifecycle task retaining the network state while the driver waits
         // for its final peer cleanup, which is a shutdown-only deadlock for a
         // silently connected peer.
-        if let Some(fanout) = self.lifecycle.fanout.lock().take() {
-            fanout.abort();
-        }
         let mut driver = self.lifecycle.driver.lock().await;
-        if let Some(driver) = driver.take() {
-            let outcome = driver.await.map_err(|error| {
-                Error::Other(format!(
-                    "network driver task failed during shutdown: {error}"
-                ))
-            });
-            *self.lifecycle.shutdown_result.lock().await =
-                Some(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
-            outcome
-        } else {
-            match self.lifecycle.shutdown_result.lock().await.clone() {
-                Some(Ok(())) | None => Ok(()),
-                Some(Err(error)) => Err(Error::Other(error)),
+        let fanout_failure = if let Some(fanout) = self.lifecycle.fanout.lock().await.take() {
+            fanout.abort();
+            match fanout.await {
+                Ok(()) => None,
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(format!(
+                    "network event fan-out task failed during shutdown: {error}"
+                )),
             }
-        }
+        } else {
+            None
+        };
+        let driver_failure = if let Some(driver) = driver.take() {
+            match driver.await {
+                Ok(()) => None,
+                Err(error) => Some(format!(
+                    "network driver task failed during shutdown: {error}"
+                )),
+            }
+        } else {
+            self.lifecycle
+                .shutdown_result
+                .lock()
+                .await
+                .clone()
+                .and_then(|result| result.err())
+        };
+        let outcome = match (driver_failure, fanout_failure) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(Error::Other(error)),
+            (Some(driver), Some(fanout)) => Err(Error::Other(format!("{driver}; {fanout}"))),
+        };
+        *self.lifecycle.shutdown_result.lock().await =
+            Some(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+        outcome
     }
 
     /// Remove this joined network's canonical semantic snapshot after its

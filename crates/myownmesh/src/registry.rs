@@ -80,6 +80,19 @@ pub enum RuntimeState {
     Stopped,
 }
 
+/// Atomic answer for a prospective join's two identity aliases.
+///
+/// `Existing` is deliberately returned for an unbound local config id that
+/// names the same currently-running wire network.  A caller can therefore
+/// replay a config with a different local id without creating a second
+/// runtime.  `Collision` covers both a different wire owner and a runtime
+/// that is still closing; neither may be bypassed by a later insert.
+pub(crate) enum JoinAdmission {
+    Empty,
+    Existing(Arc<JoinedNetwork>),
+    Collision(RuntimeState),
+}
+
 /// Snapshot view of one joined network for ctl / GUI consumers.
 /// Cheap to compute — every field is already cached on the
 /// `JoinedNetwork`.
@@ -1197,6 +1210,39 @@ impl NetworkRegistry {
         Arc::new(Self::default())
     }
 
+    /// Classify both aliases under the same registry fence used by `insert`.
+    ///
+    /// This is the only pre-join identity decision used by service
+    /// reconciliation.  In particular, a `B/N` request is satisfied by a
+    /// `Running A/N` owner when `B` is unbound, while `A/M` remains a
+    /// collision.  A `Closing` owner is never treated as absent or reusable.
+    pub(crate) fn classify_join(&self, config_id: &str, network_id: &str) -> JoinAdmission {
+        let state = self.state.lock();
+        let by_config = state.aliases.get(config_id).cloned();
+        let by_network = state.aliases.get(network_id).cloned();
+
+        if let Some(holder) = state.holder(config_id, network_id) {
+            let lifecycle = holder.lifecycle.state();
+            if lifecycle != RuntimeState::Running {
+                return JoinAdmission::Collision(lifecycle);
+            }
+        }
+
+        match (by_config, by_network) {
+            (None, None) => JoinAdmission::Empty,
+            (Some(config_owner), Some(network_owner))
+                if Arc::ptr_eq(&config_owner, &network_owner)
+                    && network_owner.joined.network_id() == network_id =>
+            {
+                JoinAdmission::Existing(config_owner.joined.clone())
+            }
+            (None, Some(network_owner)) if network_owner.joined.network_id() == network_id => {
+                JoinAdmission::Existing(network_owner.joined.clone())
+            }
+            _ => JoinAdmission::Collision(RuntimeState::Running),
+        }
+    }
+
     /// Insert a freshly-joined network together with its signaling
     /// driver handles. Indexed by both the config record id and the
     /// wire-level network id so callers can use either as the lookup
@@ -1925,6 +1971,34 @@ mod tests {
             pinned_peers: Vec::new(),
             auto_approve: true,
         }
+    }
+
+    #[tokio::test]
+    async fn join_admission_preserves_unbound_local_alias_for_running_wire_owner() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let incumbent = mesh
+            .join(network("admission-owner", "admission-wire"))
+            .await
+            .expect("the admission fixture joins");
+        assert!(registry.insert(incumbent, None).into_refusal().is_none());
+
+        match registry.classify_join("admission-alias", "admission-wire") {
+            JoinAdmission::Existing(owner) => {
+                assert_eq!(owner.config_id(), "admission-owner");
+                assert_eq!(owner.network_id(), "admission-wire");
+            }
+            JoinAdmission::Empty => panic!("a running wire owner must satisfy its alias"),
+            JoinAdmission::Collision(state) => {
+                panic!("unexpected {state:?} collision for a running wire owner")
+            }
+        }
+        assert!(matches!(
+            registry.classify_join("admission-owner", "other-wire"),
+            JoinAdmission::Collision(RuntimeState::Running)
+        ));
+        let _ = registry.shutdown_all().await;
     }
 
     fn widest_traffic() -> myownmesh_core::engine::traffic::TrafficSnapshot {

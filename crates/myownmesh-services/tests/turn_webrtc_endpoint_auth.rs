@@ -16,13 +16,27 @@ use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
     transport_lab_remote_description_fixture_grant, ConnectorCallbackPolicy,
-    FiniteResourceProvider, MeshEvent, PeerEvent, ResourceProviderPort,
-    TransportLabCallbackWorkload, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    FiniteResourceProvider, LocalApplicationResourceScope, MeshEvent, PeerEvent, ResourceClaim,
+    ResourceClass, ResourceProviderPort, TransportLabCallbackWorkload,
+    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn service_scope() -> LocalApplicationResourceScope {
+    let grant = ResourceClaim::try_from_entries(
+        ResourceClass::ALL
+            .into_iter()
+            .map(|class| (class, 1_000_000)),
+    )
+    .expect("TURN service fixture grant is representable");
+    let port = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("TURN service fixture provider is valid");
+    LocalApplicationResourceScope::transport_lab_child_of(&port)
+        .expect("TURN service fixture scope is valid")
+}
 
 fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkConfig {
     NetworkConfig {
@@ -275,20 +289,23 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());
 
-    let turn = TurnServer::start(&TurnServiceConfig {
-        enabled: true,
-        bind: "127.0.0.1".to_string(),
-        port: 0,
-        public_ip: "127.0.0.1".to_string(),
-        realm: "arc03-test".to_string(),
-        credentials: vec![TurnCredential {
-            username: "arc03-user".to_string(),
-            password: "arc03-password".to_string(),
-        }],
-        max_bps_per_connection: 0,
-        relay_port_min: 0,
-        relay_port_max: 0,
-    })
+    let turn = TurnServer::start_with_resource_scope(
+        &TurnServiceConfig {
+            enabled: true,
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+            public_ip: "127.0.0.1".to_string(),
+            realm: "arc03-test".to_string(),
+            credentials: vec![TurnCredential {
+                username: "arc03-user".to_string(),
+                password: "arc03-password".to_string(),
+            }],
+            max_bps_per_connection: 0,
+            relay_port_min: 0,
+            relay_port_max: 0,
+        },
+        service_scope(),
+    )
     .await
     .expect("real TURN server starts");
     let turn_url = format!("turn:{}?transport=udp", turn.local_addr());

@@ -375,25 +375,56 @@ impl EventEpochs {
 /// Extraction happens under the mutex; joining always happens after releasing
 /// it, so a worker cannot deadlock against a callback trying to register a
 /// successor worker.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WorkerRegistry {
     workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    max_workers: usize,
 }
 
 impl WorkerRegistry {
-    fn new() -> Self {
-        Self::default()
+    fn with_capacity(max_workers: usize) -> Self {
+        Self {
+            workers: Mutex::new(Vec::with_capacity(max_workers)),
+            max_workers,
+        }
     }
 
-    fn push(&self, worker: std::thread::JoinHandle<()>) {
-        self.workers.lock().push(worker);
+    fn push(&self, worker: std::thread::JoinHandle<()>) -> Result<(), std::thread::JoinHandle<()>> {
+        // A terminal handle still occupies its reserved slot until its result
+        // is observed. Reap those handles before deciding that the registry is
+        // full; otherwise a finished worker can permanently refuse its exact
+        // successor. Extraction keeps all joins outside the mutex.
+        let (result, finished) = {
+            let mut workers = self.workers.lock();
+            let mut finished = Vec::new();
+            let mut live = Vec::with_capacity(self.max_workers);
+            for worker in workers.drain(..) {
+                if worker.is_finished() {
+                    finished.push(worker);
+                } else {
+                    live.push(worker);
+                }
+            }
+            *workers = live;
+            let result = if workers.len() >= self.max_workers {
+                Err(worker)
+            } else {
+                workers.push(worker);
+                Ok(())
+            };
+            (result, finished)
+        };
+        for worker in finished {
+            observe_worker(worker);
+        }
+        result
     }
 
     fn reap_finished(&self) {
         let finished = {
             let mut workers = self.workers.lock();
             let mut finished = Vec::new();
-            let mut live = Vec::with_capacity(workers.len());
+            let mut live = Vec::with_capacity(self.max_workers);
             for worker in workers.drain(..) {
                 if worker.is_finished() {
                     finished.push(worker);
@@ -461,6 +492,20 @@ impl Discovery {
         if !cfg.validate() || !cfg.limits.validate() || !cfg.timing.validate() {
             return Err(Error::Other("invalid discovery configuration".into()));
         }
+        cfg.limits
+            .checked_residency(crate::mdns::discovery::DiscoveryBackend::System)
+            .map_err(|error| {
+                Error::Other(format!("invalid system discovery residency: {error}"))
+            })?;
+        // The browse and registration workers are permanent; at most R
+        // resolve workers may be admitted. Reserve the complete handle
+        // registry before touching the native DNS-SD API so every spawned
+        // worker has a bounded custody slot.
+        let worker_capacity = cfg
+            .limits
+            .max_resolve_owners
+            .checked_add(2)
+            .ok_or_else(|| Error::Other("system worker capacity overflow".into()))?;
         let regtype = CString::new(regtype_of(&cfg.service_type))
             .map_err(|e| Error::Other(format!("service type: {e}")))?;
         let instance = CString::new(cfg.instance.as_str())
@@ -478,7 +523,7 @@ impl Discovery {
             epochs: EventEpochs::with_max_epochs(cfg.limits.max_event_epochs),
             resolution_fence: Mutex::new(()),
             tx,
-            workers: WorkerRegistry::new(),
+            workers: WorkerRegistry::with_capacity(worker_capacity),
             query_deadline: cfg.timing.query_deadline,
             discovery_limits: cfg.limits,
         });
@@ -537,7 +582,13 @@ impl Discovery {
                 return Err(Error::Other(format!("spawn dnssd browse thread: {e}")));
             }
         };
-        inner.workers.push(browse_worker);
+        if let Err(browse_worker) = inner.workers.push(browse_worker) {
+            inner.stopped.store(true, Ordering::Release);
+            observe_worker(browse_worker);
+            return Err(Error::Other(
+                "system worker custody refused the browse worker".into(),
+            ));
+        }
 
         Ok((Discovery { inner }, rx))
     }
@@ -609,11 +660,16 @@ impl Discovery {
                     observe_worker(worker);
                     return false;
                 }
-                *slot = Some(stop);
                 // Keep the registration guard until the worker is retained so
                 // shutdown cannot drain the registry between the stop check
                 // and this insertion.
-                self.inner.workers.push(worker);
+                if let Err(worker) = self.inner.workers.push(worker) {
+                    stop.store(true, Ordering::Release);
+                    drop(slot);
+                    observe_worker(worker);
+                    return false;
+                }
+                *slot = Some(stop);
                 drop(slot);
                 self.inner.workers.reap_finished();
                 true
@@ -708,13 +764,6 @@ unsafe extern "C" fn browse_cb(
     let Some(domain_bytes) = bounded_cstr(domain, MAX_DNS_NAME_BYTES) else {
         return;
     };
-    // Admit the callback's one bounded event slot before copying any backend
-    // bytes.  The same permit must be consumed by Removed; reserving again
-    // there would make a capacity-one queue reject the very withdrawal that
-    // was already admitted.
-    let Ok(queue_slot) = inner.tx.try_reserve() else {
-        return;
-    };
     let Ok(name) = String::from_utf8(name_bytes.to_vec()) else {
         return;
     };
@@ -772,7 +821,19 @@ unsafe extern "C" fn browse_cb(
         match spawn_result {
             Ok(worker) => {
                 let callback_inner = &*(ctx as *const Inner);
-                callback_inner.workers.push(worker);
+                if let Err(worker) = callback_inner.workers.push(worker) {
+                    warn!("system worker custody refused a resolve worker");
+                    callback_inner.resolving.cancel(&epoch_key);
+                    callback_inner
+                        .epochs
+                        .remove_if_current(&epoch_key, event_generation);
+                    // The callback holds the publication fence. Release it
+                    // before joining so a resolve worker that already entered
+                    // its handoff cannot wait on the same fence forever.
+                    drop(_resolution_fence);
+                    observe_worker(worker);
+                    return;
+                }
                 callback_inner.workers.reap_finished();
             }
             Err(_) => {
@@ -789,15 +850,17 @@ unsafe extern "C" fn browse_cb(
     } else {
         let generation = {
             let _resolution_fence = inner.resolution_fence.lock();
-            inner.resolving.cancel(&name);
-            let generation = inner.epochs.current(&name);
-            if let Some(generation) = generation {
-                inner.epochs.remove_if_current(&name, generation);
-            }
-            generation
+            retire_removed_generation(&inner.resolving, &inner.epochs, &name)
         };
         if let Some(generation) = generation {
-            publish_removed(queue_slot, generation, name);
+            // Cancel the exact owner before trying to publish the withdrawal.
+            // A full consumer queue must not keep a resolved worker current;
+            // the worker will observe this stale generation and dispose its
+            // retained event and lease.  The withdrawal itself is best effort
+            // at this bounded callback boundary, just as before.
+            if let Ok(queue_slot) = inner.tx.try_reserve() {
+                publish_removed(queue_slot, generation, name);
+            }
         }
     }
 }
@@ -807,6 +870,48 @@ unsafe extern "C" fn browse_cb(
 /// system backend's capacity-one path.
 fn publish_removed(queue_slot: mpsc::Permit<'_, DiscoveryEvent>, generation: u64, key: String) {
     let _ = queue_slot.send(DiscoveryEvent::Removed { generation, key });
+}
+
+/// Retire an exact backend key before attempting to enqueue its withdrawal.
+/// This ordering lets a full event stream stale a resolver immediately while
+/// leaving the already-admitted withdrawal to the bounded queue boundary.
+fn retire_removed_generation(
+    resolving: &ResolveOwnership,
+    epochs: &EventEpochs,
+    key: &str,
+) -> Option<u64> {
+    resolving.cancel(key);
+    let generation = epochs.current(key);
+    if let Some(generation) = generation {
+        epochs.remove_if_current(key, generation);
+    }
+    generation
+}
+
+/// The result of trying to hand one resolved event to the bounded discovery
+/// stream.  On a full stream the event is returned intact so the resolver can
+/// keep it beside its exact [`ResolveLease`]; it is never silently dropped.
+#[derive(Debug)]
+enum ResolvedHandoff {
+    Full(DiscoveryEvent),
+    Closed(DiscoveryEvent),
+}
+
+/// Try one nonblocking resolved-event handoff.  The caller owns the returned
+/// event on both refusal paths and therefore also owns the decision to retry,
+/// cancel a stale generation, or release it after the stream is closed.
+fn try_publish_resolved(
+    sender: &mpsc::Sender<DiscoveryEvent>,
+    event: DiscoveryEvent,
+) -> std::result::Result<(), ResolvedHandoff> {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            permit.send(event);
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Full(())) => Err(ResolvedHandoff::Full(event)),
+        Err(mpsc::error::TrySendError::Closed(())) => Err(ResolvedHandoff::Closed(event)),
+    }
 }
 
 /// Borrow a NUL-terminated C string only after proving its bound. This keeps
@@ -938,25 +1043,77 @@ fn run_resolve(
             interface_index,
             inner.query_deadline,
         );
-        let completion = {
-            let _resolution_fence = inner.resolution_fence.lock();
-            lease.complete_with(|| {
-                if inner.epochs.current(&name) == Some(event_generation) {
-                    if let Some((addrs, port, txt)) = result {
-                        let _ = inner.tx.try_send(DiscoveryEvent::Resolved {
-                            generation: event_generation,
-                            key: name.clone(),
-                            addrs,
-                            port,
-                            txt,
-                        });
+
+        // Keep one exact resolved value beside its active generation until it
+        // is delivered.  A full stream is not a terminal outcome: dropping
+        // the value and completing the lease here would leave the epoch live
+        // while the engine never learns the resolution.  The ownership table
+        // still permits only one coalesced follow-up hint for this key.
+        let mut pending = result.map(|(addrs, port, txt)| DiscoveryEvent::Resolved {
+            generation: event_generation,
+            key: name.clone(),
+            addrs,
+            port,
+            txt,
+        });
+        loop {
+            if inner.stopped.load(Ordering::Acquire)
+                || inner.epochs.current(&name) != Some(event_generation)
+            {
+                let _ = lease.cancel();
+                inner.epochs.remove_if_current(&name, event_generation);
+                return;
+            }
+
+            let handoff = {
+                let _resolution_fence = inner.resolution_fence.lock();
+                if inner.stopped.load(Ordering::Acquire)
+                    || inner.epochs.current(&name) != Some(event_generation)
+                {
+                    None
+                } else if let Some(event) = pending.take() {
+                    match try_publish_resolved(&inner.tx, event) {
+                        Ok(()) => Some(Ok(lease.complete())),
+                        Err(ResolvedHandoff::Full(event)) => {
+                            pending = Some(event);
+                            Some(Err(false))
+                        }
+                        Err(ResolvedHandoff::Closed(event)) => {
+                            pending = Some(event);
+                            Some(Err(true))
+                        }
                     }
+                } else {
+                    Some(Ok(lease.complete()))
                 }
-            })
-        };
-        match completion {
-            ResolveCompletion::Finished => return,
-            ResolveCompletion::Followup(next) => lease = next,
+            };
+
+            let Some(handoff) = handoff else {
+                let _ = lease.cancel();
+                inner.epochs.remove_if_current(&name, event_generation);
+                return;
+            };
+            match handoff {
+                Ok(ResolveCompletion::Finished) => return,
+                Ok(ResolveCompletion::Followup(next)) => {
+                    lease = next;
+                    break;
+                }
+                Err(closed) if closed => {
+                    // A closed stream cannot recover; retain the exact event
+                    // only long enough to dispose it with its exact lease.
+                    pending.take();
+                    let _ = lease.cancel();
+                    inner.epochs.remove_if_current(&name, event_generation);
+                    return;
+                }
+                Err(false) => {
+                    // The existing backend poll cadence bounds shutdown
+                    // observation while avoiding a second timer or a busy
+                    // retry loop on a full consumer queue.
+                    std::thread::sleep(Duration::from_millis(DNS_SD_POLL_TIMEOUT_MS as u64));
+                }
+            }
         }
     }
 }
@@ -1244,24 +1401,148 @@ mod tests {
         assert!(tx.try_reserve().is_ok(), "slot is reusable after delivery");
     }
 
+    fn resolved_for_handoff_test(generation: u64, key: &str) -> DiscoveryEvent {
+        DiscoveryEvent::Resolved {
+            generation,
+            key: key.to_string(),
+            addrs: vec!["192.0.2.1".parse().expect("test address")],
+            port: 42_424,
+            txt: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn resolved_handoff_capacity_one_preserves_b_after_a_and_closed_cleanup() {
+        let (tx, mut rx) = mpsc::channel(1);
+        try_publish_resolved(&tx, resolved_for_handoff_test(1, "service-a"))
+            .expect("first resolved event should occupy the one slot");
+
+        let event_b = resolved_for_handoff_test(2, "service-b");
+        let event_b = match try_publish_resolved(&tx, event_b) {
+            Err(ResolvedHandoff::Full(event)) => event,
+            other => panic!("second event must remain owned while A is queued: {other:?}"),
+        };
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Resolved { generation: 1, key, .. }) if key == "service-a"
+        ));
+
+        try_publish_resolved(&tx, event_b).expect("B must be deliverable after A is consumed");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Resolved { generation: 2, key, .. }) if key == "service-b"
+        ));
+        assert!(
+            tx.try_reserve().is_ok(),
+            "delivery must release capacity exactly"
+        );
+
+        drop(rx);
+        let closed = resolved_for_handoff_test(3, "service-closed");
+        match try_publish_resolved(&tx, closed) {
+            Err(ResolvedHandoff::Closed(DiscoveryEvent::Resolved {
+                generation: 3, key, ..
+            })) => assert_eq!(key, "service-closed"),
+            other => panic!("closed stream must return the exact event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_event_stream_stales_removed_generation_before_withdrawal_delivery() {
+        let resolving = ResolveOwnership::with_max_owners(1);
+        let lease = match resolving.admit("service-stale") {
+            ResolveHint::Started(lease) => lease,
+            other => panic!("exact resolve owner must start: {other:?}"),
+        };
+        let epochs = EventEpochs::new();
+        let generation = epochs.admit("service-stale").expect("event epoch");
+        let (tx, mut rx) = mpsc::channel(1);
+        try_publish_resolved(&tx, resolved_for_handoff_test(9, "service-a"))
+            .expect("A fills the capacity-one stream");
+
+        assert_eq!(
+            retire_removed_generation(&resolving, &epochs, "service-stale"),
+            Some(generation)
+        );
+        assert_eq!(resolving.active_count(), 0);
+        assert_eq!(epochs.current("service-stale"), None);
+
+        let stale = resolved_for_handoff_test(generation, "service-stale");
+        assert!(matches!(
+            try_publish_resolved(&tx, stale),
+            Err(ResolvedHandoff::Full(DiscoveryEvent::Resolved { key, .. }))
+                if key == "service-stale"
+        ));
+        drop(lease);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Resolved { generation: 9, key, .. }) if key == "service-a"
+        ));
+        assert!(
+            tx.try_reserve().is_ok(),
+            "stale disposal must not leak a slot"
+        );
+    }
+
     #[test]
     fn worker_registry_consumes_normal_panic_cancel_and_shutdown_is_empty() {
-        let workers = WorkerRegistry::new();
-        workers.push(std::thread::spawn(|| {}));
-        workers.push(std::thread::spawn(|| panic!("injected worker failure")));
+        let workers = WorkerRegistry::with_capacity(3);
+        workers
+            .push(std::thread::spawn(|| {}))
+            .expect("first worker has a reserved slot");
+        workers
+            .push(std::thread::spawn(|| panic!("injected worker failure")))
+            .expect("second worker has a reserved slot");
 
         let canceled = Arc::new(AtomicBool::new(false));
         let canceled_worker = Arc::clone(&canceled);
-        workers.push(std::thread::spawn(move || {
-            while !canceled_worker.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-        }));
+        workers
+            .push(std::thread::spawn(move || {
+                while !canceled_worker.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }))
+            .expect("third worker has a reserved slot");
         canceled.store(true, Ordering::Release);
 
         workers.join_all();
         assert_eq!(workers.len(), 0);
         workers.reap_finished();
+        assert_eq!(workers.len(), 0);
+    }
+
+    #[test]
+    fn worker_registry_refuses_true_live_full_without_dropping_the_unowned_handle() {
+        let workers = WorkerRegistry::with_capacity(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        workers
+            .push(std::thread::spawn(move || {
+                release_rx.recv().expect("test releases live worker");
+            }))
+            .expect("the sole worker slot is available");
+        let refused = workers
+            .push(std::thread::spawn(|| {}))
+            .expect_err("a true-live-full registry must refuse before custody is exceeded");
+        observe_worker(refused);
+        release_tx.send(()).expect("live worker is still retained");
+        workers.join_all();
+        assert_eq!(workers.len(), 0);
+    }
+
+    #[test]
+    fn worker_registry_reaps_stale_terminal_full_before_admitting_successor() {
+        let workers = WorkerRegistry::with_capacity(1);
+        workers
+            .push(std::thread::spawn(|| {}))
+            .expect("the sole worker slot is available");
+        while !workers.workers.lock()[0].is_finished() {
+            std::thread::yield_now();
+        }
+
+        workers
+            .push(std::thread::spawn(|| {}))
+            .expect("a stale terminal slot is reclaimed before successor admission");
+        workers.join_all();
         assert_eq!(workers.len(), 0);
     }
 
@@ -1299,7 +1580,7 @@ mod tests {
             instance: "mom-selftest-browser".into(),
             ..cfg.clone()
         };
-        let (_browser, mut events) = Discovery::start(&browser_cfg).expect("browser start");
+        let (browser, mut events) = Discovery::start(&browser_cfg).expect("browser start");
 
         let (advertiser, _adv_events) = Discovery::start(&cfg).expect("advertiser start");
         assert!(advertiser.register(), "register should be accepted");
@@ -1325,5 +1606,6 @@ mod tests {
         }
 
         advertiser.shutdown();
+        browser.shutdown();
     }
 }

@@ -86,7 +86,7 @@ fn author_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Res
 async fn commit_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<FactId> {
     let fact = author_open_self_participation(state, joined)?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state);
+    apply_canonical_projection_checked(state)?;
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
     Ok(fact.id)
@@ -244,7 +244,14 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
     result
 }
 
-pub(super) fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
+pub(crate) fn apply_canonical_projection_checked(state: &Arc<EngineState>) -> Result<bool> {
+    apply_canonical_projection_with(state, crate::roster::save)
+}
+
+fn apply_canonical_projection_with<F>(state: &Arc<EngineState>, save: F) -> Result<bool>
+where
+    F: FnOnce(&crate::roster::Roster) -> Result<()>,
+{
     let projection = canonical_projection_snapshot(state);
     let CanonicalProjection {
         roles,
@@ -254,27 +261,29 @@ pub(super) fn apply_canonical_projection(state: &Arc<EngineState>) -> bool {
     } = projection;
     let roster_changed = {
         let mut roster = state.roster.write();
+        let mut candidate = roster.clone();
         let mut changed = false;
         for (pubkey, role) in &roles {
-            if !crate::roster::is_authorized(&roster, pubkey) {
-                crate::roster::add_peer_in(&mut roster, pubkey, "");
+            if !crate::roster::is_authorized(&candidate, pubkey) {
+                crate::roster::add_peer_in(&mut candidate, pubkey, "");
                 changed = true;
             }
-            if crate::roster::set_role_in(&mut roster, pubkey, *role) {
+            if crate::roster::set_role_in(&mut candidate, pubkey, *role) {
                 changed = true;
             }
         }
-        let before = roster.authorized_devices.len();
-        roster.authorized_devices.retain(|entry| {
+        let before = candidate.authorized_devices.len();
+        candidate.authorized_devices.retain(|entry| {
             roles.contains_key(&entry.device_id)
                 && !evicted.contains(&entry.device_id)
                 && !stood_down.contains(&entry.device_id)
         });
-        changed |= before != roster.authorized_devices.len();
+        changed |= before != candidate.authorized_devices.len();
         if changed {
-            let _ = crate::roster::save(&roster);
+            save(&candidate)?;
+            *roster = candidate;
         }
-        changed
+        Ok(changed)
     };
     roster_changed
 }
@@ -466,7 +475,7 @@ pub(super) async fn on_fact_inventory(
     if !missing.is_empty() {
         let request = FactRequest::new(state.mesh_context_id(), missing);
         let mut pages = request.pages();
-        while let Some(fact_ids) = pages.next() {
+        for fact_ids in pages.by_ref() {
             let page = FactRequest::new(request.context_id(), fact_ids);
             let result =
                 super::send_logical_reply(state, route, &MeshMessage::FactRequest(page)).await;
@@ -769,7 +778,7 @@ async fn commit_proposal(
     crate::custody::require(&state.network_id, mfa_code)?;
     let fact = signed_fact(state, body, Vec::new())?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state);
+    apply_canonical_projection_checked(state)?;
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
     if let FactBody::RoleGrant { target, role } = &fact.content.body {
@@ -853,7 +862,7 @@ pub async fn propose_membership_admit(
         Vec::new(),
     )?;
     admit_authored_fact(state, &fact)?;
-    let _ = apply_canonical_projection(state);
+    apply_canonical_projection_checked(state)?;
     broadcast_fact_inventory(state).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
     Ok(fact.id)
@@ -890,7 +899,14 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    apply_canonical_projection(state);
+    if let Err(error) = apply_canonical_projection_checked(state) {
+        diag(
+            state,
+            crate::events::DiagLevel::Warn,
+            format!("rejecting semantic fact projection: {error}"),
+        );
+        return;
+    }
     // Fact admission is the explicit lifecycle boundary for terminal recovery.
     // Refresh the local stand-down cache, then reconcile only the subject whose
     // canonical cell may have changed. Recovery never waits for a ticker to
@@ -1201,6 +1217,30 @@ mod governance_projection_controls {
             }),
             "an offline proof bundle must carry every causal dependency"
         );
+    }
+
+    #[test]
+    fn projection_persistence_failure_is_returned_before_roster_commit() {
+        let state = crate::engine::build_test_closed_state("projection-save-failure", [0x2a; 32]);
+        state.roster.write().authorized_devices.clear();
+
+        let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted_by_save = Arc::clone(&attempted);
+        let error = apply_canonical_projection_with(&state, move |_| {
+            attempted_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Roster(
+                "injected projection persistence failure".into(),
+            ))
+        })
+        .expect_err("projection persistence failure must reach the caller");
+        assert!(attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(error, Error::Roster(_)));
+        assert!(state.roster.read().authorized_devices.is_empty());
+
+        let changed = apply_canonical_projection_with(&state, |_| Ok(()))
+            .expect("a successful persistence boundary must commit the projection");
+        assert!(changed);
+        assert!(!state.roster.read().authorized_devices.is_empty());
     }
 
     #[test]
