@@ -27,9 +27,9 @@
 //!   single-consumer) and the two attaches share one
 //!   [`SignalingRuntime`], which is what lets it see that the two
 //!   copies coming back are one emission.
-//! - [`attach_local`] - an in-process
-//!   [`myownmesh_signaling::local::LocalBroker`] (tests and
-//!   single-process apps).
+//! - `attach_local` - an in-process
+//!   [`myownmesh_signaling::local::LocalBroker`] available to explicit
+//!   `transport-lab` builds.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -41,6 +41,7 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(test)]
 use std::sync::{Mutex as StdMutex, OnceLock};
 
+#[cfg(any(test, feature = "transport-lab"))]
 use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::discovery::{DiscoveryBackend, MdnsTimingProfile};
 use myownmesh_signaling::mdns::driver::{
@@ -1388,6 +1389,7 @@ impl AliasProvider for CoreMdnsAliasProvider {
 /// The scope is what bounds every record the runtime retains, so a runtime that
 /// cannot get one is not built at all rather than built with an invented
 /// capacity: there is no unfunded mode to fall back to.
+#[cfg(feature = "transport-lab")]
 fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<SignalingRuntime>> {
     let runtime = SignalingRuntime::new(
         state.signaling_inbound_tx.clone(),
@@ -1404,6 +1406,7 @@ fn signaling_runtime(state: &Arc<NetworkState>, driver: &str) -> Option<Arc<Sign
 /// Spawns two pump tasks (outbound engine → broker, inbound
 /// broker → engine) that live until either side closes its
 /// queue. Returns once both pumps are spawned.
+#[cfg(feature = "transport-lab")]
 pub fn attach_local(state: &Arc<NetworkState>, broker: &LocalBroker) {
     let room = myownmesh_signaling::nostr::handle::derive_room_handle(
         &resolve_app_id(),
@@ -1598,6 +1601,7 @@ enum CarrierReport {
     },
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
 impl From<LocalInbound> for CarrierReport {
     fn from(inbound: LocalInbound) -> Self {
         match inbound {

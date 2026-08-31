@@ -7062,7 +7062,11 @@ impl Transport {
         .await;
 
         match result {
-            Ok((mut session, events)) => {
+            Ok((session, events)) => {
+                #[cfg(any(test, feature = "transport-lab"))]
+                let mut session = session;
+                #[cfg(not(any(test, feature = "transport-lab")))]
+                let session = session;
                 let owner = construction.take_owner().ok_or_else(|| {
                     Error::Transport(
                         "native construction owner was lost before handoff".to_string(),

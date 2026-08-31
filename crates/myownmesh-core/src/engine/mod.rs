@@ -44,8 +44,10 @@ pub mod tick;
 pub mod traffic;
 pub mod wake;
 
+#[cfg(feature = "transport-lab")]
+pub use signaling_bridge::attach_local;
+pub use signaling_bridge::attach_signaling;
 pub use signaling_bridge::SignalingDrivers;
-pub use signaling_bridge::{attach_local, attach_signaling};
 // The ingress boundary is the Signaling Node's, and none of it is public — not
 // the admitted value, not the thing that makes one. `EphemeralIngress` appears
 // in `NetworkState`'s inbound sender and in `run_driver`'s receiver, and both of
@@ -109,7 +111,9 @@ pub(crate) use lifecycle::{
     create_network_in_mesh_scope, import_network_in_mesh_scope, ingest_semantic_fact,
     join_open_participation, spawn_network_in_mesh_scope,
 };
-pub(crate) use state::{NetworkCmd, NetworkState};
+#[cfg(any(test, feature = "transport-lab"))]
+pub(crate) use state::NetworkCmd;
+pub(crate) use state::NetworkState;
 #[cfg(test)]
 pub(crate) use supervisor::handle_command;
 pub(crate) use supervisor::run_driver;

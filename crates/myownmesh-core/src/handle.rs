@@ -519,6 +519,7 @@ impl JoinedNetwork {
     /// both endpoints in one process. It traverses the same bounded ingress,
     /// authentication, and promotion path as the configured carriers; the
     /// broker is only the transport between those production boundaries.
+    #[cfg(feature = "transport-lab")]
     pub fn attach_local(&self, broker: &myownmesh_signaling::local::LocalBroker) {
         crate::engine::attach_local(&self.state, broker);
     }

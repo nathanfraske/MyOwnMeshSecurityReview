@@ -255,6 +255,7 @@ pub(super) fn submit_task_batch(
     let _ = custodian.close_and_join();
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
 fn submit_task_batch_fallback(
     custodian: &LateTransportCustodian,
     tasks: Vec<tokio::task::JoinHandle<()>>,
