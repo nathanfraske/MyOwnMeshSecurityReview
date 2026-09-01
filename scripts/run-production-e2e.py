@@ -80,7 +80,7 @@ def read_json_line(reader: BinaryIO, limit: int = 8 * 1024 * 1024) -> Any:
     return json.loads(line.decode("utf-8"))
 
 
-def open_event_subscription(control_socket: Path) -> tuple[socket.socket, BinaryIO, int, str]:
+def open_event_subscription(control_socket: Path) -> tuple[socket.socket, BinaryIO, str, str]:
     stream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stream.settimeout(5.0)
     stream.connect(str(control_socket))
@@ -94,7 +94,13 @@ def open_event_subscription(control_socket: Path) -> tuple[socket.socket, Binary
     data = ack.get("data") or {}
     client_id = data.get("client_id")
     capability = data.get("client_capability")
-    if not isinstance(client_id, int) or not isinstance(capability, str) or not capability:
+    canonical_client_id = (
+        isinstance(client_id, str)
+        and client_id.startswith("c")
+        and client_id[1:].isdigit()
+        and str(int(client_id[1:])) == client_id[1:]
+    )
+    if not canonical_client_id or not isinstance(capability, str) or not capability:
         reader.close()
         stream.close()
         raise ContractError("events_subscribe did not return its routing id and capability")
