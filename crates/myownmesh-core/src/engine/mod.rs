@@ -7904,7 +7904,7 @@ async fn confirm_active_session_on_announce(state: &Arc<NetworkState>, device_id
     // weak witness; no worker ownership crosses the configured delay.
     let weak_owner = owner.for_worker(probed_worker).downgrade();
     let device_id = device_id.to_string();
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_cancellable_shutdown_task(&shutdown_permit, || {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             let Some(state) = weak_state.upgrade() else {

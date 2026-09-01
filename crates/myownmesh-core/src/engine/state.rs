@@ -116,8 +116,13 @@ struct PeerEventPumpRegistry {
 /// admission check and its handle registration; once shutdown has drained
 /// those witnesses, `closed` makes the registry a permanent refusal point.
 struct ShutdownTaskRegistry {
-    handles: Vec<JoinHandle<()>>,
+    handles: Vec<ShutdownTask>,
     closed: bool,
+}
+
+struct ShutdownTask {
+    handle: JoinHandle<()>,
+    cancel_on_shutdown: bool,
 }
 
 impl ShutdownTaskRegistry {
@@ -128,7 +133,14 @@ impl ShutdownTaskRegistry {
         }
     }
 
-    fn take_for_shutdown(&mut self) -> Vec<JoinHandle<()>> {
+    fn push(&mut self, handle: JoinHandle<()>, cancel_on_shutdown: bool) {
+        self.handles.push(ShutdownTask {
+            handle,
+            cancel_on_shutdown,
+        });
+    }
+
+    fn take_for_shutdown(&mut self) -> Vec<ShutdownTask> {
         self.closed = true;
         std::mem::take(&mut self.handles)
     }
@@ -795,7 +807,7 @@ pub struct NetworkState {
     /// the state models an unread queue without turning it into a dead queue.
     #[cfg(test)]
     parked_command_receiver: Mutex<Option<ResourceMailboxReceiver<NetworkCmd>>>,
-    shutdown_requested: std::sync::atomic::AtomicBool,
+    shutdown_requested: AtomicBool,
     /// Counts mutation witnesses which may still be registering a task.  The
     /// shutdown path waits for this count before closing `shutdown_tasks`, so
     /// an admitted producer cannot lose its JoinHandle at the handoff.
@@ -806,7 +818,7 @@ pub struct NetworkState {
     /// owner. This is stronger than `shutdown_requested`: callers must not
     /// purge while teardown is still draining live state.
     shutdown_complete: std::sync::atomic::AtomicBool,
-    shutdown_ready: tokio::sync::Notify,
+    shutdown_ready: Notify,
 
     /// Offerer-side reconnect intents (see [`ReconnectIntent`]). Keyed by
     /// device id; an entry lives from the moment we drop a peer we owe an
@@ -1415,12 +1427,12 @@ impl NetworkState {
             local_signaling_forwarders: Mutex::new(Some(Vec::new())),
             #[cfg(test)]
             parked_command_receiver: Mutex::new(None),
-            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_requested: AtomicBool::new(false),
             shutdown_mutations: Mutex::new(0),
             shutdown_mutations_ready: Notify::new(),
             shutdown_tasks: Mutex::new(Some(ShutdownTaskRegistry::new())),
             shutdown_complete: std::sync::atomic::AtomicBool::new(false),
-            shutdown_ready: tokio::sync::Notify::new(),
+            shutdown_ready: Notify::new(),
             reconnect_intents: Mutex::new(std::collections::HashMap::new()),
             recovery_cohort: Mutex::new(RecoveryCohort::new()),
             carrier_state: CarrierState::default(),
@@ -1731,10 +1743,7 @@ impl NetworkState {
         if packet.is_none() {
             checkout.control().request_close();
         }
-        if self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.shutdown_requested.load(Ordering::Acquire) {
             checkout.control().request_close();
         }
         packet.map(|packet| {
@@ -1922,9 +1931,7 @@ impl NetworkState {
             };
             tasks.extend(pending);
             if self.closed_relay_pending_epoch(session_id) != Some(allocation_epoch)
-                || self
-                    .shutdown_requested
-                    .load(std::sync::atomic::Ordering::Acquire)
+                || self.shutdown_requested.load(Ordering::Acquire)
             {
                 expiry.cancel();
                 Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)
@@ -2252,10 +2259,7 @@ impl NetworkState {
         crate::runtime::relay::ClosedRelayRefusal,
     > {
         loop {
-            if self
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.shutdown_requested.load(Ordering::Acquire) {
                 return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
             }
             let wake = {
@@ -2271,10 +2275,7 @@ impl NetworkState {
             let notified = wake.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.shutdown_requested.load(Ordering::Acquire) {
                 return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
             }
             tokio::select! {
@@ -2681,10 +2682,7 @@ impl NetworkState {
     }
 
     fn ensure_durable_owner_mutation_allowed(&self) -> Result<()> {
-        if self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(Error::Network(
                 "durable semantic owner is fenced by shutdown".to_string(),
             ));
@@ -3995,8 +3993,7 @@ impl NetworkState {
     }
 
     pub fn request_shutdown(&self) {
-        self.shutdown_requested
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.shutdown_requested.store(true, Ordering::SeqCst);
         self.shutdown_ready.notify_waiters();
         self.cmd_tx.close();
         self.speculative_promotion_tx.close();
@@ -4022,10 +4019,7 @@ impl NetworkState {
     /// mutex, so no lock is held across async cleanup.
     pub(crate) fn try_admit_shutdown_mutation(&self) -> Option<ShutdownMutationPermit<'_>> {
         let mut admitted = self.shutdown_mutations.lock();
-        if self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if self.shutdown_requested.load(Ordering::SeqCst) {
             None
         } else {
             *admitted = admitted
@@ -4040,7 +4034,27 @@ impl NetworkState {
     /// synchronous registration has completed.
     pub(crate) fn register_shutdown_task(
         &self,
+        permit: &ShutdownMutationPermit<'_>,
+        start: impl FnOnce() -> JoinHandle<()>,
+    ) -> bool {
+        self.register_shutdown_task_with_policy(permit, false, start)
+    }
+
+    /// Register a delayed/probe task whose remaining work has no meaning once
+    /// shutdown begins. Shutdown aborts these exact handles first and still
+    /// awaits each terminal result; no task is detached or silently dropped.
+    pub(crate) fn register_cancellable_shutdown_task(
+        &self,
+        permit: &ShutdownMutationPermit<'_>,
+        start: impl FnOnce() -> JoinHandle<()>,
+    ) -> bool {
+        self.register_shutdown_task_with_policy(permit, true, start)
+    }
+
+    fn register_shutdown_task_with_policy(
+        &self,
         _permit: &ShutdownMutationPermit<'_>,
+        cancel_on_shutdown: bool,
         start: impl FnOnce() -> JoinHandle<()>,
     ) -> bool {
         let mut tasks = self.shutdown_tasks.lock();
@@ -4050,7 +4064,7 @@ impl NetworkState {
         if tasks.closed {
             return false;
         }
-        tasks.handles.push(start());
+        tasks.push(start(), cancel_on_shutdown);
         true
     }
 
@@ -4062,8 +4076,16 @@ impl NetworkState {
             };
             tasks.take_for_shutdown()
         };
-        for handle in handles {
-            if let Err(error) = handle.await {
+        for task in &handles {
+            if task.cancel_on_shutdown {
+                task.handle.abort();
+            }
+        }
+        for task in handles {
+            if let Err(error) = task.handle.await {
+                if task.cancel_on_shutdown && error.is_cancelled() {
+                    continue;
+                }
                 tracing::warn!(%error, "engine shutdown task failed");
             }
         }
@@ -4079,10 +4101,7 @@ impl NetworkState {
         start: impl FnOnce() -> (R, JoinHandle<()>),
     ) -> Option<R> {
         let mut forwarders = self.local_signaling_forwarders.lock();
-        if self
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if self.shutdown_requested.load(Ordering::Acquire) {
             return None;
         }
         let handles = forwarders.as_mut()?;
@@ -4104,10 +4123,7 @@ impl NetworkState {
             let notified = self.shutdown_ready.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
+            if self.shutdown_requested.load(Ordering::Acquire) {
                 return;
             }
             notified.await;
@@ -6004,19 +6020,23 @@ mod shutdown_task_registry_tests {
         let finished = Arc::new(Mutex::new(Vec::new()));
         let mut registry = ShutdownTaskRegistry::new();
         let first = Arc::clone(&finished);
-        registry.handles.push(tokio::spawn(async move {
-            first.lock().expect("test witness lock").push("completed");
-        }));
-        registry
-            .handles
-            .push(tokio::spawn(async { panic!("test panic is observed") }));
+        registry.push(
+            tokio::spawn(async move {
+                first.lock().expect("test witness lock").push("completed");
+            }),
+            false,
+        );
+        registry.push(
+            tokio::spawn(async { panic!("test panic is observed") }),
+            false,
+        );
 
         let handles = registry.take_for_shutdown();
         assert!(registry.closed);
         assert!(registry.handles.is_empty());
         let mut outcomes = Vec::new();
-        for handle in handles {
-            outcomes.push(handle.await);
+        for task in handles {
+            outcomes.push(task.handle.await);
         }
         assert!(outcomes[0].is_ok());
         assert!(outcomes[1]
@@ -6024,6 +6044,33 @@ mod shutdown_task_registry_tests {
             .expect_err("panic must be observed")
             .is_panic());
         assert_eq!(*finished.lock().expect("test witness lock"), ["completed"]);
+    }
+
+    #[tokio::test]
+    async fn v4_shutdown_task_registry_cancels_and_observes_delayed_terminal() {
+        let mut registry = ShutdownTaskRegistry::new();
+        registry.push(
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+            true,
+        );
+
+        let tasks = registry.take_for_shutdown();
+        assert_eq!(tasks.len(), 1);
+        for task in &tasks {
+            if task.cancel_on_shutdown {
+                task.handle.abort();
+            }
+        }
+        let error = tasks
+            .into_iter()
+            .next()
+            .expect("one delayed task")
+            .handle
+            .await
+            .expect_err("shutdown cancellation is observed");
+        assert!(error.is_cancelled());
     }
 }
 

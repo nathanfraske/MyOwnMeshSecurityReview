@@ -230,12 +230,11 @@ fn schedule_hello_retries(
         return;
     };
     let weak_state = Arc::downgrade(state);
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_cancellable_shutdown_task(&shutdown_permit, || {
         tokio::spawn(async move {
-            let state = weak_state;
             for &delay_ms in &scheduler_policy.handshake_hello_retry_schedule_ms {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                let Some(state) = state.upgrade() else {
+                let Some(state) = weak_state.upgrade() else {
                     return;
                 };
                 let Some(owner) = owner.upgrade() else {
@@ -283,14 +282,13 @@ fn schedule_watchdog(
         return;
     };
     let weak_state = Arc::downgrade(state);
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_cancellable_shutdown_task(&shutdown_permit, || {
         tokio::spawn(async move {
-            let state = weak_state;
             tokio::time::sleep(std::time::Duration::from_millis(
                 scheduler_policy.handshake_timeout_ms,
             ))
             .await;
-            let Some(state) = state.upgrade() else {
+            let Some(state) = weak_state.upgrade() else {
                 return;
             };
             let Some(owner) = owner.upgrade() else {

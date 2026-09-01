@@ -164,7 +164,7 @@ pub async fn on_wake(state: &Arc<NetworkState>) {
             Some(owner.for_worker(worker).downgrade())
         })
         .collect();
-    state.register_shutdown_task(&shutdown_permit, || {
+    state.register_cancellable_shutdown_task(&shutdown_permit, || {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(policy.wake_probe_delay_ms)).await;
             let Some(state) = weak_state.upgrade() else {

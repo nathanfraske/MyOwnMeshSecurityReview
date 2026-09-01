@@ -132,6 +132,7 @@ def active_peer(control_socket: Path, network: str) -> dict[str, Any] | None:
 
 
 def terminate_process(process: subprocess.Popen[bytes], grace: float = 10.0) -> dict[str, Any]:
+    forced = False
     if process.poll() is None:
         try:
             os.killpg(process.pid, signal.SIGINT)
@@ -140,12 +141,13 @@ def terminate_process(process: subprocess.Popen[bytes], grace: float = 10.0) -> 
         try:
             process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
+            forced = True
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             process.wait(timeout=5.0)
-    return {"pid": process.pid, "returncode": process.returncode}
+    return {"pid": process.pid, "returncode": process.returncode, "forced": forced}
 
 
 def daemon_config(network: str) -> dict[str, Any]:
@@ -236,6 +238,7 @@ def main() -> int:
     event_stream: socket.socket | None = None
     event_reader: BinaryIO | None = None
     terminal_error: str | None = None
+    cleanup_error: str | None = None
 
     try:
         for name in ("a", "b"):
@@ -351,16 +354,29 @@ def main() -> int:
             event_reader.close()
         if event_stream is not None:
             event_stream.close()
-        manifest["process_terminals"] = {
+        process_terminals = {
             name: terminate_process(process) for name, process in reversed(tuple(processes.items()))
         }
+        manifest["process_terminals"] = process_terminals
+        bad_terminals = {
+            name: terminal
+            for name, terminal in process_terminals.items()
+            if terminal["forced"] or terminal["returncode"] != 0
+        }
+        if bad_terminals:
+            cleanup_error = f"daemons did not terminate gracefully: {bad_terminals!r}"
+            if terminal_error is None:
+                terminal_error = f"ContractError: {cleanup_error}"
         for stdout, stderr in logs.values():
             stdout.close()
             stderr.close()
         manifest["finished_at"] = utc_now()
         manifest["terminal_error"] = terminal_error
+        manifest["cleanup_error"] = cleanup_error
         write_json(artifact_dir / "manifest.json", manifest)
 
+    if cleanup_error is not None:
+        raise ContractError(cleanup_error)
     print(f"production E2E contract completed; artifacts: {artifact_dir}")
     return 0
 
