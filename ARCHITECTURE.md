@@ -29,8 +29,10 @@ left-to-right path is:
 concrete instance of that path with two shipped daemon processes: production
 mDNS discovery, direct WebRTC construction, fresh endpoint authentication,
 bilateral automatic promotion on an Open network, and acknowledged typed-channel
-delivery. It requires an existing binary and an owner-selected finite resource
-grant; it neither builds the product nor substitutes `LocalBroker`. Its output is
+delivery, followed by owned graceful shutdown of both daemon processes. It
+requires an existing binary and an owner-selected finite resource grant; it
+neither builds the product nor substitutes `LocalBroker`. A forced child-process
+termination or nonzero daemon exit fails the executable contract. Its output is
 raw characterization material, not a release-evidence assertion.
 
 The architecture has five cooperating mechanisms:

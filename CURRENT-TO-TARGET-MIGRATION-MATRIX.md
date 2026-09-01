@@ -95,7 +95,7 @@ profiles retain their own qualification matrices.
 | 4. Authenticate and promote | `endpoint_auth/{task,transcript}.rs`, `engine/handshake.rs`, `runtime/session_broker/mod.rs` | fresh channel-bound Device proof followed by bilateral Open auto-approval and exact current-session promotion | both snapshots report the opposite Device as authenticated and `active` |
 | 5. Bind the local consumer | `control.rs`, `ipc/clients.rs`, `control/dispatch/channel.rs` | an `EventsSubscribe` capability owns B's exact channel subscription | subscription acknowledgement is consumed in memory; its bearer capability is not persisted |
 | 6. Deliver application data | `application_gateway/channels.rs`, `ipc/bridge.rs` | A uses `ChannelSendReliable`; B receives the exact `ChannelInbound` frame through its promoted session | redacted request response, B event JSONL, and exact token match |
-| 7. Settle owners | daemon shutdown plus connector/session/control owners | event socket closes; both child process groups receive bounded graceful shutdown and a child-only kill backstop | process terminal codes and timestamps in the neutral run manifest |
+| 7. Settle owners | daemon shutdown plus connector/session/control owners | event socket closes; both daemon process groups receive bounded graceful shutdown and every registered connector/session/control owner reaches its join boundary | both processes report `forced: false` and `returncode: 0` in the neutral run manifest; the child-only kill backstop is cleanup-only and fails the contract if used |
 
 A zero harness exit states only that this executable contract reached its
 declared terminal. It is not, by itself, a platform, performance, packaging, or
