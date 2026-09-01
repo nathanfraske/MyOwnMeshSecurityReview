@@ -5602,16 +5602,13 @@ impl NetworkState {
     /// Tear down every active peer session. Called from the
     /// driver's shutdown path.
     pub(crate) async fn shutdown(self: &Arc<Self>) {
-        tracing::info!(network = %self.network_id, stage = "begin", "engine shutdown stage");
         // Drain public endpoint abandonments while peer owners and the relay
         // carrier are still available for exact Close delivery/settlement.
         self.cancel_all_closed_relay_endpoints();
         self.cancel_all_unpulled_closed_relay();
         self.drain_closed_relay_abandonments().await;
-        tracing::info!(network = %self.network_id, stage = "relay_abandonments_drained", "engine shutdown stage");
         self.request_shutdown();
         self.await_shutdown_mutations().await;
-        tracing::info!(network = %self.network_id, stage = "mutations_drained", "engine shutdown stage");
         self.settle_stale_closed_relay_owners();
         self.cancel_all_closed_relay_pending();
         let expiry_tasks = {
@@ -5626,7 +5623,6 @@ impl NetworkState {
                 tracing::warn!(%error, "closed relay pending expiry task failed during shutdown");
             }
         }
-        tracing::info!(network = %self.network_id, stage = "relay_expiries_drained", "engine shutdown stage");
         if let Some(registry) = self.closed_relay_allocations.lock().as_mut() {
             registry.request_close_all();
         }
@@ -5640,7 +5636,6 @@ impl NetworkState {
         self.closed_relay_target_accepts.lock().take();
         self.closed_relay_abandonments.lock().take();
         self.cancel_all_recovery_demands();
-        tracing::info!(network = %self.network_id, stage = "relay_and_recovery_closed", "engine shutdown stage");
         // Keep the published runtime alive while every retired connector has
         // finished releasing its exact de-duplication custody.  The field is
         // cleared only after this is the last shutdown consumer of it.
@@ -5660,11 +5655,8 @@ impl NetworkState {
                 }
             }
         }
-        tracing::info!(network = %self.network_id, stage = "peers_retired", "engine shutdown stage");
         self.peers.await_replaced_closes().await;
-        tracing::info!(network = %self.network_id, stage = "replaced_peers_closed", "engine shutdown stage");
         self.await_shutdown_tasks().await;
-        tracing::info!(network = %self.network_id, stage = "shutdown_tasks_drained", "engine shutdown stage");
         self.peer_event_pump_shutdown_started
             .store(true, Ordering::Release);
         self.peer_event_pump_shutdown_waiting.notify_waiters();
@@ -5689,7 +5681,6 @@ impl NetworkState {
                 tracing::warn!(%error, "peer event pump failed during shutdown");
             }
         }
-        tracing::info!(network = %self.network_id, stage = "peer_event_pumps_drained", "engine shutdown stage");
         drop(retired);
         drop(runtime);
         self.signaling_runtime.write().take();
@@ -5731,7 +5722,6 @@ impl NetworkState {
                 tracing::warn!(%error, "durable semantic owner release failed during shutdown");
             }
         }
-        tracing::info!(network = %self.network_id, stage = "complete", "engine shutdown stage");
     }
 
     /// Begin registering one production peer-event pump.  Shutdown closes the
