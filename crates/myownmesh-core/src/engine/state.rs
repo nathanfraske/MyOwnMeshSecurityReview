@@ -5463,10 +5463,9 @@ impl NetworkState {
         let graph = self.fact_graph.read();
         let target = crate::semantic::DeviceId::from_canonical_str(device_id)
             .map_err(|error| Error::Network(format!("noncanonical roster projection: {error}")))?;
-        let evaluator = graph.evaluator();
-        let admitted = evaluator.effective_authorized_role(&target).is_some()
-            && evaluator.effective_membership(&target) != Some(false)
-            && !evaluator.is_stood_down(&target);
+        let local = crate::semantic::DeviceId::from_canonical_str(self.identity.public_id())
+            .map_err(|error| Error::Network(format!("noncanonical local identity: {error}")))?;
+        let admitted = graph.admits_policy_session(self.verified_bootstrap(), &local, &target);
         drop(graph);
         if !admitted {
             return Err(Error::Network(
@@ -5498,11 +5497,12 @@ impl NetworkState {
         let Ok(target) = crate::semantic::DeviceId::from_canonical_str(device_id) else {
             return false;
         };
+        let Ok(local) = crate::semantic::DeviceId::from_canonical_str(self.identity.public_id())
+        else {
+            return false;
+        };
         let graph = self.fact_graph.read();
-        let evaluator = graph.evaluator();
-        evaluator.effective_authorized_role(&target).is_some()
-            && evaluator.effective_membership(&target) != Some(false)
-            && !evaluator.is_stood_down(&target)
+        graph.admits_policy_session(self.verified_bootstrap(), &local, &target)
     }
 
     /// Return the compatibility/UI roster filtered by the canonical graph.

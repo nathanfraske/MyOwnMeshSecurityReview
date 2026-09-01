@@ -967,14 +967,6 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
         let label = data.label.clone();
         drop(data);
 
-        // Persist the projection before publishing ACTIVE or emitting the
-        // approval event. A failed save therefore leaves the exact owner
-        // pending and permits a later retry, rather than exposing a state that
-        // a restart would not recover.
-        if let Err(error) = persist(state, device_id, &label) {
-            return Some(Err(error));
-        }
-
         let mut data = peer.state.write();
         if !data.authenticated
             || !data.local_approve_sent
@@ -1002,23 +994,26 @@ async fn maybe_activate_after_check_with_persistence<F, P>(
         }));
         state.resolve_connect_waiters(device_id, None);
         state.clear_reconnect_intent(device_id);
-        Some(Ok(()))
+        Some(label)
     }) else {
         return;
     };
-    let Some(result) = result else {
+    let Some(label) = result else {
         return;
     };
-    if let Err(error) = result {
+
+    // The roster is a compatibility/UI projection, not durable authority.
+    // Canonical policy above is the promotion fence, so the exact live owner
+    // is published first and a failed cache write is diagnostic only.
+    if let Err(error) = persist(state, device_id, &label) {
         state.log_diag(
             crate::events::DiagLevel::Warn,
             "roster",
             format!(
-                "persist {} after mutual approve failed: {error}",
+                "refresh compatibility projection for {} after mutual approve failed: {error}",
                 super::short_peer(device_id)
             ),
         );
-        return;
     }
 
     // Nothing is installed here, and that absence is the design. Real-time work
@@ -2052,7 +2047,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_activation_save_refusal_stays_pending_and_suppresses_approval() {
+    async fn v4_activation_save_refusal_does_not_suppress_canonical_promotion() {
         let remote_identity = crate::identity::Identity::ephemeral();
         let remote_device = remote_identity.public_id().to_string();
         let state =
@@ -2120,11 +2115,19 @@ mod tests {
             .peers
             .get_if_current(&owner)
             .expect("peer remains current");
-        assert_eq!(peer.state.read().status, PeerStatus::PendingApproval);
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        assert_eq!(peer.state.read().status, PeerStatus::Active);
+        let mut approved = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                event,
+                MeshEvent::Peer(PeerEvent::Approved { device_id, .. })
+                    if device_id == remote_device
+            ) {
+                approved = true;
+                break;
+            }
+        }
+        assert!(approved, "canonical promotion must publish approval");
         state.shutdown().await;
     }
 
