@@ -1121,12 +1121,8 @@ pub(crate) const SEMANTIC_SCHEMA_TABLES: &[SemanticSchemaTableDescriptor] = &[
 ];
 
 pub(crate) const SEMANTIC_SCHEMA_INDEXES: &[(&str, &str, &[&str])] = &[
-    ("facts_status_idx", "facts", &["status"]),
-    ("facts_author_idx", "facts", &["author"]),
     ("facts_seq_idx", "facts", &["seq"]),
-    ("facts_domain_seq_idx", "facts", &["domain", "seq"]),
     ("dependencies_dep_idx", "dependencies", &["dep_id"]),
-    ("proof_facts_fact_idx", "proof_facts", &["fact_id"]),
 ];
 
 // Every usage value is persisted as one fixed-width eight-byte BLOB.  Keep
@@ -1387,14 +1383,16 @@ impl SemanticPolicyConfig {
         for (rows, record_bytes) in table_pages {
             pages = pages.checked_add(object_pages(rows, record_bytes)?)?;
         }
-        // Charge each of the ten PRIMARY KEY autoindex b-trees and six
-        // named secondary indexes as its own object.  Separate roots,
+        // Charge each of the eight non-integer PRIMARY KEY autoindex b-trees
+        // and the two named secondary indexes as its own object. SQLite
+        // aliases an INTEGER PRIMARY KEY to the table rowid, so the singleton
+        // semantic_usage/proof_usage tables do not own separate index trees.
+        // Separate roots,
         // interior rounding, and overflow streams are all retained in the
         // envelope rather than being hidden by a combined row count.
         let primary_index_trees = [
             (3, META_KEY_MAX_BYTES),
             (fact_rows, FACT_ID_BYTES),
-            (1, SQL_INTEGER_BYTES),
             (workload.max_author_usage_rows, DEVICE_KEY_BYTES),
             (workload.max_dependency_edges, 2 * FACT_ID_BYTES),
             (
@@ -1404,20 +1402,15 @@ impl SemanticPolicyConfig {
             (workload.max_proof_records, FACT_ID_BYTES),
             (workload.max_proof_links, 2 * FACT_ID_BYTES),
             (1, COMMITMENT_NAME_MAX_BYTES),
-            (1, SQL_INTEGER_BYTES),
         ];
-        debug_assert_eq!(primary_index_trees.len(), SEMANTIC_SCHEMA_TABLES.len());
+        debug_assert_eq!(primary_index_trees.len(), 8);
         for (rows, key_bytes) in primary_index_trees {
             let payload = checked_rows(rows, key_bytes)?;
             pages = pages.checked_add(object_pages(rows, payload)?)?;
         }
         let secondary_index_trees = [
-            (fact_rows, FACT_STATUS_MAX_BYTES),
-            (fact_rows, DEVICE_KEY_BYTES),
             (fact_rows, SQL_INTEGER_BYTES),
-            (fact_rows, FACT_DOMAIN_MAX_BYTES + SQL_INTEGER_BYTES),
             (workload.max_dependency_edges, FACT_ID_BYTES),
-            (workload.max_proof_links, FACT_ID_BYTES),
         ];
         debug_assert_eq!(secondary_index_trees.len(), SEMANTIC_SCHEMA_INDEXES.len());
         for (rows, key_bytes) in secondary_index_trees {

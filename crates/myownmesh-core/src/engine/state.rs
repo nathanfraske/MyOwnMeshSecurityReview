@@ -5969,9 +5969,23 @@ impl NetworkState {
         // send-preparation finish its exact owner/store step before the slot
         // becomes permanently unavailable to stale state facades.
         let _publication = self.durable_publication_gate.lock();
-        let _semantic_fence = self.fact_graph.write();
+        let mut semantic_graph = self.fact_graph.write();
         match self.durable_semantic_owner.release() {
             Ok(()) => {
+                // `shutdown(&self)` is deliberately borrow-based, and the
+                // mesh registry or another facade may therefore retain this
+                // retired NetworkState after its worker and storage lease
+                // have terminated.  Keeping the complete fact history here
+                // would make an ordinary same-process reopen hold both the
+                // old and restored ledgers.  Once the durable owner has
+                // joined successfully no operation may use this state again,
+                // so retain only the immutable bootstrap/policy boundary and
+                // release the history before publishing shutdown completion.
+                *semantic_graph = crate::semantic::FactGraph::from_bootstrap_with_policy(
+                    &self.verified_bootstrap,
+                    self.config.read().semantic_policy,
+                );
+                self.durable_provisional.lock().clear();
                 self.shutdown_complete
                     .store(true, std::sync::atomic::Ordering::Release);
             }

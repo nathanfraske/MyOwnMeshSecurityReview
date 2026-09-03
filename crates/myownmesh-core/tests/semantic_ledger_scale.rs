@@ -1075,6 +1075,11 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     );
     let before_shutdown = after_compaction;
     network.shutdown().await?;
+    assert_eq!(
+        network.semantic_fact_count_for_lab(),
+        0,
+        "a retired state releases its in-memory ledger before same-process reopen"
+    );
     drop(network);
     let restore_started = Instant::now();
     let reopened = mesh.join(config).await?;

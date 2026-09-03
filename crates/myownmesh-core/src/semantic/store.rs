@@ -1394,7 +1394,11 @@ impl DurableSemanticStore {
     fn create_schema(transaction: &SemanticSqliteTransaction<'_>) -> Result<(), DurableStoreError> {
         transaction
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta (
+                "DROP INDEX IF EXISTS facts_status_idx;
+                DROP INDEX IF EXISTS facts_author_idx;
+                DROP INDEX IF EXISTS facts_domain_seq_idx;
+                DROP INDEX IF EXISTS proof_facts_fact_idx;
+                CREATE TABLE IF NOT EXISTS meta (
                     key TEXT PRIMARY KEY NOT NULL,
                     value BLOB NOT NULL
                 );
@@ -1406,10 +1410,7 @@ impl DurableSemanticStore {
                     domain TEXT NOT NULL,
                     seq INTEGER NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS facts_status_idx ON facts(status);
-                CREATE INDEX IF NOT EXISTS facts_author_idx ON facts(author);
                 CREATE INDEX IF NOT EXISTS facts_seq_idx ON facts(seq);
-                CREATE INDEX IF NOT EXISTS facts_domain_seq_idx ON facts(domain, seq);
                 CREATE TABLE IF NOT EXISTS semantic_usage (
                     usage_id INTEGER PRIMARY KEY CHECK(usage_id = 1),
                     admitted_count BLOB NOT NULL,
@@ -1451,7 +1452,6 @@ impl DurableSemanticStore {
                     fact_id BLOB NOT NULL REFERENCES facts(fact_id),
                     PRIMARY KEY(delivery_id, fact_id)
                 );
-                CREATE INDEX IF NOT EXISTS proof_facts_fact_idx ON proof_facts(fact_id);
                 CREATE TABLE IF NOT EXISTS commitments (
                     name TEXT PRIMARY KEY NOT NULL,
                     value BLOB NOT NULL

@@ -507,6 +507,13 @@ impl JoinedNetwork {
         crate::engine::lifecycle::semantic_state_identity(&self.state)
     }
 
+    /// Transport-lab observation of the live in-memory semantic history.
+    /// Retired states report zero after their durable owner has terminated.
+    #[cfg(feature = "transport-lab")]
+    pub fn semantic_fact_count_for_lab(&self) -> usize {
+        self.state.semantic_fact_count()
+    }
+
     /// Checkpoint the exact durable semantic database owned by this network.
     /// This never reloads or replaces the already-authoritative live graph.
     pub fn compact_semantic_state(&self) -> Result<()> {
