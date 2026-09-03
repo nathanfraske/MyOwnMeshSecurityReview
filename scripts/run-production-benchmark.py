@@ -123,6 +123,10 @@ SEMANTIC_OPTIONAL_SCALE_COUNTERS = {
     "process_scope_cpu_time_ms": "float",
     "process_scope_read_bytes_delta": "int",
     "process_lifetime_peak_vmhwm_bytes": "int",
+    "process_rss_after_seed_bytes": "int",
+    "process_rss_after_workload_bytes": "int",
+    "process_rss_after_compaction_bytes": "int",
+    "process_rss_after_restore_bytes": "int",
     "process_scope_write_bytes_delta": "int",
     "process_scope_write_bytes_per_admission": "float",
 }

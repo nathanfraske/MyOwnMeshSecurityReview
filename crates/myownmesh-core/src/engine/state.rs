@@ -1410,10 +1410,7 @@ impl NetworkState {
         .map_err(|error| Error::Network(format!("open semantic proof outbox: {error}")))?;
         let (initial_graph, durable_provisional) =
             match durable_semantic_owner.restore(&verified_bootstrap) {
-                Ok(restored) => (
-                    restored.graph().clone(),
-                    restored.provisional_custody().to_vec(),
-                ),
+                Ok(restored) => restored.into_parts(),
                 Err(crate::semantic::store::DurableStoreError::Missing { .. }) => {
                     let graph = crate::semantic::FactGraph::from_bootstrap_with_policy(
                         &verified_bootstrap,
@@ -2790,6 +2787,7 @@ impl NetworkState {
                 }
                 live.clone()
             };
+            seeded.begin_deferred_projection_commitment_for_lab();
 
             for index in 0..count {
                 let body = crate::semantic::FactBody::RoleGrant {
@@ -2827,6 +2825,7 @@ impl NetworkState {
                     }
                 }
             }
+            seeded.finish_deferred_projection_commitment_for_lab();
 
             let _publication = state.durable_publication_gate.lock();
             let mut live = state.fact_graph.write();
@@ -2836,9 +2835,9 @@ impl NetworkState {
                 ));
             }
             state.ensure_durable_owner_mutation_allowed()?;
-            state
+            seeded = state
                 .durable_semantic_owner
-                .commit(&seeded, Vec::new())
+                .commit_owned_for_lab(seeded, Vec::new())
                 .map_err(|error| Error::Network(format!("semantic seed commit: {error}")))?;
             *live = seeded;
             state
@@ -3017,26 +3016,17 @@ impl NetworkState {
         self.durable_admission_max.load(Ordering::SeqCst)
     }
 
-    /// Re-verify and compact the exact production-owned semantic snapshot.
-    /// The restored graph is installed only after compaction/reopen succeeds.
+    /// Checkpoint the production-owned semantic database without rebuilding
+    /// or replacing the already-authoritative live graph.
     pub(crate) fn compact_durable_semantic_state(&self) -> Result<()> {
-        // Admission serializes the live graph before entering the durable
-        // owner.  Compaction must use the same graph -> owner order and keep
-        // that fence through installing both restored views, otherwise an
-        // admission could publish against a snapshot that compaction is
-        // about to replace.
+        // Admission and checkpointing share this publication fence so the
+        // checkpoint observes a transaction boundary. SQLite remains the
+        // durable authority; compaction does not deserialize history.
         let _publication = self.durable_publication_gate.lock();
-        let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
-        let restored = self
-            .durable_semantic_owner
-            .compact(&self.verified_bootstrap)
-            .map_err(|error| Error::Network(format!("semantic snapshot compact: {error}")))?;
-        let restored_graph = restored.graph().clone();
-        let restored_provisional = restored.provisional_custody().to_vec();
-        *live = restored_graph;
-        *self.durable_provisional.lock() = restored_provisional;
-        Ok(())
+        self.durable_semantic_owner
+            .compact()
+            .map_err(|error| Error::Network(format!("semantic snapshot compact: {error}")))
     }
 
     /// Purge this network instance's canonical semantic snapshot.  This is
@@ -3065,10 +3055,8 @@ impl NetworkState {
             .map_err(|error| Error::Network(format!("semantic snapshot purge: {error}")))
     }
 
-    /// Compact and reopen this network's canonical semantic snapshot through
-    /// the same owner used by admission and restart.  The operation is
-    /// fail-closed: a failed verification or publication leaves the live graph
-    /// untouched.
+    /// Checkpoint this network's canonical semantic database through the same
+    /// owner used by admission and restart. The live graph is untouched.
     pub fn compact_semantic_state(&self) -> Result<()> {
         self.compact_durable_semantic_state()
     }

@@ -226,6 +226,10 @@ impl AuthoringWitness {
 #[derive(Debug)]
 pub struct FactGraph {
     pub(crate) facts: BTreeMap<FactId, SignedFact>,
+    /// Canonical admission order. Durable snapshots persist this as `seq`,
+    /// allowing restart to rebuild in one streaming pass without allocating a
+    /// second graph-sized topological sort.
+    pub(crate) admission_order: Vec<FactId>,
     pub(crate) quarantined: BTreeMap<FactId, SignedFact>,
     policy_limits: SemanticAdmissionPolicy,
     admitted_bytes: u64,
@@ -254,8 +258,15 @@ pub struct FactGraph {
     /// cannot cross-invalidate the other subject's cells.  Values are the
     /// authority-bearing facts that directly cite that predecessor; walking
     /// this index reaches only the branch whose authority validity changed.
+    /// Test-only mirror used to assert the on-demand reverse traversal. The
+    /// production graph derives this rare resolution index for one subject
+    /// when needed instead of retaining an edge tree for the full history.
+    #[cfg(test)]
     authority_dependents_index: BTreeMap<(DeviceId, FactId), BTreeSet<FactId>>,
     authority_selector_index: BTreeMap<DeviceId, BTreeSet<(FactId, FactId)>>,
+    /// Test-only mirror of dependencies already present in each signed fact.
+    /// Retaining a second graph-sized copy in production wastes memory.
+    #[cfg(test)]
     dependency_index: BTreeMap<FactId, Vec<FactId>>,
     cells_index: BTreeSet<ExclusiveCell>,
     stand_down_index: BTreeMap<DeviceId, BTreeSet<FactId>>,
@@ -268,6 +279,7 @@ pub struct FactGraph {
     /// identity through facts, canonical dependencies, and the v2 root
     /// instead of comparing counters across process lifetimes.
     generation: u64,
+    defer_projection_commitment: bool,
     projection_cache: Arc<Mutex<Option<(u64, Projection)>>>,
 }
 
@@ -275,6 +287,7 @@ impl Clone for FactGraph {
     fn clone(&self) -> Self {
         Self {
             facts: self.facts.clone(),
+            admission_order: self.admission_order.clone(),
             quarantined: self.quarantined.clone(),
             policy_limits: self.policy_limits,
             admitted_bytes: self.admitted_bytes,
@@ -292,8 +305,10 @@ impl Clone for FactGraph {
             policy: self.policy.clone(),
             cell_heads_index: self.cell_heads_index.clone(),
             authority_heads_index: self.authority_heads_index.clone(),
+            #[cfg(test)]
             authority_dependents_index: self.authority_dependents_index.clone(),
             authority_selector_index: self.authority_selector_index.clone(),
+            #[cfg(test)]
             dependency_index: self.dependency_index.clone(),
             cells_index: self.cells_index.clone(),
             stand_down_index: self.stand_down_index.clone(),
@@ -301,6 +316,7 @@ impl Clone for FactGraph {
             facts_revision: self.facts_revision,
             indexed_revision: self.indexed_revision,
             generation: self.generation,
+            defer_projection_commitment: self.defer_projection_commitment,
             projection_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -320,15 +336,6 @@ struct IndexResidencyDelta {
     added: u64,
     removed: u64,
 }
-
-// These are logical bytes requested by the retained Rust values, not claims
-// about allocator slabs or implementation-private B-tree node metadata.  The
-// map entry accounts for the inline `(DeviceId, FactId)` key and its retained
-// `BTreeSet` value; the set entry accounts for each dependent FactId.  The
-// DeviceId's canonical encoded String bytes are added from the actual key.
-const AUTHORITY_DEPENDENT_MAP_ENTRY_INLINE_BYTES: u64 =
-    size_of::<((DeviceId, FactId), BTreeSet<FactId>)>() as u64;
-const AUTHORITY_DEPENDENT_SET_ENTRY_BYTES: u64 = size_of::<FactId>() as u64;
 
 fn insert_maximal_head(
     facts: &BTreeMap<FactId, SignedFact>,
@@ -511,6 +518,7 @@ struct GraphRollback {
     quarantined_dependency_edges: u64,
     generation: u64,
     facts_revision: u64,
+    admission_order_len: usize,
     indexed_fact_count: usize,
     indexed_revision: u64,
     projection_cache_generation: Option<u64>,
@@ -533,6 +541,7 @@ impl GraphRollback {
             quarantined_dependency_edges: graph.quarantined_dependency_edges,
             generation: graph.generation,
             facts_revision: graph.facts_revision,
+            admission_order_len: graph.admission_order.len(),
             indexed_fact_count: graph.indexed_fact_count,
             indexed_revision: graph.indexed_revision,
             projection_cache_generation: graph
@@ -670,6 +679,7 @@ impl GraphRollback {
         }
         graph.generation = self.generation;
         graph.facts_revision = self.facts_revision;
+        graph.admission_order.truncate(self.admission_order_len);
         graph.rebuild_indexes();
         // Rebuilding derived maps also reconciles canonical scalar totals. A
         // journal rollback must nevertheless restore the exact pre-journal
@@ -822,6 +832,7 @@ impl FactGraph {
         let policy_limits = policy_limits.into();
         Self {
             facts: BTreeMap::new(),
+            admission_order: Vec::new(),
             quarantined: BTreeMap::new(),
             policy_limits,
             admitted_bytes: 0,
@@ -835,16 +846,14 @@ impl FactGraph {
             waiting_by_dependency: BTreeMap::new(),
             ready_quarantine: BTreeSet::new(),
             context_id: bootstrap.context_id(),
-            authority_roots: bootstrap
-                .authority_roots()
-                .iter()
-                .filter_map(|root| DeviceId::from_canonical_str(root).ok())
-                .collect(),
+            authority_roots: bootstrap.authority_roots().iter().cloned().collect(),
             policy: bootstrap.policy().clone(),
             cell_heads_index: BTreeMap::new(),
             authority_heads_index: BTreeMap::new(),
+            #[cfg(test)]
             authority_dependents_index: BTreeMap::new(),
             authority_selector_index: BTreeMap::new(),
+            #[cfg(test)]
             dependency_index: BTreeMap::new(),
             cells_index: BTreeSet::new(),
             stand_down_index: BTreeMap::new(),
@@ -852,12 +861,27 @@ impl FactGraph {
             facts_revision: 0,
             indexed_revision: 0,
             generation: 0,
+            defer_projection_commitment: false,
             projection_cache: Arc::new(Mutex::new(None)),
         }
     }
 
     pub fn context_id(&self) -> MeshContextId {
         self.context_id
+    }
+
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn begin_deferred_projection_commitment_for_lab(&mut self) {
+        self.defer_projection_commitment = true;
+    }
+
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn finish_deferred_projection_commitment_for_lab(&mut self) {
+        self.defer_projection_commitment = false;
+        let mut projection_cache = self.projection_cache.lock();
+        if let Some((generation, projection)) = projection_cache.take() {
+            *projection_cache = Some((generation, projection.rebuild_commitment()));
+        }
     }
 
     /// Return the versioned canonical projection root maintained by the graph.
@@ -895,8 +919,10 @@ impl FactGraph {
         INDEX_REBUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         self.cell_heads_index.clear();
         self.authority_heads_index.clear();
+        #[cfg(test)]
         self.authority_dependents_index.clear();
         self.authority_selector_index.clear();
+        #[cfg(test)]
         self.dependency_index.clear();
         self.cells_index.clear();
         self.stand_down_index.clear();
@@ -913,17 +939,15 @@ impl FactGraph {
         let mut indegree = BTreeMap::new();
         let mut dependents = BTreeMap::<FactId, BTreeSet<FactId>>::new();
         for id in &ids {
-            let count = self
-                .dependency_index
-                .get(id)
-                .into_iter()
-                .flatten()
+            let fact_dependencies = self.facts.get(id).map(dependencies).unwrap_or_default();
+            let count = fact_dependencies
+                .iter()
                 .filter(|dependency| self.facts.contains_key(dependency))
                 .count();
             indegree.insert(*id, count);
-            for dependency in self.dependency_index.get(id).into_iter().flatten() {
-                if self.facts.contains_key(dependency) {
-                    dependents.entry(*dependency).or_default().insert(*id);
+            for dependency in fact_dependencies {
+                if self.facts.contains_key(&dependency) {
+                    dependents.entry(dependency).or_default().insert(*id);
                 }
             }
         }
@@ -954,6 +978,7 @@ impl FactGraph {
             let ordered_ids = ordered.iter().copied().collect::<BTreeSet<_>>();
             ordered.extend(ids.iter().copied().filter(|id| !ordered_ids.contains(id)));
         }
+        self.admission_order = ordered.clone();
         for id in ordered {
             self.index_fact_heads(id);
         }
@@ -985,9 +1010,9 @@ impl FactGraph {
     /// Return the complete canonical dependency edge set for one admitted row.
     /// It includes content parents, evidence/cited heads, and every declared
     /// AuthorityUse predecessor; callers must not persist parents alone.
-    pub(crate) fn canonical_dependency_edges(&self, id: &FactId) -> Option<&[FactId]> {
+    pub(crate) fn canonical_dependency_edges(&self, id: &FactId) -> Option<Vec<FactId>> {
         self.indexes_current()
-            .then(|| self.dependency_index.get(id).map(Vec::as_slice))
+            .then(|| self.facts.get(id).map(dependencies))
             .flatten()
     }
 
@@ -1011,6 +1036,64 @@ impl FactGraph {
             rollback.restore(self);
         }
         result
+    }
+
+    /// Restore rows already ordered by their durable admission sequence.
+    /// This is only for a newly constructed graph: an error discards that
+    /// graph, so retaining a graph-sized rollback journal would waste memory.
+    pub(crate) fn restore_admitted_in_order(
+        &mut self,
+        admitted: Vec<SignedFact>,
+        quarantined: Vec<SignedFact>,
+    ) -> Result<(), SemanticError> {
+        if !self.facts.is_empty() || !self.quarantined.is_empty() {
+            return Err(SemanticError::DuplicateFact(
+                self.facts
+                    .keys()
+                    .next()
+                    .copied()
+                    .or_else(|| self.quarantined.keys().next().copied())
+                    .expect("nonempty restore graph has a fact"),
+            ));
+        }
+        self.defer_projection_commitment = true;
+        for fact in admitted {
+            match self.admit_inner(fact, false)? {
+                Admission::Inserted => {}
+                Admission::AlreadyPresent | Admission::Quarantined { .. } => {
+                    return Err(SemanticError::DomainMismatch)
+                }
+            }
+        }
+        for fact in quarantined {
+            match self.admit_inner(fact, false)? {
+                Admission::Quarantined { .. } => {}
+                Admission::AlreadyPresent | Admission::Inserted => {
+                    return Err(SemanticError::DomainMismatch)
+                }
+            }
+        }
+        self.defer_projection_commitment = false;
+        let mut projection_cache = self.projection_cache.lock();
+        if let Some((generation, projection)) = projection_cache.take() {
+            let projection = projection.rebuild_commitment();
+            let resident = self
+                .admitted_bytes
+                .checked_add(self.derived_index_bytes)
+                .and_then(|bytes| bytes.checked_add(projection.commitment_bytes()))
+                .ok_or(SemanticError::CapacityExceeded {
+                    dimension: super::SemanticCapacityDimension::AdmittedBytes,
+                    limit: self.policy_limits.max_database_bytes,
+                    observed: u64::MAX,
+                })?;
+            self.check_capacity(
+                super::SemanticCapacityDimension::AdmittedBytes,
+                resident,
+                self.policy_limits.max_database_bytes,
+            )?;
+            *projection_cache = Some((generation, projection));
+        }
+        Ok(())
     }
 
     fn bulk_restore_admitted_inner(
@@ -1118,26 +1201,28 @@ impl FactGraph {
             .exclusive_cells()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        let dependencies = dependencies(fact);
         let stand_down = match &fact.content.body {
             FactBody::EvictionProof { target, .. } => Some(target.clone()),
             FactBody::SelfStandDown { device_id, .. } => Some(device_id.clone()),
             _ => None,
         };
-        self.dependency_index.insert(fact_id, dependencies);
-        for authority_use in &fact.content.authority_uses {
-            if Self::is_payload_local_resolution(
-                &fact.content.body,
-                &fact.content.author,
-                &authority_use.subject,
-            ) {
-                continue;
-            }
-            for predecessor in &authority_use.predecessors {
-                self.authority_dependents_index
-                    .entry((authority_use.subject.clone(), *predecessor))
-                    .or_default()
-                    .insert(fact_id);
+        #[cfg(test)]
+        {
+            self.dependency_index.insert(fact_id, dependencies(fact));
+            for authority_use in &fact.content.authority_uses {
+                if Self::is_payload_local_resolution(
+                    &fact.content.body,
+                    &fact.content.author,
+                    &authority_use.subject,
+                ) {
+                    continue;
+                }
+                for predecessor in &authority_use.predecessors {
+                    self.authority_dependents_index
+                        .entry((authority_use.subject.clone(), *predecessor))
+                        .or_default()
+                        .insert(fact_id);
+                }
             }
         }
         for cell in &cells {
@@ -1284,6 +1369,30 @@ impl FactGraph {
         subject: &DeviceId,
         seeds: impl IntoIterator<Item = FactId>,
     ) -> (BTreeSet<ExclusiveCell>, BTreeSet<DeviceId>) {
+        // Resolutions are rare. Build the subject-local reverse edges for the
+        // duration of this operation instead of retaining an O(history)
+        // reverse tree beside the canonical signed facts for every ordinary
+        // admission.
+        let mut dependents_by_predecessor = BTreeMap::<FactId, Vec<FactId>>::new();
+        for (fact_id, fact) in &self.facts {
+            for authority_use in &fact.content.authority_uses {
+                if authority_use.subject != *subject
+                    || Self::is_payload_local_resolution(
+                        &fact.content.body,
+                        &fact.content.author,
+                        subject,
+                    )
+                {
+                    continue;
+                }
+                for predecessor in &authority_use.predecessors {
+                    dependents_by_predecessor
+                        .entry(*predecessor)
+                        .or_default()
+                        .push(*fact_id);
+                }
+            }
+        }
         let mut cells = BTreeSet::new();
         let mut subjects = BTreeSet::new();
         let mut pending = seeds.into_iter().collect::<Vec<_>>();
@@ -1317,7 +1426,7 @@ impl FactGraph {
                 }
                 _ => {}
             }
-            if let Some(dependents) = self.authority_dependents_index.get(&(subject.clone(), id)) {
+            if let Some(dependents) = dependents_by_predecessor.get(&id) {
                 pending.extend(dependents.iter().copied());
             }
         }
@@ -1374,9 +1483,9 @@ impl FactGraph {
         (cells, subjects)
     }
 
-    fn indexed_dependencies(&self, id: &FactId) -> Option<&[FactId]> {
+    fn indexed_dependencies(&self, id: &FactId) -> Option<Vec<FactId>> {
         self.indexes_current()
-            .then(|| self.dependency_index.get(id).map(Vec::as_slice))
+            .then(|| self.facts.get(id).map(dependencies))
             .flatten()
     }
 
@@ -1433,7 +1542,8 @@ impl FactGraph {
     }
 
     fn device_dynamic_bytes(&self, device: &DeviceId) -> Result<u64, SemanticError> {
-        self.checked_len(device.base32().len())
+        let _ = device;
+        Ok(0)
     }
 
     fn cell_dynamic_bytes(&self, cell: &ExclusiveCell) -> Result<u64, SemanticError> {
@@ -1449,15 +1559,6 @@ impl FactGraph {
         #[cfg(test)]
         RESIDENCY_SCAN_COUNT.with(|count| count.set(count.get().saturating_add(1)));
         let mut total = 0;
-        for dependencies in self.dependency_index.values() {
-            let entry = self.checked_entry_bytes(
-                self.checked_size::<(FactId, Vec<FactId>)>()?,
-                0,
-                dependencies.len(),
-                self.checked_size::<FactId>()?,
-            )?;
-            total = self.checked_add_bytes(total, entry)?;
-        }
         for (cell, heads) in &self.cell_heads_index {
             let entry = self.checked_entry_bytes(
                 self.checked_size::<(ExclusiveCell, BTreeSet<FactId>)>()?,
@@ -1476,7 +1577,6 @@ impl FactGraph {
             )?;
             total = self.checked_add_bytes(total, entry)?;
         }
-        total = self.checked_add_bytes(total, self.authority_dependents_residency_bytes()?)?;
         for (subject, selectors) in &self.authority_selector_index {
             let entry = self.checked_entry_bytes(
                 self.checked_size::<(DeviceId, BTreeSet<(FactId, FactId)>)>()?,
@@ -1556,15 +1656,6 @@ impl FactGraph {
     ) -> Result<IndexResidencyDelta, SemanticError> {
         let mut delta = IndexResidencyDelta::default();
         let direct_dependencies = dependencies(fact);
-        self.add_index_residency(
-            &mut delta,
-            self.checked_entry_bytes(
-                self.checked_size::<(FactId, Vec<FactId>)>()?,
-                0,
-                direct_dependencies.len(),
-                self.checked_size::<FactId>()?,
-            )?,
-        )?;
 
         let cells = fact
             .content
@@ -1620,36 +1711,6 @@ impl FactGraph {
                     self.device_dynamic_bytes(&subject)?
                 },
             )?;
-        }
-
-        let mut reverse_keys = BTreeSet::new();
-        for authority_use in &fact.content.authority_uses {
-            if Self::is_payload_local_resolution(
-                &fact.content.body,
-                &fact.content.author,
-                &authority_use.subject,
-            ) {
-                continue;
-            }
-            for predecessor in &authority_use.predecessors {
-                let key = (authority_use.subject.clone(), *predecessor);
-                if !reverse_keys.insert(key.clone()) {
-                    continue;
-                }
-                let dependents = self.authority_dependents_index.get(&key);
-                if dependents.is_none() {
-                    self.add_index_residency(
-                        &mut delta,
-                        self.checked_add_bytes(
-                            AUTHORITY_DEPENDENT_MAP_ENTRY_INLINE_BYTES,
-                            self.device_dynamic_bytes(&authority_use.subject)?,
-                        )?,
-                    )?;
-                }
-                if !dependents.is_some_and(|dependents| dependents.contains(&fact.id)) {
-                    self.add_index_residency(&mut delta, AUTHORITY_DEPENDENT_SET_ENTRY_BYTES)?;
-                }
-            }
         }
 
         if let FactBody::AuthorityLineageResolution {
@@ -1711,16 +1772,6 @@ impl FactGraph {
 
     fn index_residency_delta(&self, fact: &SignedFact) -> Result<u64, SemanticError> {
         let mut total = 0;
-        let dependencies = dependencies(fact);
-        total = self.checked_add_bytes(
-            total,
-            self.checked_entry_bytes(
-                self.checked_size::<(FactId, Vec<FactId>)>()?,
-                0,
-                dependencies.len(),
-                self.checked_size::<FactId>()?,
-            )?,
-        )?;
         let cells = fact
             .content
             .body
@@ -1790,7 +1841,6 @@ impl FactGraph {
                 )?,
             )?;
         }
-        total = self.checked_add_bytes(total, self.authority_dependents_residency_delta(fact)?)?;
         if let FactBody::AuthorityLineageResolution { subject, .. } = &fact.content.body {
             let selectors = self.authority_selector_index.get(subject);
             total = self.checked_add_bytes(
@@ -1887,110 +1937,14 @@ impl FactGraph {
     }
 
     fn authority_dependents_residency_bytes(&self) -> Result<u64, SemanticError> {
-        self.authority_dependents_index.iter().try_fold(
-            0u64,
-            |total, ((subject, _predecessor), dependents)| {
-                let encoded_subject_bytes =
-                    u64::try_from(subject.base32().len()).map_err(|_| {
-                        SemanticError::CapacityExceeded {
-                            dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                            limit: self.policy_limits.max_database_bytes,
-                            observed: u64::MAX,
-                        }
-                    })?;
-                let map_entry = AUTHORITY_DEPENDENT_MAP_ENTRY_INLINE_BYTES
-                    .checked_add(encoded_subject_bytes)
-                    .ok_or(SemanticError::CapacityExceeded {
-                        dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                        limit: self.policy_limits.max_database_bytes,
-                        observed: u64::MAX,
-                    })?;
-                let dependent_count = u64::try_from(dependents.len()).map_err(|_| {
-                    SemanticError::CapacityExceeded {
-                        dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                        limit: self.policy_limits.max_database_bytes,
-                        observed: u64::MAX,
-                    }
-                })?;
-                let set_entries = dependent_count
-                    .checked_mul(AUTHORITY_DEPENDENT_SET_ENTRY_BYTES)
-                    .ok_or(SemanticError::CapacityExceeded {
-                        dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                        limit: self.policy_limits.max_database_bytes,
-                        observed: u64::MAX,
-                    })?;
-                total
-                    .checked_add(map_entry)
-                    .and_then(|value| value.checked_add(set_entries))
-                    .ok_or(SemanticError::CapacityExceeded {
-                        dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                        limit: self.policy_limits.max_database_bytes,
-                        observed: u64::MAX,
-                    })
-            },
-        )
+        Ok(0)
     }
 
     fn authority_dependents_residency_delta(
         &self,
-        fact: &SignedFact,
+        _fact: &SignedFact,
     ) -> Result<u64, SemanticError> {
-        let mut unique_keys = BTreeSet::new();
-        fact.content
-            .authority_uses
-            .iter()
-            .filter(|authority_use| {
-                !Self::is_payload_local_resolution(
-                    &fact.content.body,
-                    &fact.content.author,
-                    &authority_use.subject,
-                )
-            })
-            .try_fold(0u64, |total, authority_use| {
-                authority_use
-                    .predecessors
-                    .iter()
-                    .try_fold(total, |total, predecessor| {
-                        let key = (authority_use.subject.clone(), *predecessor);
-                        if !unique_keys.insert(key.clone()) {
-                            return Ok(total);
-                        }
-                        let dependents = self.authority_dependents_index.get(&key);
-                        let map_entry = if dependents.is_none() {
-                            let encoded_subject_bytes = u64::try_from(
-                                authority_use.subject.base32().len(),
-                            )
-                            .map_err(|_| SemanticError::CapacityExceeded {
-                                dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                                limit: self.policy_limits.max_database_bytes,
-                                observed: u64::MAX,
-                            })?;
-                            AUTHORITY_DEPENDENT_MAP_ENTRY_INLINE_BYTES
-                                .checked_add(encoded_subject_bytes)
-                                .ok_or(SemanticError::CapacityExceeded {
-                                    dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                                    limit: self.policy_limits.max_database_bytes,
-                                    observed: u64::MAX,
-                                })?
-                        } else {
-                            0
-                        };
-                        let dependent_entry =
-                            if dependents.is_some_and(|dependents| dependents.contains(&fact.id)) {
-                                0
-                            } else {
-                                AUTHORITY_DEPENDENT_SET_ENTRY_BYTES
-                            };
-                        total
-                            .checked_add(map_entry)
-                            .and_then(|value| value.checked_add(dependent_entry))
-                            .ok_or(SemanticError::CapacityExceeded {
-                                dimension: super::SemanticCapacityDimension::AdmittedBytes,
-                                limit: self.policy_limits.max_database_bytes,
-                                observed: u64::MAX,
-                            })
-                    })
-            })
+        Ok(0)
     }
 
     fn fact_cost(&self, fact: &SignedFact) -> Result<FactCost, SemanticError> {
@@ -2746,6 +2700,7 @@ impl FactGraph {
             .checked_add(cost.dependency_edges)
             .expect("admitted edges were preflighted");
         self.facts.insert(fact_id, fact);
+        self.admission_order.push(fact_id);
         self.facts_revision = self
             .facts_revision
             .checked_add(1)
@@ -2765,12 +2720,21 @@ impl FactGraph {
             .expect("indexed fact remains in the admitted graph");
         let (projection_cells, projection_stand_down_targets) =
             self.projection_impact_for_fact(stored_fact);
-        let projection = Projection::update_from_graph(
-            self,
-            previous_projection,
-            &projection_cells,
-            &projection_stand_down_targets,
-        );
+        let projection = if self.defer_projection_commitment {
+            Projection::update_from_graph_deferred_commitment(
+                self,
+                previous_projection,
+                &projection_cells,
+                &projection_stand_down_targets,
+            )
+        } else {
+            Projection::update_from_graph(
+                self,
+                previous_projection,
+                &projection_cells,
+                &projection_stand_down_targets,
+            )
+        };
         let projection_bytes = projection.commitment_bytes();
         let resident = self
             .admitted_bytes
@@ -3115,6 +3079,7 @@ impl FactGraph {
                 .into_iter()
                 .filter_map(|id| self.facts.get(&id).cloned().map(|fact| (id, fact)))
                 .collect(),
+            admission_order: Vec::new(),
             quarantined: BTreeMap::new(),
             policy_limits: self.policy_limits,
             admitted_bytes: 0,
@@ -3132,8 +3097,10 @@ impl FactGraph {
             policy: self.policy.clone(),
             cell_heads_index: BTreeMap::new(),
             authority_heads_index: BTreeMap::new(),
+            #[cfg(test)]
             authority_dependents_index: BTreeMap::new(),
             authority_selector_index: BTreeMap::new(),
+            #[cfg(test)]
             dependency_index: BTreeMap::new(),
             cells_index: BTreeSet::new(),
             stand_down_index: BTreeMap::new(),
@@ -3141,6 +3108,7 @@ impl FactGraph {
             facts_revision: 0,
             indexed_revision: 0,
             generation: 0,
+            defer_projection_commitment: false,
             projection_cache: Arc::new(Mutex::new(None)),
         };
         causal.rebuild_indexes();
@@ -3577,15 +3545,9 @@ impl FactGraph {
     }
 
     fn direct_dependency(&self, descendant: &FactId, ancestor: &FactId) -> bool {
-        if self.indexes_current() {
-            self.dependency_index
-                .get(descendant)
-                .is_some_and(|dependencies| dependencies.contains(ancestor))
-        } else {
-            self.facts
-                .get(descendant)
-                .is_some_and(|fact| dependencies(fact).contains(ancestor))
-        }
+        self.facts
+            .get(descendant)
+            .is_some_and(|fact| dependencies(fact).contains(ancestor))
     }
 
     /// Return the incomparable head set only when the cell is conflicted.
@@ -4708,17 +4670,11 @@ mod tests {
                     graph
                         .authority_dependents_residency_delta(&grant_other)
                         .expect("branch reverse-index delta computes"),
-                    "cost uses the exact unique-key/dependent cardinality delta"
+                    "cost and retained residency agree"
                 );
-                assert!(
-                    branch_cost.authority_dependents_index_bytes
-                        >= AUTHORITY_DEPENDENT_MAP_ENTRY_INLINE_BYTES
-                            + u64::try_from(
-                                grant_other.content.authority_uses[0].subject.base32().len()
-                            )
-                            .expect("canonical DeviceId length fits")
-                            + AUTHORITY_DEPENDENT_SET_ENTRY_BYTES,
-                    "reverse witness key/value residency is funded from logical components"
+                assert_eq!(
+                    branch_cost.authority_dependents_index_bytes, 0,
+                    "the production graph derives rare subject-local reverse edges on demand"
                 );
                 let order = if reverse {
                     branches.iter().rev().cloned().collect::<Vec<_>>()
@@ -5353,24 +5309,11 @@ mod tests {
     #[test]
     fn authority_resolution_tracks_distinct_membership_and_stand_down_branches() {
         let (bootstrap, root_key) = closed(120);
-        let controller_key = key(121);
         let target_a = device(&key(122));
         let target_b = device(&key(123));
-        let controller = device(&controller_key);
+        let root = device(&root_key);
 
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
-        let grant_controller = fact(
-            &bootstrap,
-            &root_key,
-            FactBody::RoleGrant {
-                target: controller.clone(),
-                role: Role::Controller,
-            },
-            Vec::new(),
-        );
-        graph
-            .admit(grant_controller.clone())
-            .expect("controller grant admits");
         let grant_a = witnessed_fact(
             &graph,
             &root_key,
@@ -5402,12 +5345,12 @@ mod tests {
             .expect("eviction proposal admits");
         let attestation_b = witnessed_fact(
             &graph,
-            &key(123),
+            &key(122),
             FactBody::Attestation {
                 target: target_b.clone(),
                 proposal: proposal_b.id,
                 decision: super::super::AttestationDecision::Evict,
-                signer: target_b.clone(),
+                signer: target_a.clone(),
                 contributions: Vec::new(),
             },
         );
@@ -5417,27 +5360,22 @@ mod tests {
 
         let branch_membership = witnessed_fact(
             &graph,
-            &controller_key,
+            &root_key,
             FactBody::MembershipAdmit {
                 target: target_a.clone(),
+            },
+        );
+        let branch_stand_down = witnessed_fact(
+            &graph,
+            &root_key,
+            FactBody::EvictionProof {
+                target: target_b.clone(),
+                evidence: vec![attestation_b.id],
             },
         );
         graph
             .admit(branch_membership.clone())
             .expect("membership branch admits");
-        let branch_stand_down = fact_with_authority_predecessors(
-            &bootstrap,
-            &controller_key,
-            FactBody::EvictionProof {
-                target: target_b.clone(),
-                evidence: vec![attestation_b.id],
-            },
-            vec![grant_controller.id, proposal_b.id, attestation_b.id],
-            &[
-                (controller.clone(), vec![grant_controller.id]),
-                (target_b.clone(), vec![attestation_b.id]),
-            ],
-        );
         graph
             .admit(branch_stand_down.clone())
             .expect("stand-down branch admits without the other branch as a parent");
@@ -5473,7 +5411,7 @@ mod tests {
                 &graph,
                 &root_key,
                 FactBody::AuthorityLineageResolution {
-                    subject: controller.clone(),
+                    subject: root.clone(),
                     cited_heads: cited_heads.clone(),
                     selected_head,
                 },
@@ -5507,7 +5445,7 @@ mod tests {
             if selected_head == branch_membership.id {
                 assert_eq!(
                     journal_graph.evaluator().effective_membership(&target_a),
-                    Some(false)
+                    Some(true)
                 );
                 assert!(!journal_graph.projection().is_stood_down(&target_b));
             } else {
@@ -6560,19 +6498,18 @@ mod tests {
             },
             Vec::new(),
         );
-        let second = fact(
-            &bootstrap,
+        let mut expected = FactGraph::from_bootstrap(&bootstrap);
+        expected
+            .admit(first.clone())
+            .expect("first canonical row admits");
+        let second = witnessed_fact(
+            &expected,
             &root_key,
             FactBody::RoleGrant {
                 target: device(&key(123)),
                 role: Role::Controller,
             },
-            Vec::new(),
         );
-        let mut expected = FactGraph::from_bootstrap(&bootstrap);
-        expected
-            .admit(first.clone())
-            .expect("first canonical row admits");
         expected
             .admit(second.clone())
             .expect("second canonical row admits");
@@ -6866,20 +6803,19 @@ mod tests {
             },
             Vec::new(),
         );
-        let second = fact(
-            &bootstrap,
-            &root_key,
-            FactBody::RoleGrant {
-                target: device(&key(186)),
-                role: Role::Member,
-            },
-            vec![first.id],
-        );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         let mut after_first = graph.clone();
         after_first
             .admit(first.clone())
             .expect("first prefix fact admits");
+        let second = witnessed_fact(
+            &after_first,
+            &root_key,
+            FactBody::RoleGrant {
+                target: device(&key(186)),
+                role: Role::Member,
+            },
+        );
         let second_cost = after_first
             .fact_cost(&second)
             .expect("second cost computes");
@@ -6932,14 +6868,17 @@ mod tests {
             },
             Vec::new(),
         );
-        let child = fact(
-            &bootstrap,
+        let mut witness_graph = FactGraph::from_bootstrap(&bootstrap);
+        witness_graph
+            .admit(parent.clone())
+            .expect("witness parent admits");
+        let child = witnessed_fact(
+            &witness_graph,
             &root_key,
             FactBody::RoleGrant {
                 target: device(&key(188)),
                 role: Role::Member,
             },
-            vec![parent.id],
         );
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
         graph
@@ -6947,12 +6886,24 @@ mod tests {
             .expect("child is retained as a waiter");
         graph.admit(parent).expect("parent admits");
         let cost = graph.fact_cost(&child).expect("ready child cost computes");
-        graph.policy_limits.max_database_bytes = graph
+        let reserve_bound = graph
             .admitted_bytes
             .checked_add(cost.encoded_bytes)
             .and_then(|bytes| bytes.checked_add(graph.derived_index_bytes))
             .and_then(|bytes| bytes.checked_add(cost.derived_index_bytes))
             .expect("retry pre-projection boundary remains representable");
+        let mut after_retry = graph.clone();
+        after_retry
+            .retry_quarantined()
+            .expect("unbounded ready child admits");
+        let post_retry_resident = after_retry
+            .admitted_bytes
+            .checked_add(after_retry.derived_index_bytes)
+            .and_then(|bytes| bytes.checked_add(after_retry.projection().commitment_bytes()))
+            .expect("post-retry capacity remains representable");
+        assert!(post_retry_resident > reserve_bound);
+        graph.policy_limits.max_database_bytes = post_retry_resident - 1;
+        assert!(graph.policy_limits.max_database_bytes >= reserve_bound);
         let before = graph_snapshot(&graph);
 
         assert!(matches!(

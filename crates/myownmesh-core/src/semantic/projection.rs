@@ -599,6 +599,49 @@ impl Projection {
         next
     }
 
+    /// Restore-only variant of the sparse map update. The Patricia root is
+    /// rebuilt once after the ordered replay, avoiding 256 Merkle allocations
+    /// per historical fact while preserving the same projected maps.
+    pub(crate) fn update_from_graph_deferred_commitment(
+        graph: &FactGraph,
+        previous: Self,
+        affected_cells: &BTreeSet<ExclusiveCell>,
+        affected_stand_down_targets: &BTreeSet<DeviceId>,
+    ) -> Self {
+        let mut next = previous;
+        let cells = Arc::make_mut(&mut next.cells);
+        for cell in affected_cells {
+            match Self::projected_cell(graph, cell) {
+                Some(value) => {
+                    cells.insert(cell.clone(), value);
+                }
+                None => {
+                    cells.remove(cell);
+                }
+            }
+        }
+        let stand_down = Arc::make_mut(&mut next.stand_down);
+        for target in affected_stand_down_targets {
+            let next_stand_down = graph
+                .indexed_stand_down_candidates_for(target)
+                .and_then(|proofs| projected_stand_down_for_target(graph, target, proofs));
+            match next_stand_down {
+                Some(value) => {
+                    stand_down.insert(target.clone(), value);
+                }
+                None => {
+                    stand_down.remove(target);
+                }
+            }
+        }
+        next
+    }
+
+    pub(crate) fn rebuild_commitment(mut self) -> Self {
+        self.commitment = Arc::new(commitment_from_maps(&self.cells, &self.stand_down));
+        self
+    }
+
     pub fn cell(&self, cell: &ExclusiveCell) -> Option<&CellProjection> {
         self.cells.get(cell)
     }

@@ -1332,10 +1332,11 @@ impl SemanticPolicyConfig {
             )?)?;
         let table_pages = [
             (
-                2,
+                3,
                 checked_sum(&[
-                    checked_sum(&[META_KEY_MAX_BYTES, 4])?,
+                    checked_sum(&[META_KEY_MAX_BYTES, SQL_INTEGER_BYTES])?,
                     checked_sum(&[10, FACT_ID_BYTES])?,
+                    checked_sum(&[13, 12])?,
                 ])?,
             ),
             (fact_rows, fact_payload),
@@ -1391,7 +1392,7 @@ impl SemanticPolicyConfig {
         // interior rounding, and overflow streams are all retained in the
         // envelope rather than being hidden by a combined row count.
         let primary_index_trees = [
-            (2, META_KEY_MAX_BYTES),
+            (3, META_KEY_MAX_BYTES),
             (fact_rows, FACT_ID_BYTES),
             (1, SQL_INTEGER_BYTES),
             (workload.max_author_usage_rows, DEVICE_KEY_BYTES),

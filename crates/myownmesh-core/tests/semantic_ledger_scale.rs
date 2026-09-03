@@ -125,6 +125,10 @@ struct ScaleMetrics {
     process_scope_cpu_time_ms: Option<f64>,
     process_scope_read_bytes_delta: Option<u64>,
     process_lifetime_peak_vmhwm_bytes: Option<u64>,
+    process_rss_after_seed_bytes: Option<u64>,
+    process_rss_after_workload_bytes: Option<u64>,
+    process_rss_after_compaction_bytes: Option<u64>,
+    process_rss_after_restore_bytes: Option<u64>,
     process_scope_write_bytes_delta: Option<u64>,
     process_scope_write_bytes_per_admission: Option<f64>,
     provider_baseline: ProviderSnapshot,
@@ -626,6 +630,25 @@ fn process_vmhwm_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(target_os = "linux")]
+fn process_vmrss_bytes() -> Option<u64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        let value = line
+            .strip_prefix("VmRSS:")?
+            .split_whitespace()
+            .next()?
+            .parse::<u64>()
+            .ok()?;
+        value.checked_mul(1024)
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_vmrss_bytes() -> Option<u64> {
+    None
+}
+
 fn percentile_ms_sorted(samples: &[Duration], percentile: usize) -> f64 {
     assert!(
         !samples.is_empty(),
@@ -722,6 +745,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         "the bulk fixture publishes exactly the requested validated prefix"
     );
     let seeded_db = db_footprint(home.path());
+    let process_rss_after_seed_bytes = process_vmrss_bytes();
     assert_footprint_within(&selected_policy, seeded_db, "seeded");
     let initial_io_bytes = process_io_bytes();
     let initial_cpu_time_ms = process_cpu_time_ms();
@@ -1036,11 +1060,13 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
             (before.is_finite() && after.is_finite() && after >= before).then(|| after - before)
         })
     });
+    let process_rss_after_workload_bytes = process_vmrss_bytes();
 
     let compaction_started = Instant::now();
     network.compact_semantic_state()?;
     let compaction_ms = compaction_started.elapsed().as_secs_f64() * 1_000.0;
     let after_compaction = db_footprint(home.path());
+    let process_rss_after_compaction_bytes = process_vmrss_bytes();
     assert_footprint_within(&selected_policy, after_compaction, "compaction");
     assert_eq!(
         network.semantic_state_identity()?,
@@ -1057,6 +1083,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let restored_identity = reopened.semantic_state_identity()?;
     assert_eq!(restored_identity, final_identity);
     let after_restore = db_footprint(home.path());
+    let process_rss_after_restore_bytes = process_vmrss_bytes();
     assert_footprint_within(&selected_policy, after_restore, "restore");
     assert_eq!(after_restore.main_bytes, before_shutdown.main_bytes);
     assert!(
@@ -1148,6 +1175,10 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         process_scope_cpu_time_ms,
         process_scope_read_bytes_delta,
         process_lifetime_peak_vmhwm_bytes: process_vmhwm_bytes(),
+        process_rss_after_seed_bytes,
+        process_rss_after_workload_bytes,
+        process_rss_after_compaction_bytes,
+        process_rss_after_restore_bytes,
         process_scope_write_bytes_delta: process_write_delta,
         process_scope_write_bytes_per_admission: process_write_per_admission,
         provider_baseline,

@@ -507,9 +507,8 @@ impl JoinedNetwork {
         crate::engine::lifecycle::semantic_state_identity(&self.state)
     }
 
-    /// Compact and reopen the exact durable semantic state owned by this
-    /// network. The canonical state owner performs verification and only then
-    /// replaces the live graph, so a failed compaction leaves it unchanged.
+    /// Checkpoint the exact durable semantic database owned by this network.
+    /// This never reloads or replaces the already-authoritative live graph.
     pub fn compact_semantic_state(&self) -> Result<()> {
         self.state.compact_semantic_state()
     }

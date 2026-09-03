@@ -4,7 +4,10 @@
 //! label, carrier spelling, or alternate serialization cannot become a second
 //! semantic identity or exclusive-cell key.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::VerifyingKey;
@@ -34,8 +37,75 @@ impl FactDomain {
 /// This is the raw Ed25519 public key in its canonical lowercase base32 form.
 /// Display suffixes, uppercase encodings, padding, and alternate base32 forms
 /// are rejected before a value can enter a fact or cell.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct DeviceId(String);
+#[derive(Clone)]
+pub struct DeviceId(Arc<DeviceIdInner>);
+
+struct DeviceIdInner {
+    bytes: [u8; 32],
+    canonical: Box<str>,
+}
+
+#[derive(Default)]
+struct DeviceIdInterner {
+    entries: HashMap<[u8; 32], Weak<DeviceIdInner>>,
+    insertions_since_cleanup: usize,
+}
+
+fn intern_device_id(bytes: [u8; 32], canonical: String) -> DeviceId {
+    static INTERNER: OnceLock<Mutex<DeviceIdInterner>> = OnceLock::new();
+    const CLEANUP_INTERVAL: usize = 1_024;
+
+    let interner = INTERNER.get_or_init(|| Mutex::new(DeviceIdInterner::default()));
+    let mut interner = interner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = interner.entries.get(&bytes).and_then(Weak::upgrade) {
+        return DeviceId(existing);
+    }
+    if interner.insertions_since_cleanup >= CLEANUP_INTERVAL {
+        interner
+            .entries
+            .retain(|_, value| value.strong_count() != 0);
+        interner.insertions_since_cleanup = 0;
+    }
+    let value = Arc::new(DeviceIdInner {
+        bytes,
+        canonical: canonical.into_boxed_str(),
+    });
+    interner.entries.insert(bytes, Arc::downgrade(&value));
+    interner.insertions_since_cleanup += 1;
+    DeviceId(value)
+}
+
+impl PartialEq for DeviceId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.bytes == other.0.bytes
+    }
+}
+
+impl Eq for DeviceId {}
+
+impl PartialOrd for DeviceId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DeviceId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Preserve the public canonical-identifier ordering used before the
+        // backing allocation was interned. Raw key-byte ordering is not the
+        // same ordering as lowercase base32 and can change canonical fact
+        // encoding, B-tree iteration, and deterministic rebuild results.
+        self.0.canonical.cmp(&other.0.canonical)
+    }
+}
+
+impl Hash for DeviceId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.bytes.hash(state);
+    }
+}
 
 /// Signed, typed authority lineage for one authority-bearing subject.  The
 /// predecessor list is part of FactContent (and therefore of FactId), so a
@@ -129,8 +199,8 @@ impl DeviceId {
     pub fn from_public_key_bytes(bytes: [u8; 32]) -> Result<Self, String> {
         VerifyingKey::from_bytes(&bytes)
             .map_err(|error| format!("invalid Ed25519 public key: {error}"))?;
-        let encoded = BASE32_NOPAD.encode(&bytes).to_lowercase();
-        Ok(Self(encoded))
+        let canonical = BASE32_NOPAD.encode(&bytes).to_lowercase();
+        Ok(intern_device_id(bytes, canonical))
     }
 
     pub fn from_canonical_str(value: &str) -> Result<Self, String> {
@@ -145,24 +215,21 @@ impl DeviceId {
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);
-        let id = Self::from_public_key_bytes(key)?;
-        if id.base32() != value {
+        VerifyingKey::from_bytes(&key)
+            .map_err(|error| format!("invalid Ed25519 public key: {error}"))?;
+        let canonical = BASE32_NOPAD.encode(&key).to_lowercase();
+        if canonical != value {
             return Err("DeviceId is not the canonical base32 spelling".into());
         }
-        Ok(id)
+        Ok(intern_device_id(key, canonical))
     }
 
     pub fn as_bytes(&self) -> [u8; 32] {
-        let bytes = BASE32_NOPAD
-            .decode(self.0.to_uppercase().as_bytes())
-            .expect("DeviceId stores canonical base32");
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&bytes);
-        key
+        self.0.bytes
     }
 
     pub fn base32(&self) -> String {
-        self.0.clone()
+        self.0.canonical.to_string()
     }
 }
 
@@ -170,19 +237,19 @@ impl std::ops::Deref for DeviceId {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.0.canonical
     }
 }
 
 impl fmt::Debug for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("DeviceId").field(&self.base32()).finish()
+        f.debug_tuple("DeviceId").field(&self.0.canonical).finish()
     }
 }
 
 impl fmt::Display for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.base32())
+        f.write_str(&self.0.canonical)
     }
 }
 
@@ -191,7 +258,7 @@ impl Serialize for DeviceId {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.base32())
+        serializer.serialize_str(&self.0.canonical)
     }
 }
 

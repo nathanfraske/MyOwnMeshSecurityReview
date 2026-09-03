@@ -91,8 +91,12 @@ class BenchmarkRunnerTests(unittest.TestCase):
                 "process_scope_cpu_time_ms": 1.0,
                 "process_scope_read_bytes_delta": 2,
                 "process_lifetime_peak_vmhwm_bytes": 3,
-                "process_scope_write_bytes_delta": 4,
-                "process_scope_write_bytes_per_admission": 5.0,
+                "process_rss_after_seed_bytes": 4,
+                "process_rss_after_workload_bytes": 5,
+                "process_rss_after_compaction_bytes": 6,
+                "process_rss_after_restore_bytes": 7,
+                "process_scope_write_bytes_delta": 8,
+                "process_scope_write_bytes_per_admission": 9.0,
             }
         )
         BENCHMARK._validate_scale_optional_counters(linux, "linux-scale")
