@@ -4892,6 +4892,16 @@ impl DurableSemanticOwner {
         })
     }
 
+    /// Finish a transport-lab bulk seed with the same SQLite TRUNCATE
+    /// checkpoint used by ordinary compaction, without rebuilding the graph
+    /// that the fixture has already validated in memory.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn checkpoint_scale_seed_for_lab(&self) -> Result<(), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(true, true, true, |_store, _connection| Ok(()))
+    }
+
     pub(crate) fn proof_records(
         &self,
         context_id: MeshContextId,

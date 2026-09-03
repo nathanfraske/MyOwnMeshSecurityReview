@@ -2841,6 +2841,10 @@ impl NetworkState {
                 .commit(&seeded, Vec::new())
                 .map_err(|error| Error::Network(format!("semantic seed commit: {error}")))?;
             *live = seeded;
+            state
+                .durable_semantic_owner
+                .checkpoint_scale_seed_for_lab()
+                .map_err(|error| Error::Network(format!("semantic seed checkpoint: {error}")))?;
             Ok(())
         })
         .await
