@@ -143,7 +143,7 @@ impl DirectoryCapability {
     pub(crate) fn read_file(&self, name: &str, limit: usize) -> std::io::Result<Vec<u8>> {
         let mut file = self.open_file(name, false)?;
         let mut bytes = Vec::with_capacity(limit.min(4096));
-        file.by_ref()
+        std::io::Read::by_ref(&mut file)
             .take(limit.saturating_add(1) as u64)
             .read_to_end(&mut bytes)?;
         if bytes.len() > limit {
