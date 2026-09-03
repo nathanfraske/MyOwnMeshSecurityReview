@@ -1032,6 +1032,7 @@ pub struct SemanticPolicyConfig {
 /// a store connection exists.  A store may pass its actual page size to the
 /// checked envelope helpers below.
 pub const SQLITE_DEFAULT_PAGE_SIZE_BYTES: u64 = 4096;
+pub(crate) const SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 const SQLITE_WAL_HEADER_BYTES: u64 = 32;
 const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
@@ -1277,7 +1278,7 @@ impl SemanticPolicyConfig {
         const FACT_STATUS_MAX_BYTES: u64 = 11;
         const FACT_DOMAIN_MAX_BYTES: u64 = 16;
         const PROOF_STATE_MAX_BYTES: u64 = 12;
-        const META_KEY_MAX_BYTES: u64 = 16;
+        const META_KEY_MAX_BYTES: u64 = 18;
         const COMMITMENT_NAME_MAX_BYTES: u64 = 10;
         let usable = page_size_bytes.checked_sub(PAGE_HEADER_BYTES)?;
         let leaf_capacity = usable.checked_sub(CELL_POINTER_BYTES)?.max(1);
@@ -1328,11 +1329,12 @@ impl SemanticPolicyConfig {
             )?)?;
         let table_pages = [
             (
-                3,
+                4,
                 checked_sum(&[
                     checked_sum(&[META_KEY_MAX_BYTES, SQL_INTEGER_BYTES])?,
                     checked_sum(&[10, FACT_ID_BYTES])?,
                     checked_sum(&[13, 12])?,
+                    SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
                 ])?,
             ),
             (fact_rows, fact_payload),
@@ -1391,7 +1393,7 @@ impl SemanticPolicyConfig {
         // interior rounding, and overflow streams are all retained in the
         // envelope rather than being hidden by a combined row count.
         let primary_index_trees = [
-            (3, META_KEY_MAX_BYTES),
+            (4, META_KEY_MAX_BYTES),
             (fact_rows, FACT_ID_BYTES),
             (workload.max_author_usage_rows, DEVICE_KEY_BYTES),
             (workload.max_dependency_edges, 2 * FACT_ID_BYTES),

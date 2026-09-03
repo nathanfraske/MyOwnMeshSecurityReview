@@ -35,7 +35,7 @@ use serde_json::Error as JsonError;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::causal::dependencies as canonical_dependencies;
+use super::causal::{dependencies as canonical_dependencies, LiveFactGraphCheckpoint};
 use super::proof_outbox::{ProofDeliveryId, ProofRecord, ProofRecordState};
 #[cfg(test)]
 use super::SemanticFactRow;
@@ -45,6 +45,7 @@ use super::{
 };
 use crate::config::{
     SemanticPolicyConfig, SEMANTIC_INGRESS_OWNER, SEMANTIC_INGRESS_OWNER_MAX_BYTES,
+    SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
 };
 use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 
@@ -54,11 +55,14 @@ const SEMANTIC_DATABASE_FILE: &str = "store.sqlite3";
 // Version 3 adds exact proof-link usage to the singleton proof counters, so
 // steady-state proof mutations never scan the retained link table.
 const SEMANTIC_DATABASE_VERSION: u64 = 3;
+const LIVE_CHECKPOINT_KEY: &str = "live_checkpoint_v1";
 #[cfg(test)]
 const SQLITE_WAL_HEADER_BYTES: u64 = 32;
 #[cfg(test)]
 const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static ORDERED_RESTORE_ROWS: AtomicU64 = AtomicU64::new(0);
 
 /// A local store for one bootstrap record.
 ///
@@ -92,6 +96,16 @@ impl ProvisionalCustody {
 pub struct RestoredSemanticState {
     graph: FactGraph,
     provisional: Vec<ProvisionalCustody>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableLiveCheckpoint {
+    version: u16,
+    generation: u64,
+    graph: LiveFactGraphCheckpoint,
+    provisional: Vec<ProvisionalCustody>,
+    checksum: [u8; 32],
 }
 
 impl RestoredSemanticState {
@@ -3861,24 +3875,35 @@ impl DurableSemanticStore {
             .max_admitted_bytes
             .checked_add(self.policy.max_quarantined_bytes)
             .ok_or(DurableStoreError::InvalidPolicy)?;
-        count_at_most("SELECT COUNT(*) FROM meta", 3, "meta rows")?;
-        max_length_at_most("SELECT MAX(LENGTH(key)) FROM meta", 16, "meta key bytes")?;
+        count_at_most("SELECT COUNT(*) FROM meta", 4, "meta rows")?;
+        max_length_at_most("SELECT MAX(LENGTH(key)) FROM meta", 18, "meta key bytes")?;
         max_length_at_most(
             "SELECT MAX(LENGTH(value)) FROM meta",
-            32,
+            SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
             "meta value bytes",
         )?;
         sum_length_at_most(
             "SELECT COALESCE(SUM(LENGTH(key)),0) FROM meta",
-            3u64.checked_mul(16)
+            4u64.checked_mul(18)
                 .ok_or(DurableStoreError::InvalidPolicy)?,
             "meta key bytes",
         )?;
         sum_length_at_most(
             "SELECT COALESCE(SUM(LENGTH(value)),0) FROM meta",
-            3u64.checked_mul(32)
+            SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES
+                .checked_add(3 * 32)
                 .ok_or(DurableStoreError::InvalidPolicy)?,
             "meta value bytes",
+        )?;
+        exact_width(
+            "SELECT COUNT(*) FROM meta
+             WHERE key NOT IN ('database_version','context_id','fact_sequence','live_checkpoint_v1')",
+            "unknown semantic metadata key",
+        )?;
+        exact_width(
+            "SELECT COUNT(*) FROM meta
+             WHERE key != 'live_checkpoint_v1' AND LENGTH(value) > 32",
+            "semantic metadata value exceeds its fixed bound",
         )?;
 
         count_at_most("SELECT COUNT(*) FROM facts", max_fact_rows, "fact rows")?;
@@ -4847,6 +4872,173 @@ impl DurableSemanticStore {
         self.restore_from_connection(&connection, bootstrap)
     }
 
+    fn restore_live_checkpoint(
+        &self,
+        connection: &SemanticSqliteConnection,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<Option<RestoredSemanticState>, DurableStoreError> {
+        let encoded: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key=?",
+                params![LIVE_CHECKPOINT_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(DurableStoreError::Sqlite)?;
+        let Some(encoded) = encoded else {
+            return Ok(None);
+        };
+        if encoded.len() as u64 > SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES {
+            return Err(DurableStoreError::LimitExceeded("live checkpoint bytes"));
+        }
+        let checkpoint: DurableLiveCheckpoint =
+            serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: format!("invalid live checkpoint: {error}"),
+            })?;
+        if checkpoint.version != 1 {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "unsupported live checkpoint version".into(),
+            });
+        }
+        let database_version: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='database_version'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        if database_version.as_slice() != SEMANTIC_DATABASE_VERSION.to_be_bytes().as_slice() {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "unsupported database version".into(),
+            });
+        }
+        let stored_context: Vec<u8> = connection
+            .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                row.get(0)
+            })
+            .map_err(DurableStoreError::Sqlite)?;
+        if stored_context.as_slice() != bootstrap.context_id().as_bytes() {
+            let actual = stored_context
+                .try_into()
+                .map(MeshContextId::from_bytes)
+                .unwrap_or_else(|_| MeshContextId::from_bytes([0; 32]));
+            return Err(DurableStoreError::ContextMismatch {
+                expected: bootstrap.context_id(),
+                actual,
+            });
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&(
+            checkpoint.generation,
+            &checkpoint.graph,
+            &checkpoint.provisional,
+        ))?);
+        if hasher.finalize().as_slice() != checkpoint.checksum {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "live checkpoint checksum mismatch".into(),
+            });
+        }
+        let stored_usage = self.read_semantic_usage(connection)?;
+        if checkpoint.generation != stored_usage.generation {
+            // A process stopped between a semantic commit and its clean
+            // checkpoint. The cache is merely stale; replay remains the
+            // canonical crash-recovery path.
+            return Ok(None);
+        }
+        let projection: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM commitments WHERE name='projection'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        let projection: [u8; 32] =
+            projection
+                .try_into()
+                .map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid projection commitment".into(),
+                })?;
+        let graph = FactGraph::from_live_checkpoint(bootstrap, self.policy, checkpoint.graph)
+            .map_err(|reason| DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason,
+            })?;
+        let counters = graph.durable_usage_counters();
+        if counters
+            != (
+                stored_usage.admitted_count,
+                stored_usage.admitted_bytes,
+                stored_usage.quarantined_count,
+                stored_usage.quarantined_bytes,
+                stored_usage.dependency_edges,
+            )
+            || checkpoint.provisional.len() as u64 != stored_usage.provisional_count
+        {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "live checkpoint counters do not match durable usage".into(),
+            });
+        }
+        if !graph.verify_projection_commitment(projection) {
+            return Err(DurableStoreError::ProjectionMismatch {
+                path: self.path.clone(),
+            });
+        }
+        validate_provisional_for_state(&checkpoint.provisional, &graph)?;
+        Ok(Some(RestoredSemanticState {
+            graph,
+            provisional: checkpoint.provisional,
+        }))
+    }
+
+    fn persist_live_checkpoint_connection(
+        &self,
+        connection: &mut SemanticSqliteConnection,
+        graph: LiveFactGraphCheckpoint,
+        provisional: Vec<ProvisionalCustody>,
+    ) -> Result<(), DurableStoreError> {
+        self.preflight_capacity(connection)?;
+        let transaction = connection
+            .transaction()
+            .map_err(DurableStoreError::Sqlite)?;
+        let generation: Vec<u8> = transaction
+            .query_row(
+                "SELECT generation FROM semantic_usage WHERE usage_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        let generation = self.decode_usage_counter(generation, "invalid usage generation")?;
+        let mut hasher = Sha256::new();
+        hasher.update(serde_json::to_vec(&(generation, &graph, &provisional))?);
+        let mut checksum = [0u8; 32];
+        checksum.copy_from_slice(&hasher.finalize());
+        let checkpoint = DurableLiveCheckpoint {
+            version: 1,
+            generation,
+            graph,
+            provisional,
+            checksum,
+        };
+        let encoded = serde_json::to_vec(&checkpoint)?;
+        if encoded.len() as u64 > SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES {
+            return Err(DurableStoreError::LimitExceeded("live checkpoint bytes"));
+        }
+        transaction
+            .execute(
+                "INSERT INTO meta(key,value) VALUES(?,?)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![LIVE_CHECKPOINT_KEY, encoded],
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        transaction.commit().map_err(DurableStoreError::Sqlite)
+    }
+
     fn restore_ordered_in_snapshot(
         &self,
         connection: &Connection,
@@ -4903,6 +5095,8 @@ impl DurableSemanticStore {
             .map_err(DurableStoreError::Sqlite)?;
         let mut previous_seq = None;
         while let Some(row) = rows.next().map_err(DurableStoreError::Sqlite)? {
+            #[cfg(test)]
+            ORDERED_RESTORE_ROWS.fetch_add(1, Ordering::Relaxed);
             let fact_id: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
             let encoded: Vec<u8> = row.get(1).map_err(DurableStoreError::Sqlite)?;
             let status: String = row.get(2).map_err(DurableStoreError::Sqlite)?;
@@ -5195,6 +5389,16 @@ impl DurableSemanticStore {
             return Err(DurableStoreError::Missing {
                 path: self.path.clone(),
             });
+        }
+        match self.restore_live_checkpoint(connection, bootstrap) {
+            Ok(Some(restored)) => return Ok(restored),
+            Ok(None) => {}
+            Err(error) => {
+                // The checkpoint is a bounded acceleration cache. Canonical
+                // signed history remains recoverable through the existing
+                // validating replay when the cache is damaged or obsolete.
+                tracing::warn!(%error, "ignoring unusable semantic live checkpoint");
+            }
         }
         let admission_ordered = connection
             .query_row(
@@ -5889,6 +6093,24 @@ impl DurableSemanticOwner {
         let bootstrap = bootstrap.clone();
         self.worker_call(false, false, false, move |store, connection| {
             store.restore_from_connection(connection, &bootstrap)
+        })
+    }
+
+    /// Persist the already-validated bounded live continuation at the same
+    /// publication fence used by admission. This is a cache of canonical
+    /// SQLite history, not a second authority: a generation mismatch falls
+    /// back to ordinary replay after an unclean stop.
+    pub(crate) fn persist_live_checkpoint(
+        &self,
+        graph: &FactGraph,
+        provisional: &[ProvisionalCustody],
+    ) -> Result<(), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        let graph = graph.live_checkpoint();
+        let provisional = provisional.to_vec();
+        self.worker_call(false, false, false, move |store, connection| {
+            store.persist_live_checkpoint_connection(connection, graph, provisional)
         })
     }
 
@@ -7678,6 +7900,45 @@ mod tests {
         let reopened = store.open_writable().expect("same slot reopens");
         reopened.restore(&bootstrap).expect("reopen snapshot");
         drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn clean_live_checkpoint_restores_without_history_replay() {
+        let root = root();
+        let bootstrap = closed("checkpoint-restart", 21, [21; 32]);
+        let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let journal = graph
+            .admit_journaled(root_fact(&bootstrap, &key(21)))
+            .expect("admit checkpoint fact");
+        assert!(matches!(
+            journal.admission(),
+            super::super::Admission::Inserted
+        ));
+        journal.commit();
+
+        let store = DurableSemanticStore::new(&root, "checkpoint-restart-slot");
+        let owner = store.open_writable().expect("checkpoint owner");
+        owner
+            .commit(&graph, Vec::new())
+            .expect("canonical snapshot");
+        graph.seal_live_checkpoint();
+        owner
+            .persist_live_checkpoint(&graph, &[])
+            .expect("persist bounded live checkpoint");
+        owner.release().expect("release checkpoint owner");
+        drop(owner);
+
+        ORDERED_RESTORE_ROWS.store(0, Ordering::Relaxed);
+        let reopened = store.open_writable().expect("reopen checkpoint owner");
+        let restored = reopened.restore(&bootstrap).expect("restore checkpoint");
+        assert_eq!(restored.graph().len(), 1);
+        assert_eq!(
+            ORDERED_RESTORE_ROWS.load(Ordering::Relaxed),
+            0,
+            "a current clean checkpoint must not enumerate historical rows"
+        );
+        reopened.release().expect("release reopened owner");
         let _ = std::fs::remove_dir_all(root);
     }
 

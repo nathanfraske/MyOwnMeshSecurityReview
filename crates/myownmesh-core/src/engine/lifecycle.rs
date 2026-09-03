@@ -267,15 +267,21 @@ async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
     bootstrap: VerifiedBootstrap,
     instance_root: Option<std::path::PathBuf>,
 ) -> Result<(Arc<NetworkState>, tokio::task::JoinHandle<()>)> {
-    let (state, signaling_inbound_rx, cmd_rx) = NetworkState::new_in_mesh_scope_with_instance_root(
-        config,
-        identity,
-        transport,
-        bootstrap,
-        mesh_scope,
-        local_resources,
-        instance_root,
-    )?;
+    let mesh_scope = mesh_scope.clone();
+    let local_resources = local_resources.clone();
+    let (state, signaling_inbound_rx, cmd_rx) = tokio::task::spawn_blocking(move || {
+        NetworkState::new_in_mesh_scope_with_instance_root(
+            config,
+            identity,
+            transport,
+            bootstrap,
+            &mesh_scope,
+            &local_resources,
+            instance_root,
+        )
+    })
+    .await
+    .map_err(|error| Error::Network(format!("semantic startup worker failed: {error}")))??;
     let driver_state = state.clone();
     let handle = tokio::spawn(async move {
         super::run_driver(driver_state, signaling_inbound_rx, cmd_rx).await;

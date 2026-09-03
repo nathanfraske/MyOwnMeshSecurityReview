@@ -8,6 +8,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 thread_local! {
@@ -294,6 +295,41 @@ pub struct FactGraph {
     cold_history_since_retirement: usize,
     staged_cold_pending: usize,
     projection_cache: Arc<Mutex<Option<(u64, Projection)>>>,
+}
+
+/// Exact bounded continuation state persisted at a clean publication fence.
+/// Historical signed bodies remain in SQLite; this record contains only the
+/// live authority state that the next process needs before accepting work.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveFactGraphCheckpoint {
+    version: u16,
+    context_id: MeshContextId,
+    facts: Vec<SignedFact>,
+    admission_order: Vec<FactId>,
+    quarantined: Vec<SignedFact>,
+    admitted_fact_count: u64,
+    admitted_bytes: u64,
+    derived_index_bytes: u64,
+    quarantined_bytes: u64,
+    admitted_dependency_edges: u64,
+    quarantined_dependency_edges: u64,
+    quarantined_by_author: Vec<(DeviceId, (u64, u64))>,
+    retained_by_author: Vec<(DeviceId, (u64, u64))>,
+    quarantine_missing: Vec<(FactId, Vec<FactId>)>,
+    waiting_by_dependency: Vec<(FactId, Vec<FactId>)>,
+    ready_quarantine: Vec<FactId>,
+    cell_heads: Vec<(ExclusiveCell, Vec<FactId>)>,
+    authority_heads: Vec<(DeviceId, Vec<FactId>)>,
+    authority_selectors: Vec<(DeviceId, Vec<(FactId, FactId)>)>,
+    cells: Vec<ExclusiveCell>,
+    stand_down_heads: Vec<(DeviceId, Vec<FactId>)>,
+    facts_revision: u64,
+    indexed_revision: u64,
+    generation: u64,
+    projection_cells: Vec<(ExclusiveCell, super::CellProjection)>,
+    projection_stand_down: Vec<(DeviceId, super::StandDown)>,
+    projection_root: [u8; 32],
 }
 
 impl Clone for FactGraph {
@@ -967,6 +1003,259 @@ impl FactGraph {
         self.projection_commitment_root() == expected
     }
 
+    pub(crate) fn live_checkpoint(&self) -> LiveFactGraphCheckpoint {
+        let projection = self.projection();
+        let (projection_cells, projection_stand_down) = projection.checkpoint_parts();
+        LiveFactGraphCheckpoint {
+            version: 1,
+            context_id: self.context_id,
+            facts: self.facts.values().cloned().collect(),
+            admission_order: self.admission_order.clone(),
+            quarantined: self.quarantined.values().cloned().collect(),
+            admitted_fact_count: self.admitted_fact_count,
+            admitted_bytes: self.admitted_bytes,
+            derived_index_bytes: self.derived_index_bytes,
+            quarantined_bytes: self.quarantined_bytes,
+            admitted_dependency_edges: self.admitted_dependency_edges,
+            quarantined_dependency_edges: self.quarantined_dependency_edges,
+            quarantined_by_author: self
+                .quarantined_by_author
+                .iter()
+                .map(|(author, counts)| (author.clone(), *counts))
+                .collect(),
+            retained_by_author: self
+                .retained_by_author
+                .iter()
+                .map(|(author, counts)| (author.clone(), *counts))
+                .collect(),
+            quarantine_missing: self
+                .quarantine_missing
+                .iter()
+                .map(|(id, missing)| (*id, missing.iter().copied().collect()))
+                .collect(),
+            waiting_by_dependency: self
+                .waiting_by_dependency
+                .iter()
+                .map(|(id, waiting)| (*id, waiting.iter().copied().collect()))
+                .collect(),
+            ready_quarantine: self.ready_quarantine.iter().copied().collect(),
+            cell_heads: self
+                .cell_heads_index
+                .iter()
+                .map(|(cell, heads)| (cell.clone(), heads.iter().copied().collect()))
+                .collect(),
+            authority_heads: self
+                .authority_heads_index
+                .iter()
+                .map(|(subject, heads)| (subject.clone(), heads.iter().copied().collect()))
+                .collect(),
+            authority_selectors: self
+                .authority_selector_index
+                .iter()
+                .map(|(subject, selectors)| (subject.clone(), selectors.iter().copied().collect()))
+                .collect(),
+            cells: self.cells_index.iter().cloned().collect(),
+            stand_down_heads: self
+                .stand_down_index
+                .iter()
+                .map(|(subject, heads)| (subject.clone(), heads.iter().copied().collect()))
+                .collect(),
+            facts_revision: self.facts_revision,
+            indexed_revision: self.indexed_revision,
+            generation: self.generation,
+            projection_cells,
+            projection_stand_down,
+            projection_root: projection.commitment_root(),
+        }
+    }
+
+    pub(crate) fn durable_usage_counters(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.admitted_fact_count,
+            self.admitted_bytes,
+            self.quarantined.len() as u64,
+            self.quarantined_bytes,
+            self.admitted_dependency_edges
+                .saturating_add(self.quarantined_dependency_edges),
+        )
+    }
+
+    pub(crate) fn from_live_checkpoint(
+        bootstrap: &VerifiedBootstrap,
+        policy: crate::config::SemanticPolicyConfig,
+        checkpoint: LiveFactGraphCheckpoint,
+    ) -> Result<Self, String> {
+        if checkpoint.version != 1 || checkpoint.context_id != bootstrap.context_id() {
+            return Err("live checkpoint version or context mismatch".into());
+        }
+        let fact_count = checkpoint.facts.len();
+        let quarantine_count = checkpoint.quarantined.len();
+        let mut facts = BTreeMap::new();
+        for fact in checkpoint.facts {
+            fact.verify().map_err(|error| error.to_string())?;
+            if fact.content.mesh_context != checkpoint.context_id
+                || facts.insert(fact.id, fact).is_some()
+            {
+                return Err("invalid or duplicate live checkpoint fact".into());
+            }
+        }
+        let mut quarantined = BTreeMap::new();
+        for fact in checkpoint.quarantined {
+            fact.verify().map_err(|error| error.to_string())?;
+            if fact.content.mesh_context != checkpoint.context_id
+                || facts.contains_key(&fact.id)
+                || quarantined.insert(fact.id, fact).is_some()
+            {
+                return Err("invalid or duplicate live checkpoint quarantine".into());
+            }
+        }
+        if facts.len() != fact_count
+            || quarantined.len() != quarantine_count
+            || checkpoint.admitted_fact_count < fact_count as u64
+            || checkpoint.admitted_fact_count > policy.max_admitted_facts
+            || quarantined.len() as u64 > policy.max_quarantined_facts
+            || checkpoint.admitted_bytes > policy.max_admitted_bytes
+            || checkpoint.quarantined_bytes > policy.max_quarantined_bytes
+            || checkpoint
+                .admitted_dependency_edges
+                .checked_add(checkpoint.quarantined_dependency_edges)
+                .is_none_or(|edges| edges > policy.max_dependency_edges)
+        {
+            return Err("live checkpoint exceeds semantic policy".into());
+        }
+
+        fn unique_map<K: Ord, V>(values: Vec<(K, V)>) -> Option<BTreeMap<K, V>> {
+            let count = values.len();
+            let map = values.into_iter().collect::<BTreeMap<_, _>>();
+            (map.len() == count).then_some(map)
+        }
+        fn unique_set<T: Ord>(values: Vec<T>) -> Option<BTreeSet<T>> {
+            let count = values.len();
+            let set = values.into_iter().collect::<BTreeSet<_>>();
+            (set.len() == count).then_some(set)
+        }
+        fn set_map<K: Ord, V: Ord>(values: Vec<(K, Vec<V>)>) -> Option<BTreeMap<K, BTreeSet<V>>> {
+            let mut result = BTreeMap::new();
+            for (key, values) in values {
+                let values = unique_set(values)?;
+                if result.insert(key, values).is_some() {
+                    return None;
+                }
+            }
+            Some(result)
+        }
+
+        let admission_order = checkpoint.admission_order;
+        let admission_ids = unique_set(admission_order.clone())
+            .ok_or_else(|| "duplicate live checkpoint admission id".to_string())?;
+        if admission_ids.len() != facts.len()
+            || admission_ids.iter().any(|id| !facts.contains_key(id))
+        {
+            return Err("live checkpoint admission order is incomplete".into());
+        }
+        let quarantined_by_author = unique_map(checkpoint.quarantined_by_author)
+            .ok_or_else(|| "duplicate checkpoint quarantined author".to_string())?;
+        let retained_by_author = unique_map(checkpoint.retained_by_author)
+            .ok_or_else(|| "duplicate checkpoint retained author".to_string())?;
+        let quarantine_missing = set_map(checkpoint.quarantine_missing)
+            .ok_or_else(|| "invalid checkpoint missing-dependency index".to_string())?;
+        let waiting_by_dependency = set_map(checkpoint.waiting_by_dependency)
+            .ok_or_else(|| "invalid checkpoint waiting index".to_string())?;
+        let ready_quarantine = unique_set(checkpoint.ready_quarantine)
+            .ok_or_else(|| "duplicate checkpoint ready id".to_string())?;
+        if ready_quarantine
+            .iter()
+            .any(|id| !quarantined.contains_key(id))
+            || quarantine_missing
+                .keys()
+                .any(|id| !quarantined.contains_key(id))
+        {
+            return Err("checkpoint quarantine index names a non-quarantined fact".into());
+        }
+        let cell_heads_index = set_map(checkpoint.cell_heads)
+            .ok_or_else(|| "invalid checkpoint cell heads".to_string())?;
+        let authority_heads_index = set_map(checkpoint.authority_heads)
+            .ok_or_else(|| "invalid checkpoint authority heads".to_string())?;
+        let authority_selector_index = set_map(checkpoint.authority_selectors)
+            .ok_or_else(|| "invalid checkpoint authority selectors".to_string())?;
+        let cells_index =
+            unique_set(checkpoint.cells).ok_or_else(|| "duplicate checkpoint cell".to_string())?;
+        let stand_down_index = set_map(checkpoint.stand_down_heads)
+            .ok_or_else(|| "invalid checkpoint stand-down heads".to_string())?;
+        if cell_heads_index
+            .values()
+            .chain(authority_heads_index.values())
+            .chain(stand_down_index.values())
+            .flatten()
+            .any(|id| !facts.contains_key(id))
+        {
+            return Err("checkpoint head index names a non-resident fact".into());
+        }
+        let projection = Projection::from_checkpoint_parts(
+            checkpoint.projection_cells,
+            checkpoint.projection_stand_down,
+        )
+        .ok_or_else(|| "duplicate checkpoint projection entry".to_string())?;
+        if projection.commitment_root() != checkpoint.projection_root {
+            return Err("checkpoint projection commitment mismatch".into());
+        }
+        let projected_ids_are_resident = projection.cells().all(|(_, value)| match value {
+            super::CellProjection::Value(id) => facts.contains_key(id),
+            super::CellProjection::Conflict(ids) => {
+                !ids.is_empty() && ids.iter().all(|id| facts.contains_key(id))
+            }
+        }) && projection.stand_down_targets().all(|target| {
+            projection
+                .stand_down(target)
+                .is_some_and(|value| facts.contains_key(&value.proof))
+        });
+        if !projected_ids_are_resident {
+            return Err("checkpoint projection names a non-resident fact".into());
+        }
+
+        let graph = Self {
+            facts,
+            admitted_fact_count: checkpoint.admitted_fact_count,
+            admission_order,
+            quarantined,
+            policy_limits: policy.into(),
+            admitted_bytes: checkpoint.admitted_bytes,
+            derived_index_bytes: checkpoint.derived_index_bytes,
+            quarantined_bytes: checkpoint.quarantined_bytes,
+            admitted_dependency_edges: checkpoint.admitted_dependency_edges,
+            quarantined_dependency_edges: checkpoint.quarantined_dependency_edges,
+            quarantined_by_author,
+            retained_by_author,
+            quarantine_missing,
+            waiting_by_dependency,
+            ready_quarantine,
+            context_id: checkpoint.context_id,
+            authority_roots: bootstrap.authority_roots().iter().cloned().collect(),
+            policy: bootstrap.policy().clone(),
+            cell_heads_index,
+            authority_heads_index,
+            #[cfg(test)]
+            authority_dependents_index: BTreeMap::new(),
+            authority_selector_index,
+            #[cfg(test)]
+            dependency_index: BTreeMap::new(),
+            cells_index,
+            stand_down_index,
+            indexed_fact_count: fact_count,
+            facts_revision: checkpoint.facts_revision,
+            indexed_revision: checkpoint.indexed_revision,
+            generation: checkpoint.generation,
+            defer_projection_commitment: false,
+            cold_history_since_retirement: 0,
+            staged_cold_pending: 0,
+            projection_cache: Arc::new(Mutex::new(Some((checkpoint.generation, projection)))),
+        };
+        if graph.indexed_revision != graph.facts_revision {
+            return Err("checkpoint index revision mismatch".into());
+        }
+        Ok(graph)
+    }
+
     /// Retire signed bodies that are no longer needed by the live semantic
     /// continuation. The canonical rows remain in SQLite and the logical
     /// counters continue to describe the complete retained history.
@@ -1038,6 +1327,14 @@ impl FactGraph {
         self.cold_history_since_retirement = 0;
         self.staged_cold_pending = 0;
         *self.projection_cache.lock() = Some((self.generation, projection));
+    }
+
+    /// Seal the smallest exact continuation state for a durable restart.
+    /// Unlike the amortized admission sweep, shutdown must not leave a
+    /// partially filled retirement batch in the checkpoint.
+    pub(crate) fn seal_live_checkpoint(&mut self) {
+        self.cold_history_since_retirement = COLD_HISTORY_RETIREMENT_INTERVAL;
+        self.retire_cold_history();
     }
 
     /// Temporarily attach an already-verified durable causal closure while a

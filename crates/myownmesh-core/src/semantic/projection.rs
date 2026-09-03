@@ -3,19 +3,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::causal::FactGraph;
 use super::content::{DeviceId, Encoder, ExclusiveCell, FactBody};
 use super::FactId;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CellProjection {
     Value(FactId),
     Conflict(Vec<FactId>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandDown {
     pub target: DeviceId,
     pub proof: FactId,
@@ -377,6 +378,43 @@ fn is_ancestor_within(
 }
 
 impl Projection {
+    pub(crate) fn checkpoint_parts(
+        &self,
+    ) -> (
+        Vec<(ExclusiveCell, CellProjection)>,
+        Vec<(DeviceId, StandDown)>,
+    ) {
+        (
+            self.cells
+                .iter()
+                .map(|(cell, value)| (cell.clone(), value.clone()))
+                .collect(),
+            self.stand_down
+                .iter()
+                .map(|(target, value)| (target.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn from_checkpoint_parts(
+        cells: Vec<(ExclusiveCell, CellProjection)>,
+        stand_down: Vec<(DeviceId, StandDown)>,
+    ) -> Option<Self> {
+        let cell_count = cells.len();
+        let stand_down_count = stand_down.len();
+        let cells = cells.into_iter().collect::<BTreeMap<_, _>>();
+        let stand_down = stand_down.into_iter().collect::<BTreeMap<_, _>>();
+        if cells.len() != cell_count || stand_down.len() != stand_down_count {
+            return None;
+        }
+        let commitment = commitment_from_maps(&cells, &stand_down);
+        Some(Self {
+            cells: Arc::new(cells),
+            stand_down: Arc::new(stand_down),
+            commitment: Arc::new(commitment),
+        })
+    }
+
     pub(crate) fn sparse_entries(
         &self,
         cells: &BTreeSet<ExclusiveCell>,

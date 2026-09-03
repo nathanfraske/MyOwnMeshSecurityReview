@@ -6077,6 +6077,18 @@ impl NetworkState {
         // becomes permanently unavailable to stale state facades.
         let _publication = self.durable_publication_gate.lock();
         let mut semantic_graph = self.fact_graph.write();
+        semantic_graph.seal_live_checkpoint();
+        let provisional = self.durable_provisional.lock().clone();
+        if let Err(error) = self
+            .durable_semantic_owner
+            .persist_live_checkpoint(&semantic_graph, &provisional)
+        {
+            // The ledger transaction remains authoritative. A failed or
+            // interrupted checkpoint only makes the next startup take the
+            // existing full crash-recovery path.
+            tracing::warn!(%error, "durable semantic live checkpoint failed during shutdown");
+        }
+        drop(provisional);
         match self.durable_semantic_owner.release() {
             Ok(()) => {
                 // `shutdown(&self)` is deliberately borrow-based, and the
