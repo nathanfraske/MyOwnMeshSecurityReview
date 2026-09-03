@@ -693,6 +693,10 @@ mod metric_controls {
 }
 
 async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_test_writer()
+        .try_init();
     let home = tempfile::tempdir().expect("scaling instance root");
     let _home_env = ScopedMeshHome::new(home.path());
     let network_id = format!("semantic-ledger-scale-{scale}");
