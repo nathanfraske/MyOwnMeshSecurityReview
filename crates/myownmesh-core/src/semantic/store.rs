@@ -1186,15 +1186,230 @@ impl DurableSemanticStore {
         connection: &SemanticSqliteConnection,
         context_id: MeshContextId,
     ) -> Result<Vec<ProofRecord>, DurableStoreError> {
-        let snapshot = self.load_snapshot_connection(connection, &self.path)?;
-        self.validate_aggregate_limits(&snapshot)?;
-        if snapshot.context_id != context_id {
+        connection
+            .with_read_snapshot(|connection| {
+                Ok(self.proof_records_in_snapshot(connection, context_id))
+            })
+            .map_err(DurableStoreError::Sqlite)?
+    }
+
+    fn proof_records_in_snapshot(
+        &self,
+        connection: &Connection,
+        context_id: MeshContextId,
+    ) -> Result<Vec<ProofRecord>, DurableStoreError> {
+        let stored_context: Vec<u8> = connection
+            .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                row.get(0)
+            })
+            .map_err(DurableStoreError::Sqlite)?;
+        if stored_context.as_slice() != context_id.as_bytes() {
+            let actual = stored_context
+                .try_into()
+                .map(MeshContextId::from_bytes)
+                .map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid context id".into(),
+                })?;
             return Err(DurableStoreError::ContextMismatch {
                 expected: context_id,
-                actual: snapshot.context_id,
+                actual,
             });
         }
-        Ok(snapshot.proofs)
+
+        let rows = bounded_query_collect(
+            connection,
+            "SELECT delivery_id,encoded,context_id,target,state FROM proofs ORDER BY delivery_id",
+            [],
+            self.policy.max_proof_records,
+            self.policy.max_proof_bytes,
+            "proof rows",
+            |row| {
+                let delivery_id: Vec<u8> = row.get(0)?;
+                let encoded: Vec<u8> = row.get(1)?;
+                let row_context: Vec<u8> = row.get(2)?;
+                let target: Vec<u8> = row.get(3)?;
+                let state: String = row.get(4)?;
+                let bytes =
+                    u64::try_from(encoded.len()).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok(((delivery_id, encoded, row_context, target, state), bytes))
+            },
+        )?;
+        let proofs = rows
+            .into_iter()
+            .map(|row| self.decode_proof_row(row))
+            .collect::<Result<Vec<_>, _>>()?;
+        canonical_proofs(&proofs)?;
+        if proofs.iter().any(|proof| proof.context_id != context_id) {
+            return Err(DurableStoreError::ContextMismatch {
+                expected: context_id,
+                actual: proofs
+                    .iter()
+                    .find(|proof| proof.context_id != context_id)
+                    .expect("mismatched proof exists")
+                    .context_id,
+            });
+        }
+
+        let mut statement = connection
+            .prepare("SELECT fact_id FROM proof_facts WHERE delivery_id=? ORDER BY fact_id")
+            .map_err(DurableStoreError::Sqlite)?;
+        for proof in &proofs {
+            let mut rows = statement
+                .query(params![proof.delivery_id.as_bytes().to_vec()])
+                .map_err(DurableStoreError::Sqlite)?;
+            let mut fact_ids = Vec::with_capacity(proof.fact_ids.len());
+            while let Some(row) = rows.next().map_err(DurableStoreError::Sqlite)? {
+                if fact_ids.len() >= proof.fact_ids.len().saturating_add(1) {
+                    return Err(DurableStoreError::LimitExceeded("proof links"));
+                }
+                let value: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
+                let value: [u8; 32] = value.try_into().map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid proof fact link".into(),
+                })?;
+                fact_ids.push(FactId::from_bytes(value));
+            }
+            if fact_ids != proof.fact_ids {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "proof fact index does not match proof bytes".into(),
+                });
+            }
+        }
+        drop(statement);
+
+        let orphaned: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM proof_facts pf
+                 LEFT JOIN facts f ON f.fact_id=pf.fact_id
+                 LEFT JOIN proofs p ON p.delivery_id=pf.delivery_id
+                 WHERE f.fact_id IS NULL OR p.delivery_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        if orphaned != 0 {
+            return Err(DurableStoreError::UnknownProofFact);
+        }
+        let stored = self.read_proof_usage_raw(connection)?;
+        let expected = Self::proof_usage(&proofs, stored.generation)?;
+        if stored != expected {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "proof usage does not match normalized rows".into(),
+            });
+        }
+        Ok(proofs)
+    }
+
+    fn admitted_causal_history_in_snapshot(
+        &self,
+        connection: &Connection,
+        roots: &[FactId],
+    ) -> Result<Vec<SignedFact>, DurableStoreError> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("(?)", roots.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "WITH RECURSIVE roots(fact_id) AS (VALUES {placeholders}),
+             closure(fact_id) AS (
+                 SELECT fact_id FROM roots
+                 UNION
+                 SELECT d.dep_id FROM dependencies d JOIN closure c ON d.fact_id=c.fact_id
+             )
+             SELECT f.fact_id,f.encoded
+             FROM facts f JOIN closure c ON c.fact_id=f.fact_id
+             WHERE f.status='admitted'
+             ORDER BY f.seq"
+        );
+        let values = roots
+            .iter()
+            .map(|id| id.as_bytes().to_vec())
+            .collect::<Vec<_>>();
+        let params = rusqlite::params_from_iter(values.iter());
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = bounded_query_collect(
+            connection,
+            &sql,
+            params,
+            self.policy.max_proof_links,
+            self.policy.max_proof_bytes,
+            "causal verification history",
+            |row| {
+                let id: Vec<u8> = row.get(0)?;
+                let encoded: Vec<u8> = row.get(1)?;
+                let bytes = u64::try_from(id.len())
+                    .ok()
+                    .and_then(|value| value.checked_add(u64::try_from(encoded.len()).ok()?))
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                Ok(((id, encoded), bytes))
+            },
+        )?;
+        rows.into_iter()
+            .map(|(id, encoded)| {
+                let id: [u8; 32] = id.try_into().map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid causal history fact id".into(),
+                })?;
+                let fact: SignedFact = serde_json::from_slice(&encoded).map_err(|error| {
+                    DurableStoreError::Corrupt {
+                        path: self.path.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+                if fact.id.as_bytes() != &id {
+                    return Err(DurableStoreError::Corrupt {
+                        path: self.path.clone(),
+                        reason: "causal history id does not match signed bytes".into(),
+                    });
+                }
+                Ok(fact)
+            })
+            .collect()
+    }
+
+    fn provisional_in_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<Vec<ProvisionalCustody>, DurableStoreError> {
+        let rows: Vec<(Vec<u8>, String)> = bounded_query_collect(
+            connection,
+            "SELECT fact_id,owner FROM provisional ORDER BY fact_id,owner",
+            [],
+            self.policy.max_provisional_rows,
+            self.policy
+                .max_provisional_rows
+                .checked_mul(32 + SEMANTIC_INGRESS_OWNER_MAX_BYTES)
+                .ok_or(DurableStoreError::InvalidPolicy)?,
+            "provisional rows",
+            |row| {
+                let fact_id: Vec<u8> = row.get(0)?;
+                let owner: String = row.get(1)?;
+                let bytes = u64::try_from(fact_id.len())
+                    .ok()
+                    .and_then(|value| value.checked_add(u64::try_from(owner.len()).ok()?))
+                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                Ok(((fact_id, owner), bytes))
+            },
+        )?;
+        canonical_provisional(
+            rows.into_iter()
+                .map(|(fact_id, owner)| {
+                    let fact_id: [u8; 32] =
+                        fact_id.try_into().map_err(|_| DurableStoreError::Corrupt {
+                            path: self.path.clone(),
+                            reason: "invalid provisional fact id".into(),
+                        })?;
+                    Ok(ProvisionalCustody {
+                        fact_id: FactId::from_bytes(fact_id),
+                        owner,
+                    })
+                })
+                .collect::<Result<Vec<_>, DurableStoreError>>()?,
+        )
     }
 
     #[cfg(test)]
@@ -1614,7 +1829,6 @@ impl DurableSemanticStore {
         })
     }
 
-    #[cfg(test)]
     fn read_semantic_usage_raw(
         &self,
         connection: &Connection,
@@ -2403,12 +2617,15 @@ impl DurableSemanticStore {
         expected_base_projection: [u8; 32],
         projection_commitment: [u8; 32],
         custody: &[ProvisionalCustody],
+        row_limit_override: Option<usize>,
     ) -> Result<SemanticDeltaPlan, DurableStoreError> {
         let batch_limit = usize::try_from(self.policy.max_ready_batch)
             .map_err(|_| DurableStoreError::InvalidPolicy)?;
-        let max_rows = batch_limit
-            .checked_add(1)
-            .ok_or(DurableStoreError::InvalidPolicy)?;
+        let max_rows = row_limit_override.unwrap_or(
+            batch_limit
+                .checked_add(1)
+                .ok_or(DurableStoreError::InvalidPolicy)?,
+        );
         if delta.rows().len() > max_rows
             || delta.promoted().len() > batch_limit
             || delta.removed().len() > batch_limit
@@ -4630,6 +4847,334 @@ impl DurableSemanticStore {
         self.restore_from_connection(&connection, bootstrap)
     }
 
+    fn restore_ordered_in_snapshot(
+        &self,
+        connection: &Connection,
+        bootstrap: &VerifiedBootstrap,
+    ) -> Result<RestoredSemanticState, DurableStoreError> {
+        self.preflight_snapshot_rows(connection, &self.path)?;
+        let version: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='database_version'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        if version.as_slice() != SEMANTIC_DATABASE_VERSION.to_be_bytes().as_slice() {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "unsupported database version".into(),
+            });
+        }
+        let context: Vec<u8> = connection
+            .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                row.get(0)
+            })
+            .map_err(DurableStoreError::Sqlite)?;
+        let context: [u8; 32] = context.try_into().map_err(|_| DurableStoreError::Corrupt {
+            path: self.path.clone(),
+            reason: "invalid context id".into(),
+        })?;
+        let context_id = MeshContextId::from_bytes(context);
+        if context_id != bootstrap.context_id() {
+            return Err(DurableStoreError::ContextMismatch {
+                expected: bootstrap.context_id(),
+                actual: context_id,
+            });
+        }
+        let stored_usage = self.read_semantic_usage_raw(connection)?;
+        let mut expected_usage = SemanticUsage {
+            generation: stored_usage.generation,
+            ..SemanticUsage::default()
+        };
+        let mut expected_authors = std::collections::BTreeMap::<[u8; 32], AuthorUsage>::new();
+        let mut quarantined = Vec::new();
+        let mut graph = FactGraph::from_bootstrap_with_policy(bootstrap, self.policy);
+        graph.begin_deferred_projection_commitment();
+
+        let mut dependency_statement = connection
+            .prepare("SELECT dep_id FROM dependencies WHERE fact_id=? ORDER BY dep_id")
+            .map_err(DurableStoreError::Sqlite)?;
+        let mut fact_statement = connection
+            .prepare("SELECT fact_id,encoded,status,author,domain,seq FROM facts ORDER BY seq")
+            .map_err(DurableStoreError::Sqlite)?;
+        let mut rows = fact_statement
+            .query([])
+            .map_err(DurableStoreError::Sqlite)?;
+        let mut previous_seq = None;
+        while let Some(row) = rows.next().map_err(DurableStoreError::Sqlite)? {
+            let fact_id: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
+            let encoded: Vec<u8> = row.get(1).map_err(DurableStoreError::Sqlite)?;
+            let status: String = row.get(2).map_err(DurableStoreError::Sqlite)?;
+            let author: Vec<u8> = row.get(3).map_err(DurableStoreError::Sqlite)?;
+            let domain: String = row.get(4).map_err(DurableStoreError::Sqlite)?;
+            let seq: i64 = row.get(5).map_err(DurableStoreError::Sqlite)?;
+            if seq < 0 || previous_seq.is_some_and(|previous| seq <= previous) {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "fact sequence index is not strictly increasing".into(),
+                });
+            }
+            previous_seq = Some(seq);
+            let fact: SignedFact =
+                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: error.to_string(),
+                })?;
+            let indexed_id: [u8; 32] =
+                fact_id.try_into().map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid fact id index".into(),
+                })?;
+            if fact.id.as_bytes() != &indexed_id
+                || fact.content.author.as_bytes().as_slice() != author.as_slice()
+                || serde_json::to_string(&fact.content.domain)? != domain
+            {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "fact index does not match signed bytes".into(),
+                });
+            }
+
+            let expected_dependencies = canonical_dependencies(&fact);
+            let mut dependency_rows = dependency_statement
+                .query(params![fact.id.as_bytes().to_vec()])
+                .map_err(DurableStoreError::Sqlite)?;
+            let mut actual_dependencies = Vec::with_capacity(expected_dependencies.len());
+            while let Some(row) = dependency_rows.next().map_err(DurableStoreError::Sqlite)? {
+                let dependency: Vec<u8> = row.get(0).map_err(DurableStoreError::Sqlite)?;
+                let dependency: [u8; 32] =
+                    dependency
+                        .try_into()
+                        .map_err(|_| DurableStoreError::Corrupt {
+                            path: self.path.clone(),
+                            reason: "invalid dependency id".into(),
+                        })?;
+                actual_dependencies.push(FactId::from_bytes(dependency));
+            }
+            if actual_dependencies != expected_dependencies {
+                return Err(DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "dependency index does not match signed bytes".into(),
+                });
+            }
+
+            let bytes =
+                u64::try_from(encoded.len()).map_err(|_| DurableStoreError::InvalidPolicy)?;
+            expected_usage.dependency_edges = expected_usage
+                .dependency_edges
+                .checked_add(
+                    u64::try_from(actual_dependencies.len())
+                        .map_err(|_| DurableStoreError::InvalidPolicy)?,
+                )
+                .and_then(|value| value.checked_add(fact.content.authority_uses.len() as u64))
+                .ok_or(DurableStoreError::InvalidPolicy)?;
+            let author_usage = expected_authors
+                .entry(fact.content.author.as_bytes())
+                .or_default();
+            author_usage.retained_count = author_usage
+                .retained_count
+                .checked_add(1)
+                .ok_or(DurableStoreError::InvalidPolicy)?;
+            author_usage.retained_bytes = author_usage
+                .retained_bytes
+                .checked_add(bytes)
+                .ok_or(DurableStoreError::InvalidPolicy)?;
+
+            match status.as_str() {
+                "admitted" => {
+                    expected_usage.admitted_count = expected_usage
+                        .admitted_count
+                        .checked_add(1)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    expected_usage.admitted_bytes = expected_usage
+                        .admitted_bytes
+                        .checked_add(bytes)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    let needs_history = expected_dependencies
+                        .iter()
+                        .any(|dependency| graph.get(dependency).is_none());
+                    let history = if needs_history {
+                        self.admitted_causal_history_in_snapshot(
+                            connection,
+                            &expected_dependencies,
+                        )?
+                    } else {
+                        Vec::new()
+                    };
+                    let journal = if history.is_empty() {
+                        graph.admit_journaled(fact)
+                    } else {
+                        graph.admit_journaled_with_history(fact, history)
+                    }
+                    .map_err(|error| DurableStoreError::Rebuild {
+                        path: self.path.clone(),
+                        reason: error.to_string(),
+                    })?;
+                    if !matches!(journal.admission(), super::Admission::Inserted) {
+                        return Err(DurableStoreError::Rebuild {
+                            path: self.path.clone(),
+                            reason: "admitted row did not replay as admitted".into(),
+                        });
+                    }
+                    journal.commit();
+                    graph.retire_cold_history();
+                }
+                "quarantined" => {
+                    expected_usage.quarantined_count = expected_usage
+                        .quarantined_count
+                        .checked_add(1)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    expected_usage.quarantined_bytes = expected_usage
+                        .quarantined_bytes
+                        .checked_add(bytes)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    author_usage.quarantined_count = author_usage
+                        .quarantined_count
+                        .checked_add(1)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    author_usage.quarantined_bytes = author_usage
+                        .quarantined_bytes
+                        .checked_add(bytes)
+                        .ok_or(DurableStoreError::InvalidPolicy)?;
+                    quarantined.push(fact);
+                }
+                _ => {
+                    return Err(DurableStoreError::Corrupt {
+                        path: self.path.clone(),
+                        reason: "invalid fact status".into(),
+                    })
+                }
+            }
+        }
+        drop(rows);
+        drop(fact_statement);
+        drop(dependency_statement);
+
+        let orphaned_dependencies: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies d LEFT JOIN facts f ON f.fact_id=d.fact_id WHERE f.fact_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        if orphaned_dependencies != 0 {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "dependency index names an unknown fact".into(),
+            });
+        }
+
+        for fact in quarantined {
+            let dependencies = canonical_dependencies(&fact);
+            let history = self.admitted_causal_history_in_snapshot(connection, &dependencies)?;
+            let journal = graph
+                .admit_journaled_with_history(fact, history)
+                .map_err(|error| DurableStoreError::Rebuild {
+                    path: self.path.clone(),
+                    reason: error.to_string(),
+                })?;
+            if !matches!(journal.admission(), super::Admission::Quarantined { .. }) {
+                return Err(DurableStoreError::Rebuild {
+                    path: self.path.clone(),
+                    reason: "quarantined row did not replay as quarantined".into(),
+                });
+            }
+            journal.commit();
+            graph.retire_cold_history();
+        }
+        graph.finish_deferred_projection_commitment();
+
+        let provisional = self.provisional_in_snapshot(connection)?;
+        expected_usage.provisional_count =
+            u64::try_from(provisional.len()).map_err(|_| DurableStoreError::InvalidPolicy)?;
+        expected_usage.author_usage_rows =
+            u64::try_from(expected_authors.len()).map_err(|_| DurableStoreError::InvalidPolicy)?;
+        if expected_usage != stored_usage {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "semantic usage does not match streamed rows".into(),
+            });
+        }
+
+        let author_rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> =
+            bounded_query_collect(
+                connection,
+                "SELECT author,retained_count,retained_bytes,quarantined_count,quarantined_bytes FROM author_usage ORDER BY author",
+                [],
+                self.policy.max_author_usage_rows,
+                self.policy.max_author_usage_rows.checked_mul(64).ok_or(DurableStoreError::InvalidPolicy)?,
+                "author usage rows",
+                |row| {
+                    let values = (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+                    Ok((values, 64))
+                },
+            )?;
+        let mut actual_authors = std::collections::BTreeMap::new();
+        for (author, retained_count, retained_bytes, quarantined_count, quarantined_bytes) in
+            author_rows
+        {
+            let author: [u8; 32] = author.try_into().map_err(|_| DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "invalid author usage key".into(),
+            })?;
+            actual_authors.insert(
+                author,
+                AuthorUsage {
+                    retained_count: decode_counter_for_path(
+                        retained_count,
+                        &self.path,
+                        "invalid retained author count",
+                    )?,
+                    retained_bytes: decode_counter_for_path(
+                        retained_bytes,
+                        &self.path,
+                        "invalid retained author bytes",
+                    )?,
+                    quarantined_count: decode_counter_for_path(
+                        quarantined_count,
+                        &self.path,
+                        "invalid quarantined author count",
+                    )?,
+                    quarantined_bytes: decode_counter_for_path(
+                        quarantined_bytes,
+                        &self.path,
+                        "invalid quarantined author bytes",
+                    )?,
+                },
+            );
+        }
+        if actual_authors != expected_authors {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "author usage does not match streamed rows".into(),
+            });
+        }
+
+        validate_provisional_for_state(&provisional, &graph)?;
+        let _proofs = self.proof_records_in_snapshot(connection, context_id)?;
+        let projection_commitment: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM commitments WHERE name='projection'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(DurableStoreError::Sqlite)?;
+        let projection_commitment: [u8; 32] =
+            projection_commitment
+                .try_into()
+                .map_err(|_| DurableStoreError::Corrupt {
+                    path: self.path.clone(),
+                    reason: "invalid projection commitment".into(),
+                })?;
+        if !graph.verify_projection_commitment(projection_commitment) {
+            return Err(DurableStoreError::ProjectionMismatch {
+                path: self.path.clone(),
+            });
+        }
+        Ok(RestoredSemanticState { graph, provisional })
+    }
+
     fn restore_from_connection(
         &self,
         connection: &SemanticSqliteConnection,
@@ -4650,6 +5195,23 @@ impl DurableSemanticStore {
             return Err(DurableStoreError::Missing {
                 path: self.path.clone(),
             });
+        }
+        let admission_ordered = connection
+            .query_row(
+                "SELECT value FROM meta WHERE key='fact_sequence'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(DurableStoreError::Sqlite)?
+            .as_deref()
+            == Some("admission_v1");
+        if admission_ordered {
+            return connection
+                .with_read_snapshot(|connection| {
+                    Ok(self.restore_ordered_in_snapshot(connection, bootstrap))
+                })
+                .map_err(DurableStoreError::Sqlite)?;
         }
         let snapshot = self.load_snapshot_connection(connection, &self.path)?;
         if snapshot.context_id != bootstrap.context_id() {
@@ -4698,6 +5260,7 @@ impl DurableSemanticStore {
                 path: self.path.clone(),
             });
         }
+        graph.retire_cold_history();
         Ok(RestoredSemanticState { graph, provisional })
     }
 }
@@ -4744,6 +5307,300 @@ impl DurableSemanticOwner {
     pub(crate) fn ensure_live(&self) -> Result<(), DurableStoreError> {
         let _gate = self.store.lock_process()?;
         self.ensure_live_unlocked()
+    }
+
+    /// Read one admitted canonical fact by content id. Historical bodies are
+    /// served from SQLite rather than retained in the live authority graph.
+    pub(crate) fn admitted_fact(
+        &self,
+        fact_id: FactId,
+    ) -> Result<Option<SignedFact>, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(false, false, false, move |store, connection| {
+            let row: Option<(Vec<u8>, String)> = connection
+                .query_row(
+                    "SELECT encoded,status FROM facts WHERE fact_id=?",
+                    params![fact_id.as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(DurableStoreError::Sqlite)?;
+            let Some((encoded, status)) = row else {
+                return Ok(None);
+            };
+            if status != "admitted" {
+                return Ok(None);
+            }
+            let fact: SignedFact =
+                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
+                    path: store.path.clone(),
+                    reason: error.to_string(),
+                })?;
+            if fact.id != fact_id {
+                return Err(DurableStoreError::Corrupt {
+                    path: store.path.clone(),
+                    reason: "fact row id does not match signed bytes".into(),
+                });
+            }
+            Ok(Some(fact))
+        })
+    }
+
+    pub(crate) fn admitted_facts(
+        &self,
+        fact_ids: Vec<FactId>,
+    ) -> Result<Vec<Option<SignedFact>>, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(false, false, false, move |store, connection| {
+            connection
+                .prepare(
+                    "SELECT encoded,status FROM facts WHERE fact_id=?",
+                    |statement| {
+                        let mut facts = Vec::with_capacity(fact_ids.len());
+                        for fact_id in fact_ids {
+                            let row: Option<(Vec<u8>, String)> = statement
+                                .query_row(params![fact_id.as_bytes().to_vec()], |row| {
+                                    Ok((row.get(0)?, row.get(1)?))
+                                })
+                                .optional()?;
+                            let fact = match row {
+                                Some((encoded, status)) if status == "admitted" => {
+                                    let fact: SignedFact = serde_json::from_slice(&encoded)
+                                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                                    if fact.id != fact_id {
+                                        return Err(rusqlite::Error::InvalidQuery);
+                                    }
+                                    Some(fact)
+                                }
+                                Some(_) | None => None,
+                            };
+                            facts.push(fact);
+                        }
+                        Ok(facts)
+                    },
+                )
+                .map_err(|error| match error {
+                    rusqlite::Error::InvalidQuery => DurableStoreError::Corrupt {
+                        path: store.path.clone(),
+                        reason: "invalid admitted fact row".into(),
+                    },
+                    other => DurableStoreError::Sqlite(other),
+                })
+        })
+    }
+
+    /// Read a bounded deterministic page of admitted fact ids from SQLite.
+    pub(crate) fn admitted_fact_ids_after(
+        &self,
+        cursor: Option<FactId>,
+        limit: usize,
+    ) -> Result<Vec<FactId>, DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(false, false, false, move |store, connection| {
+            let limit = i64::try_from(limit).map_err(|_| DurableStoreError::InvalidPolicy)?;
+            let mut ids = Vec::new();
+            let sql = if cursor.is_some() {
+                "SELECT fact_id FROM facts WHERE status='admitted' AND fact_id>? ORDER BY fact_id LIMIT ?"
+            } else {
+                "SELECT fact_id FROM facts WHERE status='admitted' ORDER BY fact_id LIMIT ?"
+            };
+            connection.prepare(sql, |statement| {
+                let mut rows = match cursor {
+                    Some(cursor) => statement.query(params![cursor.as_bytes().to_vec(), limit])?,
+                    None => statement.query(params![limit])?,
+                };
+                while let Some(row) = rows.next()? {
+                    let encoded: Vec<u8> = row.get(0)?;
+                    let bytes: [u8; 32] = encoded
+                        .try_into()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                    ids.push(FactId::from_bytes(bytes));
+                }
+                Ok(())
+            })
+            .map_err(DurableStoreError::Sqlite)?;
+            if ids.len() > usize::try_from(limit).unwrap_or(usize::MAX) {
+                return Err(DurableStoreError::Corrupt {
+                    path: store.path.clone(),
+                    reason: "fact id page exceeded its SQL limit".into(),
+                });
+            }
+            Ok(ids)
+        })
+    }
+
+    /// Stream the exact durable semantic state commitment without
+    /// materializing historical facts in the process heap.
+    pub(crate) fn state_identity_digest(
+        &self,
+        context_id: MeshContextId,
+    ) -> Result<(u64, u64, [u8; 32]), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(false, false, false, move |store, connection| {
+            connection
+                .with_read_snapshot(|connection| {
+                    Ok((|| -> Result<(u64, u64, [u8; 32]), DurableStoreError> {
+                        let stored_context: Vec<u8> = connection
+                            .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                                row.get(0)
+                            })
+                            .map_err(DurableStoreError::Sqlite)?;
+                        if stored_context.as_slice() != context_id.as_bytes() {
+                            return Err(DurableStoreError::ContextMismatch {
+                                expected: context_id,
+                                actual: stored_context
+                                    .try_into()
+                                    .map(MeshContextId::from_bytes)
+                                    .unwrap_or_else(|_| MeshContextId::from_bytes([0; 32])),
+                            });
+                        }
+                        let usage = store.read_semantic_usage_raw(connection)?;
+                        let mut hasher = Sha256::new();
+                        hasher.update(b"myownmesh-semantic-state-v2\0context\0");
+                        hasher.update(context_id.as_bytes());
+                        hasher.update(b"\0admitted-count\0");
+                        hasher.update(usage.admitted_count.to_le_bytes());
+                        hasher.update(b"\0admitted\0");
+                        for (status, count_label) in [
+                            ("admitted", usage.admitted_count),
+                            ("quarantined", usage.quarantined_count),
+                        ] {
+                            if status == "quarantined" {
+                                hasher.update(b"\0unresolved-count\0");
+                                hasher.update(count_label.to_le_bytes());
+                                hasher.update(b"\0unresolved\0");
+                            }
+                            let sql =
+                                "SELECT fact_id,encoded FROM facts WHERE status=? ORDER BY fact_id";
+                            let mut statement =
+                                connection.prepare(sql).map_err(DurableStoreError::Sqlite)?;
+                            let mut rows = statement
+                                .query(params![status])
+                                .map_err(DurableStoreError::Sqlite)?;
+                            let mut observed = 0u64;
+                            while let Some(row) = rows.next().map_err(DurableStoreError::Sqlite)? {
+                                let fact_id: Vec<u8> =
+                                    row.get(0).map_err(DurableStoreError::Sqlite)?;
+                                let encoded: Vec<u8> =
+                                    row.get(1).map_err(DurableStoreError::Sqlite)?;
+                                if fact_id.len() != 32 {
+                                    return Err(DurableStoreError::Corrupt {
+                                        path: store.path.clone(),
+                                        reason: "semantic identity row has an invalid id".into(),
+                                    });
+                                }
+                                hasher.update(&fact_id);
+                                hasher.update(&encoded);
+                                hasher.update([0]);
+                                observed = observed
+                                    .checked_add(1)
+                                    .ok_or(DurableStoreError::InvalidPolicy)?;
+                            }
+                            if observed != count_label {
+                                return Err(DurableStoreError::Corrupt {
+                                    path: store.path.clone(),
+                                    reason: "semantic identity rows do not match usage".into(),
+                                });
+                            }
+                        }
+                        let digest = hasher.finalize();
+                        let mut commitment = [0u8; 32];
+                        commitment.copy_from_slice(&digest);
+                        Ok((usage.admitted_count, usage.quarantined_count, commitment))
+                    })())
+                })
+                .map_err(DurableStoreError::Sqlite)?
+        })
+    }
+
+    /// Load the bounded admitted causal closure needed to validate a stale or
+    /// out-of-order candidate. SQLite performs recursive traversal; ordinary
+    /// current-head admissions return only their direct hot witnesses and do
+    /// not allocate history-sized process state.
+    pub(crate) fn admitted_causal_history(
+        &self,
+        roots: Vec<FactId>,
+    ) -> Result<Vec<SignedFact>, DurableStoreError> {
+        if roots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        self.worker_call(false, false, false, move |store, connection| {
+            connection
+                .with_read_snapshot(|connection| {
+                    Ok((|| -> Result<Vec<SignedFact>, DurableStoreError> {
+                        let placeholders = std::iter::repeat_n("(?)", roots.len())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let sql = format!(
+                            "WITH RECURSIVE roots(fact_id) AS (VALUES {placeholders}),
+                 closure(fact_id) AS (
+                     SELECT fact_id FROM roots
+                     UNION
+                     SELECT d.dep_id FROM dependencies d JOIN closure c ON d.fact_id=c.fact_id
+                 )
+                 SELECT f.fact_id,f.encoded
+                 FROM facts f JOIN closure c ON c.fact_id=f.fact_id
+                 WHERE f.status='admitted'
+                 ORDER BY f.seq"
+                        );
+                        let values = roots
+                            .iter()
+                            .map(|id| id.as_bytes().to_vec())
+                            .collect::<Vec<_>>();
+                        let params = rusqlite::params_from_iter(values.iter());
+                        let rows: Vec<(Vec<u8>, Vec<u8>)> = bounded_query_collect(
+                            connection,
+                            &sql,
+                            params,
+                            store.policy.max_proof_links,
+                            store.policy.max_proof_bytes,
+                            "causal verification history",
+                            |row| {
+                                let id: Vec<u8> = row.get(0)?;
+                                let encoded: Vec<u8> = row.get(1)?;
+                                let bytes = u64::try_from(id.len())
+                                    .ok()
+                                    .and_then(|value| {
+                                        value.checked_add(u64::try_from(encoded.len()).ok()?)
+                                    })
+                                    .ok_or(rusqlite::Error::InvalidQuery)?;
+                                Ok(((id, encoded), bytes))
+                            },
+                        )?;
+                        rows.into_iter()
+                            .map(|(id, encoded)| {
+                                let id: [u8; 32] =
+                                    id.try_into().map_err(|_| DurableStoreError::Corrupt {
+                                        path: store.path.clone(),
+                                        reason: "invalid causal history fact id".into(),
+                                    })?;
+                                let fact: SignedFact =
+                                    serde_json::from_slice(&encoded).map_err(|error| {
+                                        DurableStoreError::Corrupt {
+                                            path: store.path.clone(),
+                                            reason: error.to_string(),
+                                        }
+                                    })?;
+                                if fact.id.as_bytes() != &id {
+                                    return Err(DurableStoreError::Corrupt {
+                                        path: store.path.clone(),
+                                        reason: "causal history id does not match signed bytes"
+                                            .into(),
+                                    });
+                                }
+                                Ok(fact)
+                            })
+                            .collect()
+                    })())
+                })
+                .map_err(DurableStoreError::Sqlite)?
+        })
     }
 
     pub(crate) fn release(&self) -> Result<(), DurableStoreError> {
@@ -4800,24 +5657,6 @@ impl DurableSemanticOwner {
         })
     }
 
-    /// Transfer a transport-lab seed into the storage worker and return the
-    /// same allocation after publication. This avoids duplicating a large
-    /// graph merely to cross the worker boundary; production admissions still
-    /// use bounded deltas.
-    #[cfg(feature = "transport-lab")]
-    pub(crate) fn commit_owned_for_lab(
-        &self,
-        graph: FactGraph,
-        provisional: Vec<ProvisionalCustody>,
-    ) -> Result<FactGraph, DurableStoreError> {
-        let _gate = self.store.lock_process()?;
-        self.ensure_live_unlocked()?;
-        self.worker_call(true, false, false, move |store, connection| {
-            store.store_snapshot_on_connection(connection, &graph, provisional)?;
-            Ok(graph)
-        })
-    }
-
     pub(crate) fn commit_semantic_delta(
         &self,
         context_id: MeshContextId,
@@ -4838,6 +5677,41 @@ impl DurableSemanticOwner {
                 expected_base_projection,
                 projection_commitment,
                 &custody,
+                None,
+            )?;
+            if !plan.changed {
+                return Ok(());
+            }
+            store.preflight_capacity(connection)?;
+            let transaction = connection
+                .transaction()
+                .map_err(DurableStoreError::Sqlite)?;
+            store.apply_semantic_delta(&transaction, &plan)?;
+            transaction.commit().map_err(DurableStoreError::Sqlite)
+        })
+    }
+
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn commit_semantic_seed_delta_for_lab(
+        &self,
+        context_id: MeshContextId,
+        delta: &SemanticDelta,
+        expected_base_projection: [u8; 32],
+        projection_commitment: [u8; 32],
+        max_rows: usize,
+    ) -> Result<(), DurableStoreError> {
+        let _gate = self.store.lock_process()?;
+        self.ensure_live_unlocked()?;
+        let delta = delta.clone();
+        self.worker_call(false, false, false, move |store, connection| {
+            let plan = store.plan_semantic_delta(
+                connection,
+                context_id,
+                &delta,
+                expected_base_projection,
+                projection_commitment,
+                &[],
+                Some(max_rows),
             )?;
             if !plan.changed {
                 return Ok(());

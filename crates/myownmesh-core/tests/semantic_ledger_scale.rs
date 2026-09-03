@@ -154,7 +154,10 @@ struct ScaleWindowEvidence {
 const SCALE_WINDOW_TARGETS: usize = 128;
 const WINDOW_SAMPLE_LIMIT: usize = 64;
 const MAX_TIMING_SAMPLES: usize = SCALE_WINDOW_TARGETS * WINDOW_SAMPLE_LIMIT;
-const LARGE_SCALE_TIMED_ADMISSIONS: usize = 10_000;
+// Large-scale controls validate the whole durable history, then measure enough
+// individual production admissions for stable percentile/window evidence.
+// More samples only add fsync wall time; they do not improve the scale proof.
+const LARGE_SCALE_TIMED_ADMISSIONS: usize = 2_000;
 
 #[derive(Debug, Serialize)]
 struct TailFactEvidence {

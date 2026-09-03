@@ -423,13 +423,19 @@ async fn broadcast_for_owner(
 }
 
 struct FactInventoryCursor {
-    graph: Arc<parking_lot::RwLock<crate::semantic::FactGraph>>,
+    source: FactInventorySource,
     context_id: crate::semantic::MeshContextId,
     cursor: Option<FactId>,
     finished: bool,
     invalid: bool,
     #[cfg(test)]
     visited_candidates: usize,
+}
+
+enum FactInventorySource {
+    Durable(Arc<EngineState>),
+    #[cfg(test)]
+    Graph(Arc<parking_lot::RwLock<crate::semantic::FactGraph>>),
 }
 
 impl FactInventoryCursor {
@@ -455,13 +461,35 @@ impl FactInventoryCursor {
         let fact_ids = {
             let mut fact_ids = Vec::new();
             let mut encoded_len = empty_len;
-            let graph = self.graph.read();
-            for fact_id in graph.ids_after(self.cursor) {
+            let maximum_ids = crate::protocol::RECEIVE_FRAME_BYTES
+                .saturating_sub(empty_len)
+                .checked_div(53)
+                .unwrap_or(0)
+                .saturating_add(1);
+            let candidates = match &self.source {
+                FactInventorySource::Durable(state) => {
+                    match state.admitted_semantic_fact_ids_after(self.cursor, maximum_ids) {
+                        Ok(ids) => ids,
+                        Err(_) => {
+                            self.invalid = true;
+                            return None;
+                        }
+                    }
+                }
+                #[cfg(test)]
+                FactInventorySource::Graph(graph) => graph
+                    .read()
+                    .ids_after(self.cursor)
+                    .take(maximum_ids)
+                    .copied()
+                    .collect(),
+            };
+            for fact_id in candidates {
                 #[cfg(test)]
                 {
                     self.visited_candidates = self.visited_candidates.saturating_add(1);
                 }
-                let id_len = match serde_json::to_vec(fact_id) {
+                let id_len = match serde_json::to_vec(&fact_id) {
                     Ok(encoded) => encoded.len(),
                     Err(_) => {
                         self.invalid = true;
@@ -483,7 +511,7 @@ impl FactInventoryCursor {
                     }
                     break;
                 }
-                fact_ids.push(*fact_id);
+                fact_ids.push(fact_id);
                 encoded_len = candidate_len;
             }
             fact_ids
@@ -508,7 +536,7 @@ impl FactInventoryCursor {
 
 fn local_fact_inventory_cursor(state: &Arc<EngineState>) -> FactInventoryCursor {
     FactInventoryCursor {
-        graph: state.authoritative_fact_graph(),
+        source: FactInventorySource::Durable(Arc::clone(state)),
         context_id: state.mesh_context_id(),
         cursor: None,
         finished: false,
@@ -651,17 +679,17 @@ pub(super) async fn on_fact_inventory(
     // incomparable inventories alive indefinitely. The periodic/event-driven
     // full inventory pass repairs lost pages and converges once missing ids
     // have been admitted.
-    let missing = {
-        let graph = state.authoritative_fact_graph();
-        let graph = graph.read();
-        let missing = inventory
-            .fact_ids()
-            .iter()
-            .copied()
-            .filter(|id| graph.get(id).is_none())
-            .collect::<Vec<_>>();
-        missing
-    };
+    let mut missing = Vec::new();
+    for id in inventory.fact_ids() {
+        match state.admitted_semantic_fact(*id) {
+            Ok(Some(_)) => {}
+            Ok(None) => missing.push(*id),
+            Err(error) => {
+                tracing::debug!(%error, "durable fact inventory lookup failed");
+                return;
+            }
+        }
+    }
     if !missing.is_empty() {
         let request = FactRequest::new(state.mesh_context_id(), missing);
         let mut pages = request.pages();
@@ -697,7 +725,7 @@ pub(super) async fn on_fact_request(
     }
     let mut page_facts = Vec::new();
     for id in request.fact_ids() {
-        let Some(fact) = state.authoritative_fact_graph().read().get(id).cloned() else {
+        let Ok(Some(fact)) = state.admitted_semantic_fact(*id) else {
             continue;
         };
         page_facts.push(fact);
@@ -1549,10 +1577,10 @@ mod governance_projection_controls {
                 .expect("fixture fact signs");
             graph.facts.insert(fact.id, fact);
         }
-        let expected_ids = graph.len();
+        let expected_ids = graph.ids().count();
         let graph = Arc::new(parking_lot::RwLock::new(graph));
         let mut cursor = FactInventoryCursor {
-            graph,
+            source: FactInventorySource::Graph(graph),
             context_id,
             cursor: None,
             finished: false,
@@ -1588,7 +1616,10 @@ mod governance_projection_controls {
             .expect("the exact-boundary page serializes")
             .len();
         let next_id = {
-            let graph = cursor.graph.read();
+            let FactInventorySource::Graph(graph) = &cursor.source else {
+                panic!("unit cursor uses the graph source");
+            };
+            let graph = graph.read();
             let candidate = graph
                 .ids_after(first_page.fact_ids().last().copied())
                 .next()

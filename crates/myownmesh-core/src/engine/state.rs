@@ -2765,7 +2765,7 @@ impl NetworkState {
     }
 
     /// Build a large valid history with ordinary semantic validation and
-    /// publish it in one durable snapshot. This transport-lab fixture avoids
+    /// publish it in bounded durable batches. This transport-lab fixture avoids
     /// timing hundreds of thousands of setup fsyncs so scale tests can measure
     /// the public hot path at a chosen ledger size.
     #[cfg(feature = "transport-lab")]
@@ -2778,55 +2778,6 @@ impl NetworkState {
         tokio::task::spawn_blocking(move || {
             let author = crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
                 .map_err(|error| Error::Other(format!("noncanonical local DeviceId: {error}")))?;
-            let mut seeded = {
-                let live = state.fact_graph.read();
-                if !live.is_empty() {
-                    return Err(Error::Other(
-                        "semantic scale fixture requires an empty graph".into(),
-                    ));
-                }
-                live.clone()
-            };
-            seeded.begin_deferred_projection_commitment_for_lab();
-
-            for index in 0..count {
-                let body = crate::semantic::FactBody::RoleGrant {
-                    target: target.clone(),
-                    role: if index % 2 == 0 {
-                        crate::semantic::Role::Member
-                    } else {
-                        crate::semantic::Role::Owner
-                    },
-                };
-                let witness = seeded.authoring_witness(&body, &author);
-                let mut authority_parents = Vec::new();
-                for subject in body.authority_use_subjects(&author) {
-                    authority_parents
-                        .extend(seeded.authority_lineage(&subject).heads().iter().copied());
-                }
-                let content = crate::semantic::FactContent::from_authoring_witness(
-                    &seeded,
-                    body,
-                    &witness,
-                    authority_parents,
-                );
-                let fact = crate::semantic::SignedFact::sign(content, state.identity.signing_key())
-                    .map_err(|error| {
-                        Error::Other(format!("semantic seed fact rejected: {error}"))
-                    })?;
-                match seeded.admit(fact).map_err(|error| {
-                    Error::Other(format!("semantic seed admission failed: {error}"))
-                })? {
-                    crate::semantic::Admission::Inserted => {}
-                    other => {
-                        return Err(Error::Other(format!(
-                            "semantic seed produced unexpected admission {other:?}"
-                        )))
-                    }
-                }
-            }
-            seeded.finish_deferred_projection_commitment_for_lab();
-
             let _publication = state.durable_publication_gate.lock();
             let mut live = state.fact_graph.write();
             if !live.is_empty() {
@@ -2835,11 +2786,90 @@ impl NetworkState {
                 ));
             }
             state.ensure_durable_owner_mutation_allowed()?;
-            seeded = state
-                .durable_semantic_owner
-                .commit_owned_for_lab(seeded, Vec::new())
-                .map_err(|error| Error::Network(format!("semantic seed commit: {error}")))?;
-            *live = seeded;
+
+            // The fixture uses the same bounded semantic delta transaction as
+            // production, grouping at most one ready-batch worth of rows per
+            // fsync. It never constructs a history-sized in-memory graph.
+            // Stay well below the default 1,024 dirty-page transaction bound:
+            // these compact fact rows average multiple rows per 4 KiB page.
+            // A 1,024-row batch keeps transient memory small while avoiding
+            // nearly a thousand fsync boundaries in the 250K control.
+            const SEED_BATCH_ROWS: usize = 1_024;
+            let mut next_index = 0usize;
+            while next_index < count {
+                let batch_end = next_index.saturating_add(SEED_BATCH_ROWS).min(count);
+                let before_batch = live.clone();
+                let previous_projection = live.projection();
+                let expected_base_projection = previous_projection.commitment_root();
+                let mut batch_delta = crate::semantic::SemanticDelta::default();
+                live.begin_deferred_projection_commitment();
+
+                let prepared = (|| -> Result<()> {
+                    for index in next_index..batch_end {
+                        let body = crate::semantic::FactBody::RoleGrant {
+                            target: target.clone(),
+                            role: if index % 2 == 0 {
+                                crate::semantic::Role::Member
+                            } else {
+                                crate::semantic::Role::Owner
+                            },
+                        };
+                        let witness = live.authoring_witness(&body, &author);
+                        let mut authority_parents = Vec::new();
+                        for subject in body.authority_use_subjects(&author) {
+                            authority_parents
+                                .extend(live.authority_lineage(&subject).heads().iter().copied());
+                        }
+                        let content = crate::semantic::FactContent::from_authoring_witness(
+                            &live,
+                            body,
+                            &witness,
+                            authority_parents,
+                        );
+                        let fact = crate::semantic::SignedFact::sign(
+                            content,
+                            state.identity.signing_key(),
+                        )
+                        .map_err(|error| {
+                            Error::Other(format!("semantic seed fact rejected: {error}"))
+                        })?;
+                        let journal = live.admit_journaled(fact).map_err(|error| {
+                            Error::Other(format!("semantic seed admission failed: {error}"))
+                        })?;
+                        if !matches!(journal.admission(), crate::semantic::Admission::Inserted) {
+                            return Err(Error::Other(format!(
+                                "semantic seed produced unexpected admission {:?}",
+                                journal.admission()
+                            )));
+                        }
+                        batch_delta.append_seed_delta(journal.delta().clone());
+                        journal.commit();
+                        live.retire_cold_history();
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = prepared {
+                    *live = before_batch;
+                    return Err(error);
+                }
+
+                let batch_delta = live.finish_deferred_seed_delta(previous_projection, batch_delta);
+                let projection_commitment = live.projection_commitment_root();
+                if let Err(error) = state
+                    .durable_semantic_owner
+                    .commit_semantic_seed_delta_for_lab(
+                        state.mesh_context_id,
+                        &batch_delta,
+                        expected_base_projection,
+                        projection_commitment,
+                        SEED_BATCH_ROWS,
+                    )
+                {
+                    *live = before_batch;
+                    return Err(Error::Network(format!("semantic seed commit: {error}")));
+                }
+                next_index = batch_end;
+            }
             state
                 .durable_semantic_owner
                 .checkpoint_scale_seed_for_lab()
@@ -2898,13 +2928,43 @@ impl NetworkState {
         let _publication = self.durable_publication_gate.lock();
         let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
+        if live.get(&fact.id).is_none() {
+            if let Some(existing) = self
+                .durable_semantic_owner
+                .admitted_fact(fact.id)
+                .map_err(|error| Error::Network(format!("durable fact lookup: {error}")))?
+            {
+                if existing == fact {
+                    return Ok((
+                        crate::semantic::Admission::AlreadyPresent,
+                        Vec::new(),
+                        crate::semantic::SemanticDelta::default(),
+                    ));
+                }
+                return Err(Error::Other(format!(
+                    "semantic fact rejected: duplicate fact id {}",
+                    fact.id
+                )));
+            }
+        }
+        let dependency_roots = crate::semantic::causal::dependencies(&fact);
+        let needs_cold_history = dependency_roots.iter().any(|id| live.get(id).is_none());
+        let causal_history = if !needs_cold_history {
+            Vec::new()
+        } else {
+            self.admitted_semantic_causal_history(dependency_roots)?
+        };
         let expected_base_projection = live.projection_commitment_root();
-        let journal = live
-            .admit_journaled(fact)
-            .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
+        let journal = if causal_history.is_empty() {
+            live.admit_journaled(fact)
+        } else {
+            live.admit_journaled_with_history(fact, causal_history)
+        }
+        .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
         let admission = journal.admission().clone();
         if matches!(admission, crate::semantic::Admission::AlreadyPresent) {
             journal.commit();
+            live.retire_cold_history();
             return Ok((
                 admission,
                 Vec::new(),
@@ -2941,6 +3001,7 @@ impl NetworkState {
         let semantic_delta = journal.delta().clone();
         let provisional_removed = journal.delta().provisional_removed().to_vec();
         journal.commit();
+        live.retire_cold_history();
 
         {
             let mut provisional = self.durable_provisional.lock();
@@ -3073,6 +3134,56 @@ impl NetworkState {
         self.fact_graph.read().quarantined().count()
     }
 
+    /// Resolve one admitted fact from the canonical durable history. The live
+    /// graph intentionally retains only the bounded continuation set.
+    pub(crate) fn admitted_semantic_fact(
+        &self,
+        fact_id: crate::semantic::FactId,
+    ) -> Result<Option<crate::semantic::SignedFact>> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .admitted_fact(fact_id)
+            .map_err(|error| Error::Network(format!("durable fact read: {error}")))
+    }
+
+    pub(crate) fn admitted_semantic_fact_ids_after(
+        &self,
+        cursor: Option<crate::semantic::FactId>,
+        limit: usize,
+    ) -> Result<Vec<crate::semantic::FactId>> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .admitted_fact_ids_after(cursor, limit)
+            .map_err(|error| Error::Network(format!("durable fact inventory: {error}")))
+    }
+
+    pub(crate) fn admitted_semantic_facts(
+        &self,
+        fact_ids: Vec<crate::semantic::FactId>,
+    ) -> Result<Vec<Option<crate::semantic::SignedFact>>> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .admitted_facts(fact_ids)
+            .map_err(|error| Error::Network(format!("durable fact page: {error}")))
+    }
+
+    pub(crate) fn semantic_state_digest(&self) -> Result<(u64, u64, [u8; 32])> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .state_identity_digest(self.mesh_context_id)
+            .map_err(|error| Error::Network(format!("durable semantic identity: {error}")))
+    }
+
+    fn admitted_semantic_causal_history(
+        &self,
+        roots: Vec<crate::semantic::FactId>,
+    ) -> Result<Vec<crate::semantic::SignedFact>> {
+        self.ensure_durable_owner_mutation_allowed()?;
+        self.durable_semantic_owner
+            .admitted_causal_history(roots)
+            .map_err(|error| Error::Network(format!("durable causal history: {error}")))
+    }
+
     /// Number of exact provisional custody claims paired with unresolved facts.
     pub fn semantic_provisional_custody_count(&self) -> usize {
         self.durable_provisional.lock().len()
@@ -3110,12 +3221,11 @@ impl NetworkState {
         fact_ids: &[crate::semantic::FactId],
     ) -> Result<ProofRecord> {
         let _publication = self.durable_publication_gate.lock();
-        let graph = self.fact_graph.read();
         self.ensure_durable_owner_mutation_allowed()?;
         let target = crate::semantic::DeviceId::from_canonical_str(owner.device_id())
             .map_err(|error| Error::Network(format!("durable proof target rejected: {error}")))?;
         for fact_id in fact_ids {
-            if graph.get(fact_id).is_none() {
+            if self.admitted_semantic_fact(*fact_id)?.is_none() {
                 return Err(Error::Network(format!(
                     "durable proof fact {fact_id} is absent"
                 )));
@@ -3148,7 +3258,6 @@ impl NetworkState {
         &self,
         record: &ProofRecord,
     ) -> Result<crate::protocol::ProofDeliveryMessage> {
-        let graph = self.fact_graph.read();
         if record.context_id != self.mesh_context_id || !record.is_pending() {
             return Err(Error::Network(
                 "durable proof record is not Pending in this mesh context".to_string(),
@@ -3156,13 +3265,11 @@ impl NetworkState {
         }
         let mut facts = Vec::with_capacity(record.fact_ids.len());
         for fact_id in &record.fact_ids {
-            let fact = graph
-                .get(fact_id)
-                .cloned()
+            let fact = self
+                .admitted_semantic_fact(*fact_id)?
                 .ok_or_else(|| Error::Network(format!("durable proof fact {fact_id} is absent")))?;
             facts.push(fact);
         }
-        drop(graph);
 
         let delivery = crate::protocol::ProofDeliveryMessage::new(
             record.context_id,
@@ -3205,20 +3312,20 @@ impl NetworkState {
         if let Some(stand_down) = projection.stand_down(&target) {
             pending.push(stand_down.proof);
         }
+        drop(graph);
         let mut ids = std::collections::BTreeSet::new();
         while let Some(id) = pending.pop() {
             if !ids.insert(id) {
                 continue;
             }
-            let Some(fact) = graph.get(&id) else {
+            let Some(fact) = self.admitted_semantic_fact(id)? else {
                 return Err(Error::Network(
                     "durable eviction proof closure is incomplete".to_string(),
                 ));
             };
-            pending.extend(crate::semantic::causal::dependencies(fact));
+            pending.extend(crate::semantic::causal::dependencies(&fact));
         }
         let fact_ids = ids.into_iter().collect::<Vec<_>>();
-        drop(graph);
         ProofRecord::pending(
             self.mesh_context_id,
             target,

@@ -15,7 +15,14 @@ thread_local! {
     static INDEX_REBUILD_COUNT: Cell<usize> = Cell::new(0);
 }
 
+// Sweep cold bodies in small batches. This keeps peak history residency
+// bounded (at most 64 newly admitted fact bodies) without walking every live
+// participant head on every admission.
+const COLD_HISTORY_RETIREMENT_INTERVAL: usize = 64;
+
 use super::content::{DeviceId, ExclusiveCell, FactBody, Role};
+#[cfg(feature = "transport-lab")]
+use super::projection::ProjectionDelta;
 use super::{
     FactId, MeshContextId, Projection, SemanticError, SignedFact, VerifiedBootstrap,
     VerifiedProjectPolicy,
@@ -226,6 +233,10 @@ impl AuthoringWitness {
 #[derive(Debug)]
 pub struct FactGraph {
     pub(crate) facts: BTreeMap<FactId, SignedFact>,
+    /// Total admitted history, including rows whose signed bodies have been
+    /// retired from the live continuation set after durable publication.
+    /// SQLite remains the canonical owner of those cold rows.
+    admitted_fact_count: u64,
     /// Canonical admission order. Durable snapshots persist this as `seq`,
     /// allowing restart to rebuild in one streaming pass without allocating a
     /// second graph-sized topological sort.
@@ -280,6 +291,8 @@ pub struct FactGraph {
     /// instead of comparing counters across process lifetimes.
     generation: u64,
     defer_projection_commitment: bool,
+    cold_history_since_retirement: usize,
+    staged_cold_pending: usize,
     projection_cache: Arc<Mutex<Option<(u64, Projection)>>>,
 }
 
@@ -287,6 +300,7 @@ impl Clone for FactGraph {
     fn clone(&self) -> Self {
         Self {
             facts: self.facts.clone(),
+            admitted_fact_count: self.admitted_fact_count,
             admission_order: self.admission_order.clone(),
             quarantined: self.quarantined.clone(),
             policy_limits: self.policy_limits,
@@ -317,7 +331,9 @@ impl Clone for FactGraph {
             indexed_revision: self.indexed_revision,
             generation: self.generation,
             defer_projection_commitment: self.defer_projection_commitment,
-            projection_cache: Arc::new(Mutex::new(None)),
+            cold_history_since_retirement: self.cold_history_since_retirement,
+            staged_cold_pending: self.staged_cold_pending,
+            projection_cache: Arc::new(Mutex::new(self.projection_cache.lock().clone())),
         }
     }
 }
@@ -484,6 +500,21 @@ impl SemanticDelta {
             && self.promoted.len() <= max_ready_batch
             && self.removed.len() <= max_ready_batch
     }
+
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn append_seed_delta(&mut self, mut next: Self) {
+        if self.projection_delta.is_none() {
+            self.projection_delta = next.projection_delta.take();
+        }
+        self.rows.append(&mut next.rows);
+        self.promoted.append(&mut next.promoted);
+        self.removed.append(&mut next.removed);
+        self.provisional_added.append(&mut next.provisional_added);
+        self.provisional_removed
+            .append(&mut next.provisional_removed);
+        self.affected_cells.append(&mut next.affected_cells);
+        self.affected_subjects.append(&mut next.affected_subjects);
+    }
 }
 
 #[derive(Debug)]
@@ -512,6 +543,7 @@ struct GraphRollback {
     quarantined_by_author: BTreeMap<DeviceId, Option<(u64, u64)>>,
     retained_by_author: BTreeMap<DeviceId, Option<(u64, u64)>>,
     admitted_bytes: u64,
+    admitted_fact_count: u64,
     derived_index_bytes: u64,
     quarantined_bytes: u64,
     admitted_dependency_edges: u64,
@@ -521,7 +553,9 @@ struct GraphRollback {
     admission_order_len: usize,
     indexed_fact_count: usize,
     indexed_revision: u64,
-    projection_cache_generation: Option<u64>,
+    cold_history_since_retirement: usize,
+    staged_cold_pending: usize,
+    projection_cache: Option<(u64, Projection)>,
 }
 
 impl GraphRollback {
@@ -535,6 +569,7 @@ impl GraphRollback {
             quarantined_by_author: BTreeMap::new(),
             retained_by_author: BTreeMap::new(),
             admitted_bytes: graph.admitted_bytes,
+            admitted_fact_count: graph.admitted_fact_count,
             derived_index_bytes: graph.derived_index_bytes,
             quarantined_bytes: graph.quarantined_bytes,
             admitted_dependency_edges: graph.admitted_dependency_edges,
@@ -544,11 +579,9 @@ impl GraphRollback {
             admission_order_len: graph.admission_order.len(),
             indexed_fact_count: graph.indexed_fact_count,
             indexed_revision: graph.indexed_revision,
-            projection_cache_generation: graph
-                .projection_cache
-                .lock()
-                .as_ref()
-                .map(|(generation, _)| *generation),
+            cold_history_since_retirement: graph.cold_history_since_retirement,
+            staged_cold_pending: graph.staged_cold_pending,
+            projection_cache: graph.projection_cache.lock().clone(),
         }
     }
 
@@ -606,6 +639,7 @@ impl GraphRollback {
         let admitted_dependency_edges = self.admitted_dependency_edges;
         let quarantined_dependency_edges = self.quarantined_dependency_edges;
         graph.admitted_bytes = self.admitted_bytes;
+        graph.admitted_fact_count = self.admitted_fact_count;
         graph.derived_index_bytes = self.derived_index_bytes;
         graph.quarantined_bytes = self.quarantined_bytes;
         graph.admitted_dependency_edges = self.admitted_dependency_edges;
@@ -686,15 +720,16 @@ impl GraphRollback {
         // scalar snapshot, including a loader-provided value that was being
         // validated by the caller.
         graph.admitted_bytes = admitted_bytes;
+        graph.admitted_fact_count = self.admitted_fact_count;
         graph.derived_index_bytes = derived_index_bytes;
         graph.quarantined_bytes = quarantined_bytes;
         graph.admitted_dependency_edges = admitted_dependency_edges;
         graph.quarantined_dependency_edges = quarantined_dependency_edges;
         graph.indexed_fact_count = self.indexed_fact_count;
         graph.indexed_revision = self.indexed_revision;
-        *graph.projection_cache.lock() = self
-            .projection_cache_generation
-            .map(|generation| (generation, Projection::from_graph(graph)));
+        graph.cold_history_since_retirement = self.cold_history_since_retirement;
+        graph.staged_cold_pending = self.staged_cold_pending;
+        *graph.projection_cache.lock() = self.projection_cache;
     }
 }
 
@@ -707,6 +742,7 @@ impl GraphRollback {
 pub(crate) struct AdmissionJournal<'graph> {
     graph: &'graph mut FactGraph,
     rollback: Option<GraphRollback>,
+    staged_cold: Vec<FactId>,
     delta: SemanticDelta,
     admission: Admission,
 }
@@ -728,10 +764,20 @@ impl<'graph> AdmissionJournal<'graph> {
         if let Some(rollback) = self.rollback.take() {
             rollback.restore(self.graph);
         }
+        self.graph.remove_staged_cold(&self.staged_cold);
+        self.staged_cold.clear();
     }
 
     pub(crate) fn commit(mut self) {
         self.rollback.take();
+        let hydrated_cold_history = !self.staged_cold.is_empty();
+        self.staged_cold.clear();
+        if hydrated_cold_history {
+            // A committed candidate may still need its hydrated ancestors
+            // while its projection is finalized, but they must not escape
+            // the journal as a second in-memory copy of SQLite history.
+            self.graph.retire_cold_history();
+        }
     }
 }
 
@@ -739,6 +785,8 @@ impl Drop for AdmissionJournal<'_> {
     fn drop(&mut self) {
         if let Some(rollback) = self.rollback.take() {
             rollback.restore(self.graph);
+            self.graph.remove_staged_cold(&self.staged_cold);
+            self.staged_cold.clear();
         }
     }
 }
@@ -832,6 +880,7 @@ impl FactGraph {
         let policy_limits = policy_limits.into();
         Self {
             facts: BTreeMap::new(),
+            admitted_fact_count: 0,
             admission_order: Vec::new(),
             quarantined: BTreeMap::new(),
             policy_limits,
@@ -862,6 +911,8 @@ impl FactGraph {
             indexed_revision: 0,
             generation: 0,
             defer_projection_commitment: false,
+            cold_history_since_retirement: 0,
+            staged_cold_pending: 0,
             projection_cache: Arc::new(Mutex::new(None)),
         }
     }
@@ -870,18 +921,39 @@ impl FactGraph {
         self.context_id
     }
 
-    #[cfg(feature = "transport-lab")]
-    pub(crate) fn begin_deferred_projection_commitment_for_lab(&mut self) {
+    pub(crate) fn begin_deferred_projection_commitment(&mut self) {
         self.defer_projection_commitment = true;
     }
 
-    #[cfg(feature = "transport-lab")]
-    pub(crate) fn finish_deferred_projection_commitment_for_lab(&mut self) {
+    pub(crate) fn finish_deferred_projection_commitment(&mut self) {
         self.defer_projection_commitment = false;
         let mut projection_cache = self.projection_cache.lock();
         if let Some((generation, projection)) = projection_cache.take() {
             *projection_cache = Some((generation, projection.rebuild_commitment()));
         }
+    }
+
+    #[cfg(feature = "transport-lab")]
+    pub(crate) fn finish_deferred_seed_delta(
+        &mut self,
+        previous: Projection,
+        mut delta: SemanticDelta,
+    ) -> SemanticDelta {
+        let base_generation = delta
+            .projection_delta
+            .as_ref()
+            .map(ProjectionDelta::base_generation)
+            .unwrap_or(self.generation);
+        self.finish_deferred_projection_commitment();
+        let current = self.projection();
+        delta.projection_delta = Some(current.delta_from(
+            &previous,
+            base_generation,
+            self.generation,
+            &delta.affected_cells,
+            &delta.affected_subjects,
+        ));
+        delta
     }
 
     /// Return the versioned canonical projection root maintained by the graph.
@@ -895,12 +967,162 @@ impl FactGraph {
         self.projection_commitment_root() == expected
     }
 
+    /// Retire signed bodies that are no longer needed by the live semantic
+    /// continuation. The canonical rows remain in SQLite and the logical
+    /// counters continue to describe the complete retained history.
+    ///
+    /// Current heads, one direct witness layer, active stand-down evidence,
+    /// and unresolved quarantine support stay resident. This is enough for
+    /// the normal continuation path; cold proof material and anti-entropy are
+    /// resolved by the durable owner instead of turning the process heap into
+    /// a second database.
+    pub(crate) fn retire_cold_history(&mut self) {
+        if self.staged_cold_pending == 0
+            && self.cold_history_since_retirement < COLD_HISTORY_RETIREMENT_INTERVAL
+        {
+            return;
+        }
+        self.ensure_indexes_current();
+        // Seal the complete projection before any historical body leaves the
+        // map. Incremental updates carry unchanged cells forward from here.
+        let projection = self.projection();
+        let mut retained = BTreeSet::new();
+        for ids in self.cell_heads_index.values() {
+            retained.extend(ids.iter().copied());
+        }
+        for ids in self.authority_heads_index.values() {
+            retained.extend(ids.iter().copied());
+        }
+        for subject in self.stand_down_index.keys() {
+            if let Some(stand_down) = projection.stand_down(subject) {
+                retained.insert(stand_down.proof);
+            }
+        }
+        for missing in self.quarantine_missing.values() {
+            retained.extend(missing.iter().copied());
+        }
+
+        // Keep the direct signed witness layer needed to validate the next
+        // continuation. Do not recursively retain ancestry: that history is
+        // precisely what SQLite owns.
+        let direct_witnesses = retained
+            .iter()
+            .filter_map(|id| self.facts.get(id))
+            .flat_map(dependencies)
+            .collect::<BTreeSet<_>>();
+        retained.extend(direct_witnesses);
+
+        self.facts.retain(|id, _| retained.contains(id));
+        self.admission_order.retain(|id| retained.contains(id));
+        self.stand_down_index.retain(|_, ids| {
+            ids.retain(|id| retained.contains(id));
+            !ids.is_empty()
+        });
+        self.authority_selector_index.retain(|_, selectors| {
+            // The selector row, not the selected fact, owns this cached pair.
+            // Keeping every historical selector merely because many of them
+            // chose the same still-live branch would reintroduce linear heap
+            // growth under repeated lineage resolution.
+            selectors.retain(|(id, _)| retained.contains(id));
+            !selectors.is_empty()
+        });
+        self.derived_index_bytes = self
+            .logical_index_residency_bytes()
+            .expect("retained live semantic indexes remain measurable");
+        self.indexed_fact_count = self.facts.len();
+        self.facts_revision = self
+            .facts_revision
+            .checked_add(1)
+            .expect("FactGraph revision exhausted while retiring cold history");
+        self.indexed_revision = self.facts_revision;
+        self.cold_history_since_retirement = 0;
+        self.staged_cold_pending = 0;
+        *self.projection_cache.lock() = Some((self.generation, projection));
+    }
+
+    /// Temporarily attach an already-verified durable causal closure while a
+    /// single candidate is checked. These rows are deliberately not added to
+    /// the live-head indexes or logical usage counters: SQLite remains their
+    /// owner and the rows exist here only for candidate-relative validation.
+    fn stage_cold_history(
+        &mut self,
+        history: Vec<SignedFact>,
+    ) -> Result<Vec<FactId>, SemanticError> {
+        for fact in &history {
+            fact.verify()?;
+            if fact.content.mesh_context != self.context_id {
+                return Err(SemanticError::ContextMismatch {
+                    expected: self.context_id,
+                    found: fact.content.mesh_context.to_string(),
+                });
+            }
+        }
+        let mut staged = Vec::with_capacity(history.len());
+        for fact in history {
+            let id = fact.id;
+            if let Some(existing) = self.facts.get(&id) {
+                if existing != &fact {
+                    self.remove_staged_cold(&staged);
+                    return Err(SemanticError::DuplicateFact(id));
+                }
+                continue;
+            }
+            if self.quarantined.contains_key(&id) {
+                self.remove_staged_cold(&staged);
+                return Err(SemanticError::DuplicateFact(id));
+            }
+            self.facts.insert(id, fact);
+            staged.push(id);
+        }
+
+        // The live indexes intentionally continue to describe only the hot
+        // working set. Mark that state current so admission falls through to
+        // its candidate-relative causal traversal when cold rows are needed.
+        self.indexed_fact_count = self.facts.len();
+        self.staged_cold_pending = self.staged_cold_pending.saturating_add(staged.len());
+        Ok(staged)
+    }
+
+    fn remove_staged_cold(&mut self, staged: &[FactId]) {
+        if staged.is_empty() {
+            return;
+        }
+        let admitted_fact_count = self.admitted_fact_count;
+        let admitted_bytes = self.admitted_bytes;
+        let derived_index_bytes = self.derived_index_bytes;
+        let admitted_dependency_edges = self.admitted_dependency_edges;
+        let quarantined_bytes = self.quarantined_bytes;
+        let quarantined_dependency_edges = self.quarantined_dependency_edges;
+        let projection_cache = self.projection_cache.lock().clone();
+
+        for id in staged {
+            self.facts.remove(id);
+        }
+        self.staged_cold_pending = self.staged_cold_pending.saturating_sub(staged.len());
+        self.admission_order.retain(|id| !staged.contains(id));
+        self.facts_revision = self
+            .facts_revision
+            .checked_add(1)
+            .expect("FactGraph revision exhausted while releasing cold history");
+        self.rebuild_indexes();
+
+        // Rebuilding repairs only the hot indexes. The logical counters and
+        // projection still describe the complete SQLite-owned history.
+        self.admitted_fact_count = admitted_fact_count;
+        self.admitted_bytes = admitted_bytes;
+        self.derived_index_bytes = derived_index_bytes;
+        self.admitted_dependency_edges = admitted_dependency_edges;
+        self.quarantined_bytes = quarantined_bytes;
+        self.quarantined_dependency_edges = quarantined_dependency_edges;
+        *self.projection_cache.lock() = projection_cache;
+    }
+
     pub fn len(&self) -> usize {
-        self.facts.len()
+        usize::try_from(self.admitted_fact_count).unwrap_or(usize::MAX)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.facts.is_empty()
+        self.admitted_fact_count == 0
     }
 
     pub fn get(&self, id: &FactId) -> Option<&SignedFact> {
@@ -984,6 +1206,7 @@ impl FactGraph {
         }
         self.indexed_fact_count = self.facts.len();
         self.indexed_revision = self.facts_revision;
+        self.admitted_fact_count = u64::try_from(self.facts.len()).unwrap_or(u64::MAX);
         // The maps are derived from the canonical fact set.  Reconcile the
         // scalar ownership ledger at the same boundary so a loader or
         // compaction path cannot leave bytes/edge counters from an older
@@ -1948,12 +2171,23 @@ impl FactGraph {
     }
 
     fn fact_cost(&self, fact: &SignedFact) -> Result<FactCost, SemanticError> {
+        self.fact_cost_with_history(fact, None)
+    }
+
+    fn fact_cost_with_history(
+        &self,
+        fact: &SignedFact,
+        history: Option<&FactGraph>,
+    ) -> Result<FactCost, SemanticError> {
         let (encoded_bytes, dependency_edges) = self.fact_encoded_and_edges(fact)?;
         let dependencies = dependencies(fact);
         let missing = dependencies
             .iter()
             .copied()
-            .filter(|dependency| !self.facts.contains_key(dependency))
+            .filter(|dependency| {
+                !self.facts.contains_key(dependency)
+                    && history.is_none_or(|history| !history.facts.contains_key(dependency))
+            })
             .collect::<Vec<_>>();
         // Each component is a logical request made by a retained map/vector
         // value.  Shared map keys are charged only when this fact introduces
@@ -2150,7 +2384,7 @@ impl FactGraph {
         }
         self.checked_total(
             super::SemanticCapacityDimension::AdmittedFacts,
-            self.checked_len(self.facts.len())?,
+            self.admitted_fact_count,
             1,
             self.policy_limits.max_admitted_facts,
         )?;
@@ -2209,6 +2443,14 @@ impl FactGraph {
         &self,
         fact: &SignedFact,
     ) -> Result<AdmissionPreflight, SemanticError> {
+        self.preflight_admission_with_history(fact, None)
+    }
+
+    fn preflight_admission_with_history(
+        &self,
+        fact: &SignedFact,
+        history: Option<&FactGraph>,
+    ) -> Result<AdmissionPreflight, SemanticError> {
         fact.verify()?;
         if fact.content.mesh_context != self.context_id {
             return Err(SemanticError::ContextMismatch {
@@ -2240,13 +2482,15 @@ impl FactGraph {
         if fact.content.parents.contains(&fact.id) {
             return Err(SemanticError::SelfParent);
         }
-        let cost = self.fact_cost(fact)?;
+        let cost = self.fact_cost_with_history(fact, history)?;
         if cost.missing.is_empty() {
             if let Some(operation) = self.semantic_noop(&fact.content.body) {
                 return Err(SemanticError::NoOp(operation));
             }
             for parent in &fact.content.parents {
-                if !self.facts.contains_key(parent) {
+                if !self.facts.contains_key(parent)
+                    && history.is_none_or(|history| !history.facts.contains_key(parent))
+                {
                     return Err(SemanticError::MissingParent(*parent));
                 }
             }
@@ -2278,7 +2522,23 @@ impl FactGraph {
         fact: SignedFact,
     ) -> Result<AdmissionJournal<'_>, SemanticError> {
         let preflight = self.preflight_admission(&fact)?;
-        self.apply_preflight_journaled(fact, preflight)
+        self.apply_preflight_journaled_with_history(fact, preflight, None, Vec::new())
+    }
+
+    pub(crate) fn admit_journaled_with_history(
+        &mut self,
+        fact: SignedFact,
+        history: Vec<SignedFact>,
+    ) -> Result<AdmissionJournal<'_>, SemanticError> {
+        let staged_cold = self.stage_cold_history(history)?;
+        let preflight = match self.preflight_admission(&fact) {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.remove_staged_cold(&staged_cold);
+                return Err(error);
+            }
+        };
+        self.apply_preflight_journaled_with_history(fact, preflight, None, staged_cold)
     }
 
     /// Apply a preflight result while retaining the same journal guarantees.
@@ -2289,11 +2549,22 @@ impl FactGraph {
         fact: SignedFact,
         preflight: AdmissionPreflight,
     ) -> Result<AdmissionJournal<'_>, SemanticError> {
+        self.apply_preflight_journaled_with_history(fact, preflight, None, Vec::new())
+    }
+
+    fn apply_preflight_journaled_with_history(
+        &mut self,
+        fact: SignedFact,
+        preflight: AdmissionPreflight,
+        history: Option<&FactGraph>,
+        staged_cold: Vec<FactId>,
+    ) -> Result<AdmissionJournal<'_>, SemanticError> {
         let fact_id = fact.id;
         if matches!(preflight.admission(), &Admission::AlreadyPresent) {
             return Ok(AdmissionJournal {
                 graph: self,
                 rollback: None,
+                staged_cold,
                 delta: SemanticDelta::default(),
                 admission: preflight.admission,
             });
@@ -2338,10 +2609,12 @@ impl FactGraph {
             }
         }
         let admission =
-            match self.admit_inner_with_projection(fact, false, Some(previous_projection)) {
+            match self.admit_inner_with_projection(fact, false, Some(previous_projection), history)
+            {
                 Ok(admission) => admission,
                 Err(error) => {
                     rollback.restore(self);
+                    self.remove_staged_cold(&staged_cold);
                     return Err(error);
                 }
             };
@@ -2350,6 +2623,7 @@ impl FactGraph {
         if matches!(&admission, Admission::Inserted) {
             if batch_limit == 0 {
                 rollback.restore(self);
+                self.remove_staged_cold(&staged_cold);
                 return Err(SemanticError::CapacityExceeded {
                     dimension: super::SemanticCapacityDimension::ReadyBatch,
                     limit: 0,
@@ -2371,6 +2645,7 @@ impl FactGraph {
             }
             if let Err(error) = self.retry_quarantined_batch(batch_limit) {
                 rollback.restore(self);
+                self.remove_staged_cold(&staged_cold);
                 return Err(error);
             }
         }
@@ -2436,6 +2711,7 @@ impl FactGraph {
         }
         if !delta.is_bounded_and_unique(self.policy_limits.max_ready_batch) {
             rollback.restore(self);
+            self.remove_staged_cold(&staged_cold);
             return Err(SemanticError::CapacityExceeded {
                 dimension: super::SemanticCapacityDimension::ReadyBatch,
                 limit: self.policy_limits.max_ready_batch,
@@ -2445,6 +2721,7 @@ impl FactGraph {
         Ok(AdmissionJournal {
             graph: self,
             rollback: Some(rollback),
+            staged_cold,
             delta,
             admission,
         })
@@ -2506,7 +2783,7 @@ impl FactGraph {
         fact: SignedFact,
         retained_reserved: bool,
     ) -> Result<Admission, SemanticError> {
-        self.admit_inner_with_projection(fact, retained_reserved, None)
+        self.admit_inner_with_projection(fact, retained_reserved, None, None)
     }
 
     fn admit_inner_with_projection(
@@ -2514,6 +2791,7 @@ impl FactGraph {
         fact: SignedFact,
         retained_reserved: bool,
         supplied_previous_projection: Option<Projection>,
+        history: Option<&FactGraph>,
     ) -> Result<Admission, SemanticError> {
         self.ensure_indexes_current();
         fact.verify()?;
@@ -2541,7 +2819,7 @@ impl FactGraph {
         if fact.content.parents.contains(&fact.id) {
             return Err(SemanticError::SelfParent);
         }
-        let cost = self.fact_cost(&fact)?;
+        let cost = self.fact_cost_with_history(&fact, history)?;
         if !cost.missing.is_empty() {
             if !self.is_authorized_signer(&fact.content.author) {
                 return Err(SemanticError::QuarantineSignerNotEligible);
@@ -2587,11 +2865,19 @@ impl FactGraph {
             return Err(SemanticError::NoOp(operation));
         }
         for parent in &fact.content.parents {
-            if !self.facts.contains_key(parent) {
+            if !self.facts.contains_key(parent)
+                && history.is_none_or(|history| !history.facts.contains_key(parent))
+            {
                 return Err(SemanticError::MissingParent(*parent));
             }
         }
-        let causal = self.causal_past(&fact)?;
+        let causal = if self.current_heads_are_complete(&fact) {
+            CausalAdmissionGraph::Full(self)
+        } else if let Some(history) = history {
+            CausalAdmissionGraph::Full(history)
+        } else {
+            self.causal_past(&fact)?
+        };
         if let FactBody::Resolution {
             cell,
             cited_heads,
@@ -2700,6 +2986,11 @@ impl FactGraph {
             .checked_add(cost.dependency_edges)
             .expect("admitted edges were preflighted");
         self.facts.insert(fact_id, fact);
+        self.admitted_fact_count = self
+            .admitted_fact_count
+            .checked_add(1)
+            .expect("admitted fact count was preflighted");
+        self.cold_history_since_retirement = self.cold_history_since_retirement.saturating_add(1);
         self.admission_order.push(fact_id);
         self.facts_revision = self
             .facts_revision
@@ -3079,6 +3370,7 @@ impl FactGraph {
                 .into_iter()
                 .filter_map(|id| self.facts.get(&id).cloned().map(|fact| (id, fact)))
                 .collect(),
+            admitted_fact_count: 0,
             admission_order: Vec::new(),
             quarantined: BTreeMap::new(),
             policy_limits: self.policy_limits,
@@ -3109,6 +3401,8 @@ impl FactGraph {
             indexed_revision: 0,
             generation: 0,
             defer_projection_commitment: false,
+            cold_history_since_retirement: 0,
+            staged_cold_pending: 0,
             projection_cache: Arc::new(Mutex::new(None)),
         };
         causal.rebuild_indexes();
@@ -7054,5 +7348,113 @@ mod tests {
             &[(device(&root_key), vec![predecessor])],
         );
         assert!(dependencies(&fact).contains(&predecessor));
+    }
+
+    #[test]
+    fn cold_history_retirement_keeps_constant_live_state_and_hydrates_exact_dependencies() {
+        let (bootstrap, root_key) = closed(85);
+        let author = device(&root_key);
+        let target = device(&key(86));
+        let mut complete = FactGraph::from_bootstrap(&bootstrap);
+        let mut live = FactGraph::from_bootstrap(&bootstrap);
+        let mut history = Vec::new();
+
+        for index in 0..64 {
+            let body = FactBody::RoleGrant {
+                target: target.clone(),
+                role: if index % 2 == 0 {
+                    Role::Member
+                } else {
+                    Role::Controller
+                },
+            };
+            let witness = live.authoring_witness(&body, &author);
+            let fact = SignedFact::sign(
+                super::super::FactContent::from_authoring_witness(
+                    &live,
+                    body,
+                    &witness,
+                    std::iter::empty(),
+                ),
+                &root_key,
+            )
+            .expect("cold-history fact signs");
+            complete
+                .admit(fact.clone())
+                .expect("complete reference admits fact");
+            live.admit(fact.clone()).expect("live graph admits fact");
+            live.retire_cold_history();
+            history.push(fact);
+
+            assert_eq!(live.len(), index + 1, "logical history remains exact");
+            assert_eq!(live.projection(), complete.projection());
+            assert!(
+                live.facts.len() <= COLD_HISTORY_RETIREMENT_INTERVAL + 4,
+                "live continuation stays independent of total history"
+            );
+            assert_eq!(
+                live.derived_index_bytes,
+                live.logical_index_residency_bytes()
+                    .expect("live index footprint is measurable"),
+                "retirement accounting describes only resident indexes"
+            );
+        }
+
+        let cold = history.first().expect("history has a cold row").clone();
+        assert!(live.get(&cold.id).is_none(), "old row is owned by SQLite");
+        let next_body = FactBody::RoleGrant {
+            target: target.clone(),
+            role: Role::Member,
+        };
+        let next_witness = live.authoring_witness(&next_body, &author);
+        let next = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &live,
+                next_body,
+                &next_witness,
+                [cold.id],
+            ),
+            &root_key,
+        )
+        .expect("cold-dependent fact signs");
+        complete
+            .admit(next.clone())
+            .expect("complete reference admits cold-dependent fact");
+        live.admit_journaled_with_history(next, history.clone())
+            .expect("durable cold dependency hydrates for admission")
+            .commit();
+        live.retire_cold_history();
+        assert_eq!(live.len(), complete.len());
+        assert_eq!(live.projection(), complete.projection());
+
+        let rollback_cold = history[1].clone();
+        assert!(live.get(&rollback_cold.id).is_none());
+        let before = live.clone();
+        let rollback_body = FactBody::RoleGrant {
+            target,
+            role: Role::Controller,
+        };
+        let rollback_witness = live.authoring_witness(&rollback_body, &author);
+        let rollback_fact = SignedFact::sign(
+            super::super::FactContent::from_authoring_witness(
+                &live,
+                rollback_body,
+                &rollback_witness,
+                [rollback_cold.id],
+            ),
+            &root_key,
+        )
+        .expect("rollback fact signs");
+        live.admit_journaled_with_history(rollback_fact, history)
+            .expect("rollback candidate hydrates")
+            .rollback();
+        assert_eq!(live.len(), before.len());
+        assert_eq!(live.projection(), before.projection());
+        assert_eq!(live.facts, before.facts);
+        assert!(
+            live.get(&rollback_cold.id).is_none(),
+            "rollback releases cold staging"
+        );
+        assert_eq!(live.retained_by_author, before.retained_by_author);
     }
 }

@@ -364,9 +364,7 @@ impl Serialize for FactIdsWire<'_> {
 }
 
 struct SelectedFacts<'a> {
-    graph: &'a crate::semantic::FactGraph,
-    cursor: Option<crate::semantic::FactId>,
-    count: usize,
+    facts: &'a [SignedFact],
 }
 
 impl Serialize for SelectedFacts<'_> {
@@ -374,49 +372,16 @@ impl Serialize for SelectedFacts<'_> {
     where
         S: Serializer,
     {
-        let mut sequence = serializer.serialize_seq(Some(self.count))?;
-        let mut admitted = self.graph.ids_after(self.cursor).peekable();
-        let mut quarantined = self
-            .graph
-            .quarantined()
-            .filter(move |(id, _)| self.cursor.is_none_or(|cursor| **id > cursor))
-            .peekable();
-        for _ in 0..self.count {
-            let Some((_, fact, from_admitted)) =
-                (match (admitted.peek().copied(), quarantined.peek().copied()) {
-                    (None, None) => None,
-                    (Some(id), None) => self.graph.get(id).map(|fact| (id, fact, true)),
-                    (None, Some((id, fact))) => Some((id, fact, false)),
-                    (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
-                        if admitted_id < quarantined_id {
-                            self.graph
-                                .get(admitted_id)
-                                .map(|fact| (admitted_id, fact, true))
-                        } else {
-                            Some((quarantined_id, quarantined_fact, false))
-                        }
-                    }
-                })
-            else {
-                return Err(serde::ser::Error::custom(
-                    "semantic page selection changed during serialization",
-                ));
-            };
+        let mut sequence = serializer.serialize_seq(Some(self.facts.len()))?;
+        for fact in self.facts {
             sequence.serialize_element(fact)?;
-            if from_admitted {
-                admitted.next();
-            } else {
-                quarantined.next();
-            }
         }
         sequence.end()
     }
 }
 
 struct SelectedPageWire<'a> {
-    graph: &'a crate::semantic::FactGraph,
-    cursor: Option<crate::semantic::FactId>,
-    count: usize,
+    facts: &'a [SignedFact],
     context_id: crate::semantic::MeshContextId,
     next_cursor: Option<crate::semantic::FactId>,
     complete: bool,
@@ -429,14 +394,7 @@ impl Serialize for SelectedPageWire<'_> {
     {
         let mut state = serializer.serialize_struct("SemanticFactPage", 4)?;
         state.serialize_field("context_id", &self.context_id)?;
-        state.serialize_field(
-            "facts",
-            &SelectedFacts {
-                graph: self.graph,
-                cursor: self.cursor,
-                count: self.count,
-            },
-        )?;
+        state.serialize_field("facts", &SelectedFacts { facts: self.facts })?;
         state.serialize_field("next_cursor", &self.next_cursor)?;
         state.serialize_field("complete", &self.complete)?;
         state.end()
@@ -481,43 +439,65 @@ pub(crate) fn export_semantic_fact_page(
             request.context_id
         )));
     }
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
-    let mut admitted = graph.ids_after(request.cursor).peekable();
     let cursor = request.cursor;
-    let mut quarantined = graph
+    let fetch_limit = max_facts
+        .checked_add(1)
+        .ok_or_else(|| Error::Other("semantic page limit overflow".into()))?;
+    let admitted_ids = state.admitted_semantic_fact_ids_after(cursor, fetch_limit)?;
+    let admitted_rows = state.admitted_semantic_facts(admitted_ids.clone())?;
+    let admitted = admitted_ids
+        .iter()
+        .copied()
+        .zip(admitted_rows)
+        .map(|(id, fact)| {
+            fact.map(|fact| (id, fact)).ok_or_else(|| {
+                Error::Other(format!(
+                    "admitted semantic fact {id} disappeared during paging"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let quarantined = state
+        .authoritative_fact_graph()
+        .read()
         .quarantined()
         .filter(move |(id, _)| cursor.is_none_or(|cursor| **id > cursor))
-        .peekable();
-    let mut fact_count = 0usize;
+        .take(fetch_limit)
+        .map(|(id, fact)| (*id, fact.clone()))
+        .collect::<Vec<_>>();
+    let mut admitted_index = 0usize;
+    let mut quarantined_index = 0usize;
+    let mut facts = Vec::with_capacity(max_facts);
     let mut fact_bytes = 0usize;
     let mut next_cursor = None;
+    let mut stopped_for_bytes = false;
 
-    while fact_count < max_facts {
-        let Some((id, fact, from_admitted)) =
-            (match (admitted.peek().copied(), quarantined.peek().copied()) {
-                (None, None) => None,
-                (Some(id), None) => graph.get(id).map(|fact| (id, fact, true)),
-                (None, Some((id, fact))) => Some((id, fact, false)),
-                (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
-                    if admitted_id < quarantined_id {
-                        graph.get(admitted_id).map(|fact| (admitted_id, fact, true))
-                    } else {
-                        Some((quarantined_id, quarantined_fact, false))
-                    }
+    while facts.len() < max_facts {
+        let next_admitted = admitted.get(admitted_index);
+        let next_quarantined = quarantined.get(quarantined_index);
+        let (id, fact, from_admitted) = match (next_admitted, next_quarantined) {
+            (None, None) => break,
+            (Some((id, fact)), None) => (*id, fact, true),
+            (None, Some((id, fact))) => (*id, fact, false),
+            (Some((admitted_id, admitted_fact)), Some((quarantined_id, quarantined_fact))) => {
+                if admitted_id < quarantined_id {
+                    (*admitted_id, admitted_fact, true)
+                } else {
+                    (*quarantined_id, quarantined_fact, false)
                 }
-            })
-        else {
-            break;
+            }
         };
+        if next_cursor == Some(id) {
+            return Err(Error::Other("duplicate semantic page id".into()));
+        }
         let one_fact_bytes = serialized_len(fact)?;
         let candidate_fact_bytes = fact_bytes
             .checked_add(one_fact_bytes)
-            .and_then(|bytes| bytes.checked_add(usize::from(fact_count != 0)))
+            .and_then(|bytes| bytes.checked_add(usize::from(!facts.is_empty())))
             .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
         let metadata_bytes = serialized_len(&SemanticPageMetadataWire {
             context_id: request.context_id,
-            next_cursor: Some(*id),
+            next_cursor: Some(id),
             complete: false,
             facts: EmptyFacts,
         })?;
@@ -525,24 +505,30 @@ pub(crate) fn export_semantic_fact_page(
             .checked_add(candidate_fact_bytes)
             .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
         if encoded > max_encoded_bytes {
+            stopped_for_bytes = true;
             break;
         }
-        fact_count += 1;
+        facts.push(fact.clone());
         fact_bytes = candidate_fact_bytes;
-        next_cursor = Some(*id);
+        next_cursor = Some(id);
         if from_admitted {
-            admitted.next();
+            admitted_index += 1;
         } else {
-            quarantined.next();
+            quarantined_index += 1;
         }
     }
 
-    if fact_count == 0 && (admitted.peek().is_some() || quarantined.peek().is_some()) {
+    let has_loaded_remainder =
+        admitted_index < admitted.len() || quarantined_index < quarantined.len();
+    if facts.is_empty() && (has_loaded_remainder || stopped_for_bytes) {
         return Err(Error::Other(
             "first semantic fact does not fit the requested page bound".into(),
         ));
     }
-    let complete = admitted.peek().is_none() && quarantined.peek().is_none();
+    let complete = !stopped_for_bytes
+        && !has_loaded_remainder
+        && admitted_ids.len() < fetch_limit
+        && quarantined.len() < fetch_limit;
     if complete {
         next_cursor = None;
     }
@@ -554,7 +540,7 @@ pub(crate) fn export_semantic_fact_page(
     })?;
     let encoded = metadata_bytes
         .checked_add(fact_bytes)
-        .and_then(|bytes| bytes.checked_add(fact_count.saturating_sub(1)))
+        .and_then(|bytes| bytes.checked_add(facts.len().saturating_sub(1)))
         .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
     if encoded > max_encoded_bytes {
         return Err(Error::Other(
@@ -563,9 +549,7 @@ pub(crate) fn export_semantic_fact_page(
     }
 
     let wire = SelectedPageWire {
-        graph: &graph,
-        cursor: request.cursor,
-        count: fact_count,
+        facts: &facts,
         context_id: request.context_id,
         next_cursor,
         complete,
@@ -581,39 +565,6 @@ pub(crate) fn export_semantic_fact_page(
     let funding = scope
         .acquire(claim)
         .map_err(|error| Error::Other(format!("semantic page admission refused: {error}")))?;
-    let mut admitted = graph.ids_after(request.cursor).peekable();
-    let cursor = request.cursor;
-    let mut quarantined = graph
-        .quarantined()
-        .filter(move |(id, _)| cursor.is_none_or(|cursor| **id > cursor))
-        .peekable();
-    let mut facts = Vec::with_capacity(fact_count);
-    for _ in 0..fact_count {
-        let Some((_, fact, from_admitted)) =
-            (match (admitted.peek().copied(), quarantined.peek().copied()) {
-                (None, None) => None,
-                (Some(id), None) => graph.get(id).map(|fact| (id, fact, true)),
-                (None, Some((id, fact))) => Some((id, fact, false)),
-                (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
-                    if admitted_id < quarantined_id {
-                        graph.get(admitted_id).map(|fact| (admitted_id, fact, true))
-                    } else {
-                        Some((quarantined_id, quarantined_fact, false))
-                    }
-                }
-            })
-        else {
-            return Err(Error::Other(
-                "semantic page selection changed during materialization".into(),
-            ));
-        };
-        facts.push(fact.clone());
-        if from_admitted {
-            admitted.next();
-        } else {
-            quarantined.next();
-        }
-    }
     Ok(crate::semantic::SemanticFactPage::new(
         request.context_id,
         facts,
@@ -737,22 +688,22 @@ pub(crate) async fn import_semantic_fact_page(
     };
     reduce_verified_facts(state, page_context_id, facts, next_cursor, complete).await?;
 
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
     let mut retained = Sha256::new();
     for fact_id in &submitted_ids {
-        let fact = graph.get(fact_id).or_else(|| {
-            graph
+        let fact = state.admitted_semantic_fact(*fact_id)?.or_else(|| {
+            state
+                .authoritative_fact_graph()
+                .read()
                 .quarantined()
                 .find(|(id, _)| **id == *fact_id)
-                .map(|(_, fact)| fact)
+                .map(|(_, fact)| fact.clone())
         });
         let Some(fact) = fact else {
             return Err(Error::Other(format!(
                 "signed fact {fact_id} was not retained by the semantic reducer"
             )));
         };
-        serde_json::to_writer(DigestWriter(&mut retained), fact)
+        serde_json::to_writer(DigestWriter(&mut retained), &fact)
             .map_err(|error| Error::Other(format!("retained fact encoding failed: {error}")))?;
         retained.update([0]);
     }
@@ -762,7 +713,9 @@ pub(crate) async fn import_semantic_fact_page(
             "semantic reducer changed a submitted signed fact".into(),
         ));
     }
-    identity_for_graph(state, &graph)
+    let graph = state.authoritative_fact_graph();
+    let identity = identity_for_graph(state, &graph.read());
+    identity
 }
 
 /// Return a stable identity for the live graph and its projected authority
@@ -782,40 +735,22 @@ fn identity_for_graph(
     graph: &crate::semantic::FactGraph,
 ) -> Result<crate::semantic::SemanticStateIdentity> {
     let context_id = graph.context_id();
-    let admitted_fact_count = u64::try_from(graph.len())
+    let live_admitted_fact_count = u64::try_from(graph.len())
         .map_err(|_| Error::Other("semantic admitted fact count overflow".into()))?;
-    let unresolved_fact_count = graph.quarantined().try_fold(0u64, |count, _| {
+    let live_unresolved_fact_count = graph.quarantined().try_fold(0u64, |count, _| {
         count
             .checked_add(1)
             .ok_or_else(|| Error::Other("semantic unresolved fact count overflow".into()))
     })?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"myownmesh-semantic-state-v2\0context\0");
-    hasher.update(context_id.as_bytes());
-    hasher.update(b"\0admitted-count\0");
-    hasher.update(admitted_fact_count.to_le_bytes());
-    hasher.update(b"\0admitted\0");
-    for fact_id in graph.ids() {
-        hasher.update(fact_id.as_bytes());
-        let fact = graph
-            .get(fact_id)
-            .ok_or_else(|| Error::Other(format!("semantic fact {fact_id} disappeared")))?;
-        serde_json::to_writer(DigestWriter(&mut hasher), fact)
-            .map_err(|error| Error::Other(format!("semantic identity encoding failed: {error}")))?;
-        hasher.update([0]);
+    let (admitted_fact_count, unresolved_fact_count, state_commitment) =
+        state.semantic_state_digest()?;
+    if admitted_fact_count != live_admitted_fact_count
+        || unresolved_fact_count != live_unresolved_fact_count
+    {
+        return Err(Error::Other(
+            "live semantic counters do not match durable history".into(),
+        ));
     }
-    hasher.update(b"\0unresolved-count\0");
-    hasher.update(unresolved_fact_count.to_le_bytes());
-    hasher.update(b"\0unresolved\0");
-    for (fact_id, fact) in graph.quarantined() {
-        hasher.update(fact_id.as_bytes());
-        serde_json::to_writer(DigestWriter(&mut hasher), fact)
-            .map_err(|error| Error::Other(format!("semantic identity encoding failed: {error}")))?;
-        hasher.update([0]);
-    }
-    let state_digest = hasher.finalize();
-    let mut state_commitment = [0; 32];
-    state_commitment.copy_from_slice(&state_digest);
     let wire = SemanticStateIdentityWire {
         context_id,
         admitted_fact_count,

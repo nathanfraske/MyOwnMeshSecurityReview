@@ -358,11 +358,14 @@ fn page_is_admitted(state: &Arc<NetworkState>, facts: &[SignedFact]) -> bool {
     if facts.is_empty() {
         return false;
     }
-    let graph = state.authoritative_fact_graph();
-    let graph = graph.read();
-    facts
-        .iter()
-        .all(|fact| graph.get(&fact.id).is_some_and(|admitted| admitted == fact))
+    facts.iter().all(|fact| {
+        state
+            .admitted_semantic_fact(fact.id)
+            .ok()
+            .flatten()
+            .as_ref()
+            == Some(fact)
+    })
 }
 
 /// Return whether a proof delivery is complete enough to acknowledge.  This
