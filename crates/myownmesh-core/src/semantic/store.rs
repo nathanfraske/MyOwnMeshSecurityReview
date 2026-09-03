@@ -7907,15 +7907,38 @@ mod tests {
     fn clean_live_checkpoint_restores_without_history_replay() {
         let root = root();
         let bootstrap = closed("checkpoint-restart", 21, [21; 32]);
+        let signing_key = key(21);
         let mut graph = FactGraph::from_bootstrap(&bootstrap);
+        let first_target =
+            super::super::DeviceId::from_public_key_bytes(*key(22).verifying_key().as_bytes())
+                .expect("first test target id");
         let journal = graph
-            .admit_journaled(root_fact(&bootstrap, &key(21)))
+            .admit_journaled(root_fact_for_target(&bootstrap, &signing_key, first_target))
             .expect("admit checkpoint fact");
         assert!(matches!(
             journal.admission(),
             super::super::Admission::Inserted
         ));
         journal.commit();
+        let author =
+            super::super::DeviceId::from_public_key_bytes(*signing_key.verifying_key().as_bytes())
+                .expect("test root id");
+        let body = FactBody::RoleGrant {
+            target: super::super::DeviceId::from_public_key_bytes(
+                *key(23).verifying_key().as_bytes(),
+            )
+            .expect("test target id"),
+            role: super::super::Role::Member,
+        };
+        let witness = graph.authoring_witness(&body, &author);
+        let dependent = SignedFact::sign(
+            FactContent::from_authoring_witness(&graph, body, &witness, std::iter::empty()),
+            &signing_key,
+        )
+        .expect("dependent checkpoint fact signs");
+        graph
+            .admit(dependent)
+            .expect("dependent checkpoint fact admits");
 
         let store = DurableSemanticStore::new(&root, "checkpoint-restart-slot");
         let owner = store.open_writable().expect("checkpoint owner");
@@ -7932,7 +7955,7 @@ mod tests {
         ORDERED_RESTORE_ROWS.store(0, Ordering::Relaxed);
         let reopened = store.open_writable().expect("reopen checkpoint owner");
         let restored = reopened.restore(&bootstrap).expect("restore checkpoint");
-        assert_eq!(restored.graph().len(), 1);
+        assert_eq!(restored.graph().len(), 2);
         assert_eq!(
             ORDERED_RESTORE_ROWS.load(Ordering::Relaxed),
             0,

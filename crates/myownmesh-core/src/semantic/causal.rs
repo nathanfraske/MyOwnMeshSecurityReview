@@ -2414,22 +2414,14 @@ impl FactGraph {
                 .map_err(|_| SemanticError::EncodingFailed)?
                 .len(),
         )?;
+        // `dependencies` already contains every authority predecessor.  The
+        // durable store charges those canonical dependency rows once, plus
+        // one logical edge for each authority-use row.  Keep admission and
+        // durable accounting identical so a clean checkpoint can be
+        // validated in constant work at restart.
         let dependency_count = self.checked_len(dependencies(fact).len())?;
         let authority_use_count = self.checked_len(fact.content.authority_uses.len())?;
-        let predecessor_count =
-            fact.content
-                .authority_uses
-                .iter()
-                .try_fold(0u64, |total, authority_use| {
-                    self.checked_add_bytes(
-                        total,
-                        self.checked_len(authority_use.predecessors.len())?,
-                    )
-                })?;
-        let edges = self.checked_add_bytes(
-            self.checked_add_bytes(dependency_count, authority_use_count)?,
-            predecessor_count,
-        )?;
+        let edges = self.checked_add_bytes(dependency_count, authority_use_count)?;
         Ok((encoded_bytes, edges))
     }
 
@@ -7645,6 +7637,15 @@ mod tests {
             &[(device(&root_key), vec![predecessor])],
         );
         assert!(dependencies(&fact).contains(&predecessor));
+        let graph = FactGraph::from_bootstrap(&bootstrap);
+        assert_eq!(
+            graph
+                .fact_cost(&fact)
+                .expect("fact cost computes")
+                .dependency_edges,
+            dependencies(&fact).len() as u64 + fact.content.authority_uses.len() as u64,
+            "canonical dependency rows and authority-use rows are each charged once"
+        );
     }
 
     #[test]
