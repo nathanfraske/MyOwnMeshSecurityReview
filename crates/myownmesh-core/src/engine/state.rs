@@ -2767,6 +2767,86 @@ impl NetworkState {
         Arc::clone(&self.fact_graph)
     }
 
+    /// Build a large valid history with ordinary semantic validation and
+    /// publish it in one durable snapshot. This transport-lab fixture avoids
+    /// timing hundreds of thousands of setup fsyncs so scale tests can measure
+    /// the public hot path at a chosen ledger size.
+    #[cfg(feature = "transport-lab")]
+    pub(crate) async fn seed_semantic_scale_history_for_lab(
+        self: &Arc<Self>,
+        target: crate::semantic::DeviceId,
+        count: usize,
+    ) -> Result<()> {
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let author = crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
+                .map_err(|error| Error::Other(format!("noncanonical local DeviceId: {error}")))?;
+            let mut seeded = {
+                let live = state.fact_graph.read();
+                if !live.is_empty() {
+                    return Err(Error::Other(
+                        "semantic scale fixture requires an empty graph".into(),
+                    ));
+                }
+                live.clone()
+            };
+
+            for index in 0..count {
+                let body = crate::semantic::FactBody::RoleGrant {
+                    target: target.clone(),
+                    role: if index % 2 == 0 {
+                        crate::semantic::Role::Member
+                    } else {
+                        crate::semantic::Role::Owner
+                    },
+                };
+                let witness = seeded.authoring_witness(&body, &author);
+                let mut authority_parents = Vec::new();
+                for subject in body.authority_use_subjects(&author) {
+                    authority_parents
+                        .extend(seeded.authority_lineage(&subject).heads().iter().copied());
+                }
+                let content = crate::semantic::FactContent::from_authoring_witness(
+                    &seeded,
+                    body,
+                    &witness,
+                    authority_parents,
+                );
+                let fact = crate::semantic::SignedFact::sign(content, state.identity.signing_key())
+                    .map_err(|error| {
+                        Error::Other(format!("semantic seed fact rejected: {error}"))
+                    })?;
+                match seeded.admit(fact).map_err(|error| {
+                    Error::Other(format!("semantic seed admission failed: {error}"))
+                })? {
+                    crate::semantic::Admission::Inserted => {}
+                    other => {
+                        return Err(Error::Other(format!(
+                            "semantic seed produced unexpected admission {other:?}"
+                        )))
+                    }
+                }
+            }
+
+            let _publication = state.durable_publication_gate.lock();
+            let mut live = state.fact_graph.write();
+            if !live.is_empty() {
+                return Err(Error::Other(
+                    "semantic scale graph changed while the seed was prepared".into(),
+                ));
+            }
+            state.ensure_durable_owner_mutation_allowed()?;
+            state
+                .durable_semantic_owner
+                .commit(&seeded, Vec::new())
+                .map_err(|error| Error::Network(format!("semantic seed commit: {error}")))?;
+            *live = seeded;
+            Ok(())
+        })
+        .await
+        .map_err(|error| Error::Network(format!("semantic seed worker failed: {error}")))?
+    }
+
     fn ensure_durable_owner_mutation_allowed(&self) -> Result<()> {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(Error::Network(

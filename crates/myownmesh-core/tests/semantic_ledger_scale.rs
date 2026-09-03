@@ -87,6 +87,9 @@ struct ScaleMetrics {
     platform: &'static str,
     scale_n: usize,
     admitted_delta: u64,
+    seeded_admissions: usize,
+    timed_admissions: usize,
+    seed_total_ms: f64,
     unresolved: u64,
     admission_total_ms: f64,
     admission_end_to_end_total_ms: f64,
@@ -147,6 +150,7 @@ struct ScaleWindowEvidence {
 const SCALE_WINDOW_TARGETS: usize = 128;
 const WINDOW_SAMPLE_LIMIT: usize = 64;
 const MAX_TIMING_SAMPLES: usize = SCALE_WINDOW_TARGETS * WINDOW_SAMPLE_LIMIT;
+const LARGE_SCALE_TIMED_ADMISSIONS: usize = 10_000;
 
 #[derive(Debug, Serialize)]
 struct TailFactEvidence {
@@ -694,16 +698,42 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let initial_identity = network.semantic_state_identity()?;
     let initial_db = db_footprint(home.path());
     assert_footprint_within(&selected_policy, initial_db, "initial");
-    let initial_io_bytes = process_io_bytes();
-    let initial_cpu_time_ms = process_cpu_time_ms();
-    let sample_every = (scale / 100).max(1);
-    let mut peak_db = initial_db;
-    let workload_started = Instant::now();
-    let mut progress_checkpoint_count = 0usize;
-    let window_size = if scale == 0 {
-        1
+    let timed_admissions = if scale >= 250_000 {
+        LARGE_SCALE_TIMED_ADMISSIONS.min(scale)
     } else {
         scale
+    };
+    let seeded_admissions = scale
+        .checked_sub(timed_admissions)
+        .expect("timed admissions fit selected scale");
+    let fixed_target = target_id(0);
+    let seed_started = Instant::now();
+    if seeded_admissions > 0 {
+        let seed_target = myownmesh_core::semantic::DeviceId::from_canonical_str(&fixed_target)
+            .expect("fixed scale target is canonical");
+        network
+            .seed_semantic_scale_history_for_lab(seed_target, seeded_admissions)
+            .await?;
+    }
+    let seed_total_ms = seed_started.elapsed().as_secs_f64() * 1_000.0;
+    assert_eq!(
+        network.semantic_state_identity()?.admitted_fact_count(),
+        u64::try_from(seeded_admissions).expect("seed count fits u64"),
+        "the bulk fixture publishes exactly the requested validated prefix"
+    );
+    let seeded_db = db_footprint(home.path());
+    assert_footprint_within(&selected_policy, seeded_db, "seeded");
+    let initial_io_bytes = process_io_bytes();
+    let initial_cpu_time_ms = process_cpu_time_ms();
+    let sample_every = (timed_admissions / 100).max(1);
+    let mut peak_db = initial_db;
+    peak_db.observe_peak(seeded_db);
+    let workload_started = Instant::now();
+    let mut progress_checkpoint_count = 0usize;
+    let window_size = if timed_admissions == 0 {
+        1
+    } else {
+        timed_admissions
             .checked_add(SCALE_WINDOW_TARGETS - 1)
             .expect("scale window arithmetic fits usize")
             / SCALE_WINDOW_TARGETS
@@ -712,13 +742,13 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         .checked_add(WINDOW_SAMPLE_LIMIT - 1)
         .expect("window sample arithmetic fits usize")
         / WINDOW_SAMPLE_LIMIT;
-    let mut window_start_admitted = 0usize;
+    let mut window_start_admitted = seeded_admissions;
     let mut window_admission_total_ms = 0.0;
     let mut admission_total_ms = 0.0;
     let mut window_evidence: Vec<ScaleWindowEvidence> =
-        Vec::with_capacity(SCALE_WINDOW_TARGETS.min(scale.max(1)));
+        Vec::with_capacity(SCALE_WINDOW_TARGETS.min(timed_admissions.max(1)));
     let mut window_samples = Vec::with_capacity(WINDOW_SAMPLE_LIMIT.min(window_size));
-    let mut bounded_samples = Vec::with_capacity(MAX_TIMING_SAMPLES.min(scale));
+    let mut bounded_samples = Vec::with_capacity(MAX_TIMING_SAMPLES.min(timed_admissions));
     let mut tail_evidence = None;
     let mut no_op_evidence = None;
     // Failure diagnostics are deliberately opt-in: normal successful scale
@@ -727,14 +757,16 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     // both sides of the failed durable commit.
     let capture_failure_diagnostics =
         std::env::var_os("MYOWNMESH_SCALE_FAILURE_DIAGNOSTICS").is_some();
-    let fixed_target = target_id(0);
     assert_eq!(
         fixed_target,
         target_id(0),
         "scale workload target must remain the deterministic index-0 identity"
     );
 
-    for index in 0..scale {
+    for index in seeded_admissions..scale {
+        let measured_index = index
+            .checked_sub(seeded_admissions)
+            .expect("measured index follows the seeded prefix");
         // Keep the projected roster bounded while extending the canonical fact
         // history. Alternating effective roles on one subject makes each
         // proposal a distinct signed fact with the prior fact as its causal
@@ -818,7 +850,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
                 provider_after: after_provider,
             });
         }
-        if index == 0 {
+        if measured_index == 0 {
             let before_identity = network
                 .semantic_state_identity()
                 .expect("no-op identity before duplicate");
@@ -854,8 +886,9 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
                 provider_after: after_provider,
             });
         }
-        let progress_checkpoint = index % sample_every == 0 || index + 1 == scale;
-        let window_checkpoint = (index + 1) % window_size == 0 || index + 1 == scale;
+        let progress_checkpoint = measured_index % sample_every == 0 || index + 1 == scale;
+        let measured_count = measured_index + 1;
+        let window_checkpoint = measured_count % window_size == 0 || index + 1 == scale;
         if progress_checkpoint || window_checkpoint {
             if progress_checkpoint {
                 progress_checkpoint_count = progress_checkpoint_count
@@ -912,11 +945,11 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
             }
         }
     }
-    let expected_progress_checkpoints = if scale == 0 {
+    let expected_progress_checkpoints = if timed_admissions == 0 {
         0
     } else {
-        let regular = (scale - 1) / sample_every + 1;
-        regular + usize::from((scale - 1) % sample_every != 0)
+        let regular = (timed_admissions - 1) / sample_every + 1;
+        regular + usize::from((timed_admissions - 1) % sample_every != 0)
     };
     assert_eq!(
         progress_checkpoint_count, expected_progress_checkpoints,
@@ -995,7 +1028,8 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let process_write_delta = initial_io_bytes
         .and_then(|(_, before)| final_io_bytes.and_then(|(_, after)| after.checked_sub(before)));
     let process_write_per_admission = process_write_delta.map(|bytes| {
-        bytes as f64 / f64::from(u32::try_from(scale).expect("scale fits f64 divisor"))
+        bytes as f64
+            / f64::from(u32::try_from(timed_admissions).expect("timed admissions fit f64 divisor"))
     });
     let process_scope_cpu_time_ms = initial_cpu_time_ms.and_then(|before| {
         process_cpu_time_ms().and_then(|after| {
@@ -1049,7 +1083,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     let admission_p95_ms = percentile_ms_sorted(&bounded_samples, 95);
     let admission_p99_ms = percentile_ms_sorted(&bounded_samples, 99);
     let admissions_per_sec = (admission_total_ms > 0.0)
-        .then(|| scale as f64 * 1_000.0 / admission_total_ms)
+        .then(|| timed_admissions as f64 * 1_000.0 / admission_total_ms)
         .unwrap_or(0.0);
     let early_window_average_ms_per_admission = window_evidence
         .first()
@@ -1076,6 +1110,9 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         platform: platform(),
         scale_n: scale,
         admitted_delta,
+        seeded_admissions,
+        timed_admissions,
+        seed_total_ms,
         unresolved: restored_unresolved,
         admission_total_ms,
         admission_end_to_end_total_ms: admission_total_ms,

@@ -93,6 +93,9 @@ SEMANTIC_SCALE_FIELDS = {
     "platform",
     "scale_n",
     "admitted_delta",
+    "seeded_admissions",
+    "timed_admissions",
+    "seed_total_ms",
     "unresolved",
     "admission_total_ms",
     "admission_end_to_end_total_ms",
@@ -974,6 +977,20 @@ def validate_semantic_metric(metric: Any, selector: str, scale_n: int | None) ->
             raise BenchmarkError(f"semantic case {selector} is missing fields: {', '.join(missing)}")
         if metric.get("scale_n") != scale_n or metric.get("admitted_delta") != scale_n:
             raise BenchmarkError(f"semantic case {selector} did not admit exactly scale_n facts")
+        seeded_admissions = metric.get("seeded_admissions")
+        timed_admissions = metric.get("timed_admissions")
+        if (
+            isinstance(seeded_admissions, bool)
+            or not isinstance(seeded_admissions, int)
+            or seeded_admissions < 0
+            or isinstance(timed_admissions, bool)
+            or not isinstance(timed_admissions, int)
+            or timed_admissions <= 0
+            or seeded_admissions + timed_admissions != scale_n
+        ):
+            raise BenchmarkError(
+                f"semantic case {selector} has an inconsistent seeded/timed admission split"
+            )
         if metric.get("unresolved") != 0:
             raise BenchmarkError(f"semantic case {selector} left unresolved facts")
         if metric.get("cache_state") != SEMANTIC_CACHE_STATE:
@@ -983,6 +1000,7 @@ def validate_semantic_metric(metric: Any, selector: str, scale_n: int | None) ->
             "admission_end_to_end_total_ms",
             "admission_p50_ms",
             "admission_p95_ms",
+            "seed_total_ms",
             "compaction_ms",
             "startup_plus_restore_ms",
         ):

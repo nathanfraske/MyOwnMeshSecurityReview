@@ -463,6 +463,20 @@ impl ClosedRelayChannel {
 }
 
 impl JoinedNetwork {
+    /// Prepare a validated large-history fixture for transport-lab scale
+    /// measurements, then leave subsequent admissions on the public path.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn seed_semantic_scale_history_for_lab(
+        &self,
+        target: crate::semantic::DeviceId,
+        count: usize,
+    ) -> Result<()> {
+        self.state
+            .seed_semantic_scale_history_for_lab(target, count)
+            .await
+    }
+
     /// Import one bounded semantic fact page through the durable reducer and
     /// return the resulting deterministic graph identity.
     ///
