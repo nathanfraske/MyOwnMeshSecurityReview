@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -159,6 +160,14 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
         }
     }
 
+    // The peer registry is keyed by Device ID, but keep the edge plan's
+    // uniqueness and ordering explicit: a concurrent state-watch tick must
+    // not schedule duplicate carriers for one exact edge.
+    to_prune.sort_unstable();
+    to_prune.dedup();
+    to_dial.sort_unstable();
+    to_dial.dedup();
+
     for id in to_prune {
         state.log_diag_with(
             crate::events::DiagLevel::Info,
@@ -174,15 +183,27 @@ pub(crate) async fn shape_connections(state: &Arc<NetworkState>) {
         // moment the shape wants it again.
         super::note_sighted_without_dialing(state, &id, "topology pruned");
     }
+    // The plan is finite because it was derived from one peer-registry
+    // snapshot, so the number of in-flight dials is explicitly bounded by
+    // the number of unique wanted edges. Each future owns one edge and a
+    // failure is contained by ensure_peer_session; it cannot cancel sibling
+    // carriers. The transport worker may be created here, but it remains
+    // Sighted/pending until the existing signed handshake and approval path
+    // promotes it to Active or a usable application session.
+    let mut dials = FuturesUnordered::new();
     for id in to_dial {
-        state.log_diag_with(
-            crate::events::DiagLevel::Info,
-            "topology",
-            format!("dialing shape edge to {}", super::short_peer(&id)),
-            serde_json::json!({ "peer": id }),
-        );
-        super::ensure_peer_session(state, &id, crate::transport::Role::Offerer).await;
+        let state = Arc::clone(state);
+        dials.push(async move {
+            state.log_diag_with(
+                crate::events::DiagLevel::Info,
+                "topology",
+                format!("dialing shape edge to {}", super::short_peer(&id)),
+                serde_json::json!({ "peer": id }),
+            );
+            super::ensure_peer_session(&state, &id, crate::transport::Role::Offerer).await;
+        });
     }
+    while dials.next().await.is_some() {}
 }
 
 async fn send_shelve_unshelve(state: &Arc<NetworkState>, device_id: &str, shelved: bool) {
@@ -247,6 +268,36 @@ mod tests {
             state.peers.get("~hub").unwrap().has_current_worker(),
             "the shape pass upgrades a wanted placeholder to a real dial"
         );
+    }
+
+    #[tokio::test]
+    async fn shape_pass_dials_each_unique_edge_without_promotion() {
+        let state = build_test_state("shape-dial-parallel");
+        let mode = TopologyMode::Ring {
+            n_preferred: Some(3),
+        };
+        *state.topology.write() = mode.clone();
+        *state.topology_impl.write() = from_mode(&mode);
+        // These two high-sorting placeholders are both wanted by the ring
+        // and the local test identity sorts below them. The control therefore
+        // exercises one finite two-edge plan, not a serial single-edge path.
+        insert_session_less_peer(&state, "~edge-a", None);
+        insert_session_less_peer(&state, "~edge-b", None);
+
+        shape_connections(&state).await;
+
+        for id in ["~edge-a", "~edge-b"] {
+            let peer = state.peers.get(id).expect("planned edge remains visible");
+            assert!(
+                peer.has_current_worker(),
+                "every unique wanted edge starts a carrier: {id}"
+            );
+            assert_ne!(
+                peer.state.read().status,
+                PeerStatus::Active,
+                "carrier creation alone cannot promote an application session: {id}"
+            );
+        }
     }
 
     #[tokio::test]

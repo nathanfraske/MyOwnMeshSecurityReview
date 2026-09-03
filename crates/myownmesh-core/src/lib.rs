@@ -9,7 +9,9 @@
 //!
 //! ```no_run
 //! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
-//! use myownmesh_core::{ClosedRelayPolicyConfig, Mesh, MeshConfig, NetworkConfig, TopologyMode};
+//! use myownmesh_core::{
+//!     ClosedRelayPolicyConfig, Mesh, MeshConfig, NetworkConfig, RoutingPolicyConfig, TopologyMode,
+//! };
 //!
 //! // The process owner supplies the reviewed connector policy explicitly.
 //! let mesh = Mesh::open_connector_capable(
@@ -25,6 +27,8 @@
 //!     label: "Home".into(),
 //!     kind: Default::default(),                            // Open (default)
 //!     scheduler: Default::default(),
+//!     semantic_policy: Default::default(),
+//!     routing_policy: RoutingPolicyConfig::default(),
 //!     event_capacity: 256,
 //!     connection_trace_capacity: 512,
 //!     topology: TopologyMode::default(),
@@ -32,7 +36,6 @@
 //!     closed_relay: ClosedRelayPolicyConfig::default(),
 //!     stun_servers: Default::default(),
 //!     turn_servers: Default::default(),
-//!     roster_path: None,
 //!     pinned_peers: Vec::new(),
 //!     auto_approve: false,
 //! }).await?;
@@ -54,9 +57,10 @@
 //! - [`Identity`] — long-lived ed25519 device identity persisted at
 //!   `~/.myownmesh/.secrets/identity.json` (mode 0600 on Unix). The
 //!   public key is the Device ID surfaced on the wire.
-//! - [`Roster`] — per-network list of approved peer Device IDs.
-//!   Reconnects from rostered peers auto-allow without re-prompting
-//!   the user.
+//! - [`Roster`] — per-network local/UI projection of peer metadata derived
+//!   from canonical signed policy. It is not an admission authority: a
+//!   reconnect is admitted only when canonical policy permits it and the
+//!   explicit `NetworkConfig::auto_approve` setting is enabled.
 //! - [`protocol`] — wire format: `hello` / `auth_response` / `approve`
 //!   / `deny` / `ping` / `pong` / `shelve` / `unshelve` /
 //!   `capabilities_update` / generic RPC frames. See `docs/PROTOCOL.md`.
@@ -103,8 +107,8 @@
 //!
 //! A user-visible 6-char verification code lets a human
 //! eyeball-confirm the handshake over voice/video at first-meeting
-//! time; thereafter the peer's pubkey is in the roster and
-//! auto-approved on reconnect.
+//! time; subsequent reconnect approval still requires the exact canonical
+//! policy and the explicit `NetworkConfig::auto_approve` setting.
 //!
 //! # Where to look next
 //!
@@ -149,9 +153,9 @@ pub mod verification;
 pub use application_gateway::capability_advert_planning_claim;
 pub use channels::{Channel, ChannelError, ChannelMessage};
 pub use config::{
-    AutoUpdateConfig, MeshConfig, NetworkConfig, NetworkKind, NodeServiceConfig, ServicesConfig,
-    SignalingLimits, SignalingServerConfig, StunServer, StunServiceConfig, TopologyMode,
-    TurnCredential, TurnServer, TurnServiceConfig,
+    AutoUpdateConfig, MeshConfig, NetworkConfig, NetworkKind, NodeServiceConfig,
+    RoutingPolicyConfig, ServicesConfig, SignalingLimits, SignalingServerConfig, StunServer,
+    StunServiceConfig, TopologyMode, TurnCredential, TurnServer, TurnServiceConfig,
 };
 pub use engine::conn_trace::ConnTrace;
 pub use engine::ladder::ConnectionTier;

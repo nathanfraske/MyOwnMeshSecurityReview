@@ -90,27 +90,19 @@ impl std::hash::Hash for RelaySessionId {
 pub struct DeliveryRetention {
     pub encoded_event_bytes: usize,
     /// The relay record is inline in `DeliveryMapNode`; the node lease below
-    /// owns this allocation, so the compatibility record charge is zero.
+    /// owns this allocation, so the inline record charge is zero.
     pub structural_entry_bytes: usize,
-    /// Exact allocation size of the provider-owned relay entry node. This is
-    /// the canonical per-emission entry charge; the legacy `*_map_growth`
-    /// field below is an equal compatibility alias, not an additional charge.
+    /// Exact allocation size of the provider-owned relay entry node.
     pub relay_entry_bytes: usize,
-    /// Exact allocation size of `Box<DeliveryMapNode<RelaySessionId,
-    /// RelayEntry>>`, reserved before the relay node is inserted.
-    pub relay_map_growth_bytes: usize,
     /// Exact bytes for the attempt record allocation.
     /// The attempt record is inline in `DeliveryMapNode`; the node lease owns
-    /// it and this compatibility record charge is therefore zero.
+    /// it and this inline record charge is therefore zero.
     pub attempt_record_bytes: usize,
     /// Exact bytes for the event-id key allocation.
     pub attempt_key_bytes: usize,
     /// Exact allocation size of `Box<DeliveryMapNode<String, AttemptEntry>>`,
     /// reserved before the attempt node is inserted.
     pub attempt_entry_bytes: usize,
-    /// Compatibility alias for `attempt_entry_bytes`; providers must charge
-    /// one or the other, never both.
-    pub attempt_map_growth_bytes: usize,
 }
 
 /// Exact provider inputs for one relay-session registration.
@@ -120,16 +112,12 @@ pub struct SessionRetention {
     /// This is deliberately not an allocator-layout claim: the provider also
     /// owns an opaque residual for the identity allocation.
     pub session_identity_bytes: usize,
-    /// Compatibility record commitment carrying the identity accounting above.
-    /// The session map record itself is inline in `session_entry_bytes`.
+    /// Record commitment carrying the identity accounting above. The session
+    /// map record itself is inline in `session_entry_bytes`.
     pub session_record_bytes: usize,
     pub session_set_node_bytes: usize,
-    /// Exact allocation size of the provider-owned session entry node. The
-    /// existing growth field is an equal compatibility alias.
+    /// Exact allocation size of the provider-owned session entry node.
     pub session_entry_bytes: usize,
-    /// Compatibility growth alias; the exact session-map node is charged by
-    /// `session_entry_bytes` and this value is intentionally zero.
-    pub session_set_growth_bytes: usize,
 }
 
 /// Why a provider refused a per-relay delivery entry.
@@ -163,28 +151,13 @@ pub trait DeliveryLease: Send + Sync {
 pub trait DeliveryProvider: Send + Sync {
     /// Fund the bounded raw-frame parse before JSON or envelope decoding.
     ///
-    /// The frame has not been interpreted yet, so the default uses the
-    /// provider's existing attempt-map residual seam with a zero-content
-    /// placeholder. Providers charge `encoded_event_bytes` from the supplied
-    /// retention; no peer-controlled collection is built before this lease is
-    /// acquired. The lease is released when the caller finishes the parse.
+    /// Providers charge `encoded_event_bytes` from the supplied retention; no
+    /// peer-controlled collection is built before this lease is acquired.
+    /// The lease is released when the caller finishes the parse.
     fn reserve_inbound_frame(
         &self,
         frame_bytes: usize,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        let event = NostrEvent {
-            id: String::new(),
-            pubkey: String::new(),
-            created_at: 0,
-            kind: 0,
-            tags: Vec::new(),
-            content: String::new(),
-            sig: String::new(),
-        };
-        let mut retention = DeliveryRetention::for_attempt("<inbound-frame>", &event);
-        retention.encoded_event_bytes = frame_bytes;
-        self.reserve_attempt_map_growth("<inbound-frame>", &event, retention)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Observe the process-local source before duplicate detection.  This is
     /// intentionally only the binding hook: the provider-owned lifetime is
@@ -194,36 +167,20 @@ pub trait DeliveryProvider: Send + Sync {
     fn on_admission_source(&self, _source: AdmissionSource, _attempt: &str, _event_id: &str) {}
 
     /// Retain one opaque provider residual for the process-local admission
-    /// identity.  The identity is deliberately still a small, copyable token
-    /// for the consumer boundary; this lease is its provider-owned lifetime
-    /// and prevents that token from becoming an unaccounted authority path.
-    /// The compatibility default uses the zero-byte attempt-map residual
-    /// seam, so it adds no second byte charge or wire allocation.
+    /// identity. The lease prevents that token from becoming an unaccounted
+    /// authority path.
     fn reserve_admission_source(
         &self,
         attempt: &str,
         event: &NostrEvent,
         retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        let mut residual = retention;
-        residual.attempt_entry_bytes = 0;
-        residual.attempt_map_growth_bytes = 0;
-        self.reserve_attempt_map_growth(attempt, event, residual)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Fund the `RelaySessionId` Arc allocation before it is created.
-    /// Providers that do not own a finite resource scope should explicitly
-    /// return an unmetered lease; the compatibility default delegates to the
-    /// existing session-record seam with a zero-allocation sentinel identity.
     fn reserve_session_identity(
         &self,
         retention: SessionRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        // The rejected sentinel is zero-allocation. This compatibility
-        // adapter lets existing providers fund the Arc before it is created
-        // without requiring a second provider API or a temporary Arc.
-        self.reserve_session_record(RelaySessionId::rejected(), retention)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Fund the session record before it is inserted into the live session set.
     fn reserve_session_record(
@@ -239,21 +196,12 @@ pub trait DeliveryProvider: Send + Sync {
         retention: SessionRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
-    /// Fund the exact session-set growth before insertion.
-    fn reserve_session_set_growth(
-        &self,
-        session: RelaySessionId,
-        retention: SessionRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
-
     /// Fund the exact one-allocation session-map entry.
     fn reserve_session_entry(
         &self,
         session: RelaySessionId,
         retention: SessionRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        self.reserve_session_set_growth(session, retention)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Fund the exact attempt record before it is inserted into the live map.
     fn reserve_attempt_record(
@@ -271,14 +219,7 @@ pub trait DeliveryProvider: Send + Sync {
         retention: DeliveryRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
-    /// Fund the exact attempt-map growth allocation.
-    fn reserve_attempt_map_growth(
-        &self,
-        attempt: &str,
-        event: &NostrEvent,
-        retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
-
+    /// Fund the exact per-relay delivery allocation.
     fn reserve(
         &self,
         attempt: &str,
@@ -287,28 +228,13 @@ pub trait DeliveryProvider: Send + Sync {
         retention: DeliveryRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
-    /// Fund the relay-map growth separately from the relay delivery entry.
-    fn reserve_relay_map_growth(
-        &self,
-        attempt: &str,
-        session: RelaySessionId,
-        event: &NostrEvent,
-        retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
-
     /// Fund the exact attempt-map entry owned by the provider.
-    ///
-    /// New providers should override this seam. The default preserves the
-    /// older byte-hint adapter while callers migrate; the store never treats
-    /// the HashMap tuple layout as its own custody claim.
     fn reserve_attempt_entry(
         &self,
         attempt: &str,
         event: &NostrEvent,
         retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        self.reserve_attempt_map_growth(attempt, event, retention)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Fund the exact relay-map entry owned by the provider.
     fn reserve_relay_entry(
@@ -317,23 +243,16 @@ pub trait DeliveryProvider: Send + Sync {
         session: RelaySessionId,
         event: &NostrEvent,
         retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        self.reserve_relay_map_growth(attempt, session, event, retention)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 
     /// Fund the owned attempt-correlation string separately from the event-id
-    /// key. The compatibility default reuses the old key seam with an exact
-    /// correlation-length hint, so existing providers remain source-stable.
+    /// key.
     fn reserve_attempt_correlation(
         &self,
         attempt: &str,
         event: &NostrEvent,
         retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        let mut correlation = retention;
-        correlation.attempt_key_bytes = attempt.len();
-        self.reserve_attempt_key(attempt, event, correlation)
-    }
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal>;
 }
 
 /// Test-only provider for local delivery-driver controls. Production core
@@ -359,6 +278,22 @@ impl DeliveryLease for UnmeteredLease {
 
 #[cfg(test)]
 impl DeliveryProvider for UnmeteredDeliveryProvider {
+    fn reserve_inbound_frame(
+        &self,
+        _frame_bytes: usize,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(UnmeteredLease))
+    }
+
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(UnmeteredLease))
+    }
+
     fn reserve_session_identity(
         &self,
         _retention: SessionRetention,
@@ -382,7 +317,7 @@ impl DeliveryProvider for UnmeteredDeliveryProvider {
         Ok(Box::new(UnmeteredLease))
     }
 
-    fn reserve_session_set_growth(
+    fn reserve_session_entry(
         &self,
         _session: RelaySessionId,
         _retention: SessionRetention,
@@ -408,7 +343,7 @@ impl DeliveryProvider for UnmeteredDeliveryProvider {
         Ok(Box::new(UnmeteredLease))
     }
 
-    fn reserve_attempt_map_growth(
+    fn reserve_attempt_entry(
         &self,
         _attempt: &str,
         _event: &NostrEvent,
@@ -427,10 +362,19 @@ impl DeliveryProvider for UnmeteredDeliveryProvider {
         Ok(Box::new(UnmeteredLease))
     }
 
-    fn reserve_relay_map_growth(
+    fn reserve_relay_entry(
         &self,
         _attempt: &str,
         _session: RelaySessionId,
+        _event: &NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(UnmeteredLease))
+    }
+
+    fn reserve_attempt_correlation(
+        &self,
+        _attempt: &str,
         _event: &NostrEvent,
         _retention: DeliveryRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
@@ -460,11 +404,9 @@ impl DeliveryRetention {
             encoded_event_bytes: counter.0,
             structural_entry_bytes: 0,
             relay_entry_bytes,
-            relay_map_growth_bytes: relay_entry_bytes,
             attempt_record_bytes: 0,
             attempt_key_bytes: event.id.len(),
             attempt_entry_bytes,
-            attempt_map_growth_bytes: attempt_entry_bytes,
         }
     }
 }
@@ -478,7 +420,6 @@ impl SessionRetention {
             session_record_bytes: std::mem::size_of::<Arc<()>>(),
             session_set_node_bytes: 0,
             session_entry_bytes,
-            session_set_growth_bytes: 0,
         }
     }
 }
@@ -700,7 +641,7 @@ impl CarrierAggregate {
 struct SessionEntry {
     record_lease: Box<dyn DeliveryLease>,
     node_lease: Box<dyn DeliveryLease>,
-    growth_lease: Box<dyn DeliveryLease>,
+    entry_lease: Box<dyn DeliveryLease>,
 }
 
 /// A provider-funded, one-allocation-per-entry map.
@@ -1036,7 +977,7 @@ impl DeliveryStore {
                 return (RelaySessionId::rejected(), Some(error), Vec::new());
             }
         };
-        let growth_lease = match self
+        let entry_lease = match self
             .provider
             .reserve_session_entry(session.clone(), retention)
         {
@@ -1052,7 +993,7 @@ impl DeliveryStore {
             SessionEntry {
                 record_lease,
                 node_lease,
-                growth_lease,
+                entry_lease,
             },
         );
         let mut refused = Vec::new();
@@ -1548,7 +1489,7 @@ impl DeliveryStore {
             if let Some(session_entry) = state.sessions.remove(&session) {
                 leases.push(session_entry.record_lease);
                 leases.push(session_entry.node_lease);
-                leases.push(session_entry.growth_lease);
+                leases.push(session_entry.entry_lease);
             }
             for (_, entry) in state.attempts.iter_mut() {
                 if let Some(relay) = entry.relays.remove(&session) {
@@ -1591,7 +1532,7 @@ impl DeliveryStore {
             for (_, session_entry) in mem::take(&mut state.sessions).into_iter() {
                 leases.push(session_entry.record_lease);
                 leases.push(session_entry.node_lease);
-                leases.push(session_entry.growth_lease);
+                leases.push(session_entry.entry_lease);
             }
             for (_, entry) in mem::take(&mut state.attempts).into_iter() {
                 count += entry.relays.len();
@@ -1671,6 +1612,13 @@ mod tests {
 
     macro_rules! unmetered_reservations {
         () => {
+            fn reserve_inbound_frame(
+                &self,
+                _frame_bytes: usize,
+            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+                Ok(Box::new(UnmeteredLease))
+            }
+
             fn reserve_session_identity(
                 &self,
                 _retention: SessionRetention,
@@ -1694,7 +1642,7 @@ mod tests {
                 Ok(Box::new(UnmeteredLease))
             }
 
-            fn reserve_session_set_growth(
+            fn reserve_session_entry(
                 &self,
                 _session: RelaySessionId,
                 _retention: SessionRetention,
@@ -1710,8 +1658,25 @@ mod tests {
             ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
                 Ok(Box::new(UnmeteredLease))
             }
+        };
+    }
 
-            fn reserve_attempt_map_growth(
+    macro_rules! unmetered_admission_source {
+        () => {
+            fn reserve_admission_source(
+                &self,
+                _attempt: &str,
+                _event: &NostrEvent,
+                _retention: DeliveryRetention,
+            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+                Ok(Box::new(UnmeteredLease))
+            }
+        };
+    }
+
+    macro_rules! unmetered_exact_entries {
+        () => {
+            fn reserve_attempt_entry(
                 &self,
                 _attempt: &str,
                 _event: &NostrEvent,
@@ -1720,10 +1685,19 @@ mod tests {
                 Ok(Box::new(UnmeteredLease))
             }
 
-            fn reserve_relay_map_growth(
+            fn reserve_relay_entry(
                 &self,
                 _attempt: &str,
                 _session: RelaySessionId,
+                _event: &NostrEvent,
+                _retention: DeliveryRetention,
+            ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+                Ok(Box::new(UnmeteredLease))
+            }
+
+            fn reserve_attempt_correlation(
+                &self,
+                _attempt: &str,
                 _event: &NostrEvent,
                 _retention: DeliveryRetention,
             ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
@@ -1747,7 +1721,9 @@ mod tests {
 
     impl DeliveryProvider for CountingProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve(
             &self,
@@ -1784,6 +1760,7 @@ mod tests {
 
     impl DeliveryProvider for ExactCustodyProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
 
         fn reserve(
             &self,
@@ -1820,7 +1797,7 @@ mod tests {
             _event: &NostrEvent,
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-            assert!(retention.attempt_map_growth_bytes > 0);
+            assert!(retention.attempt_entry_bytes > 0);
             Ok(self.lease_bytes("attempt-entry", retention.attempt_entry_bytes))
         }
 
@@ -1831,7 +1808,7 @@ mod tests {
             _event: &NostrEvent,
             retention: DeliveryRetention,
         ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-            assert!(retention.relay_map_growth_bytes > 0);
+            assert!(retention.relay_entry_bytes > 0);
             Ok(self.lease_bytes("relay-entry", retention.relay_entry_bytes))
         }
     }
@@ -1861,7 +1838,9 @@ mod tests {
 
     impl DeliveryProvider for OpenOnFinishProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve(
             &self,
@@ -1915,7 +1894,9 @@ mod tests {
 
     impl DeliveryProvider for RejectOnceProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve(
             &self,
@@ -1941,7 +1922,9 @@ mod tests {
 
     impl DeliveryProvider for ToggleProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve(
             &self,
@@ -1977,6 +1960,7 @@ mod tests {
     impl DeliveryProvider for SourceResidueProvider {
         unmetered_reservations!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve_admission_source(
             &self,
@@ -2008,7 +1992,9 @@ mod tests {
 
     impl DeliveryProvider for RefuseSpecificProvider {
         unmetered_reservations!();
+        unmetered_admission_source!();
         unmetered_attempt_key!();
+        unmetered_exact_entries!();
 
         fn reserve(
             &self,
@@ -2656,20 +2642,12 @@ mod tests {
         assert_eq!(retention.structural_entry_bytes, 0);
         assert_eq!(retention.attempt_record_bytes, 0);
         assert_eq!(
-            retention.attempt_map_growth_bytes,
+            retention.attempt_entry_bytes,
             std::mem::size_of::<DeliveryMapNode<String, AttemptEntry>>()
         );
         assert_eq!(
-            retention.attempt_entry_bytes,
-            retention.attempt_map_growth_bytes
-        );
-        assert_eq!(
-            retention.relay_map_growth_bytes,
-            std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>()
-        );
-        assert_eq!(
             retention.relay_entry_bytes,
-            retention.relay_map_growth_bytes
+            std::mem::size_of::<DeliveryMapNode<RelaySessionId, RelayEntry>>()
         );
         let session_retention = SessionRetention::exact();
         assert!(session_retention.session_identity_bytes > 0);
@@ -2684,7 +2662,6 @@ mod tests {
         );
         assert_eq!(session_retention.session_set_node_bytes, 0);
         assert!(session_retention.session_entry_bytes > 0);
-        assert_eq!(session_retention.session_set_growth_bytes, 0);
         let bytes = Arc::new(AtomicUsize::new(0));
         let store = DeliveryStore::new(Arc::new(ExactCustodyProvider {
             live: Arc::clone(&live),

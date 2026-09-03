@@ -26,6 +26,17 @@ use myownmesh_signaling::{
     ErasedOwner, InboundSink, OwnedSignal, TaskCustodian, UnboundedSource,
 };
 
+async fn start_test_server(
+    bind: &str,
+    port: u16,
+    limits: Limits,
+) -> Result<myownmesh_signaling::server::SignalingServerHandle, myownmesh_signaling::Error> {
+    let capacity = SignalingServer::required_task_custody_slots(&limits)?;
+    let owner = DedicatedTaskCustodian::new(capacity)
+        .map_err(|error| myownmesh_signaling::Error::Other(format!("test custodian: {error:?}")))?;
+    SignalingServer::start_with_custodian(bind, port, limits, owner).await
+}
+
 struct NoopAttemptRefusalSink;
 
 impl AttemptRefusalSink for NoopAttemptRefusalSink {
@@ -40,6 +51,7 @@ impl AttemptOutcomeSink for NoopAttemptOutcomeSink {
 
 fn test_nostr_timing() -> NostrTimingConfig {
     NostrTimingConfig {
+        connect_timeout: Duration::from_secs(30),
         reconnect_initial: Duration::from_secs(2),
         reconnect_max: Duration::from_secs(60),
         reconnect_max_attempts: 6,
@@ -209,7 +221,28 @@ impl DeliveryLease for CountingLease {
     }
 }
 
+macro_rules! noop_inbound_and_correlation {
+    () => {
+        fn reserve_inbound_frame(
+            &self,
+            _frame_bytes: usize,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            Ok(Box::new(NoopLease))
+        }
+
+        fn reserve_attempt_correlation(
+            &self,
+            _attempt: &str,
+            _event: &myownmesh_signaling::nostr::event::NostrEvent,
+            _retention: DeliveryRetention,
+        ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+            Ok(Box::new(NoopLease))
+        }
+    };
+}
+
 impl DeliveryProvider for AccountingProvider {
+    noop_inbound_and_correlation!();
     fn reserve_admission_source(
         &self,
         _attempt: &str,
@@ -242,7 +275,7 @@ impl DeliveryProvider for AccountingProvider {
         Ok(self.lease())
     }
 
-    fn reserve_session_set_growth(
+    fn reserve_session_entry(
         &self,
         _session: RelaySessionId,
         _retention: SessionRetention,
@@ -268,7 +301,7 @@ impl DeliveryProvider for AccountingProvider {
         Ok(self.lease())
     }
 
-    fn reserve_attempt_map_growth(
+    fn reserve_attempt_entry(
         &self,
         _attempt: &str,
         _event: &myownmesh_signaling::nostr::event::NostrEvent,
@@ -277,7 +310,7 @@ impl DeliveryProvider for AccountingProvider {
         Ok(self.lease())
     }
 
-    fn reserve_relay_map_growth(
+    fn reserve_relay_entry(
         &self,
         _attempt: &str,
         _session: RelaySessionId,
@@ -303,6 +336,17 @@ impl DeliveryProvider for AccountingProvider {
 }
 
 impl DeliveryProvider for AlwaysRefuseSessionProvider {
+    noop_inbound_and_correlation!();
+
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        Ok(Box::new(NoopLease))
+    }
+
     fn reserve_session_identity(
         &self,
         _retention: SessionRetention,
@@ -326,7 +370,7 @@ impl DeliveryProvider for AlwaysRefuseSessionProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_session_set_growth(
+    fn reserve_session_entry(
         &self,
         _session: RelaySessionId,
         _retention: SessionRetention,
@@ -352,7 +396,7 @@ impl DeliveryProvider for AlwaysRefuseSessionProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_attempt_map_growth(
+    fn reserve_attempt_entry(
         &self,
         _attempt: &str,
         _event: &myownmesh_signaling::nostr::event::NostrEvent,
@@ -371,7 +415,7 @@ impl DeliveryProvider for AlwaysRefuseSessionProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_relay_map_growth(
+    fn reserve_relay_entry(
         &self,
         _attempt: &str,
         _session: RelaySessionId,
@@ -383,6 +427,7 @@ impl DeliveryProvider for AlwaysRefuseSessionProvider {
 }
 
 impl DeliveryProvider for CountingProvider {
+    noop_inbound_and_correlation!();
     fn reserve_admission_source(
         &self,
         _attempt: &str,
@@ -418,7 +463,7 @@ impl DeliveryProvider for CountingProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_session_set_growth(
+    fn reserve_session_entry(
         &self,
         _session: RelaySessionId,
         _retention: SessionRetention,
@@ -444,7 +489,7 @@ impl DeliveryProvider for CountingProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_attempt_map_growth(
+    fn reserve_attempt_entry(
         &self,
         _attempt: &str,
         _event: &myownmesh_signaling::nostr::event::NostrEvent,
@@ -453,7 +498,7 @@ impl DeliveryProvider for CountingProvider {
         Ok(Box::new(NoopLease))
     }
 
-    fn reserve_relay_map_growth(
+    fn reserve_relay_entry(
         &self,
         _attempt: &str,
         _session: RelaySessionId,
@@ -589,10 +634,10 @@ async fn next_event_kind(
 
 #[tokio::test]
 async fn two_relays_replay_presence_but_never_replay_departure() {
-    let relay_a = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let relay_a = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .expect("relay A starts");
-    let relay_b = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let relay_b = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .expect("relay B starts");
     let url_a = format!("ws://127.0.0.1:{}", relay_a.local_addr().port());
@@ -701,7 +746,7 @@ async fn two_relays_replay_presence_but_never_replay_departure() {
 
 #[tokio::test]
 async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
-    let relay = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let relay = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .expect("relay starts");
     let url = format!("ws://127.0.0.1:{}", relay.local_addr().port());
@@ -757,7 +802,7 @@ async fn session_provider_refusal_is_backoff_bounded_and_shutdown_is_prompt() {
 async fn relay_returns_exact_nip01_ok_for_accepted_event() {
     use myownmesh_signaling::nostr::event::{make_event, NostrIdentity};
 
-    let relay = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let relay = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .expect("relay starts");
     let url = format!("ws://127.0.0.1:{}", relay.local_addr().port());

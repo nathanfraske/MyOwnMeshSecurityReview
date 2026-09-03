@@ -25,6 +25,8 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use parking_lot::Mutex as SyncMutex;
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -82,7 +84,7 @@ use crate::runtime::attempt::{
     WebRtcConnectorCapablePolicy,
 };
 
-use super::ice::build_rtc_configuration;
+use super::ice::{build_rtc_configuration, IceCandidatePath};
 
 mod callback;
 
@@ -2818,6 +2820,10 @@ enum DataChannelOpenTransition {
 pub(crate) struct RemoteDescriptionApplyReport {
     pub(crate) queued_candidate_count: usize,
     pub(crate) candidate_failure_count: usize,
+    /// The exact number of admitted candidates was also the parallelism bound:
+    /// every candidate already owns its queue/attempt leases, so no hidden
+    /// scheduler cap is introduced between admission and native application.
+    pub(crate) candidate_parallelism_bound: usize,
 }
 
 /// One remote candidate paired with the observation that follows its owner.
@@ -3191,6 +3197,52 @@ fn pending_remote_candidate_queue_claim_with_content(
         (crate::resource::ResourceClass::StorageObject, 2),
         (crate::resource::ResourceClass::OpaqueDependencyResidual, 2),
     ])
+}
+
+/// Fund the temporary bounded planner before any of its vectors or future
+/// nodes are materialized. The queue's candidate leases remain separate; this
+/// claim covers only the scheduler-owned path metadata and container nodes.
+fn remote_candidate_drain_plan_claim(
+    candidate_count: usize,
+) -> Result<crate::resource::ResourceClaim> {
+    let count = u64::try_from(candidate_count).map_err(|_| {
+        Error::Transport("remote-candidate planner count is not representable".to_string())
+    })?;
+    let path_bytes = count
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<IceCandidatePath>()).map_err(|_| {
+                Error::Transport("remote-candidate path size is not representable".to_string())
+            })?,
+        )
+        .ok_or_else(|| Error::Transport("remote-candidate path claim overflowed".to_string()))?;
+    let pending_bytes = count
+        .checked_mul(
+            u64::try_from(std::mem::size_of::<Option<PendingRemoteCandidate>>()).map_err(|_| {
+                Error::Transport("pending candidate size is not representable".to_string())
+            })?,
+        )
+        .ok_or_else(|| Error::Transport("pending candidate claim overflowed".to_string()))?;
+    let scheduler_bytes = u64::try_from(std::mem::size_of::<WebRtcCandidatePathPlanner>())
+        .map_err(|_| Error::Transport("candidate planner size is not representable".to_string()))?;
+    let accounted_bytes = path_bytes
+        .checked_add(pending_bytes)
+        .and_then(|bytes| bytes.checked_add(scheduler_bytes))
+        .ok_or_else(|| Error::Transport("candidate planner claim overflowed".to_string()))?;
+    let residual_nodes = count
+        .checked_mul(3)
+        .and_then(|nodes| nodes.checked_add(1))
+        .ok_or_else(|| Error::Transport("candidate planner residual overflowed".to_string()))?;
+    crate::resource::ResourceClaim::try_from_entries([
+        (
+            crate::resource::ResourceClass::AccountedMemoryBytes,
+            accounted_bytes,
+        ),
+        (
+            crate::resource::ResourceClass::OpaqueDependencyResidual,
+            residual_nodes,
+        ),
+    ])
+    .map_err(|error| Error::Transport(format!("candidate planner claim overflowed: {error}")))
 }
 
 fn candidate_content_bytes(candidate: &LocalIceCandidate) -> Option<usize> {
@@ -5478,8 +5530,105 @@ impl WebRtcConnectorWorker {
         transaction.disarm();
         let queued_candidate_count = pending.len();
         let mut candidate_failure_count = 0_usize;
-        for candidate in pending {
-            if let Err(error) = self.apply_remote_candidate(candidate).await {
+        if queued_candidate_count == 0 {
+            return Ok(RemoteDescriptionApplyReport {
+                queued_candidate_count,
+                candidate_failure_count,
+                candidate_parallelism_bound: 0,
+            });
+        }
+
+        // The queue is already the exact owner-funded admission boundary. Use
+        // its finite size as the parallelism bound instead of adding a hidden
+        // scheduler constant. IDs are local opaque ordinals, so ranking cannot
+        // expose candidate contents or manufacture application capability.
+        let work_resources = self.remote_candidates.lock().current.work_resources.clone();
+        let planner_claim = match remote_candidate_drain_plan_claim(queued_candidate_count) {
+            Ok(claim) => claim,
+            Err(error) => {
+                self.close_owner.start();
+                return Err(error);
+            }
+        };
+        let planner_lease = match work_resources.acquire(
+            crate::resource::ResourceAuthorityClass::Speculative,
+            planner_claim,
+        ) {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.close_owner.start();
+                return Err(Error::from(error));
+            }
+        };
+        let mut paths = Vec::with_capacity(queued_candidate_count);
+        let mut pending_by_id = Vec::with_capacity(queued_candidate_count);
+        for (index, candidate) in pending.enumerate() {
+            let path_id = match u64::try_from(index) {
+                Ok(path_id) => path_id,
+                Err(_) => {
+                    self.close_owner.start();
+                    return Err(Error::Transport(
+                        "remote-candidate path ID is not representable".to_string(),
+                    ));
+                }
+            };
+            paths.push(IceCandidatePath::new(
+                path_id,
+                super::diag::IceCandidateKind::Unknown,
+                super::ice::classify_candidate_sdp(&candidate.candidate.candidate),
+                0,
+            ));
+            pending_by_id.push(Some(candidate));
+        }
+        let parallelism = match std::num::NonZeroUsize::new(queued_candidate_count) {
+            Some(parallelism) => parallelism,
+            None => {
+                self.close_owner.start();
+                return Err(Error::Transport(
+                    "non-empty remote-candidate queue lost its size".to_string(),
+                ));
+            }
+        };
+        let mut planner = match WebRtcCandidatePathPlanner::new(paths, parallelism, parallelism) {
+            Ok(planner) => planner,
+            Err(error) => {
+                self.close_owner.start();
+                return Err(Error::Transport(format!(
+                    "remote-candidate path planning refused: {error}"
+                )));
+            }
+        };
+        let mut applications = FuturesUnordered::new();
+        let mut planner_terminal = false;
+        loop {
+            for path_id in planner.start_parallel_paths() {
+                let pending_index = match usize::try_from(path_id) {
+                    Ok(pending_index) => pending_index,
+                    Err(_) => {
+                        self.close_owner.start();
+                        return Err(Error::Transport(
+                            "remote-candidate path ID is not representable".to_string(),
+                        ));
+                    }
+                };
+                let pending = match pending_by_id.get_mut(pending_index).and_then(Option::take) {
+                    Some(pending) => pending,
+                    None => {
+                        self.close_owner.start();
+                        return Err(Error::Transport(
+                            "remote-candidate planner lost its exact admitted candidate"
+                                .to_string(),
+                        ));
+                    }
+                };
+                applications
+                    .push(async move { (path_id, self.apply_remote_candidate(pending).await) });
+            }
+
+            let Some((path_id, result)) = applications.next().await else {
+                break;
+            };
+            if let Err(error) = result {
                 candidate_failure_count =
                     candidate_failure_count
                         .checked_add(1)
@@ -5488,12 +5637,40 @@ impl WebRtcConnectorWorker {
                                 dimension: crate::resource::ResourceClass::OpaqueDependencyResidual,
                             },
                         ))?;
-                warn!(?error, "queued remote-candidate application failed");
+                warn!(
+                    ?error,
+                    path_id, "queued remote-candidate application failed"
+                );
+                if !planner_terminal {
+                    let decision = match planner.observe(path_id, false) {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            self.close_owner.start();
+                            return Err(Error::Transport(format!(
+                                "remote-candidate path observation refused: {error}"
+                            )));
+                        }
+                    };
+                    planner_terminal = matches!(decision, WebRtcCandidatePathDecision::Exhausted);
+                }
+            } else if !planner_terminal {
+                let decision = match planner.observe(path_id, true) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        self.close_owner.start();
+                        return Err(Error::Transport(format!(
+                            "remote-candidate path observation refused: {error}"
+                        )));
+                    }
+                };
+                planner_terminal = matches!(decision, WebRtcCandidatePathDecision::Selected(_));
             }
         }
+        drop(planner_lease);
         Ok(RemoteDescriptionApplyReport {
             queued_candidate_count,
             candidate_failure_count,
+            candidate_parallelism_bound: queued_candidate_count,
         })
     }
 
@@ -6589,9 +6766,12 @@ impl Transport {
         config.ice_transport_policy = self.ice_transport_policy;
         let (permit, attempt_lifetime, claim) =
             admit_single_connector_candidate(self.runtime.clone(), resource_owner.clone());
-        let mut candidate = permit.reserve_connector_candidate(claim).ok_or_else(|| {
-            Error::Transport("connector attempt retired before admission".to_string())
-        })?;
+        let mut candidate = permit
+            .reserve_connector_candidate_checked(claim)
+            .map_err(Error::from)?
+            .ok_or_else(|| {
+                Error::Transport("connector attempt retired before admission".to_string())
+            })?;
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .map_err(|error| Error::Transport(error.to_string()))?;

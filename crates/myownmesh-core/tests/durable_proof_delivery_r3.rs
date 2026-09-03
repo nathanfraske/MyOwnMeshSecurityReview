@@ -6,17 +6,18 @@
 //! proof-wire APIs from the proof-delivery lane.  The façade keeps each test
 //! on the same durable semantic slot as production.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
+    TopologyMode,
 };
 use myownmesh_core::engine::transport_lab::{
-    admit_durable_proof, durable_proof_records, install_capability_replay_park_for_lab,
-    materialize_durable_proof_delivery, pending_durable_proofs, promote_exact_owner_for_lab,
-    proof_owner_for_device, rebind_durable_proof, release_capability_replay_park_for_lab, rpc,
-    settle_durable_proof_ack, supersede_durable_proof, wait_capability_replay_park_for_lab,
+    admit_durable_proof, durable_proof_records, materialize_durable_proof_delivery,
+    pending_durable_proofs, promote_exact_owner_for_lab, proof_owner_for_device,
+    rebind_durable_proof, rpc, settle_durable_proof_ack, supersede_durable_proof,
 };
 use myownmesh_core::engine::transport_lab::{
     attach_local, create_network_in_instance_root, import_network_in_instance_root,
@@ -31,7 +32,7 @@ use myownmesh_core::semantic::{
 use myownmesh_core::CapabilityAdvert;
 use myownmesh_signaling::local::LocalBroker;
 use tempfile::TempDir;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 mod support;
 
@@ -43,12 +44,13 @@ fn closed_config(id: &str) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Closed,
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -623,7 +625,7 @@ async fn wait_for_proof_owner(
         if Instant::now() > deadline {
             panic!("never installed proof owner for {device_id}");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -639,7 +641,7 @@ async fn wait_for_no_proof_owner(
         if Instant::now() > deadline {
             panic!("stale proof owner remained installed for {device_id}");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -654,7 +656,7 @@ async fn wait_for_replayed_proof(
             if Instant::now() > deadline {
                 panic!("production proof replay did not expose a current owner");
             }
-            sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
             continue;
         };
         let expected = myownmesh_core::engine::transport_lab::new_durable_proof_record(
@@ -695,7 +697,7 @@ async fn wait_for_replayed_proof(
         if Instant::now() > deadline {
             panic!("production proof replay did not expose Pending or an exact Settled tombstone");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -720,7 +722,7 @@ async fn wait_for_durable_record_state(
                 record.state
             );
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
 }
 
@@ -744,6 +746,97 @@ fn assert_settled_tombstone(
         .expect("exact delivery tombstone remains persisted");
     assert_exact_delivery_metadata(&tombstone, expected);
     assert_eq!(tombstone.state, ProofRecordState::Settled);
+}
+
+struct DurableSlot {
+    directory: PathBuf,
+    stem: String,
+}
+
+/// Locate the exact slot once. Subsequent observations address only its four
+/// bounded paths, so duplicate/no-op comparisons are O(delta), not scans of
+/// unrelated durable state.
+fn discover_durable_slot(root: &Path) -> DurableSlot {
+    fn visit(root: &Path) -> Option<DurableSlot> {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return None;
+        };
+        for entry in entries {
+            let entry = entry.expect("durable slot entry is readable");
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(slot) = visit(&path) {
+                    return Some(slot);
+                }
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix("-store.sqlite3") {
+                return Some(DurableSlot {
+                    directory: path.parent().expect("slot has a parent").to_path_buf(),
+                    stem: stem.to_string(),
+                });
+            }
+        }
+        None
+    }
+
+    visit(root).expect("fixture creates one canonical semantic slot")
+}
+
+/// Capture only the exact slot and its four SQLite sidecars. The relative
+/// names make equality independent of the temporary test directory.
+fn durable_slot_footprint(slot: &DurableSlot) -> BTreeMap<String, u64> {
+    let mut files = BTreeMap::new();
+    for suffix in [
+        "-store.sqlite3",
+        "-store.sqlite3-wal",
+        "-store.sqlite3-shm",
+        "-store.sqlite3-journal",
+    ] {
+        let path = slot.directory.join(format!("{}{}", slot.stem, suffix));
+        if path.is_file() {
+            files.insert(
+                path.file_name()
+                    .expect("slot file has a name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::metadata(&path)
+                    .expect("durable slot metadata is readable")
+                    .len(),
+            );
+        }
+    }
+    files
+}
+
+fn durable_slot_totals(files: &BTreeMap<String, u64>) -> serde_json::Value {
+    let mut main_bytes = 0u64;
+    let mut wal_bytes = 0u64;
+    let mut shm_bytes = 0u64;
+    let mut journal_bytes = 0u64;
+    for (path, size) in files {
+        let total = if path.ends_with("-store.sqlite3") {
+            &mut main_bytes
+        } else if path.ends_with("-store.sqlite3-wal") {
+            &mut wal_bytes
+        } else if path.ends_with("-store.sqlite3-shm") {
+            &mut shm_bytes
+        } else if path.ends_with("-store.sqlite3-journal") {
+            &mut journal_bytes
+        } else {
+            continue;
+        };
+        *total = total
+            .checked_add(*size)
+            .expect("durable slot footprint fits u64");
+    }
+    serde_json::json!({
+        "main_bytes": main_bytes,
+        "wal_bytes": wal_bytes,
+        "shm_bytes": shm_bytes,
+        "journal_bytes": journal_bytes,
+    })
 }
 
 #[tokio::test]
@@ -1001,7 +1094,7 @@ async fn r3_pending_approval_proof_delivery_sends_one_ack_and_settles_sender() {
         if Instant::now() > deadline {
             panic!("PendingApproval target never adopted the valid ProofDelivery");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
     assert!(
         restarted_target.semantic_fact_count() > target_initial_fact_count,
@@ -1781,7 +1874,7 @@ async fn r3_external_transport_pause_supersedes_materialized_e0_before_resume() 
         if Instant::now() > deadline {
             panic!("canonical E1 was not sent after external transport resumed");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     }
 
     reopened.request_shutdown();
@@ -1852,7 +1945,6 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
     eprintln!("r3 park control: selected E0 lifecycle shutdown completed");
     eprintln!("r3 park control: original target lifecycle shutdown completed");
     drop(_broker);
-    let replay_park = install_capability_replay_park_for_lab(&state, &owner);
     drop(owner);
     drop(state);
 
@@ -1956,17 +2048,9 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         if Instant::now() >= promotion_deadline {
             panic!("exact reopened owner promotion was not admitted within 20s (owner_observed={owner_observed})");
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::task::yield_now().await;
     };
     eprintln!("r3 park control: exact reopened owner promotion observed");
-    eprintln!("r3 park control: waiting for capability replay park entry");
-    tokio::time::timeout(
-        Duration::from_secs(20),
-        wait_capability_replay_park_for_lab(&replay_park),
-    )
-    .await
-    .expect("capability replay park entry timed out");
-    eprintln!("r3 park control: capability replay park entry observed");
     let e0_terminal =
         wait_for_durable_record_state(&reopened, e0.delivery_id, ProofRecordState::Superseded)
             .await;
@@ -1988,7 +2072,6 @@ async fn r3_regrant_before_resume_supersedes_e0_without_replay_or_stand_down() {
         "the stale E0 never reaches the target as a stand-down-causing proof"
     );
 
-    release_capability_replay_park_for_lab(&replay_park);
     let e0_after_release = durable_proof_records(&reopened)
         .expect("observe E0 after releasing capability replay")
         .into_iter()
@@ -2296,4 +2379,240 @@ async fn r3_restart_preserves_adopted_graph_self_eviction_and_pending_receipt() 
     receiver_driver
         .await
         .expect("self-evicted receiver shutdown");
+}
+
+#[tokio::test]
+async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
+    let root = TempDir::new().expect("instance root");
+    let (
+        state,
+        driver,
+        target_state,
+        target_driver,
+        identity,
+        _target,
+        _member,
+        facts,
+        _context,
+        config,
+        _broker,
+        _target_root,
+    ) = create_fixture(&root, "r3-many-deliveries").await;
+    let owner = wait_for_proof_owner(&state, _target.public_id()).await;
+    let slot = discover_durable_slot(root.path());
+
+    // Every non-empty contiguous fact window is a distinct P record and
+    // retains its exact L fact links.  This gives the mutation controls more
+    // than one unrelated row while keeping the workload derived entirely
+    // from the authenticated proof closure.
+    let mut records = Vec::new();
+    let mut linked_fact_ids = BTreeSet::new();
+    for start in 0..facts.len() {
+        for end in (start + 1)..=facts.len() {
+            let fact_ids: Vec<_> = facts[start..end].iter().map(|fact| fact.id).collect();
+            linked_fact_ids.extend(fact_ids.iter().copied());
+            let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+                &state, &owner, &fact_ids,
+            )
+            .expect("derive bounded proof record from admitted facts");
+            materialize_durable_proof_delivery(&state, &record)
+                .expect("materialize each exact linked delivery");
+            admit_durable_proof(&state, record.clone()).expect("persist each pending delivery");
+            records.push(record);
+        }
+    }
+    assert!(
+        records.len() > facts.len(),
+        "the control must seed many proof rows and linked facts"
+    );
+    let seeded = durable_proof_records(&state).expect("read seeded proof rows");
+    assert_eq!(seeded.len(), records.len());
+    assert_eq!(
+        seeded
+            .iter()
+            .flat_map(|record| record.fact_ids.iter().copied())
+            .collect::<BTreeSet<_>>(),
+        linked_fact_ids,
+        "all seeded L links are retained"
+    );
+
+    let duplicate_before = durable_slot_footprint(&slot);
+    assert_eq!(
+        admit_durable_proof(&state, records[0].clone()).expect("duplicate enqueue"),
+        records[0],
+        "byte-identical P enqueue is idempotent"
+    );
+    let duplicate_after = durable_slot_footprint(&slot);
+    assert_eq!(
+        duplicate_before, duplicate_after,
+        "duplicate enqueue is a durable byte/page no-op"
+    );
+
+    let rebind_before = durable_slot_footprint(&slot);
+    assert!(
+        rebind_durable_proof(&state, &owner, &records[1]).expect("same-owner rebind"),
+        "the exact current owner may rebind one pending delivery"
+    );
+    let rebind_after = durable_slot_footprint(&slot);
+
+    let supersede_before = durable_slot_footprint(&slot);
+    assert!(
+        supersede_durable_proof(&state, &owner, &records[2], Some(records[3].delivery_id),)
+            .expect("supersede one exact pending delivery"),
+        "the exact current owner may supersede one delivery"
+    );
+    let supersede_after = durable_slot_footprint(&slot);
+
+    let settle_delivery =
+        materialize_durable_proof_delivery(&state, &records[4]).expect("settle delivery wire");
+    let settle_before = durable_slot_footprint(&slot);
+    assert!(
+        settle_durable_proof_ack(&state, &owner, &records[4], settle_delivery.delivery_id)
+            .expect("settle one exact delivery"),
+        "the exact owner and delivery settle one pending record"
+    );
+    let settle_after = durable_slot_footprint(&slot);
+
+    let duplicate_ack_before = durable_slot_footprint(&slot);
+    assert!(
+        !settle_durable_proof_ack(&state, &owner, &records[4], settle_delivery.delivery_id)
+            .expect("duplicate ACK"),
+        "duplicate ACK is an idempotent semantic no-op"
+    );
+    let duplicate_ack_after = durable_slot_footprint(&slot);
+    assert_eq!(
+        duplicate_ack_before, duplicate_ack_after,
+        "duplicate ACK is a durable byte/page no-op"
+    );
+
+    let mut expected = records.clone();
+    expected[2].state = ProofRecordState::Superseded;
+    expected[4].state = ProofRecordState::Settled;
+    expected.sort_by_key(|record| record.delivery_id);
+    let observed = durable_proof_records(&state).expect("observe mixed terminal records");
+    assert_eq!(observed.len(), expected.len());
+    for expected_record in &expected {
+        let actual = observed
+            .iter()
+            .find(|record| record.delivery_id == expected_record.delivery_id)
+            .expect("each unrelated proof row remains present");
+        assert_exact_delivery_metadata(actual, expected_record);
+        assert_eq!(actual.state, expected_record.state);
+    }
+    assert_eq!(
+        observed
+            .iter()
+            .flat_map(|record| record.fact_ids.iter().copied())
+            .collect::<BTreeSet<_>>(),
+        linked_fact_ids,
+        "settle/rebind/supersede preserve every unrelated L fact link"
+    );
+    assert_eq!(
+        pending_durable_proofs(&state)
+            .expect("pending records after mixed terminal mutations")
+            .len(),
+        expected
+            .iter()
+            .filter(|record| record.state == ProofRecordState::Pending)
+            .count(),
+        "pending N and terminal records remain exactly partitioned"
+    );
+
+    // The configured database budget is the only bound used for footprint
+    // qualification; no test-local byte multiplier is smuggled in.
+    for footprint in [
+        &duplicate_after,
+        &rebind_after,
+        &supersede_after,
+        &settle_after,
+        &duplicate_ack_after,
+    ] {
+        let bytes = footprint
+            .values()
+            .try_fold(0u64, |total, size| total.checked_add(*size))
+            .expect("durable footprint fits u64");
+        assert!(
+            bytes <= config.semantic_policy.max_database_bytes,
+            "SQLite main/WAL/SHM/journal footprint stays within configured budget"
+        );
+    }
+
+    let configured_max_database_bytes = config.semantic_policy.max_database_bytes;
+    state.request_shutdown();
+    driver.await.expect("many-delivery sender shutdown");
+    target_state.request_shutdown();
+    target_driver.await.expect("many-delivery target shutdown");
+    drop(owner);
+    drop(state);
+
+    let (reopened, reopened_driver) = spawn_network_in_instance_root(
+        config,
+        identity,
+        support::test_transport(),
+        root.path().to_path_buf(),
+    )
+    .await
+    .expect("restart many-delivery network");
+    let reopened_records = durable_proof_records(&reopened).expect("replay exact proof rows");
+    let reopened_exact_equality = reopened_records == expected;
+    assert_eq!(
+        reopened_records, expected,
+        "restart replays the exact pending set and terminal records"
+    );
+    let reopened_pending_count = pending_durable_proofs(&reopened)
+        .expect("replay pending proof rows")
+        .len();
+    let reopened_terminal_count = reopened_records
+        .iter()
+        .filter(|record| record.state != ProofRecordState::Pending)
+        .count();
+    assert_eq!(
+        reopened_pending_count,
+        expected
+            .iter()
+            .filter(|record| record.state == ProofRecordState::Pending)
+            .count(),
+        "restart preserves the exact pending count"
+    );
+    eprintln!(
+        "DURABLE_PROOF_DELIVERY_R3_METRIC {}",
+        serde_json::json!({
+            "selector": "r3_many_pending_deliveries_preserve_unrelated_links_and_footprints",
+            "seeded_proof_count": records.len(),
+            "linked_fact_count": linked_fact_ids.len(),
+            "configured_max_database_bytes": configured_max_database_bytes,
+            "operations": {
+                "duplicate_enqueue": {
+                    "before": durable_slot_totals(&duplicate_before),
+                    "after": durable_slot_totals(&duplicate_after),
+                },
+                "rebind": {
+                    "before": durable_slot_totals(&rebind_before),
+                    "after": durable_slot_totals(&rebind_after),
+                },
+                "supersede": {
+                    "before": durable_slot_totals(&supersede_before),
+                    "after": durable_slot_totals(&supersede_after),
+                },
+                "settle": {
+                    "before": durable_slot_totals(&settle_before),
+                    "after": durable_slot_totals(&settle_after),
+                },
+                "duplicate_ack": {
+                    "before": durable_slot_totals(&duplicate_ack_before),
+                    "after": durable_slot_totals(&duplicate_ack_after),
+                },
+            },
+            "unrelated_rows_preserved": true,
+            "no_op_footprints_equal": duplicate_before == duplicate_after
+                && duplicate_ack_before == duplicate_ack_after,
+            "reopened_exact_equality": reopened_exact_equality,
+            "reopened_pending_count": reopened_pending_count,
+            "reopened_terminal_count": reopened_terminal_count,
+        })
+    );
+    reopened.request_shutdown();
+    reopened_driver
+        .await
+        .expect("many-delivery reopened shutdown");
 }

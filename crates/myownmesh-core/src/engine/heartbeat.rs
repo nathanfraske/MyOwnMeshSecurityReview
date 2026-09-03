@@ -143,7 +143,7 @@ pub(super) async fn on_ping(
         // is a median over whoever is live, so there is nothing to handle.
         let _ = state
             .peers
-            .with_same_session(dispatch.logical_operation(), |operation| {
+            .with_same_session(dispatch.logical_reply_operation(), |operation| {
                 operation.record_inbound(|peer| {
                     let mut data = peer.state.write();
                     let half_rtt = i64::from(data.rtt_ms.unwrap_or(0)) / 2;
@@ -171,7 +171,7 @@ pub(super) async fn on_pong(
     let now = monotonic_ms();
     let _ = state
         .peers
-        .with_same_session(dispatch.logical_operation(), |operation| {
+        .with_same_session(dispatch.logical_reply_operation(), |operation| {
             operation.record_inbound(|peer| {
                 let mut data = peer.state.write();
                 if data.last_ping_t == Some(pong.t) {

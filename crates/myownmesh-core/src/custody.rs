@@ -66,6 +66,7 @@ struct CustodyStore {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Enrollment {
     /// Base32 (RFC 4648, no pad) TOTP shared secret.
     secret_b32: String,
@@ -76,28 +77,18 @@ struct Enrollment {
     /// The durable transaction phase. A prepared record is visible before
     /// the caller's handoff and remains exact-retryable until it is committed
     /// or explicitly aborted.
-    #[serde(default)]
     phase: EnrollmentPhase,
     /// Stable identity of this one enrollment transaction. It is deliberately
     /// independent of the process nonce: a stale handle must not commit or
     /// abort a successor that reused the network key.
-    #[serde(default)]
     transaction_id: String,
     /// The exact one-time material needed to re-deliver a prepared handoff.
     /// This is present only while `phase` is `Prepared` and is cleared by a
     /// successful commit. The enclosing custody file is mode 0600.
-    #[serde(default)]
     prepared_recovery_codes: Vec<String>,
     /// Authenticator account label needed to reconstruct the exact URI when a
     /// prepared handoff is re-delivered after a restart.
-    #[serde(default)]
     prepared_account: String,
-    /// Pre-phase-format compatibility marker. `phase` is authoritative for
-    /// new records; this remains readable so an old prepared record is not
-    /// mistaken for a committed one during migration.
-    #[serde(default)]
-    provisional: bool,
-    #[serde(default)]
     process_nonce: String,
 }
 
@@ -105,15 +96,6 @@ struct Enrollment {
 enum EnrollmentPhase {
     Prepared,
     Committed,
-}
-
-impl Default for EnrollmentPhase {
-    fn default() -> Self {
-        // A record written before the explicit phase existed was a committed
-        // enrollment unless it also carried the old provisional marker. New
-        // writes always set the phase explicitly below.
-        Self::Committed
-    }
 }
 
 /// Validated enrollment material for rendering before an exact Commit: the
@@ -871,7 +853,6 @@ fn create_provisional_enroll_at(
             transaction_id: transaction_id.clone(),
             prepared_recovery_codes: recovery_codes.clone(),
             prepared_account: account.to_string(),
-            provisional: true,
             process_nonce: process_nonce().to_string(),
         },
     );
@@ -925,7 +906,6 @@ fn settle_exact_at(
                 .get_mut(network_id)
                 .expect("exact prepared record remains under writer guard");
             installed.phase = EnrollmentPhase::Committed;
-            installed.provisional = false;
             installed.prepared_recovery_codes.clear();
             installed.prepared_account.clear();
             installed.process_nonce.clear();
@@ -960,7 +940,7 @@ fn recover_provisional_at(path: &Path) -> Result<usize> {
 /// first attempt failed, whose material *was* delivered. Constant-time, for the
 /// same reason every other comparison against stored custody material here is.
 fn is_prepared(enrollment: &Enrollment) -> bool {
-    enrollment.phase == EnrollmentPhase::Prepared || enrollment.provisional
+    enrollment.phase == EnrollmentPhase::Prepared
 }
 
 #[cfg(any(test, feature = "transport-lab"))]
@@ -1888,63 +1868,48 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A process nonce is only diagnostic metadata. A prepared record remains
-    /// queryable even when its owner lease is absent.
+    /// Pre-V4 custody records are refused instead of being interpreted as a
+    /// committed or provisional enrollment. The explicit phase is part of the
+    /// current storage shape, and the retired provisional marker is unknown.
     #[test]
-    fn v4_r2_current_nonce_without_owner_lease_is_recovered() {
-        let path = tmp();
-        let net = "fleet-current-nonce-orphan";
-        let secret_b32 = BASE32_NOPAD.encode(&[0x42; SECRET_LEN]);
-        let lease_path = owner_lease_path(&path, net, &secret_b32);
+    fn v4_r2_pre_v4_custody_shapes_are_refused() {
+        let missing_phase = serde_json::json!({
+            "networks": {
+                "legacy": {
+                    "secret_b32": "JBSWY3DPEHPK3PXP",
+                    "recovery_hashes": [],
+                    "created_at": 1,
+                    "transaction_id": "legacy-transaction",
+                    "prepared_recovery_codes": [],
+                    "prepared_account": "legacy",
+                    "process_nonce": ""
+                }
+            }
+        });
         assert!(
-            !lease_path.exists(),
-            "the control starts with no live exact-secret owner lease"
+            serde_json::from_value::<CustodyStore>(missing_phase).is_err(),
+            "a record without the explicit current phase must fail closed"
         );
-        let mut store = CustodyStore::default();
-        store.networks.insert(
-            net.into(),
-            Enrollment {
-                secret_b32: secret_b32.clone(),
-                recovery_hashes: Vec::new(),
-                created_at: now_unix(),
-                phase: EnrollmentPhase::Prepared,
-                transaction_id: "orphaned-transaction".into(),
-                prepared_recovery_codes: vec!["abcde-fghij".into()],
-                prepared_account: "laptop".into(),
-                provisional: true,
-                process_nonce: process_nonce().to_owned(),
-            },
-        );
-        save_at(&path, &store).expect("materialize current-nonce orphan");
 
-        let before = load_at(&path).expect("read materialized orphan");
-        assert_eq!(
-            before
-                .networks
-                .get(net)
-                .expect("orphaned network")
-                .process_nonce,
-            process_nonce(),
-            "the control must exercise the nonce-equality case"
+        let provisional_marker = serde_json::json!({
+            "networks": {
+                "legacy": {
+                    "secret_b32": "JBSWY3DPEHPK3PXP",
+                    "recovery_hashes": [],
+                    "created_at": 1,
+                    "phase": "Prepared",
+                    "transaction_id": "legacy-transaction",
+                    "prepared_recovery_codes": ["abcde-fghij"],
+                    "prepared_account": "legacy",
+                    "provisional": true,
+                    "process_nonce": ""
+                }
+            }
+        });
+        assert!(
+            serde_json::from_value::<CustodyStore>(provisional_marker).is_err(),
+            "the retired provisional marker must fail closed"
         );
-        assert_eq!(
-            recover_provisional_at(&path).expect("recover current-nonce orphan"),
-            0,
-            "recovery never expires a prepared transaction"
-        );
-        let recovered = prepared_enrollments_at(&path).expect("read prepared transaction");
-        assert_eq!(recovered.len(), 1);
-        assert_eq!(recovered[0].transaction_id(), "orphaned-transaction");
-        recovered
-            .into_iter()
-            .next()
-            .expect("prepared transaction")
-            .abort()
-            .expect("explicitly abort orphaned transaction");
-        assert!(!is_enrolled_at(&path, net));
-
-        let _ = std::fs::remove_file(lease_path);
-        let _ = std::fs::remove_file(&path);
     }
 
     /// The commit side of the restart transaction is just as important as

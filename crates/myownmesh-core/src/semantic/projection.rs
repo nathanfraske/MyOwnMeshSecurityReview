@@ -1,9 +1,12 @@
 //! Pure projection of the causal graph into exclusive semantic cells.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
 
 use super::causal::FactGraph;
-use super::content::{DeviceId, ExclusiveCell, FactBody};
+use super::content::{DeviceId, Encoder, ExclusiveCell, FactBody};
 use super::FactId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,10 +21,251 @@ pub struct StandDown {
     pub proof: FactId,
 }
 
+const PROJECTION_COMMITMENT_DOMAIN: &[u8] = b"myownmesh-v4/projection-patricia-merkle/v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MerkleNode {
+    Empty {
+        hash: [u8; 32],
+        bytes: u64,
+    },
+    Leaf {
+        entries: Vec<(Vec<u8>, [u8; 32])>,
+        hash: [u8; 32],
+        bytes: u64,
+    },
+    Branch {
+        left: Arc<MerkleNode>,
+        right: Arc<MerkleNode>,
+        hash: [u8; 32],
+        bytes: u64,
+    },
+}
+
+impl MerkleNode {
+    fn hash(&self) -> [u8; 32] {
+        match self {
+            Self::Empty { hash, .. } | Self::Leaf { hash, .. } | Self::Branch { hash, .. } => *hash,
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Empty { bytes, .. } | Self::Leaf { bytes, .. } | Self::Branch { bytes, .. } => {
+                *bytes
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty { .. })
+    }
+}
+
+fn empty_node(depth: usize) -> Arc<MerkleNode> {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECTION_COMMITMENT_DOMAIN);
+    hasher.update([b'e']);
+    hasher.update((depth as u16).to_be_bytes());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&hasher.finalize());
+    Arc::new(MerkleNode::Empty {
+        hash,
+        bytes: 1 + 32,
+    })
+}
+
+fn leaf_node(entries: Vec<(Vec<u8>, [u8; 32])>) -> Arc<MerkleNode> {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECTION_COMMITMENT_DOMAIN);
+    hasher.update([b'l']);
+    hasher.update((entries.len() as u64).to_be_bytes());
+    for (key, value) in &entries {
+        hasher.update((key.len() as u64).to_be_bytes());
+        hasher.update(key);
+        hasher.update(value);
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&hasher.finalize());
+    let bytes = entries.iter().fold(1u64 + 32, |total, (key, _)| {
+        total.checked_add(key.len() as u64 + 32).unwrap_or(u64::MAX)
+    });
+    Arc::new(MerkleNode::Leaf {
+        entries,
+        hash,
+        bytes,
+    })
+}
+
+fn branch_node(depth: usize, left: Arc<MerkleNode>, right: Arc<MerkleNode>) -> Arc<MerkleNode> {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECTION_COMMITMENT_DOMAIN);
+    hasher.update([b'b']);
+    hasher.update((depth as u16).to_be_bytes());
+    hasher.update(left.hash());
+    hasher.update(right.hash());
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&hasher.finalize());
+    let bytes = (1u64 + 32)
+        .checked_add(left.bytes())
+        .and_then(|value| value.checked_add(right.bytes()))
+        .unwrap_or(u64::MAX);
+    Arc::new(MerkleNode::Branch {
+        left,
+        right,
+        hash,
+        bytes,
+    })
+}
+
+fn key_digest(key: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(PROJECTION_COMMITMENT_DOMAIN);
+    hasher.update([b'k']);
+    hasher.update((key.len() as u64).to_be_bytes());
+    hasher.update(key);
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&hasher.finalize());
+    digest
+}
+
+fn digest_bit(digest: &[u8; 32], depth: usize) -> bool {
+    digest[depth / 8] & (0x80 >> (depth % 8)) != 0
+}
+
+fn update_merkle(
+    node: &Arc<MerkleNode>,
+    depth: usize,
+    digest: &[u8; 32],
+    key: Vec<u8>,
+    value: Option<[u8; 32]>,
+) -> Arc<MerkleNode> {
+    if depth == 256 {
+        let mut entries = match node.as_ref() {
+            MerkleNode::Leaf { entries, .. } => entries.clone(),
+            MerkleNode::Empty { .. } => Vec::new(),
+            MerkleNode::Branch { .. } => Vec::new(),
+        };
+        match entries.binary_search_by(|(existing, _)| existing.cmp(&key)) {
+            Ok(index) => match value {
+                Some(value) => entries[index].1 = value,
+                None => {
+                    entries.remove(index);
+                }
+            },
+            Err(index) => {
+                if let Some(value) = value {
+                    entries.insert(index, (key, value));
+                }
+            }
+        }
+        return if entries.is_empty() {
+            empty_node(depth)
+        } else {
+            leaf_node(entries)
+        };
+    }
+
+    let (left, right) = match node.as_ref() {
+        MerkleNode::Branch { left, right, .. } => (Arc::clone(left), Arc::clone(right)),
+        MerkleNode::Empty { .. } | MerkleNode::Leaf { .. } => {
+            (empty_node(depth + 1), empty_node(depth + 1))
+        }
+    };
+    let next = if digest_bit(digest, depth) {
+        branch_node(
+            depth,
+            left,
+            update_merkle(&right, depth + 1, digest, key, value),
+        )
+    } else {
+        branch_node(
+            depth,
+            update_merkle(&left, depth + 1, digest, key, value),
+            right,
+        )
+    };
+    if let MerkleNode::Branch { left, right, .. } = next.as_ref() {
+        if left.is_empty() && right.is_empty() {
+            return empty_node(depth);
+        }
+    }
+    next
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectionCommitment {
+    root: Arc<MerkleNode>,
+}
+
+impl Default for ProjectionCommitment {
+    fn default() -> Self {
+        Self {
+            root: empty_node(0),
+        }
+    }
+}
+
+impl ProjectionCommitment {
+    fn apply(&self, key: Vec<u8>, value: Option<[u8; 32]>) -> Self {
+        Self {
+            root: update_merkle(&self.root, 0, &key_digest(&key), key, value),
+        }
+    }
+
+    fn root(&self) -> [u8; 32] {
+        self.root.hash()
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        self.root.bytes()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Projection {
-    cells: BTreeMap<ExclusiveCell, CellProjection>,
-    stand_down: BTreeMap<DeviceId, StandDown>,
+    cells: Arc<BTreeMap<ExclusiveCell, CellProjection>>,
+    stand_down: Arc<BTreeMap<DeviceId, StandDown>>,
+    commitment: Arc<ProjectionCommitment>,
+}
+
+/// Exact affected-entry input for an incremental durable projection update.
+/// Entries are sparse: an absent value means the prior entry was removed.
+/// The generation is the graph fence that produced this delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectionDelta {
+    pub(crate) base_generation: u64,
+    pub(crate) generation: u64,
+    pub(crate) base_commitment: [u8; 32],
+    pub(crate) commitment: [u8; 32],
+    pub(crate) cells: BTreeMap<ExclusiveCell, Option<CellProjection>>,
+    pub(crate) stand_down: BTreeMap<DeviceId, Option<StandDown>>,
+}
+
+impl ProjectionDelta {
+    pub(crate) fn base_generation(&self) -> u64 {
+        self.base_generation
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn base_commitment(&self) -> [u8; 32] {
+        self.base_commitment
+    }
+
+    pub(crate) fn commitment(&self) -> [u8; 32] {
+        self.commitment
+    }
+
+    pub(crate) fn cells(&self) -> &BTreeMap<ExclusiveCell, Option<CellProjection>> {
+        &self.cells
+    }
+
+    pub(crate) fn stand_down(&self) -> &BTreeMap<DeviceId, Option<StandDown>> {
+        &self.stand_down
+    }
 }
 
 /// Follow a same-cell resolution chain to the effective non-resolution head.
@@ -133,26 +377,226 @@ fn is_ancestor_within(
 }
 
 impl Projection {
+    pub(crate) fn sparse_entries(
+        &self,
+        cells: &BTreeSet<ExclusiveCell>,
+        subjects: &BTreeSet<DeviceId>,
+    ) -> (
+        BTreeMap<ExclusiveCell, Option<CellProjection>>,
+        BTreeMap<DeviceId, Option<StandDown>>,
+    ) {
+        let cells = cells
+            .iter()
+            .map(|cell| (cell.clone(), self.cells.get(cell).cloned()))
+            .collect();
+        let stand_down = subjects
+            .iter()
+            .map(|subject| (subject.clone(), self.stand_down.get(subject).cloned()))
+            .collect();
+        (cells, stand_down)
+    }
+
+    pub(crate) fn delta_from_sparse(
+        &self,
+        base_generation: u64,
+        generation: u64,
+        base_commitment: [u8; 32],
+        previous_cells: &BTreeMap<ExclusiveCell, Option<CellProjection>>,
+        previous_stand_down: &BTreeMap<DeviceId, Option<StandDown>>,
+    ) -> ProjectionDelta {
+        let cells = previous_cells
+            .iter()
+            .filter_map(|(cell, previous)| {
+                let current = self.cells.get(cell).cloned();
+                (current != *previous).then(|| (cell.clone(), current))
+            })
+            .collect();
+        let stand_down = previous_stand_down
+            .iter()
+            .filter_map(|(subject, previous)| {
+                let current = self.stand_down.get(subject).cloned();
+                (current != *previous).then(|| (subject.clone(), current))
+            })
+            .collect();
+        ProjectionDelta {
+            base_generation,
+            generation,
+            base_commitment,
+            commitment: self.commitment_root(),
+            cells,
+            stand_down,
+        }
+    }
+
+    /// Apply a sparse projection delta only when both the caller's generation
+    /// and the prior Merkle root match the captured base fence. Ownership of
+    /// the projection is intentional: its uniquely owned `Arc` maps can be
+    /// updated in place without cloning the full projection. The resulting
+    /// root is checked against the delta, so a stale or reordered durable
+    /// update cannot silently publish a different projection.
+    pub(crate) fn apply_delta(
+        self,
+        delta: &ProjectionDelta,
+        expected_base_generation: u64,
+        expected_base_commitment: [u8; 32],
+    ) -> Option<Self> {
+        if delta.base_generation != expected_base_generation
+            || delta.base_commitment != expected_base_commitment
+            || self.commitment_root() != expected_base_commitment
+        {
+            return None;
+        }
+        let mut next = self;
+        let mut commitment = (*next.commitment).clone();
+        let cells = Arc::make_mut(&mut next.cells);
+        for (cell, value) in &delta.cells {
+            match value {
+                Some(value) => {
+                    cells.insert(cell.clone(), value.clone());
+                }
+                None => {
+                    cells.remove(cell);
+                }
+            }
+            commitment = commitment.apply(
+                cell_key(cell),
+                value.as_ref().map(|value| cell_value(value)),
+            );
+        }
+        let stand_down = Arc::make_mut(&mut next.stand_down);
+        for (target, value) in &delta.stand_down {
+            match value {
+                Some(value) => {
+                    stand_down.insert(target.clone(), value.clone());
+                }
+                None => {
+                    stand_down.remove(target);
+                }
+            }
+            commitment = commitment.apply(
+                stand_down_key(target),
+                value.as_ref().map(|value| stand_down_value(value)),
+            );
+        }
+        if commitment.root() != delta.commitment {
+            return None;
+        }
+        next.commitment = Arc::new(commitment);
+        Some(next)
+    }
+
+    pub(crate) fn delta_from(
+        &self,
+        previous: &Self,
+        base_generation: u64,
+        generation: u64,
+        affected_cells: &BTreeSet<ExclusiveCell>,
+        affected_subjects: &BTreeSet<DeviceId>,
+    ) -> ProjectionDelta {
+        let mut cells = BTreeMap::new();
+        for cell in affected_cells {
+            let current = self.cells.get(cell).cloned();
+            if current != previous.cells.get(cell).cloned() {
+                cells.insert(cell.clone(), current);
+            }
+        }
+        let mut stand_down = BTreeMap::new();
+        for subject in affected_subjects {
+            let current = self.stand_down.get(subject).cloned();
+            if current != previous.stand_down.get(subject).cloned() {
+                stand_down.insert(subject.clone(), current);
+            }
+        }
+        ProjectionDelta {
+            base_generation,
+            generation,
+            base_commitment: previous.commitment_root(),
+            commitment: self.commitment_root(),
+            cells,
+            stand_down,
+        }
+    }
+
+    fn projected_cell(graph: &FactGraph, cell: &ExclusiveCell) -> Option<CellProjection> {
+        let heads = graph.cell_heads(cell);
+        match heads.as_slice() {
+            [] => None,
+            [head] => resolve_effective_head(graph, cell, *head, &mut BTreeSet::new())
+                .map(CellProjection::Value)
+                .or_else(|| Some(CellProjection::Conflict(vec![*head]))),
+            _ => Some(CellProjection::Conflict(heads)),
+        }
+    }
+
     pub(crate) fn from_graph(graph: &FactGraph) -> Self {
         let mut cells = BTreeMap::new();
         let stand_down = projected_stand_down(graph);
-        let all_cells: std::collections::BTreeSet<_> = graph
-            .facts
-            .values()
-            .flat_map(|fact| fact.content.body.exclusive_cells())
-            .collect();
+        let all_cells = graph.indexed_cells();
         for cell in all_cells {
-            let heads = graph.cell_heads(&cell);
-            let value = match heads.as_slice() {
-                [] => continue,
-                [head] => resolve_effective_head(graph, &cell, *head, &mut BTreeSet::new())
-                    .map(CellProjection::Value)
-                    .unwrap_or_else(|| CellProjection::Conflict(vec![*head])),
-                _ => CellProjection::Conflict(heads),
-            };
-            cells.insert(cell, value);
+            if let Some(value) = Self::projected_cell(graph, &cell) {
+                cells.insert(cell, value);
+            }
         }
-        Self { cells, stand_down }
+        let commitment = commitment_from_maps(&cells, &stand_down);
+        Self {
+            cells: Arc::new(cells),
+            stand_down: Arc::new(stand_down),
+            commitment: Arc::new(commitment),
+        }
+    }
+
+    /// Update only cells and stand-down targets whose authority or causal
+    /// heads may have changed. The caller supplies the exact affected sets;
+    /// all other projected values are retained from the previous snapshot.
+    pub(crate) fn update_from_graph(
+        graph: &FactGraph,
+        previous: Self,
+        affected_cells: &BTreeSet<ExclusiveCell>,
+        affected_stand_down_targets: &BTreeSet<DeviceId>,
+    ) -> Self {
+        let mut next = previous;
+        let cells = Arc::make_mut(&mut next.cells);
+        for cell in affected_cells {
+            match Self::projected_cell(graph, cell) {
+                Some(value) => {
+                    cells.insert(cell.clone(), value);
+                }
+                None => {
+                    cells.remove(cell);
+                }
+            }
+        }
+        let stand_down = Arc::make_mut(&mut next.stand_down);
+        for target in affected_stand_down_targets {
+            let next_stand_down = graph
+                .indexed_stand_down_candidates_for(target)
+                .and_then(|proofs| projected_stand_down_for_target(graph, target, proofs));
+            match next_stand_down {
+                Some(value) => {
+                    stand_down.insert(target.clone(), value);
+                }
+                None => {
+                    stand_down.remove(target);
+                }
+            }
+        }
+        let mut commitment = (*next.commitment).clone();
+        for cell in affected_cells {
+            let key = cell_key(cell);
+            commitment = commitment.apply(key, None);
+            if let Some(value) = next.cells.get(cell) {
+                commitment = commitment.apply(cell_key(cell), Some(cell_value(value)));
+            }
+        }
+        for target in affected_stand_down_targets {
+            commitment = commitment.apply(stand_down_key(target), None);
+            if let Some(value) = next.stand_down.get(target) {
+                commitment =
+                    commitment.apply(stand_down_key(target), Some(stand_down_value(value)));
+            }
+        }
+        next.commitment = Arc::new(commitment);
+        next
     }
 
     pub fn cell(&self, cell: &ExclusiveCell) -> Option<&CellProjection> {
@@ -202,6 +646,68 @@ impl Projection {
     pub fn stand_down_targets(&self) -> impl Iterator<Item = &DeviceId> {
         self.stand_down.keys()
     }
+
+    pub(crate) fn commitment_root(&self) -> [u8; 32] {
+        self.commitment.root()
+    }
+
+    pub(crate) fn commitment_bytes(&self) -> u64 {
+        self.commitment.retained_bytes()
+    }
+}
+
+fn cell_key(cell: &ExclusiveCell) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.tag("cell");
+    cell.encode(&mut encoder);
+    encoder.finish()
+}
+
+fn cell_value(value: &CellProjection) -> [u8; 32] {
+    let mut encoder = Encoder::new();
+    match value {
+        CellProjection::Value(id) => {
+            encoder.tag("value");
+            encoder.id(*id);
+        }
+        CellProjection::Conflict(ids) => {
+            encoder.tag("conflict");
+            encoder.list_ids(ids);
+        }
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&Sha256::digest(encoder.finish()));
+    hash
+}
+
+fn stand_down_key(target: &DeviceId) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.tag("stand_down");
+    encoder.device(target);
+    encoder.finish()
+}
+
+fn stand_down_value(value: &StandDown) -> [u8; 32] {
+    let mut encoder = Encoder::new();
+    encoder.device(&value.target);
+    encoder.id(value.proof);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&Sha256::digest(encoder.finish()));
+    hash
+}
+
+fn commitment_from_maps(
+    cells: &BTreeMap<ExclusiveCell, CellProjection>,
+    stand_down: &BTreeMap<DeviceId, StandDown>,
+) -> ProjectionCommitment {
+    let mut commitment = ProjectionCommitment::default();
+    for (cell, value) in cells {
+        commitment = commitment.apply(cell_key(cell), Some(cell_value(value)));
+    }
+    for (target, value) in stand_down {
+        commitment = commitment.apply(stand_down_key(target), Some(stand_down_value(value)));
+    }
+    commitment
 }
 
 /// Project stand-down evidence independently of arrival order.  A signed
@@ -211,16 +717,10 @@ impl Projection {
 /// result remains fail-closed.
 fn projected_stand_down(graph: &FactGraph) -> BTreeMap<DeviceId, StandDown> {
     let mut evidence = BTreeMap::<DeviceId, Vec<FactId>>::new();
-    for (id, fact) in &graph.facts {
-        if graph.fact_is_authoritative(id) {
-            match &fact.content.body {
-                FactBody::EvictionProof { target, .. } => {
-                    evidence.entry(target.clone()).or_default().push(*id);
-                }
-                FactBody::SelfStandDown { device_id, .. } => {
-                    evidence.entry(device_id.clone()).or_default().push(*id);
-                }
-                _ => {}
+    for (target, candidates) in graph.indexed_stand_down_candidates() {
+        for id in candidates {
+            if graph.fact_is_authoritative(&id) {
+                evidence.entry(target.clone()).or_default().push(id);
             }
         }
     }
@@ -239,6 +739,23 @@ fn projected_stand_down(graph: &FactGraph) -> BTreeMap<DeviceId, StandDown> {
     result
 }
 
+fn projected_stand_down_for_target(
+    graph: &FactGraph,
+    target: &DeviceId,
+    proofs: &BTreeSet<FactId>,
+) -> Option<StandDown> {
+    let restoration = projected_membership_restoration(graph, target);
+    let proof = proofs.iter().copied().find(|proof| {
+        graph.fact_is_authoritative(proof)
+            && restoration
+                .is_none_or(|restored| *proof != restored && !graph.is_ancestor(proof, &restored))
+    })?;
+    Some(StandDown {
+        target: target.clone(),
+        proof,
+    })
+}
+
 fn projected_membership_restoration(graph: &FactGraph, target: &DeviceId) -> Option<FactId> {
     let cell = ExclusiveCell::membership(target.clone());
     let heads = graph.cell_heads(&cell);
@@ -251,4 +768,72 @@ fn projected_membership_restoration(graph: &FactGraph, target: &DeviceId) -> Opt
         Some(FactBody::MembershipAdmit { target: admitted }) if admitted == target
     )
     .then_some(selected)
+}
+
+#[cfg(test)]
+mod commitment_tests {
+    use super::*;
+
+    fn entry(key: u8, value: u8) -> (Vec<u8>, [u8; 32]) {
+        (vec![key], [value; 32])
+    }
+
+    #[test]
+    fn canonical_root_is_insertion_order_independent() {
+        let first = ProjectionCommitment::default()
+            .apply(entry(1, 9).0, Some(entry(1, 9).1))
+            .apply(entry(2, 8).0, Some(entry(2, 8).1))
+            .apply(entry(3, 7).0, Some(entry(3, 7).1));
+        let second = ProjectionCommitment::default()
+            .apply(entry(3, 7).0, Some(entry(3, 7).1))
+            .apply(entry(1, 9).0, Some(entry(1, 9).1))
+            .apply(entry(2, 8).0, Some(entry(2, 8).1));
+        assert_eq!(first.root(), second.root());
+    }
+
+    #[test]
+    fn incremental_update_matches_full_and_delete_rollback_restores_root() {
+        let base_entries = [entry(4, 1), entry(5, 2), entry(6, 3)];
+        let base = base_entries.iter().fold(
+            ProjectionCommitment::default(),
+            |commitment, (key, value)| commitment.apply(key.clone(), Some(*value)),
+        );
+        let incremental = base.apply(vec![5], None).apply(vec![5], Some([8; 32]));
+        let full = ProjectionCommitment::default()
+            .apply(vec![4], Some([1; 32]))
+            .apply(vec![5], Some([8; 32]))
+            .apply(vec![6], Some([3; 32]));
+        assert_eq!(incremental.root(), full.root());
+
+        let deleted = incremental.apply(vec![5], None);
+        let restored = deleted.apply(vec![5], Some([8; 32]));
+        assert_eq!(restored.root(), incremental.root());
+        assert_ne!(deleted.root(), incremental.root());
+        assert!(restored.retained_bytes() >= deleted.retained_bytes());
+    }
+
+    #[test]
+    fn projection_delta_carries_generation_and_root_fence() {
+        let previous = Projection::default();
+        let current = Projection::default();
+        let delta = current.delta_from(&previous, 11, 12, &BTreeSet::new(), &BTreeSet::new());
+        assert_eq!(delta.base_generation(), 11);
+        assert_eq!(delta.generation(), 12);
+        assert_eq!(delta.base_commitment(), previous.commitment_root());
+        assert_eq!(delta.commitment(), current.commitment_root());
+        assert!(current
+            .clone()
+            .apply_delta(&delta, 11, previous.commitment_root())
+            .is_some());
+        assert!(current
+            .clone()
+            .apply_delta(&delta, 10, previous.commitment_root())
+            .is_none());
+        let mut stale = delta.clone();
+        stale.base_commitment = [0xff; 32];
+        assert!(current
+            .clone()
+            .apply_delta(&stale, 11, previous.commitment_root())
+            .is_none());
+    }
 }

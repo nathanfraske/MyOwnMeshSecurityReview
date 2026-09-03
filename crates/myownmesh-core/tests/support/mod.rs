@@ -222,6 +222,46 @@ pub fn test_transport() -> Transport {
             myownmesh_core::FiniteResourceProvider::scope_planning_charge()
                 .checked_scale(application_scopes)
                 .expect("the fixture application scope capacity is representable");
+        // Each live network/application owner retains one semantic database.
+        // Charge the real default database budget once per owner, then apply
+        // the provider's exact reservation bookkeeping charge before scaling;
+        // scaling the raw storage claim would underfund one reservation record
+        // for every additional owner.
+        let semantic_policy = myownmesh_core::config::SemanticPolicyConfig::default();
+        let semantic_storage_owner_count = mesh_scopes
+            .checked_mul(FIXTURE_APPLICATION_SCOPES_PER_WORKER)
+            .expect("fixture semantic storage owner concurrency fits u64");
+        assert_eq!(
+            semantic_storage_owner_count, application_scopes,
+            "semantic storage is funded for exactly the live application-owner bound"
+        );
+        let semantic_storage_claim = ResourceClaim::single(
+            ResourceClass::StorageBytes,
+            semantic_policy.max_database_bytes,
+        );
+        let semantic_storage_grant =
+            myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                semantic_storage_claim,
+            )
+            .expect("the fixture semantic storage reservation is representable")
+            .checked_scale(semantic_storage_owner_count)
+            .expect("the fixture semantic storage owner capacity is representable");
+        assert_eq!(
+            semantic_storage_grant.amount(ResourceClass::StorageBytes),
+            semantic_policy
+                .max_database_bytes
+                .checked_mul(semantic_storage_owner_count)
+                .expect("the fixture semantic storage byte capacity is representable"),
+            "semantic storage bytes equal the default policy per live owner"
+        );
+        assert_eq!(
+            semantic_storage_grant.amount(ResourceClass::OpaqueDependencyResidual),
+            semantic_storage_owner_count,
+            "semantic storage includes one reservation record per live owner"
+        );
+        let grant = grant
+            .checked_add(semantic_storage_grant)
+            .expect("the fixture semantic storage grant combines without overflow");
         // Rpc::attach retains one dispatcher per application and advertise
         // retains one encoded local advert. Both terms are provider-planned by
         // the production constructors, and both are bounded by the explicit

@@ -1,8 +1,11 @@
+#![cfg(feature = "transport-lab")]
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
+    SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::events::{MeshEvent, PeerEvent};
@@ -10,7 +13,9 @@ use myownmesh_core::resource::{
     FiniteResourceProvider, ResourceClaim, ResourceClass, ResourceProviderPort, ResourceReport,
 };
 use myownmesh_core::semantic::VerifiedBootstrap;
-use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, FactGraph, Role, SignedFact};
+use myownmesh_core::semantic::{
+    DeviceId, FactBody, FactContent, FactGraph, MeshContextId, Role, SignedFact,
+};
 use myownmesh_core::{
     ConnectorCallbackPolicy, Identity, Mesh, MeshConfig, WebRtcConnectorCapablePolicy,
     WebRtcConnectorProfile,
@@ -21,6 +26,19 @@ use myownmesh_signaling::local::LocalBroker;
 // production path as the shipped two-daemon runner. Give that path the same
 // bounded window instead of imposing a unit-test-sized deadline.
 const STAGE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn semantic_fact_page(
+    context_id: MeshContextId,
+    facts: &[SignedFact],
+) -> myownmesh_core::semantic::SemanticFactPage {
+    serde_json::from_value(serde_json::json!({
+        "context_id": context_id,
+        "facts": facts,
+        "next_cursor": null,
+        "complete": true,
+    }))
+    .expect("strict semantic page decodes")
+}
 
 async fn bounded<T>(
     stage: &'static str,
@@ -45,12 +63,51 @@ fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
     // This is deliberately finite and per Mesh instance.  The three-node
     // control has one connector-capable runtime per node; every named resource
     // dimension is bounded, including provider bookkeeping.
-    let grant = ResourceClaim::try_from_entries(
-        ResourceClass::ALL
-            .into_iter()
-            .map(|class| (class, 100_000_000)),
-    )
-    .expect("finite three-node connector grant is representable");
+    let relay_grant =
+        ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
+            (
+                class,
+                if class == ResourceClass::StorageBytes {
+                    0
+                } else {
+                    100_000_000
+                },
+            )
+        }))
+        .expect("finite three-node connector grant is representable");
+    let semantic_policy = SemanticPolicyConfig::default();
+    let semantic_storage_owner_count = 3_u64;
+    let semantic_storage_claim = ResourceClaim::single(
+        ResourceClass::StorageBytes,
+        semantic_policy.max_database_bytes,
+    );
+    let semantic_storage_grant =
+        FiniteResourceProvider::reservation_planning_charge(semantic_storage_claim)
+            .expect("three-node semantic storage reservation is representable")
+            .checked_scale(semantic_storage_owner_count)
+            .expect("three-node semantic storage capacity is representable");
+    let expected_storage_bytes = semantic_policy
+        .max_database_bytes
+        .checked_mul(semantic_storage_owner_count)
+        .expect("three-node semantic storage bytes are representable");
+    assert_eq!(
+        semantic_storage_grant.amount(ResourceClass::StorageBytes),
+        expected_storage_bytes,
+        "semantic storage is funded exactly once per live network owner"
+    );
+    assert_eq!(
+        semantic_storage_grant.amount(ResourceClass::OpaqueDependencyResidual),
+        semantic_storage_owner_count,
+        "semantic storage reserves exactly one provider record per live owner"
+    );
+    let grant = relay_grant
+        .checked_add(semantic_storage_grant)
+        .expect("relay and semantic grants combine without overflow");
+    assert_eq!(
+        grant.amount(ResourceClass::StorageBytes),
+        expected_storage_bytes,
+        "the three-node provider has no hidden storage slack"
+    );
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
         .expect("finite provider is valid");
     WebRtcConnectorCapablePolicy::new(
@@ -67,6 +124,8 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         connection_trace_capacity: 512,
         label: id.into(),
         kind: NetworkKind::Closed,
+        semantic_policy: Default::default(),
+        routing_policy: RoutingPolicyConfig::default(),
         scheduler: Default::default(),
         topology: TopologyMode::Star {
             hub: relay.to_string(),
@@ -84,7 +143,6 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         },
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -264,7 +322,7 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     for network in [&alice_net, &relay_net, &carol_net] {
         bounded(
             "import member facts",
-            network.import_signed_facts(member_facts.clone()),
+            network.import_semantic_fact_page(semantic_fact_page(context_id, &member_facts)),
         )
         .await??;
     }

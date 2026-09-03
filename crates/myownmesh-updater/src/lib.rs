@@ -304,7 +304,7 @@ fn apply_pending() -> Result<Option<String>> {
         .to_string();
     validate_safe_component(&target_version, "pending target version")?;
 
-    let artifacts = parse_pending_artifacts(&doc);
+    let artifacts = parse_pending_artifacts(&doc)?;
     if artifacts.is_empty() {
         let _ = std::fs::remove_file(&pending);
         return Err(Error::msg(
@@ -1293,7 +1293,7 @@ struct StagedArtifact {
     kind: ArtifactKind,
     staged: PathBuf,
     /// Digest of the staged executable, rechecked immediately before apply.
-    /// Legacy markers have no digest and are rejected by the apply path.
+    /// A missing digest is never emitted and is rejected by the apply path.
     sha256: Option<String>,
 }
 
@@ -1714,66 +1714,80 @@ async fn download_verify_stage(
 }
 
 /// Build the `pending.json` document for a set of staged artifacts. The
-/// `artifacts` array is the current format; we also keep a top-level
-/// `path` pointing at the daemon binary so an older `myownmesh` that only
-/// understands the single-binary marker still applies the daemon half.
-fn pending_doc(version: &str, artifacts: &[StagedArtifact]) -> Value {
-    let arts: Vec<Value> = artifacts
-        .iter()
-        .map(|a| {
-            let mut value = serde_json::json!({
-                "kind": a.kind.as_str(),
-                "path": a.staged.to_string_lossy(),
-            });
-            if let Some(sha256) = &a.sha256 {
-                value["sha256"] = Value::String(sha256.clone());
-            }
-            value
-        })
-        .collect();
-    let mut doc = serde_json::json!({
+/// `artifacts` array, including a digest for every member, is the only
+/// accepted on-disk format.
+fn pending_doc(version: &str, artifacts: &[StagedArtifact]) -> Result<Value> {
+    let mut arts = Vec::with_capacity(artifacts.len());
+    for artifact in artifacts {
+        let sha256 = artifact
+            .sha256
+            .as_deref()
+            .filter(|digest| !digest.trim().is_empty())
+            .ok_or_else(|| Error::msg("staged artifact has no digest"))?;
+        arts.push(serde_json::json!({
+            "kind": artifact.kind.as_str(),
+            "path": artifact.staged.to_string_lossy(),
+            "sha256": sha256,
+        }));
+    }
+    Ok(serde_json::json!({
         "version": version,
         "artifacts": arts,
         "staged_at": iso_now(),
-    });
-    if let Some(daemon) = artifacts.iter().find(|a| a.kind == ArtifactKind::Daemon) {
-        doc["path"] = Value::String(daemon.staged.to_string_lossy().into_owned());
-    }
-    doc
+    }))
 }
 
 /// Parse the staged-artifact list out of a `pending.json` document.
-/// Prefers the `artifacts` array; falls back to a legacy single-binary
-/// marker (`{ version, path }`), which is always the daemon.
-fn parse_pending_artifacts(doc: &Value) -> Vec<StagedArtifact> {
-    if let Some(arr) = doc.get("artifacts").and_then(Value::as_array) {
-        let mut out = Vec::new();
-        for a in arr {
-            let kind = a
-                .get("kind")
-                .and_then(Value::as_str)
-                .and_then(ArtifactKind::parse);
-            let path = a.get("path").and_then(Value::as_str);
-            if let (Some(kind), Some(path)) = (kind, path) {
-                out.push(StagedArtifact {
-                    kind,
-                    staged: PathBuf::from(path),
-                    sha256: a.get("sha256").and_then(Value::as_str).map(str::to_owned),
-                });
+fn parse_pending_artifacts(doc: &Value) -> Result<Vec<StagedArtifact>> {
+    let object = doc
+        .as_object()
+        .ok_or_else(|| Error::msg("pending.json must be an object"))?;
+    for key in object.keys() {
+        if !matches!(key.as_str(), "version" | "artifacts" | "staged_at") {
+            return Err(Error::msg(format!(
+                "pending.json has unknown field `{key}`"
+            )));
+        }
+    }
+    let arr = object
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::msg("pending.json has no artifacts array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (index, artifact) in arr.iter().enumerate() {
+        let artifact = artifact
+            .as_object()
+            .ok_or_else(|| Error::msg(format!("artifact {index} must be an object")))?;
+        for key in artifact.keys() {
+            if !matches!(key.as_str(), "kind" | "path" | "sha256") {
+                return Err(Error::msg(format!(
+                    "artifact {index} has unknown field `{key}`"
+                )));
             }
         }
-        if !out.is_empty() {
-            return out;
-        }
-    }
-    if let Some(path) = doc.get("path").and_then(Value::as_str) {
-        return vec![StagedArtifact {
-            kind: ArtifactKind::Daemon,
+        let kind_name = artifact
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::msg(format!("artifact {index} has no kind")))?;
+        let kind = ArtifactKind::parse(kind_name)
+            .ok_or_else(|| Error::msg(format!("artifact {index} has unknown kind")))?;
+        let path = artifact
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| Error::msg(format!("artifact {index} has no path")))?;
+        let sha256 = artifact
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|digest| !digest.trim().is_empty())
+            .ok_or_else(|| Error::msg(format!("artifact {index} has no digest")))?;
+        out.push(StagedArtifact {
+            kind,
             staged: PathBuf::from(path),
-            sha256: None,
-        }];
+            sha256: Some(sha256.to_owned()),
+        });
     }
-    Vec::new()
+    Ok(out)
 }
 
 fn write_pending_marker(version: &str, artifacts: &[StagedArtifact]) -> Result<()> {
@@ -1783,7 +1797,7 @@ fn write_pending_marker(version: &str, artifacts: &[StagedArtifact]) -> Result<(
         .parent()
         .ok_or_else(|| Error::msg("pending marker has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let doc = pending_doc(version, artifacts);
+    let doc = pending_doc(version, artifacts)?;
     let temp_path = randomized_temp_path(parent, ".myownmesh-pending-", ".tmp");
     write_pending_marker_with_temp(&pending_path, &doc, &temp_path)
 }
@@ -2436,16 +2450,18 @@ mod tests {
             StagedArtifact {
                 kind: ArtifactKind::Gui,
                 staged: PathBuf::from("/u/0.1.7/myownmesh-gui"),
-                sha256: None,
+                sha256: Some(digest.clone()),
             },
         ];
-        let doc = pending_doc("0.1.7", &arts);
+        let doc = pending_doc("0.1.7", &arts).expect("digests are present");
         assert_eq!(doc["version"].as_str(), Some("0.1.7"));
-        // Back-compat: top-level `path` is the daemon binary, so an older
-        // single-binary applier still swaps the daemon.
-        assert_eq!(doc["path"].as_str(), Some("/u/0.1.7/myownmesh"));
+        assert!(doc.get("path").is_none());
+        assert_eq!(
+            doc["artifacts"][0]["sha256"].as_str(),
+            Some(digest.as_str())
+        );
 
-        let parsed = parse_pending_artifacts(&doc);
+        let parsed = parse_pending_artifacts(&doc).expect("current marker parses");
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].kind, ArtifactKind::Daemon);
         assert_eq!(parsed[0].sha256.as_deref(), Some(digest.as_str()));
@@ -2454,13 +2470,11 @@ mod tests {
     }
 
     #[test]
-    fn pending_legacy_single_path_is_daemon() {
-        // A marker written by an older updater: just { version, path }.
+    fn pending_legacy_single_path_is_rejected() {
+        // The retired {version, path} marker must not be migrated or applied
+        // without a digest-bearing artifacts array.
         let doc = json!({ "version": "0.1.6", "path": "/u/0.1.6/myownmesh" });
-        let parsed = parse_pending_artifacts(&doc);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].kind, ArtifactKind::Daemon);
-        assert_eq!(parsed[0].staged, PathBuf::from("/u/0.1.6/myownmesh"));
+        assert!(parse_pending_artifacts(&doc).is_err());
     }
 
     #[test]

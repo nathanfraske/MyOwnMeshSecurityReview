@@ -176,6 +176,42 @@ export interface ClosedRelayPolicyConfig {
   shutdown_grace_ms: number;
 }
 
+/** Owner-selected bounds for the durable semantic fact graph. These values
+ *  are persisted with each network and must survive GUI edits and settings
+ *  sharing; they are not authority or membership controls. */
+export interface SemanticPolicyConfig {
+  max_fact_encoded_bytes: number;
+  max_dependencies_per_fact: number;
+  max_authority_uses_per_fact: number;
+  max_authority_predecessors_per_use: number;
+  max_admitted_facts: number;
+  max_admitted_bytes: number;
+  max_quarantined_facts: number;
+  max_quarantined_bytes: number;
+  max_quarantined_facts_per_author: number;
+  max_quarantined_bytes_per_author: number;
+  max_retained_facts_per_author: number;
+  max_retained_bytes_per_author: number;
+  max_dependency_edges: number;
+  max_ready_batch: number;
+  max_pending_proofs: number;
+  max_pending_proof_bytes: number;
+  max_proof_records: number;
+  max_proof_bytes: number;
+  max_proof_links: number;
+  max_author_usage_rows: number;
+  max_provisional_rows: number;
+  max_transaction_dirty_main_pages: number;
+  max_uncheckpointed_wal_frames: number;
+  max_freelist_pages: number;
+  max_fragmented_pages: number;
+  max_main_journal_bytes: number;
+  max_database_bytes: number;
+  max_wal_bytes: number;
+  wal_checkpoint_threshold_bytes: number;
+  emergency_reserve_bytes: number;
+}
+
 export interface NetworkConfigInput {
   id: string;
   network_id: string;
@@ -186,9 +222,9 @@ export interface NetworkConfigInput {
   topology?: TopologyMode;
   signaling?: SignalingConfig;
   closed_relay?: ClosedRelayPolicyConfig;
+  semantic_policy?: SemanticPolicyConfig;
   stun_servers?: StunServer[];
   turn_servers?: TurnServer[];
-  roster_path?: string | null;
   pinned_peers?: string[];
   auto_approve?: boolean;
 }
@@ -204,9 +240,9 @@ export interface NetworkConfigSnapshot {
   topology: TopologyMode;
   signaling: SignalingConfigSnapshot;
   closed_relay: ClosedRelayPolicyConfig;
+  semantic_policy: SemanticPolicyConfig;
   stun_servers: StunServer[];
   turn_servers: TurnServerSnapshot[];
-  roster_path: string | null;
   pinned_peers: string[];
   auto_approve: boolean;
 }

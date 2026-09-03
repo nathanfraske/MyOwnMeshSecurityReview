@@ -58,7 +58,7 @@ pub struct ConnectedChannelCapability {
 /// This stays private so only the connector owner can perform the transition.
 /// Arc 03 moves the call behind the connector worker's successful channel
 /// event.
-#[allow(dead_code, reason = "Arc 03 moves the production connector caller")]
+#[cfg(test)]
 pub(crate) fn mark_connected(
     candidate: ConnectorCandidateCapability,
 ) -> Option<ConnectedChannelCapability> {

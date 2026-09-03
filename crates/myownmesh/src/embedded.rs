@@ -28,6 +28,12 @@ pub enum EmbeddedStartError {
     #[error("service policy: {0}")]
     ServicePolicy(#[from] crate::services::ServicePolicyError),
 
+    #[error("service policy: {primary}; startup cleanup failed: {cleanup:?}")]
+    ServicePolicyWithCleanup {
+        primary: crate::services::ServicePolicyError,
+        cleanup: Vec<String>,
+    },
+
     #[error("network startup: {0}")]
     NetworkStartup(String),
 
@@ -111,34 +117,38 @@ impl Drop for EmbeddedTaskTerminal {
 /// `EmbeddedDaemon::drop` cannot await, and spawning a cleanup future from
 /// there would make the service/network drain itself detachable. This
 /// custodian is therefore created before either daemon root task. Drop only
-/// installs a bounded request in its one-slot mailbox and latches the normal
-/// supervisor cancellation; the custodian then joins both roots and drains
-/// services and networks in the same order as [`EmbeddedDaemon::shutdown`].
+/// installs a request in its mailbox and latches the normal supervisor
+/// cancellation; the custodian then joins both roots and drains services and
+/// networks in the same order as [`EmbeddedDaemon::shutdown`].
 ///
 /// The custodian's `WorkerOrTask` lease is acquired before its owner thread is
 /// spawned and held until its terminal branch, so cleanup is part of the
 /// caller-selected finite resource grant. Its terminal signal is retained for
 /// the graceful path; the non-awaitable Drop path observes the shared witness
 /// while the already-existing custodian performs the bounded drain. The
-/// custodian's OS-thread handle is then transferred to the process-owned,
-/// one-slot join reaper, which retains and joins it after that terminal signal.
+/// custodian's OS-thread handle is then transferred to the process-owned join
+/// reaper, which retains and joins it after that terminal signal.
 struct EmbeddedCleanupCustodian {
     mailbox: std::sync::Arc<EmbeddedCleanupMailbox>,
     terminal: Option<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>>,
-    thread_reaper: std::sync::mpsc::SyncSender<EmbeddedCleanupThreadBatch>,
+    thread_reaper: std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>,
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(test)]
     cleanup_thread_joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    cleanup_thread_joining: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct EmbeddedCleanupThreadBatch {
     thread: std::thread::JoinHandle<()>,
     #[cfg(test)]
     joined: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    joining: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct EmbeddedCleanupThreadReaper {
-    sender: Option<std::sync::mpsc::SyncSender<EmbeddedCleanupThreadBatch>>,
+    sender: Option<std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>>,
     _thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The reaper is process-lived, so its one `WorkerOrTask` charge is held
     /// for the same lifetime rather than being silently borrowed from the
@@ -164,18 +174,18 @@ impl Drop for EmbeddedCleanupThreadReaper {
     }
 }
 
-// One bounded, process-lived owner receives cleanup-thread handles after a
-// synchronous Drop. Keeping its own JoinHandle in the OnceLock means this
-// owner is not itself detached; it is deliberately non-self because it never
-// joins the thread that is executing it. Its worker/task lease is acquired
-// before the thread is spawned and remains in this OnceLock until process exit.
+// One process-lived owner receives cleanup-thread handles after a synchronous
+// Drop. Keeping its own JoinHandle in the OnceLock means this owner is not
+// itself detached; it is deliberately non-self because it never joins the
+// thread that is executing it. Its worker/task lease is acquired before the
+// thread is spawned and remains in this OnceLock until process exit.
 static EMBEDDED_CLEANUP_THREAD_REAPER: std::sync::OnceLock<
     std::sync::Mutex<Option<EmbeddedCleanupThreadReaper>>,
 > = std::sync::OnceLock::new();
 
 fn embedded_cleanup_thread_reaper(
     scope: &myownmesh_core::LocalApplicationResourceScope,
-) -> std::result::Result<std::sync::mpsc::SyncSender<EmbeddedCleanupThreadBatch>, String> {
+) -> std::result::Result<std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>, String> {
     let slot = EMBEDDED_CLEANUP_THREAD_REAPER.get_or_init(|| std::sync::Mutex::new(None));
     embedded_cleanup_thread_reaper_in(scope, slot)
 }
@@ -183,7 +193,7 @@ fn embedded_cleanup_thread_reaper(
 fn embedded_cleanup_thread_reaper_in(
     scope: &myownmesh_core::LocalApplicationResourceScope,
     slot: &std::sync::Mutex<Option<EmbeddedCleanupThreadReaper>>,
-) -> std::result::Result<std::sync::mpsc::SyncSender<EmbeddedCleanupThreadBatch>, String> {
+) -> std::result::Result<std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>, String> {
     let mut slot = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -206,11 +216,19 @@ fn embedded_cleanup_thread_reaper_in(
                 1,
             ))
             .map_err(|error| error.to_string())?;
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<EmbeddedCleanupThreadBatch>(1);
+        // This is an owner handoff, not a work queue.  It must never make a
+        // synchronous Drop wait behind another daemon's cleanup-thread join.
+        // The process-owned receiver drains every submitted terminal handle;
+        // its sender remains retained by the owner for the owner's lifetime.
+        let (sender, receiver) = std::sync::mpsc::channel::<EmbeddedCleanupThreadBatch>();
         let thread = std::thread::Builder::new()
             .name("myownmesh-embedded-cleanup-join".to_string())
             .spawn(move || {
                 while let Ok(batch) = receiver.recv() {
+                    #[cfg(test)]
+                    batch
+                        .joining
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = batch.thread.join();
                     #[cfg(test)]
                     batch
@@ -241,6 +259,10 @@ struct EmbeddedCleanupMailbox {
 
 enum EmbeddedCleanupRequest {
     Graceful,
+    #[cfg(test)]
+    Blocked {
+        release: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     Dropped {
         control: tokio::task::JoinHandle<std::result::Result<(), String>>,
         updater: tokio::task::JoinHandle<()>,
@@ -252,7 +274,7 @@ enum EmbeddedCleanupRequest {
 impl EmbeddedCleanupCustodian {
     fn new(
         lease: myownmesh_core::ResourceLease,
-        thread_reaper: std::sync::mpsc::SyncSender<EmbeddedCleanupThreadBatch>,
+        thread_reaper: std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>,
         #[cfg(test)] witness: std::sync::Arc<EmbeddedTaskWitness>,
     ) -> std::result::Result<Self, String> {
         let mailbox = std::sync::Arc::new(EmbeddedCleanupMailbox {
@@ -264,6 +286,8 @@ impl EmbeddedCleanupCustodian {
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         #[cfg(test)]
         let cleanup_thread_joined = std::sync::Arc::clone(&witness.cleanup_thread_joined);
+        #[cfg(test)]
+        let cleanup_thread_joining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread = std::thread::Builder::new()
             .name("myownmesh-embedded-cleanup".to_string())
             .spawn(move || {
@@ -301,58 +325,88 @@ impl EmbeddedCleanupCustodian {
                     }
                 };
                 let outcome = runtime.block_on(async move {
+                    let mut failures = Vec::new();
                     {
                         let _lease = lease;
-                        if let EmbeddedCleanupRequest::Dropped {
-                            control,
-                            updater,
-                            service_manager,
-                            registry,
-                        } = request
-                        {
-                            let _control_result = control.await;
+                        match request {
+                            EmbeddedCleanupRequest::Graceful => {}
                             #[cfg(test)]
-                            if let Err(error) = &_control_result {
-                                witness
-                                    .cleanup_root_join_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                if error.is_panic() {
-                                    witness
-                                        .cleanup_root_panics
-                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                }
-                                if error.is_cancelled() {
-                                    witness
-                                        .cleanup_root_cancellations
-                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            EmbeddedCleanupRequest::Blocked { release } => {
+                                while !release.load(std::sync::atomic::Ordering::SeqCst) {
+                                    tokio::task::yield_now().await;
                                 }
                             }
-                            let _updater_result = updater.await;
-                            #[cfg(test)]
-                            if let Err(error) = &_updater_result {
-                                witness
-                                    .cleanup_root_join_errors
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                if error.is_panic() {
-                                    witness
-                                        .cleanup_root_panics
-                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            EmbeddedCleanupRequest::Dropped {
+                                control,
+                                updater,
+                                service_manager,
+                                registry,
+                            } => {
+                                let control_result = control.await;
+                                match &control_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        failures.push(format!("control cleanup failed: {error}"));
+                                    }
+                                    Err(error) => failures
+                                        .push(format!("control cleanup join failed: {error}")),
                                 }
-                                if error.is_cancelled() {
+                                #[cfg(test)]
+                                if let Err(error) = &control_result {
                                     witness
-                                        .cleanup_root_cancellations
+                                        .cleanup_root_join_errors
                                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if error.is_panic() {
+                                        witness
+                                            .cleanup_root_panics
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    if error.is_cancelled() {
+                                        witness
+                                            .cleanup_root_cancellations
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                }
+                                let updater_result = updater.await;
+                                #[cfg(test)]
+                                if let Err(error) = &updater_result {
+                                    witness
+                                        .cleanup_root_join_errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if error.is_panic() {
+                                        witness
+                                            .cleanup_root_panics
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                    if error.is_cancelled() {
+                                        witness
+                                            .cleanup_root_cancellations
+                                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                }
+                                if let Err(error) = updater_result {
+                                    failures.push(format!("updater cleanup join failed: {error}"));
+                                }
+                                if let Err(error) = service_manager.shutdown().await {
+                                    failures.push(format!("service cleanup failed: {error}"));
+                                }
+                                for outcome in registry.shutdown_all_with_departures().await {
+                                    if let Err(error) = outcome {
+                                        failures.push(format!("network cleanup failed: {error}"));
+                                    }
                                 }
                             }
-                            let _ = service_manager.shutdown().await;
-                            let _ = registry.shutdown_all_with_departures().await;
                         }
                     }
                     #[cfg(test)]
                     witness
                         .cleanup_terminal
                         .store(true, std::sync::atomic::Ordering::SeqCst);
-                    Ok(())
+                    if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(failures.join("; "))
+                    }
                 });
                 let _ = terminal_sender.send(outcome);
             })
@@ -381,6 +435,8 @@ impl EmbeddedCleanupCustodian {
             thread: Some(thread),
             #[cfg(test)]
             cleanup_thread_joined,
+            #[cfg(test)]
+            cleanup_thread_joining,
         })
     }
 
@@ -404,7 +460,7 @@ impl EmbeddedCleanupCustodian {
             .terminal
             .take()
             .expect("embedded cleanup task is present until shutdown");
-        let terminal_result = terminal.await.map_err(|error| error.to_string())?;
+        let terminal_result = terminal.await.map_err(|error| error.to_string());
         let thread = self
             .thread
             .take()
@@ -413,10 +469,20 @@ impl EmbeddedCleanupCustodian {
         #[cfg(test)]
         self.cleanup_thread_joined
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        if thread_result.is_err() {
-            return Err("embedded cleanup thread panicked before join".to_string());
+        let mut failures = Vec::new();
+        match terminal_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(error),
+            Err(error) => failures.push(format!("cleanup terminal signal failed: {error}")),
         }
-        terminal_result
+        if thread_result.is_err() {
+            failures.push("embedded cleanup thread panicked before join".to_string());
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     fn handoff_drop(
@@ -432,6 +498,24 @@ impl EmbeddedCleanupCustodian {
             service_manager,
             registry,
         });
+    }
+}
+
+fn handoff_cleanup_thread(
+    thread_reaper: &std::sync::mpsc::Sender<EmbeddedCleanupThreadBatch>,
+    batch: EmbeddedCleanupThreadBatch,
+) {
+    // The reaper is established before any daemon task and retains its own
+    // sender, so a disconnected owner is an invariant failure.  Never join
+    // here: this function is called from synchronous Drop and the cleanup
+    // thread may still be driving its own Tokio runtime.
+    if thread_reaper.send(batch).is_err() {
+        // There is no safe synchronous fallback here: joining could wait on
+        // the cleanup runtime, while dropping the returned handle would
+        // detach its terminal owner.  The owner is established before daemon
+        // tasks and retained for process lifetime, so this is an invariant
+        // failure; fail closed without leaving an unobserved handle behind.
+        std::process::abort();
     }
 }
 
@@ -455,18 +539,10 @@ impl Drop for EmbeddedCleanupCustodian {
                 thread,
                 #[cfg(test)]
                 joined: std::sync::Arc::clone(&self.cleanup_thread_joined),
+                #[cfg(test)]
+                joining: std::sync::Arc::clone(&self.cleanup_thread_joining),
             };
-            match self.thread_reaper.try_send(batch) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::TrySendError::Full(batch))
-                | Err(std::sync::mpsc::TrySendError::Disconnected(batch)) => {
-                    let _ = batch.thread.join();
-                    #[cfg(test)]
-                    batch
-                        .joined
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
+            handoff_cleanup_thread(&self.thread_reaper, batch);
         }
     }
 }
@@ -792,12 +868,20 @@ async fn start_with_mesh_inner(
         if let Err(error) =
             crate::services::join_networks_checked(&mesh, &registry, &cfg.networks).await
         {
+            let mut cleanup_failures = Vec::new();
             for outcome in registry.shutdown_all_with_departures().await {
                 if let Err(cleanup_error) = outcome {
                     warn!("network startup refusal cleanup failed: {cleanup_error}");
+                    cleanup_failures.push(format!("network cleanup failed: {cleanup_error}"));
                 }
             }
-            return Err(EmbeddedStartError::NetworkStartup(error));
+            if cleanup_failures.is_empty() {
+                return Err(EmbeddedStartError::NetworkStartup(error));
+            }
+            return Err(EmbeddedStartError::NetworkStartup(format!(
+                "{error}; startup cleanup failed: {}",
+                cleanup_failures.join("; ")
+            )));
         }
     } else {
         info!("node participation disabled — pure-infrastructure mode (hosting services only)");
@@ -809,15 +893,24 @@ async fn start_with_mesh_inner(
     let report = match service_manager.apply(cfg.services.clone()).await {
         Ok(report) => report,
         Err(error) => {
+            let mut cleanup_failures = Vec::new();
             if let Err(cleanup_error) = service_manager.shutdown().await {
                 warn!("service startup refusal cleanup failed: {cleanup_error}");
+                cleanup_failures.push(format!("service cleanup failed: {cleanup_error}"));
             }
             for outcome in registry.shutdown_all_with_departures().await {
                 if let Err(cleanup_error) = outcome {
                     warn!("network startup cleanup failed: {cleanup_error}");
+                    cleanup_failures.push(format!("network cleanup failed: {cleanup_error}"));
                 }
             }
-            return Err(error.into());
+            if cleanup_failures.is_empty() {
+                return Err(error.into());
+            }
+            return Err(EmbeddedStartError::ServicePolicyWithCleanup {
+                primary: error,
+                cleanup: cleanup_failures,
+            });
         }
     };
     info!(
@@ -1011,14 +1104,236 @@ mod tests {
             .send(EmbeddedCleanupThreadBatch {
                 thread,
                 joined: std::sync::Arc::clone(&joined),
+                joining: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
-            .expect("the live retry reaper accepts one bounded join request");
+            .expect("the live retry reaper accepts one terminal join request");
         drop(sender);
         drop(slot);
         assert!(
             joined.load(std::sync::atomic::Ordering::SeqCst),
             "the successful retry owner observes its queued thread terminal"
         );
+        drop(scope);
+        drop(port);
+        assert_eq!(provider.in_use(), myownmesh_core::ResourceClaim::ZERO);
+    }
+
+    /// Two abandoned daemons may hand off their cleanup roots while the
+    /// process owner is still joining the first root.  The second synchronous
+    /// Drop must return at that saturation boundary; the pre-established owner
+    /// then joins both roots and releases its exact provider lease.
+    #[test]
+    fn cleanup_reaper_saturation_keeps_drop_nonblocking_and_joins_every_root() {
+        fn spin_until(flag: &std::sync::atomic::AtomicBool) -> bool {
+            for _ in 0..100_000 {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        }
+
+        let provider = myownmesh_core::FiniteResourceProvider::new(cleanup_reaper_control_grant(1));
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the saturation provider funds its process scope");
+        let scope = myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(&port)
+            .expect("the saturation provider funds its local scope");
+        let slot = std::sync::Mutex::new(None);
+        let sender = embedded_cleanup_thread_reaper_in(&scope, &slot)
+            .expect("the pre-established owner is funded before either handoff");
+
+        let first_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_joining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_release_thread = std::sync::Arc::clone(&first_release);
+        let first_started_thread = std::sync::Arc::clone(&first_started);
+        let first_thread = std::thread::spawn(move || {
+            first_started_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !first_release_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        assert!(
+            spin_until(&first_started),
+            "the first daemon cleanup root started"
+        );
+        sender
+            .send(EmbeddedCleanupThreadBatch {
+                thread: first_thread,
+                joined: std::sync::Arc::clone(&first_joined),
+                joining: std::sync::Arc::clone(&first_joining),
+            })
+            .expect("the first daemon cleanup root enters the process owner");
+        assert!(
+            spin_until(&first_joining),
+            "the process owner is joining the first daemon root before saturation"
+        );
+
+        let second_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_joining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_release_thread = std::sync::Arc::clone(&second_release);
+        let second_started_thread = std::sync::Arc::clone(&second_started);
+        let second_thread = std::thread::spawn(move || {
+            second_started_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+            while !second_release_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        });
+        assert!(
+            spin_until(&second_started),
+            "the second daemon cleanup root started"
+        );
+
+        let handoff_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handoff_returned_thread = std::sync::Arc::clone(&handoff_returned);
+        let handoff_sender = sender.clone();
+        let handoff = std::thread::spawn(move || {
+            handoff_cleanup_thread(
+                &handoff_sender,
+                EmbeddedCleanupThreadBatch {
+                    thread: second_thread,
+                    joined: std::sync::Arc::clone(&second_joined),
+                    joining: std::sync::Arc::clone(&second_joining),
+                },
+            );
+            handoff_returned_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            spin_until(&handoff_returned),
+            "a second synchronous Drop returns while the first root join is saturated"
+        );
+
+        first_release.store(true, std::sync::atomic::Ordering::SeqCst);
+        second_release.store(true, std::sync::atomic::Ordering::SeqCst);
+        handoff
+            .join()
+            .expect("the second Drop handoff returns cleanly");
+        assert!(
+            spin_until(&first_joined),
+            "the first root terminal is observed exactly"
+        );
+        assert!(
+            spin_until(&second_joining),
+            "the queued second root reaches its owner"
+        );
+        assert!(
+            spin_until(&second_joined),
+            "the second root terminal is observed exactly"
+        );
+
+        drop(sender);
+        drop(slot);
+        drop(scope);
+        drop(port);
+        assert_eq!(provider.in_use(), myownmesh_core::ResourceClaim::ZERO);
+    }
+
+    /// Exercise the actual custodian Drop path with two daemon-shaped cleanup
+    /// owners.  The first root deliberately keeps the reaper's join occupied;
+    /// dropping the second custodian must still return without joining on this
+    /// caller thread, and both cleanup leases must eventually be released.
+    #[test]
+    fn cleanup_custodian_drop_saturation_is_nonblocking_and_exact() {
+        fn spin_until(flag: &std::sync::atomic::AtomicBool) -> bool {
+            for _ in 0..100_000 {
+                if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
+            false
+        }
+
+        let provider = myownmesh_core::FiniteResourceProvider::new(cleanup_reaper_control_grant(3));
+        let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the custodian saturation provider funds its process scope");
+        let scope = myownmesh_core::LocalApplicationResourceScope::transport_lab_child_of(&port)
+            .expect("the custodian saturation provider funds its local scope");
+        let slot = std::sync::Mutex::new(None);
+        let sender = embedded_cleanup_thread_reaper_in(&scope, &slot)
+            .expect("the process owner is established before daemon cleanup");
+        let worker_claim =
+            myownmesh_core::ResourceClaim::single(myownmesh_core::ResourceClass::WorkerOrTask, 1);
+
+        let first_witness = std::sync::Arc::new(EmbeddedTaskWitness::new());
+        let first_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first = EmbeddedCleanupCustodian::new(
+            scope
+                .acquire(worker_claim)
+                .expect("the first daemon cleanup owner is funded"),
+            sender.clone(),
+            std::sync::Arc::clone(&first_witness),
+        )
+        .expect("the first daemon cleanup owner is ready");
+        let first_joining = std::sync::Arc::clone(&first.cleanup_thread_joining);
+        first.request(EmbeddedCleanupRequest::Blocked {
+            release: std::sync::Arc::clone(&first_release),
+        });
+        drop(first);
+        assert!(
+            spin_until(&first_joining),
+            "the reaper is joining the first daemon cleanup root"
+        );
+
+        let second_witness = std::sync::Arc::new(EmbeddedTaskWitness::new());
+        let second_release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second = EmbeddedCleanupCustodian::new(
+            scope
+                .acquire(worker_claim)
+                .expect("the second daemon cleanup owner is funded"),
+            sender.clone(),
+            std::sync::Arc::clone(&second_witness),
+        )
+        .expect("the second daemon cleanup owner is ready");
+        let second_joining = std::sync::Arc::clone(&second.cleanup_thread_joining);
+        second.request(EmbeddedCleanupRequest::Blocked {
+            release: std::sync::Arc::clone(&second_release),
+        });
+
+        let handoff_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handoff_returned_thread = std::sync::Arc::clone(&handoff_returned);
+        let handoff = std::thread::spawn(move || {
+            drop(second);
+            handoff_returned_thread.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert!(
+            spin_until(&handoff_returned),
+            "the second daemon Drop returns while the first root join is saturated"
+        );
+
+        first_release.store(true, std::sync::atomic::Ordering::SeqCst);
+        second_release.store(true, std::sync::atomic::Ordering::SeqCst);
+        handoff
+            .join()
+            .expect("the second daemon Drop handoff returns cleanly");
+        assert!(
+            spin_until(&first_witness.cleanup_thread_joined),
+            "the first daemon cleanup thread is joined exactly once"
+        );
+        assert!(
+            spin_until(&second_joining),
+            "the queued second daemon root reaches the terminal owner"
+        );
+        assert!(
+            spin_until(&second_witness.cleanup_thread_joined),
+            "the second daemon cleanup thread is joined exactly once"
+        );
+        assert!(
+            first_witness
+                .cleanup_terminal
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && second_witness
+                    .cleanup_terminal
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            "both daemon cleanup roots report terminal completion"
+        );
+
+        drop(sender);
+        drop(slot);
         drop(scope);
         drop(port);
         assert_eq!(provider.in_use(), myownmesh_core::ResourceClaim::ZERO);

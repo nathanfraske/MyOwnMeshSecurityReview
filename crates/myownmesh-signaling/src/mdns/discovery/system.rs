@@ -39,6 +39,9 @@ use super::{
     DiscoveryConfig, DiscoveryEvent, DiscoveryLimits, ResolveCompletion, ResolveHint, ResolveLease,
     ResolveOwnership, MAX_DNS_NAME_BYTES, MAX_TXT_KEY_BYTES, MAX_TXT_VALUE_BYTES,
 };
+#[cfg(test)]
+use crate::task_custodian::DedicatedTaskCustodian;
+use crate::task_custodian::{CustodianReservation, TaskCustodian};
 use crate::Error;
 
 /// Poll cadence used only to re-check stop/deadline state around the
@@ -310,6 +313,14 @@ struct Inner {
     /// shutdown joins any that are still live. This keeps callback contexts
     /// and resolve ownership alive only for their owner.
     workers: WorkerRegistry,
+    /// Caller-funded custody retained for the complete native-worker
+    /// envelope. Native DNS-SD handles are joined by `workers`; this
+    /// reservation makes that bounded ownership explicit before the first
+    /// native API call or thread spawn and remains held through shutdown.
+    _worker_custody: CustodianReservation,
+    /// Keep the lifecycle owner alive for the same interval as its
+    /// reservation, including callback-held `Inner` references.
+    _custodian_owner: Arc<dyn TaskCustodian>,
     query_deadline: Duration,
     discovery_limits: DiscoveryLimits,
 }
@@ -488,7 +499,22 @@ impl Discovery {
     /// Connect to the system daemon, start browsing, and hand back the event
     /// stream. Fails fast when the daemon is unreachable (no mDNSResponder /
     /// Avahi) — callers fall back to their other signaling transports.
+    #[cfg(test)]
     pub fn start(cfg: &DiscoveryConfig) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
+        let worker_capacity = cfg
+            .limits
+            .max_resolve_owners
+            .checked_add(2)
+            .ok_or_else(|| Error::Other("system worker capacity overflow".into()))?;
+        let owner = DedicatedTaskCustodian::new(worker_capacity)
+            .map_err(|error| Error::Other(format!("system custodian unavailable: {error:?}")))?;
+        Self::start_with_custodian(cfg, owner)
+    }
+
+    pub fn start_with_custodian(
+        cfg: &DiscoveryConfig,
+        custodian_owner: Arc<dyn TaskCustodian>,
+    ) -> crate::Result<(Self, mpsc::Receiver<DiscoveryEvent>)> {
         if !cfg.validate() || !cfg.limits.validate() || !cfg.timing.validate() {
             return Err(Error::Other("invalid discovery configuration".into()));
         }
@@ -506,6 +532,9 @@ impl Discovery {
             .max_resolve_owners
             .checked_add(2)
             .ok_or_else(|| Error::Other("system worker capacity overflow".into()))?;
+        let worker_custody = custodian_owner
+            .reserve(worker_capacity)
+            .map_err(|error| Error::Other(format!("system worker custody exhausted: {error:?}")))?;
         let regtype = CString::new(regtype_of(&cfg.service_type))
             .map_err(|e| Error::Other(format!("service type: {e}")))?;
         let instance = CString::new(cfg.instance.as_str())
@@ -524,6 +553,8 @@ impl Discovery {
             resolution_fence: Mutex::new(()),
             tx,
             workers: WorkerRegistry::with_capacity(worker_capacity),
+            _worker_custody: worker_custody,
+            _custodian_owner: custodian_owner,
             query_deadline: cfg.timing.query_deadline,
             discovery_limits: cfg.limits,
         });
@@ -1028,9 +1059,10 @@ fn run_resolve(
     regtype: String,
     domain: String,
     interface_index: u32,
-    mut lease: ResolveLease,
+    lease: ResolveLease,
     event_generation: u64,
 ) {
+    let mut lease = Some(lease);
     loop {
         if inner.stopped.load(Ordering::Acquire) {
             return;
@@ -1060,7 +1092,9 @@ fn run_resolve(
             if inner.stopped.load(Ordering::Acquire)
                 || inner.epochs.current(&name) != Some(event_generation)
             {
-                let _ = lease.cancel();
+                if let Some(lease) = lease.take() {
+                    let _ = lease.cancel();
+                }
                 inner.epochs.remove_if_current(&name, event_generation);
                 return;
             }
@@ -1073,7 +1107,10 @@ fn run_resolve(
                     None
                 } else if let Some(event) = pending.take() {
                     match try_publish_resolved(&inner.tx, event) {
-                        Ok(()) => Some(Ok(lease.complete())),
+                        Ok(()) => Some(Ok(lease
+                            .take()
+                            .expect("resolved event handoff owns its lease")
+                            .complete())),
                         Err(ResolvedHandoff::Full(event)) => {
                             pending = Some(event);
                             Some(Err(false))
@@ -1084,27 +1121,36 @@ fn run_resolve(
                         }
                     }
                 } else {
-                    Some(Ok(lease.complete()))
+                    Some(Ok(lease
+                        .take()
+                        .expect("resolved follow-up owns its lease")
+                        .complete()))
                 }
             };
 
             let Some(handoff) = handoff else {
-                let _ = lease.cancel();
+                if let Some(lease) = lease.take() {
+                    let _ = lease.cancel();
+                }
                 inner.epochs.remove_if_current(&name, event_generation);
                 return;
             };
             match handoff {
                 Ok(ResolveCompletion::Finished) => return,
                 Ok(ResolveCompletion::Followup(next)) => {
-                    lease = next;
+                    lease = Some(next);
                     break;
                 }
-                Err(closed) if closed => {
+                Err(true) => {
                     // A closed stream cannot recover; retain the exact event
                     // only long enough to dispose it with its exact lease.
-                    pending.take();
-                    let _ = lease.cancel();
-                    inner.epochs.remove_if_current(&name, event_generation);
+                    discard_closed_resolution(
+                        &inner.epochs,
+                        &name,
+                        event_generation,
+                        lease.take().expect("closed resolution owns its lease"),
+                        &mut pending,
+                    );
                     return;
                 }
                 Err(false) => {
@@ -1116,6 +1162,23 @@ fn run_resolve(
             }
         }
     }
+}
+
+/// Dispose the exact event and ownership for a terminal closed handoff.
+///
+/// A full handoff is deliberately not routed here: the event and lease remain
+/// owned by the resolver for its bounded retry.  Closed is terminal, so both
+/// the event and its exact generation must be settled before the worker exits.
+fn discard_closed_resolution(
+    epochs: &EventEpochs,
+    instance: &str,
+    generation: u64,
+    lease: ResolveLease,
+    pending: &mut Option<DiscoveryEvent>,
+) {
+    pending.take();
+    let _ = lease.cancel();
+    epochs.remove_if_current(instance, generation);
 }
 
 fn resolve_instance(
@@ -1448,6 +1511,77 @@ mod tests {
     }
 
     #[test]
+    fn resolve_handoff_error_states_preserve_or_settle_exact_owner() {
+        let resolving = ResolveOwnership::with_max_owners(2);
+        let epochs = EventEpochs::with_max_epochs(2);
+
+        let full_lease = match resolving.admit("service-full") {
+            ResolveHint::Started(lease) => lease,
+            other => panic!("full-state resolve owner must start: {other:?}"),
+        };
+        let full_generation = epochs.admit("service-full").expect("full epoch");
+        let (tx, mut rx) = mpsc::channel(1);
+        try_publish_resolved(&tx, resolved_for_handoff_test(1, "queued"))
+            .expect("queue must admit the first event");
+        let mut full_pending = Some(resolved_for_handoff_test(2, "service-full"));
+        let full_error: Result<ResolveCompletion, bool> =
+            match try_publish_resolved(&tx, full_pending.take().expect("full event")) {
+                Err(ResolvedHandoff::Full(event)) => {
+                    full_pending = Some(event);
+                    Err(false)
+                }
+                other => panic!("full handoff must preserve its event: {other:?}"),
+            };
+        assert!(matches!(full_error, Err(false)));
+        assert!(full_pending.is_some(), "full must retain its exact event");
+        assert_eq!(resolving.active_count(), 1);
+        assert_eq!(epochs.current("service-full"), Some(full_generation));
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Resolved { key, .. }) if key == "queued"
+        ));
+        try_publish_resolved(&tx, full_pending.take().expect("retained full event"))
+            .expect("full event must publish after capacity is released");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DiscoveryEvent::Resolved { key, .. }) if key == "service-full"
+        ));
+        assert!(matches!(full_lease.complete(), ResolveCompletion::Finished));
+        assert_eq!(resolving.active_count(), 0);
+
+        let closed_lease = match resolving.admit("service-closed") {
+            ResolveHint::Started(lease) => lease,
+            other => panic!("closed-state resolve owner must start: {other:?}"),
+        };
+        let closed_generation = epochs.admit("service-closed").expect("closed epoch");
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        let mut closed_pending = Some(resolved_for_handoff_test(3, "service-closed"));
+        let closed_error: Result<ResolveCompletion, bool> =
+            match try_publish_resolved(&closed_tx, closed_pending.take().expect("closed event")) {
+                Err(ResolvedHandoff::Closed(event)) => {
+                    closed_pending = Some(event);
+                    Err(true)
+                }
+                other => panic!("closed handoff must return its exact event: {other:?}"),
+            };
+        match closed_error {
+            Err(true) => discard_closed_resolution(
+                &epochs,
+                "service-closed",
+                closed_generation,
+                closed_lease,
+                &mut closed_pending,
+            ),
+            other => panic!("closed handoff must be terminal: {other:?}"),
+        }
+        assert!(closed_pending.is_none(), "closed event must be disposed");
+        assert_eq!(resolving.active_count(), 0);
+        assert_eq!(epochs.current("service-closed"), None);
+    }
+
+    #[test]
     fn full_event_stream_stales_removed_generation_before_withdrawal_delivery() {
         let resolving = ResolveOwnership::with_max_owners(1);
         let lease = match resolving.admit("service-stale") {
@@ -1544,6 +1678,40 @@ mod tests {
             .expect("a stale terminal slot is reclaimed before successor admission");
         workers.join_all();
         assert_eq!(workers.len(), 0);
+    }
+
+    #[test]
+    fn injected_custody_refusal_precedes_native_start() {
+        let cfg = DiscoveryConfig {
+            service_type: "_momtest._tcp.local.".into(),
+            instance: "mom-custody-refusal".into(),
+            port: 45454,
+            txt: vec![("v".into(), "1".into())],
+            limits: DiscoveryLimits {
+                max_resolve_owners: 1,
+                event_capacity: 2,
+                max_event_epochs: 2,
+                max_txt_entries: 2,
+                max_txt_bytes: 64,
+                max_resolved_addresses: 2,
+            },
+            timing: crate::mdns::discovery::MdnsTimingProfile::default(),
+        };
+        let owner = DedicatedTaskCustodian::new(1).expect("test custodian starts");
+        let result = Discovery::start_with_custodian(&cfg, owner);
+        match result {
+            Err(Error::Other(message)) => {
+                assert!(
+                    message.contains("system worker custody exhausted"),
+                    "unexpected refusal: {message}"
+                );
+            }
+            Ok((discovery, _events)) => {
+                discovery.shutdown();
+                panic!("worker custody refusal must precede native discovery start");
+            }
+            Err(error) => panic!("unexpected system discovery error: {error}"),
+        }
     }
 
     /// End-to-end through the real system daemon: register an instance, browse

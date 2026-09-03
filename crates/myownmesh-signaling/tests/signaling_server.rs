@@ -44,8 +44,20 @@ impl AttemptOutcomeSink for NoopAttemptOutcomeSink {
 
 const SIGNALLING_TEST_DELIVERY_CAPACITY: usize = 256;
 
+async fn start_test_server(
+    bind: &str,
+    port: u16,
+    limits: Limits,
+) -> Result<myownmesh_signaling::server::SignalingServerHandle, myownmesh_signaling::Error> {
+    let capacity = SignalingServer::required_task_custody_slots(&limits)?;
+    let owner = DedicatedTaskCustodian::new(capacity)
+        .map_err(|error| myownmesh_signaling::Error::Other(format!("test custodian: {error:?}")))?;
+    SignalingServer::start_with_custodian(bind, port, limits, owner).await
+}
+
 fn test_nostr_timing() -> myownmesh_signaling::nostr::driver::NostrTimingConfig {
     myownmesh_signaling::nostr::driver::NostrTimingConfig {
+        connect_timeout: Duration::from_secs(30),
         reconnect_initial: Duration::from_secs(2),
         reconnect_max: Duration::from_secs(60),
         reconnect_max_attempts: 6,
@@ -155,6 +167,29 @@ impl DeliveryLease for FiniteTestLease {
 }
 
 impl DeliveryProvider for FiniteTestProvider {
+    fn reserve_inbound_frame(
+        &self,
+        _frame_bytes: usize,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_session_identity(
+        &self,
+        _retention: SessionRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
     fn reserve_session_record(
         &self,
         _session: RelaySessionId,
@@ -171,7 +206,7 @@ impl DeliveryProvider for FiniteTestProvider {
         self.reserve_one()
     }
 
-    fn reserve_session_set_growth(
+    fn reserve_session_entry(
         &self,
         _session: RelaySessionId,
         _retention: SessionRetention,
@@ -197,7 +232,7 @@ impl DeliveryProvider for FiniteTestProvider {
         self.reserve_one()
     }
 
-    fn reserve_attempt_map_growth(
+    fn reserve_attempt_entry(
         &self,
         _attempt: &str,
         _event: &myownmesh_signaling::nostr::event::NostrEvent,
@@ -216,10 +251,19 @@ impl DeliveryProvider for FiniteTestProvider {
         self.reserve_one()
     }
 
-    fn reserve_relay_map_growth(
+    fn reserve_relay_entry(
         &self,
         _attempt: &str,
         _session: RelaySessionId,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.reserve_one()
+    }
+
+    fn reserve_attempt_correlation(
+        &self,
+        _attempt: &str,
         _event: &myownmesh_signaling::nostr::event::NostrEvent,
         _retention: DeliveryRetention,
     ) -> std::result::Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
@@ -263,7 +307,7 @@ fn signed_event(kind: u16, room: &str, content: &str, created_at: u64) -> Value 
 
 #[tokio::test]
 async fn relay_forwards_event_to_matching_subscriber() {
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -307,7 +351,7 @@ async fn relay_forwards_event_to_matching_subscriber() {
 
 #[tokio::test]
 async fn relay_replays_stored_presence_to_late_subscriber() {
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -347,7 +391,7 @@ async fn relay_replays_stored_presence_to_late_subscriber() {
 
 #[tokio::test]
 async fn ephemeral_events_are_not_stored() {
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -380,7 +424,7 @@ async fn ephemeral_events_are_not_stored() {
 
 #[tokio::test]
 async fn unadvertised_profile_kind_is_excluded_from_matching_stream() {
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -430,7 +474,7 @@ async fn two_drivers_discover_via_self_hosted_relay() {
     use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -508,7 +552,7 @@ async fn driver_self_announced_leave_reaches_peer() {
     use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -595,7 +639,7 @@ async fn driver_self_announced_leave_reaches_peer() {
 // the authenticated `SessionControl::Depart` over the session itself.
 #[tokio::test]
 async fn relay_emits_leave_when_member_disconnects() {
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -655,7 +699,7 @@ async fn driver_gets_peer_left_when_peer_disconnects() {
     use myownmesh_signaling::nostr::driver::{NostrDriverConfig, NostrInbound, NostrOutbound};
     use tokio::sync::mpsc;
 
-    let server = SignalingServer::start("127.0.0.1", 0, Limits::default())
+    let server = start_test_server("127.0.0.1", 0, Limits::default())
         .await
         .unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
@@ -736,7 +780,7 @@ async fn zero_limit_configuration_is_rejected_before_binding() {
         max_connections: 0,
         ..Limits::default()
     };
-    let error = SignalingServer::start("127.0.0.1", 0, limits)
+    let error = start_test_server("127.0.0.1", 0, limits)
         .await
         .err()
         .expect("an unlimited global admission must be rejected");
@@ -749,9 +793,7 @@ async fn global_admission_cap_applies_before_websocket_handshake() {
         max_connections: 1,
         ..Limits::default()
     };
-    let server = SignalingServer::start("127.0.0.1", 0, limits)
-        .await
-        .unwrap();
+    let server = start_test_server("127.0.0.1", 0, limits).await.unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
     let (first, _) = connect_async(&url).await.unwrap();
     let second = tokio::time::timeout(Duration::from_secs(2), connect_async(&url))
@@ -771,7 +813,7 @@ async fn global_admission_cap_applies_before_websocket_handshake() {
 
 #[tokio::test]
 async fn normal_connection_completion_releases_admission_before_shutdown() {
-    let server = SignalingServer::start(
+    let server = start_test_server(
         "127.0.0.1",
         0,
         Limits {
@@ -804,7 +846,7 @@ async fn normal_connection_completion_releases_admission_before_shutdown() {
 
 #[tokio::test]
 async fn stalled_peer_stays_admitted_until_writer_settlement_then_allows_successor() {
-    let server = SignalingServer::start(
+    let server = start_test_server(
         "127.0.0.1",
         0,
         Limits {
@@ -856,9 +898,7 @@ async fn handshake_bytes_are_bounded_before_websocket_parser() {
         max_handshake_bytes: 64,
         ..Limits::default()
     };
-    let server = SignalingServer::start("127.0.0.1", 0, limits)
-        .await
-        .unwrap();
+    let server = start_test_server("127.0.0.1", 0, limits).await.unwrap();
     let mut stream = TcpStream::connect(server.local_addr()).await.unwrap();
     stream.write_all(b"GET / HTTP/1.1\r\nHost: ").await.unwrap();
     stream.write_all(&[b'x'; 128]).await.unwrap();
@@ -880,9 +920,7 @@ async fn websocket_frame_and_message_limits_refuse_before_json_parse() {
         max_frame_bytes: 32,
         ..Limits::default()
     };
-    let server = SignalingServer::start("127.0.0.1", 0, limits)
-        .await
-        .unwrap();
+    let server = start_test_server("127.0.0.1", 0, limits).await.unwrap();
     let url = format!("ws://127.0.0.1:{}", server.local_addr().port());
     let (mut ws, _) = connect_async(&url).await.unwrap();
     ws.send(Message::Text("x".repeat(128))).await.unwrap();

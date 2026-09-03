@@ -6,6 +6,27 @@ use super::{
     AttestationDecision, ExclusiveCell, FactBody, FactId, MeshContextId, Role, SignedFact,
 };
 
+/// The bounded semantic resource whose admission would exceed the verified
+/// owner policy.  This remains typed so callers cannot mistake a fact-count
+/// refusal for an encoded-byte or dependency-graph refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticCapacityDimension {
+    FactEncodedBytes,
+    DependenciesPerFact,
+    AuthorityUsesPerFact,
+    AuthorityPredecessorsPerUse,
+    AdmittedFacts,
+    AdmittedBytes,
+    QuarantinedFacts,
+    QuarantinedBytes,
+    QuarantinedFactsPerAuthor,
+    QuarantinedBytesPerAuthor,
+    RetainedFactsPerAuthor,
+    RetainedBytesPerAuthor,
+    DependencyEdges,
+    ReadyBatch,
+}
+
 /// Errors raised before a fact can enter the canonical causal graph.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum SemanticError {
@@ -19,8 +40,6 @@ pub enum SemanticError {
     UnsortedParents,
     #[error("fact contains a duplicate parent")]
     DuplicateParent,
-    #[error("open participation must be authored by its device")]
-    InvalidOpenAuthor,
     #[error("fact content author does not match the signing key")]
     AuthorMismatch,
     #[error("{0} contains a noncanonical set")]
@@ -50,6 +69,10 @@ pub enum SemanticError {
     ResolutionSelectionNotCited,
     #[error("fact {0} is already present with different content")]
     DuplicateFact(FactId),
+    #[error("semantic operation is a no-op: {0}")]
+    NoOp(&'static str),
+    #[error("fact signer is not currently eligible for quarantine")]
+    QuarantineSignerNotEligible,
     #[error("resolution does not apply to its current exclusive cell")]
     ResolutionNotCurrent,
     #[error("eviction proof author is not currently authorized")]
@@ -66,6 +89,14 @@ pub enum SemanticError {
     InvalidStandDownProof,
     #[error("fact carries invalid signed AuthorityUse lineage")]
     InvalidAuthorityUse,
+    #[error("semantic capacity {dimension:?} exceeded: {observed} > {limit}")]
+    CapacityExceeded {
+        dimension: SemanticCapacityDimension,
+        limit: u64,
+        observed: u64,
+    },
+    #[error("canonical fact encoding failed")]
+    EncodingFailed,
 }
 
 /// Verify canonical content, its content-derived identifier, and its signature.
@@ -110,21 +141,6 @@ pub(crate) fn projected_membership(body: &FactBody, subject: &super::DeviceId) -
     match body {
         FactBody::Evict { target } if target == subject => Some(false),
         FactBody::MembershipAdmit { target } if target == subject => Some(true),
-        _ => None,
-    }
-}
-
-pub(crate) fn projected_open_participation(
-    body: &FactBody,
-    author: &super::DeviceId,
-    subject: &super::DeviceId,
-) -> Option<bool> {
-    match body {
-        FactBody::OpenParticipation { device_id, joined }
-            if device_id == subject && author == subject =>
-        {
-            Some(*joined)
-        }
         _ => None,
     }
 }

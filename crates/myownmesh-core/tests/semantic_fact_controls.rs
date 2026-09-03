@@ -6,11 +6,20 @@ use std::collections::HashMap;
 
 use ed25519_dalek::SigningKey;
 
-use myownmesh_core::protocol::FactBundleMessage;
+use myownmesh_core::protocol::FactPageMessage;
 use myownmesh_core::semantic::{
     Admission, AttestationDecision, DeviceId, ExclusiveCell, FactBody, FactContent, FactDomain,
-    FactGraph, FactId, Role, SemanticError, SignedFact, VerifiedBootstrap,
+    FactGraph, FactId, Role, SemanticAdmissionPolicy, SemanticCapacityDimension, SemanticError,
+    SignedFact, VerifiedBootstrap,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphState {
+    context_id: myownmesh_core::semantic::MeshContextId,
+    admitted: Vec<(FactId, Vec<u8>)>,
+    quarantined: Vec<(FactId, Vec<u8>)>,
+    projection: myownmesh_core::semantic::Projection,
+}
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -37,6 +46,30 @@ fn fact(
         key,
     )
     .expect("semantic fixture fact signs")
+}
+
+fn graph_state(graph: &FactGraph) -> GraphState {
+    GraphState {
+        context_id: graph.context_id(),
+        admitted: graph
+            .ids()
+            .map(|id| {
+                (
+                    *id,
+                    graph
+                        .get(id)
+                        .expect("admitted fact remains present")
+                        .content
+                        .canonical_bytes(),
+                )
+            })
+            .collect(),
+        quarantined: graph
+            .quarantined()
+            .map(|(id, fact)| (*id, fact.content.canonical_bytes()))
+            .collect(),
+        projection: graph.projection(),
+    }
 }
 
 fn authored(
@@ -117,19 +150,18 @@ fn wire_file_and_cache_round_trips_preserve_one_fact_identity() {
         },
         Vec::new(),
     );
-    let wire = serde_json::to_vec(&FactBundleMessage {
-        facts: vec![signed.clone()],
-    })
-    .expect("fact bundle serializes");
-    let decoded: FactBundleMessage = serde_json::from_slice(&wire).expect("fact bundle decodes");
+    let page = FactPageMessage::new(bootstrap.context_id(), vec![signed.clone()], None, true)
+        .expect("fact page is bounded");
+    let wire = serde_json::to_vec(&page).expect("fact page serializes");
+    let decoded: FactPageMessage = serde_json::from_slice(&wire).expect("fact page decodes");
     assert_eq!(decoded.facts[0], signed);
     assert_eq!(decoded.facts[0].id, signed.id);
 
     let file = tempfile::NamedTempFile::new().expect("semantic fixture file opens");
-    std::fs::write(file.path(), &wire).expect("canonical bundle writes to file");
-    let from_file: FactBundleMessage =
-        serde_json::from_slice(&std::fs::read(file.path()).expect("canonical bundle reads"))
-            .expect("canonical file bundle decodes");
+    std::fs::write(file.path(), &wire).expect("canonical page writes to file");
+    let from_file: FactPageMessage =
+        serde_json::from_slice(&std::fs::read(file.path()).expect("canonical page reads"))
+            .expect("canonical file page decodes");
     assert_eq!(from_file.facts[0], signed);
 
     let mut cache = HashMap::new();
@@ -241,39 +273,9 @@ fn ready_invalid_fact_does_not_starve_valid_sibling_in_either_arrival_order() {
 }
 
 #[test]
-fn open_participation_is_self_authored_and_eviction_proof_stands_down() {
+fn eviction_proof_stands_down_and_restoration_is_causal() {
     let signing_key = key(4);
-    let bootstrap = VerifiedBootstrap::open("semantic-controls").expect("open bootstrap");
     let device = author(&signing_key);
-    let participation =
-        FactContent::open_participation(bootstrap.context_id(), device.clone(), true, Vec::new());
-    let signed_participation =
-        SignedFact::sign(participation, &signing_key).expect("participation signs");
-    assert!(signed_participation.verify().is_ok());
-
-    let invalid = FactContent::new(
-        FactDomain::Participation,
-        bootstrap.context_id(),
-        FactBody::OpenParticipation {
-            device_id: author(&key(6)),
-            joined: true,
-        },
-        device.clone(),
-        Vec::new(),
-    );
-    assert!(matches!(
-        SignedFact::sign(invalid, &signing_key),
-        Err(SemanticError::InvalidOpenAuthor)
-    ));
-
-    let open_graph = {
-        let mut graph = FactGraph::from_bootstrap(&bootstrap);
-        graph
-            .admit(signed_participation)
-            .expect("self-authored participation admits");
-        graph
-    };
-    assert_eq!(open_graph.context_id(), bootstrap.context_id());
 
     let eviction_bootstrap = closed_bootstrap(4, 4);
     let eviction_target = author(&key(6));
@@ -368,6 +370,89 @@ fn proof_id_for(graph: &FactGraph, target: &DeviceId) -> FactId {
 }
 
 #[test]
+fn closed_repeats_are_idempotent_and_author_lifetime_cap_is_exact() {
+    let root_key = key(200);
+    let bootstrap = closed_bootstrap(200, 200);
+    let target_a = author(&key(201));
+    let target_b = author(&key(202));
+    let target_c = author(&key(203));
+    let mut policy = SemanticAdmissionPolicy::default();
+    policy.max_retained_facts_per_author = 4;
+    let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
+
+    let meaningful = [
+        FactBody::RoleGrant {
+            target: target_a.clone(),
+            role: Role::Member,
+        },
+        FactBody::RoleGrant {
+            target: target_b.clone(),
+            role: Role::Member,
+        },
+        FactBody::RoleRevoke { target: target_a },
+        FactBody::RoleRevoke { target: target_b },
+    ];
+    for body in meaningful {
+        let candidate = authored(&graph, &root_key, body, Vec::new());
+        assert_eq!(graph.admit(candidate.clone()), Ok(Admission::Inserted));
+        let before_repeat = graph_state(&graph);
+        assert_eq!(graph.admit(candidate), Ok(Admission::AlreadyPresent));
+        assert_eq!(
+            graph_state(&graph),
+            before_repeat,
+            "a repeated state-equivalent fact has no graph or projection growth"
+        );
+    }
+
+    let before_n_plus_one = graph_state(&graph);
+    let over_cap = authored(
+        &graph,
+        &root_key,
+        FactBody::RoleGrant {
+            target: target_c,
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    assert!(matches!(
+        graph.admit(over_cap),
+        Err(SemanticError::CapacityExceeded {
+            dimension: SemanticCapacityDimension::RetainedFactsPerAuthor,
+            limit: 4,
+            observed: 5,
+        })
+    ));
+    assert_eq!(
+        graph_state(&graph),
+        before_n_plus_one,
+        "the retained-per-author N+1 refusal leaves graph, projection, and identity unchanged"
+    );
+}
+
+#[test]
+fn open_lifecycle_has_zero_durable_fact_authorship() {
+    let bootstrap = VerifiedBootstrap::open("semantic-open-presence").expect("open bootstrap");
+    let signer = key(204);
+    let candidate = fact(
+        &bootstrap,
+        &signer,
+        FactBody::RoleGrant {
+            target: author(&signer),
+            role: Role::Member,
+        },
+        Vec::new(),
+    );
+    let mut graph = FactGraph::from_bootstrap(&bootstrap);
+    let before = graph_state(&graph);
+    assert_eq!(
+        graph.admit(candidate),
+        Err(SemanticError::DomainMismatch),
+        "Open lifecycle presence cannot author a durable governance fact"
+    );
+    assert_eq!(graph_state(&graph), before);
+}
+
+#[test]
 fn attestation_mutation_and_forged_eviction_are_rejected() {
     let signing_key = key(5);
     let bootstrap = closed_bootstrap(5, 5);
@@ -414,7 +499,7 @@ fn attestation_mutation_and_forged_eviction_are_rejected() {
     );
     assert!(matches!(
         SignedFact::sign(mismatched_eviction, &signing_key),
-        Err(SemanticError::InvalidOpenAuthor)
+        Err(SemanticError::InvalidStandDownProof)
     ));
 }
 
@@ -441,101 +526,6 @@ fn foreign_context_is_rejected_before_quarantine() {
     ));
     assert_eq!(graph.len(), 0);
     assert_eq!(graph.quarantined().count(), 0);
-}
-
-#[test]
-fn open_resolution_is_recursive_and_foreign_resolution_fails_closed() {
-    let participant_key = key(18);
-    let participant = author(&participant_key);
-    let bootstrap =
-        VerifiedBootstrap::open("semantic-open-resolution").expect("open bootstrap verifies");
-    let cell = myownmesh_core::semantic::ExclusiveCell::open_participation(participant.clone());
-    let joined = fact(
-        &bootstrap,
-        &participant_key,
-        FactBody::OpenParticipation {
-            device_id: participant.clone(),
-            joined: true,
-        },
-        Vec::new(),
-    );
-    let left = fact(
-        &bootstrap,
-        &participant_key,
-        FactBody::OpenParticipation {
-            device_id: participant.clone(),
-            joined: false,
-        },
-        Vec::new(),
-    );
-    let mut graph = FactGraph::from_bootstrap(&bootstrap);
-    graph
-        .admit(joined.clone())
-        .expect("joined participation admits");
-    graph
-        .admit(left.clone())
-        .expect("left participation admits");
-    let mut heads = graph.cell_heads(&cell);
-    heads.sort();
-    let first_resolution = authored(
-        &graph,
-        &participant_key,
-        FactBody::Resolution {
-            cell: cell.clone(),
-            cited_heads: heads.clone(),
-            selected_head: joined.id,
-        },
-        Vec::new(),
-    );
-    graph
-        .admit(first_resolution.clone())
-        .expect("self-authored Open resolution admits");
-
-    let right = fact(
-        &bootstrap,
-        &participant_key,
-        FactBody::OpenParticipation {
-            device_id: participant.clone(),
-            joined: false,
-        },
-        vec![joined.id],
-    );
-    graph.admit(right).expect("successor participation admits");
-    let mut current_heads = graph.cell_heads(&cell);
-    current_heads.sort();
-    let foreign_key = key(19);
-    let foreign_resolution = fact(
-        &bootstrap,
-        &foreign_key,
-        FactBody::Resolution {
-            cell: cell.clone(),
-            cited_heads: current_heads.clone(),
-            selected_head: first_resolution.id,
-        },
-        current_heads.clone(),
-    );
-    assert_eq!(
-        graph.admit(foreign_resolution),
-        Err(SemanticError::InvalidOpenAuthor)
-    );
-
-    let nested_resolution = authored(
-        &graph,
-        &participant_key,
-        FactBody::Resolution {
-            cell: cell.clone(),
-            cited_heads: current_heads.clone(),
-            selected_head: first_resolution.id,
-        },
-        Vec::new(),
-    );
-    graph
-        .admit(nested_resolution)
-        .expect("recursive self-authored Open resolution admits");
-    assert_eq!(
-        graph.evaluator().effective_open_participation(&participant),
-        Some(true)
-    );
 }
 
 #[test]
@@ -1245,28 +1235,28 @@ fn cross_cell_resolution_cannot_select_a_role_authority_fork() {
         "the losing O/RoleGrant(X) remains inactive"
     );
 
-    // OpenParticipation resolutions are profile-gated. Even when a caller
-    // can construct the typed payload and cite the exact fork, Closed
-    // admission must reject it before it can affect either projection.
-    let open_resolution = authored(
+    // A Closed authority selector must cite the complete current lineage.
+    // An incomplete typed selector is refused before it can affect either
+    // projection; no removed Open participation cell is involved.
+    let incomplete_authority_resolution = authored(
         &graph,
         &root_key,
-        FactBody::Resolution {
-            cell: ExclusiveCell::open_participation(controller.clone()),
-            cited_heads: authority_heads,
+        FactBody::AuthorityLineageResolution {
+            subject: controller.clone(),
+            cited_heads: vec![revoke.id],
             selected_head: revoke.id,
         },
         Vec::new(),
     );
     assert_eq!(
-        graph.admit(open_resolution),
-        Err(SemanticError::DomainMismatch),
-        "Closed graphs cannot use OpenParticipation(C) to select authority"
+        graph.admit(incomplete_authority_resolution),
+        Err(SemanticError::IncompleteResolution),
+        "an incomplete Closed authority selector is refused before projection"
     );
     assert_eq!(
         graph.evaluator().effective_role(&target),
         None,
-        "a rejected participation payload leaves the role loser inactive"
+        "a rejected authority selector leaves the role loser inactive"
     );
 }
 
@@ -1436,194 +1426,6 @@ fn second_order_payload_resolution_cannot_join_the_role_authority_fork() {
         fork.authority_lineage(&controller).selected_branch(),
         None,
         "no payload resolution invents a selected AuthorityUse(C) branch"
-    );
-}
-
-#[test]
-fn open_participation_payload_fork_stays_in_its_ordinary_cell() {
-    let subject_key = key(133);
-    let subject = author(&subject_key);
-    let bootstrap =
-        VerifiedBootstrap::open("semantic-open-payload-fork").expect("open bootstrap verifies");
-    let cell = ExclusiveCell::open_participation(subject.clone());
-    let base = FactGraph::from_bootstrap(&bootstrap);
-    let joined = authored(
-        &base,
-        &subject_key,
-        FactBody::OpenParticipation {
-            device_id: subject.clone(),
-            joined: true,
-        },
-        Vec::new(),
-    );
-    let left = authored(
-        &base,
-        &subject_key,
-        FactBody::OpenParticipation {
-            device_id: subject.clone(),
-            joined: false,
-        },
-        Vec::new(),
-    );
-    let left_id = left.id;
-    let joined_id = joined.id;
-    let mut graph = base;
-    graph.admit(joined).expect("open participation fact admits");
-    graph
-        .admit(left)
-        .expect("concurrent open participation fact admits");
-    assert_eq!(graph.cell_heads(&cell).len(), 2);
-    assert!(graph.projection().is_conflicted(&cell));
-
-    let mut payload_heads = graph.cell_heads(&cell);
-    payload_heads.sort();
-    let mut expected_payload_heads = vec![joined_id, left_id];
-    expected_payload_heads.sort();
-    assert_eq!(
-        payload_heads, expected_payload_heads,
-        "OpenParticipation exposes the exact two ordinary payload heads"
-    );
-    let authority_heads = graph.authority_use_heads(&subject);
-    assert!(
-        authority_heads.is_empty(),
-        "OpenParticipation has no AuthorityUse(subject) lineage heads"
-    );
-    let resolution = authored(
-        &graph,
-        &subject_key,
-        FactBody::Resolution {
-            cell: cell.clone(),
-            cited_heads: payload_heads,
-            selected_head: left_id,
-        },
-        Vec::new(),
-    );
-    let subject_use = resolution
-        .content
-        .authority_uses
-        .iter()
-        .find(|authority_use| authority_use.subject == subject)
-        .expect("the canonical payload Q carries only an empty subject-use witness");
-    assert_eq!(
-        subject_use.predecessors, authority_heads,
-        "OpenParticipation Q carries no subject-use predecessor witness"
-    );
-    let admission = graph.admit(resolution);
-    let q_inserted = matches!(&admission, Ok(Admission::Inserted));
-    assert!(
-        matches!(
-            &admission,
-            Ok(Admission::Inserted) | Err(SemanticError::IncompleteResolution)
-        ),
-        "OpenParticipation Q is rejected or remains payload-local"
-    );
-    assert_eq!(
-        graph.authority_lineage(&subject).selected_branch(),
-        None,
-        "OpenParticipation Q cannot invent an AuthorityUse branch selection"
-    );
-    if q_inserted {
-        assert_eq!(
-            graph.evaluator().effective_open_participation(&subject),
-            Some(false),
-            "a payload-local Q selects only its OpenParticipation cell"
-        );
-
-        let nested_joined = authored(
-            &graph,
-            &subject_key,
-            FactBody::OpenParticipation {
-                device_id: subject.clone(),
-                joined: true,
-            },
-            Vec::new(),
-        );
-        let nested_left = authored(
-            &graph,
-            &subject_key,
-            FactBody::OpenParticipation {
-                device_id: subject.clone(),
-                joined: false,
-            },
-            Vec::new(),
-        );
-        let nested_cell = ExclusiveCell::open_participation(subject.clone());
-        graph
-            .admit(nested_joined.clone())
-            .expect("nested OpenParticipation branch admits");
-        graph
-            .admit(nested_left.clone())
-            .expect("nested OpenParticipation fork admits");
-        let mut nested_heads = graph.cell_heads(&nested_cell);
-        nested_heads.sort();
-        let nested_resolution = authored(
-            &graph,
-            &subject_key,
-            FactBody::Resolution {
-                cell: nested_cell,
-                cited_heads: nested_heads,
-                selected_head: nested_left.id,
-            },
-            Vec::new(),
-        );
-        let nested_subject_use = nested_resolution
-            .content
-            .authority_uses
-            .iter()
-            .find(|authority_use| authority_use.subject == subject)
-            .expect("nested payload Q carries an empty subject-use witness");
-        assert!(nested_subject_use.predecessors.is_empty());
-        graph
-            .admit(nested_resolution)
-            .expect("nested self-authored Open resolution admits");
-        assert!(
-            graph.authority_use_heads(&subject).is_empty(),
-            "nested payload resolutions never create AuthorityUse(subject) heads"
-        );
-        assert_eq!(
-            graph.authority_lineage(&subject).selected_branch(),
-            None,
-            "nested payload Q cannot select an authority branch"
-        );
-        assert_eq!(
-            graph.evaluator().effective_open_participation(&subject),
-            Some(false),
-            "nested payload projection follows its selected OpenParticipation head"
-        );
-    } else {
-        assert_eq!(
-            graph.authority_lineage(&subject).heads(),
-            &[],
-            "rejected Q leaves AuthorityUse(subject) lineage empty"
-        );
-        assert_eq!(
-            graph.evaluator().effective_open_participation(&subject),
-            None,
-            "a rejected Q leaves the conflicting payload fail-closed"
-        );
-    }
-
-    // Closed role authority cannot be composed into this Open graph: the
-    // profile rejects governance RoleGrant facts before any role loser could
-    // be introduced or projected.
-    let role_payload = fact(
-        &bootstrap,
-        &subject_key,
-        FactBody::RoleGrant {
-            target: subject.clone(),
-            role: Role::Member,
-        },
-        Vec::new(),
-    );
-    assert_eq!(
-        graph.admit(role_payload),
-        Err(SemanticError::DomainMismatch),
-        "Open domain cannot compose the Closed Role-fork schedule"
-    );
-    assert_eq!(
-        graph.evaluator().effective_open_participation(&subject),
-        if q_inserted { Some(false) } else { None },
-        "Open projection remains determined only by its ordinary payload result"
     );
 }
 

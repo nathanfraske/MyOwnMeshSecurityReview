@@ -148,6 +148,13 @@ const TEST_IPC_REGISTRY_COORDINATE_BYTES: usize = 256;
 #[cfg(test)]
 const TEST_CONTROL_INBOUND_FRAMES: u64 = 16;
 
+/// Maximum simultaneously live semantic network owners in one daemon-library
+/// test. The transport pair fixture and the two-network control/registry
+/// fixtures are the largest in this binary; single-network fixtures do not
+/// increase this bound.
+#[cfg(test)]
+const TEST_SEMANTIC_NETWORKS_PER_WORKER: u64 = 2;
+
 /// One explicitly finite provider shared by daemon-library tests.
 ///
 /// These are fixture resources, not production defaults. The callback and
@@ -188,6 +195,21 @@ fn test_resource_pair() -> (
     PROVIDER
         .get_or_init(|| {
             let connectors = TEST_PROCESS_CONNECTOR_CAPACITY as u64;
+            let test_workers = std::env::var("RUST_TEST_THREADS")
+                .ok()
+                .map(|raw| {
+                    raw.parse::<std::num::NonZeroUsize>()
+                        .expect("RUST_TEST_THREADS must be a nonzero integer")
+                })
+                .unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .expect("daemon test worker concurrency must be observable")
+                });
+            let test_workers =
+                u64::try_from(test_workers.get()).expect("daemon test workers fit u64");
+            let semantic_owner_count = test_workers
+                .checked_mul(TEST_SEMANTIC_NETWORKS_PER_WORKER)
+                .expect("daemon semantic owner concurrency is representable");
             let callback_items_per_connector = 32_u64;
             // Each class funds its own callback slots from its own stated
             // ceiling, summed — not one figure spread across both.
@@ -318,6 +340,39 @@ fn test_resource_pair() -> (
                 .and_then(|claim| claim.checked_add(ipc_tasks))
                 .and_then(|claim| claim.checked_add(control_inbound))
                 .expect("daemon test resource grant is representable");
+            // Every live NetworkState retains one semantic database. Charge
+            // the real default policy budget once per possible live owner and
+            // apply the provider's exact reservation bookkeeping before
+            // scaling; scaling the raw claim would omit one record per owner.
+            let semantic_policy = myownmesh_core::config::SemanticPolicyConfig::default();
+            let semantic_storage_claim = myownmesh_core::ResourceClaim::single(
+                myownmesh_core::ResourceClass::StorageBytes,
+                semantic_policy.max_database_bytes,
+            );
+            let semantic_storage_grant =
+                myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+                    semantic_storage_claim,
+                )
+                .expect("daemon semantic storage reservation is representable")
+                .checked_scale(semantic_owner_count)
+                .expect("daemon semantic storage owner capacity is representable");
+            assert_eq!(
+                semantic_storage_grant.amount(myownmesh_core::ResourceClass::StorageBytes),
+                semantic_policy
+                    .max_database_bytes
+                    .checked_mul(semantic_owner_count)
+                    .expect("daemon semantic storage byte capacity is representable"),
+                "daemon semantic storage equals the default policy per live owner"
+            );
+            assert_eq!(
+                semantic_storage_grant
+                    .amount(myownmesh_core::ResourceClass::OpaqueDependencyResidual,),
+                semantic_owner_count,
+                "daemon semantic storage includes one reservation record per live owner"
+            );
+            let claim = claim
+                .checked_add(semantic_storage_grant)
+                .expect("daemon semantic storage grant combines without overflow");
             let provider = myownmesh_core::FiniteResourceProvider::new(claim);
             let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
                 .expect("daemon test resource provider admits its process scope");

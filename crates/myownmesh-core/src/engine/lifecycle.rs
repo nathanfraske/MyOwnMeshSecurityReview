@@ -4,13 +4,15 @@ use std::sync::Arc;
 use crate::config::NetworkConfig;
 use crate::error::{Error, Result};
 use crate::identity::Identity;
-use crate::protocol::{FactBundleMessage, MeshMessage};
+use crate::protocol::{FactPageMessage, MeshMessage};
 use crate::resource::{LocalApplicationResourceScope, MeshRuntimeResourceScope};
 use crate::semantic::{
-    BootstrapRecord, ClosedProfileId, DeviceId, ExpectedMeshContext, MeshContextId, SignedFact,
+    BootstrapRecord, ClosedProfileId, ExpectedMeshContext, FactId, MeshContextId, SignedFact,
     VerifiedBootstrap, VerifiedProjectPolicy,
 };
 use crate::transport::Transport;
+use serde::ser::{Serialize, SerializeSeq, SerializeStruct, Serializer};
+use sha2::{Digest, Sha256};
 
 use super::state::NetworkState;
 
@@ -281,41 +283,6 @@ async fn spawn_network_in_mesh_scope_with_verified_bootstrap(
     Ok((state, handle))
 }
 
-/// Explicitly join the local Open lifecycle at the low-level engine seam.
-///
-/// Authentication and carrier presence never author participation. A fresh
-/// Open network joins once; a persisted negative participation head re-enters
-/// through the causal rejoin API; an already-positive head is left untouched.
-/// Closed networks have no local Open lifecycle fact to manufacture.
-pub(crate) async fn join_open_participation(state: &Arc<NetworkState>) -> Result<()> {
-    join_open_participation_impl(state).await
-}
-
-async fn join_open_participation_impl(state: &Arc<NetworkState>) -> Result<()> {
-    if !matches!(
-        state.verified_bootstrap().policy(),
-        VerifiedProjectPolicy::Open
-    ) {
-        return Ok(());
-    }
-    let local = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|error| Error::Other(format!("local Open identity is not canonical: {error}")))?;
-    let participation = {
-        let graph = state.authoritative_fact_graph();
-        let graph = graph.read();
-        graph.evaluator().effective_open_participation(&local)
-    };
-    match participation {
-        Some(true) => Ok(()),
-        Some(false) => super::governance::rejoin_open_participation(state)
-            .await
-            .map(|_| ()),
-        None => super::governance::join_open_participation(state)
-            .await
-            .map(|_| ()),
-    }
-}
-
 /// Ingest one authenticated canonical fact through the production semantic
 /// reducer. Carrier/session identity is deliberately absent: the signed fact
 /// supplies its own authority and the reducer supplies durable admission,
@@ -328,25 +295,403 @@ pub(crate) async fn ingest_semantic_fact(state: &Arc<NetworkState>, fact: Signed
     super::semantic_ingress::reduce(state, exchange, None).await;
 }
 
-/// Import a verified bundle of canonical facts through the same durable
-/// semantic reducer used by wire delivery.
-///
-/// This is a bootstrap/repair seam, not an authority seam: signatures and
-/// canonical content are checked before framing, while authorization,
-/// dependency quarantine, custody, and projection remain exclusively owned by
-/// the bootstrap-bound `FactGraph` and durable semantic owner. Success means
-/// the bundle was accepted by the durable reducer; individual facts may still
-/// be quarantined until their dependencies arrive.
-pub(crate) async fn import_signed_facts(
+async fn reduce_verified_facts(
     state: &Arc<NetworkState>,
+    context_id: MeshContextId,
     facts: Vec<SignedFact>,
+    next_cursor: Option<FactId>,
+    complete: bool,
 ) -> Result<()> {
-    if facts.is_empty() {
+    let page = FactPageMessage::new(context_id, facts, next_cursor, complete)
+        .map_err(|error| Error::Other(format!("signed fact page refused: {error}")))?;
+    let exchange = super::semantic_ingress::DurableSemanticPort::admit(MeshMessage::FactPage(page))
+        .map_err(|_| Error::Other("signed fact page was not a durable exchange".into()))?;
+    super::semantic_ingress::reduce(state, exchange, None).await;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct SemanticFactPageOwnedWire<'a> {
+    context_id: crate::semantic::MeshContextId,
+    facts: &'a [SignedFact],
+    next_cursor: Option<crate::semantic::FactId>,
+    complete: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SemanticPageMetadataWire {
+    context_id: crate::semantic::MeshContextId,
+    facts: EmptyFacts,
+    next_cursor: Option<crate::semantic::FactId>,
+    complete: bool,
+}
+
+#[derive(serde::Serialize)]
+struct SemanticStateIdentityWire {
+    context_id: crate::semantic::MeshContextId,
+    admitted_fact_count: u64,
+    unresolved_fact_count: u64,
+    projection_commitment: [u8; 32],
+    state_commitment: [u8; 32],
+}
+
+struct EmptyFacts;
+
+impl Serialize for EmptyFacts {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_seq(Some(0))?.end()
+    }
+}
+
+struct FactIdsWire<'a> {
+    facts: &'a [SignedFact],
+}
+
+impl Serialize for FactIdsWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.facts.len()))?;
+        for fact in self.facts {
+            sequence.serialize_element(&fact.id)?;
+        }
+        sequence.end()
+    }
+}
+
+struct SelectedFacts<'a> {
+    graph: &'a crate::semantic::FactGraph,
+    cursor: Option<crate::semantic::FactId>,
+    count: usize,
+}
+
+impl Serialize for SelectedFacts<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.count))?;
+        let mut admitted = self.graph.ids_after(self.cursor).peekable();
+        let mut quarantined = self
+            .graph
+            .quarantined()
+            .filter(move |(id, _)| self.cursor.is_none_or(|cursor| **id > cursor))
+            .peekable();
+        for _ in 0..self.count {
+            let Some((_, fact, from_admitted)) =
+                (match (admitted.peek().copied(), quarantined.peek().copied()) {
+                    (None, None) => None,
+                    (Some(id), None) => self.graph.get(id).map(|fact| (id, fact, true)),
+                    (None, Some((id, fact))) => Some((id, fact, false)),
+                    (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
+                        if admitted_id < quarantined_id {
+                            self.graph
+                                .get(admitted_id)
+                                .map(|fact| (admitted_id, fact, true))
+                        } else {
+                            Some((quarantined_id, quarantined_fact, false))
+                        }
+                    }
+                })
+            else {
+                return Err(serde::ser::Error::custom(
+                    "semantic page selection changed during serialization",
+                ));
+            };
+            sequence.serialize_element(fact)?;
+            if from_admitted {
+                admitted.next();
+            } else {
+                quarantined.next();
+            }
+        }
+        sequence.end()
+    }
+}
+
+struct SelectedPageWire<'a> {
+    graph: &'a crate::semantic::FactGraph,
+    cursor: Option<crate::semantic::FactId>,
+    count: usize,
+    context_id: crate::semantic::MeshContextId,
+    next_cursor: Option<crate::semantic::FactId>,
+    complete: bool,
+}
+
+impl Serialize for SelectedPageWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SemanticFactPage", 4)?;
+        state.serialize_field("context_id", &self.context_id)?;
+        state.serialize_field(
+            "facts",
+            &SelectedFacts {
+                graph: self.graph,
+                cursor: self.cursor,
+                count: self.count,
+            },
+        )?;
+        state.serialize_field("next_cursor", &self.next_cursor)?;
+        state.serialize_field("complete", &self.complete)?;
+        state.end()
+    }
+}
+
+fn serialized_len(value: &impl Serialize) -> Result<usize> {
+    let mut writer = JsonLengthWriter(0);
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| Error::Other(format!("semantic page measurement failed: {error}")))?;
+    Ok(writer.0)
+}
+
+struct JsonLengthWriter(usize);
+
+impl std::io::Write for JsonLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Export one provider-funded page of canonical facts.  Selection and exact
+/// wire measurement borrow the graph; signed bodies are cloned only after the
+/// page's full retained/queued claim has been acquired.
+pub(crate) fn export_semantic_fact_page(
+    state: &Arc<NetworkState>,
+    request: crate::semantic::SemanticFactPageRequest,
+) -> Result<crate::semantic::SemanticFactPage> {
+    let max_facts = checked_page_limit(request.max_facts, "max_facts")?;
+    let max_encoded_bytes = checked_page_limit(request.max_encoded_bytes, "max_encoded_bytes")?;
+    if request.context_id != state.mesh_context_id() {
+        return Err(Error::Other(format!(
+            "semantic page belongs to foreign mesh context {}",
+            request.context_id
+        )));
+    }
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let mut admitted = graph.ids_after(request.cursor).peekable();
+    let cursor = request.cursor;
+    let mut quarantined = graph
+        .quarantined()
+        .filter(move |(id, _)| cursor.is_none_or(|cursor| **id > cursor))
+        .peekable();
+    let mut fact_count = 0usize;
+    let mut fact_bytes = 0usize;
+    let mut next_cursor = None;
+
+    while fact_count < max_facts {
+        let Some((id, fact, from_admitted)) =
+            (match (admitted.peek().copied(), quarantined.peek().copied()) {
+                (None, None) => None,
+                (Some(id), None) => graph.get(id).map(|fact| (id, fact, true)),
+                (None, Some((id, fact))) => Some((id, fact, false)),
+                (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
+                    if admitted_id < quarantined_id {
+                        graph.get(admitted_id).map(|fact| (admitted_id, fact, true))
+                    } else {
+                        Some((quarantined_id, quarantined_fact, false))
+                    }
+                }
+            })
+        else {
+            break;
+        };
+        let one_fact_bytes = serialized_len(fact)?;
+        let candidate_fact_bytes = fact_bytes
+            .checked_add(one_fact_bytes)
+            .and_then(|bytes| bytes.checked_add(usize::from(fact_count != 0)))
+            .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
+        let metadata_bytes = serialized_len(&SemanticPageMetadataWire {
+            context_id: request.context_id,
+            next_cursor: Some(*id),
+            complete: false,
+            facts: EmptyFacts,
+        })?;
+        let encoded = metadata_bytes
+            .checked_add(candidate_fact_bytes)
+            .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
+        if encoded > max_encoded_bytes {
+            break;
+        }
+        fact_count += 1;
+        fact_bytes = candidate_fact_bytes;
+        next_cursor = Some(*id);
+        if from_admitted {
+            admitted.next();
+        } else {
+            quarantined.next();
+        }
+    }
+
+    if fact_count == 0 && (admitted.peek().is_some() || quarantined.peek().is_some()) {
+        return Err(Error::Other(
+            "first semantic fact does not fit the requested page bound".into(),
+        ));
+    }
+    let complete = admitted.peek().is_none() && quarantined.peek().is_none();
+    if complete {
+        next_cursor = None;
+    }
+    let metadata_bytes = serialized_len(&SemanticPageMetadataWire {
+        context_id: request.context_id,
+        next_cursor,
+        complete,
+        facts: EmptyFacts,
+    })?;
+    let encoded = metadata_bytes
+        .checked_add(fact_bytes)
+        .and_then(|bytes| bytes.checked_add(fact_count.saturating_sub(1)))
+        .ok_or_else(|| Error::Other("semantic page length overflow".into()))?;
+    if encoded > max_encoded_bytes {
+        return Err(Error::Other(
+            "semantic page metadata does not fit the requested bound".into(),
+        ));
+    }
+
+    let wire = SelectedPageWire {
+        graph: &graph,
+        cursor: request.cursor,
+        count: fact_count,
+        context_id: request.context_id,
+        next_cursor,
+        complete,
+    };
+    let measurement = crate::resource::measure_serialized_mailbox_item::<
+        crate::semantic::SemanticFactPage,
+    >(&wire)
+    .map_err(|error| Error::Other(format!("semantic page measurement refused: {error}")))?;
+    let claim = measurement.into_claim();
+    let scope = state
+        .local_application_resource_scope()
+        .map_err(|error| Error::Other(format!("semantic page resource scope refused: {error}")))?;
+    let funding = scope
+        .acquire(claim)
+        .map_err(|error| Error::Other(format!("semantic page admission refused: {error}")))?;
+    let mut admitted = graph.ids_after(request.cursor).peekable();
+    let cursor = request.cursor;
+    let mut quarantined = graph
+        .quarantined()
+        .filter(move |(id, _)| cursor.is_none_or(|cursor| **id > cursor))
+        .peekable();
+    let mut facts = Vec::with_capacity(fact_count);
+    for _ in 0..fact_count {
+        let Some((_, fact, from_admitted)) =
+            (match (admitted.peek().copied(), quarantined.peek().copied()) {
+                (None, None) => None,
+                (Some(id), None) => graph.get(id).map(|fact| (id, fact, true)),
+                (None, Some((id, fact))) => Some((id, fact, false)),
+                (Some(admitted_id), Some((quarantined_id, quarantined_fact))) => {
+                    if admitted_id < quarantined_id {
+                        graph.get(admitted_id).map(|fact| (admitted_id, fact, true))
+                    } else {
+                        Some((quarantined_id, quarantined_fact, false))
+                    }
+                }
+            })
+        else {
+            return Err(Error::Other(
+                "semantic page selection changed during materialization".into(),
+            ));
+        };
+        facts.push(fact.clone());
+        if from_admitted {
+            admitted.next();
+        } else {
+            quarantined.next();
+        }
+    }
+    Ok(crate::semantic::SemanticFactPage::new(
+        request.context_id,
+        facts,
+        next_cursor,
+        complete,
+        funding,
+    ))
+}
+
+fn checked_page_limit(value: u32, name: &str) -> Result<usize> {
+    let value = usize::try_from(value)
+        .map_err(|_| Error::Other(format!("semantic page {name} is not representable")))?;
+    if value == 0 || value > crate::protocol::RECEIVE_FRAME_BYTES {
+        return Err(Error::Other(format!(
+            "semantic page {name} must be between 1 and {}",
+            crate::protocol::RECEIVE_FRAME_BYTES
+        )));
+    }
+    Ok(value)
+}
+
+#[cfg(test)]
+mod semantic_page_tests {
+    use super::checked_page_limit;
+
+    #[test]
+    fn page_limits_are_nonzero_and_protocol_bounded() {
+        let protocol_limit = crate::protocol::RECEIVE_FRAME_BYTES as u32;
+        assert!(checked_page_limit(0, "max_facts").is_err());
+        assert_eq!(
+            checked_page_limit(protocol_limit, "max_encoded_bytes").unwrap(),
+            crate::protocol::RECEIVE_FRAME_BYTES
+        );
+        assert!(checked_page_limit(protocol_limit + 1, "max_facts").is_err());
+    }
+}
+
+/// Import one bounded canonical page through the same durable reducer used by
+/// authenticated wire delivery.  The page's provider lease remains held
+/// through preflight, reduction, and exact retention checks.
+pub(crate) async fn import_semantic_fact_page(
+    state: &Arc<NetworkState>,
+    page: crate::semantic::SemanticFactPage,
+) -> Result<crate::semantic::SemanticStateIdentity> {
+    if page.facts().is_empty() {
         return Err(Error::Other("signed fact import cannot be empty".into()));
     }
-    let expected_context = state.mesh_context_id();
-    for fact in &facts {
-        if fact.content.mesh_context != expected_context {
+    if page.facts().len() > crate::protocol::RECEIVE_FRAME_BYTES {
+        return Err(Error::Other(
+            "signed fact page exceeds protocol fact bound".into(),
+        ));
+    }
+    if page.context_id() != state.mesh_context_id() {
+        return Err(Error::Other(format!(
+            "signed fact page belongs to foreign mesh context {}",
+            page.context_id()
+        )));
+    }
+    let wire = SemanticFactPageOwnedWire {
+        context_id: page.context_id(),
+        facts: page.facts(),
+        next_cursor: page.next_cursor(),
+        complete: page.is_complete(),
+    };
+    let encoded = crate::resource::mailbox_measure_serialized(&wire)
+        .map_err(|error| Error::Other(format!("semantic page measurement failed: {error}")))?
+        .1;
+    if encoded > crate::protocol::RECEIVE_FRAME_BYTES {
+        return Err(Error::Other(
+            "signed fact page exceeds protocol byte bound".into(),
+        ));
+    }
+    let page_measurement = crate::resource::measure_serialized_mailbox_item::<
+        crate::semantic::SemanticFactPage,
+    >(&wire)
+    .map_err(|error| Error::Other(format!("semantic page measurement refused: {error}")))?;
+    for fact in page.facts() {
+        if fact.content.mesh_context != page.context_id() {
             return Err(Error::Other(format!(
                 "signed fact {} belongs to a foreign mesh context",
                 fact.id
@@ -355,12 +700,173 @@ pub(crate) async fn import_signed_facts(
         fact.verify()
             .map_err(|error| Error::Other(format!("signed fact {} rejected: {error}", fact.id)))?;
     }
-    let exchange = super::semantic_ingress::DurableSemanticPort::admit(MeshMessage::FactBundle(
-        FactBundleMessage { facts },
+    let ids_measurement =
+        crate::resource::measure_serialized_mailbox_item::<Vec<FactId>>(&FactIdsWire {
+            facts: page.facts(),
+        })
+        .map_err(|error| Error::Other(format!("semantic page id measurement refused: {error}")))?;
+    let ids_scope = state
+        .local_application_resource_scope()
+        .map_err(|error| Error::Other(format!("semantic page id scope refused: {error}")))?;
+    let _submitted_ids_funding = ids_scope
+        .acquire(ids_measurement.into_claim())
+        .map_err(|error| Error::Other(format!("semantic page id admission refused: {error}")))?;
+    let submitted_facts_commitment = signed_facts_commitment(page.facts())?;
+    let submitted_ids = page.facts().iter().map(|fact| fact.id).collect::<Vec<_>>();
+    let (wire_page, funding) = page
+        .into_fact_page_message()
+        .map_err(|error| Error::Other(format!("signed fact page refused: {error}")))?;
+    let FactPageMessage {
+        context_id: page_context_id,
+        facts,
+        next_cursor,
+        complete,
+    } = wire_page;
+    let _funding = match funding {
+        Some(funding) => funding,
+        None => {
+            let scope = state.local_application_resource_scope().map_err(|error| {
+                Error::Other(format!("semantic page resource scope refused: {error}"))
+            })?;
+            scope
+                .acquire(page_measurement.into_claim())
+                .map_err(|error| {
+                    Error::Other(format!("semantic page admission refused: {error}"))
+                })?
+        }
+    };
+    reduce_verified_facts(state, page_context_id, facts, next_cursor, complete).await?;
+
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let mut retained = Sha256::new();
+    for fact_id in &submitted_ids {
+        let fact = graph.get(fact_id).or_else(|| {
+            graph
+                .quarantined()
+                .find(|(id, _)| **id == *fact_id)
+                .map(|(_, fact)| fact)
+        });
+        let Some(fact) = fact else {
+            return Err(Error::Other(format!(
+                "signed fact {fact_id} was not retained by the semantic reducer"
+            )));
+        };
+        serde_json::to_writer(DigestWriter(&mut retained), fact)
+            .map_err(|error| Error::Other(format!("retained fact encoding failed: {error}")))?;
+        retained.update([0]);
+    }
+    let retained_digest = retained.finalize();
+    if retained_digest.as_slice() != submitted_facts_commitment.as_slice() {
+        return Err(Error::Other(
+            "semantic reducer changed a submitted signed fact".into(),
+        ));
+    }
+    identity_for_graph(state, &graph)
+}
+
+/// Return a stable identity for the live graph and its projected authority
+/// state.  The state commitment covers signed bodies and signatures, while
+/// the projection commitment is the exact transcript sealed by the durable
+/// semantic store.
+pub(crate) fn semantic_state_identity(
+    state: &Arc<NetworkState>,
+) -> Result<crate::semantic::SemanticStateIdentity> {
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    identity_for_graph(state, &graph)
+}
+
+fn identity_for_graph(
+    state: &Arc<NetworkState>,
+    graph: &crate::semantic::FactGraph,
+) -> Result<crate::semantic::SemanticStateIdentity> {
+    let context_id = graph.context_id();
+    let admitted_fact_count = u64::try_from(graph.len())
+        .map_err(|_| Error::Other("semantic admitted fact count overflow".into()))?;
+    let unresolved_fact_count = graph.quarantined().try_fold(0u64, |count, _| {
+        count
+            .checked_add(1)
+            .ok_or_else(|| Error::Other("semantic unresolved fact count overflow".into()))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"myownmesh-semantic-state-v2\0context\0");
+    hasher.update(context_id.as_bytes());
+    hasher.update(b"\0admitted-count\0");
+    hasher.update(admitted_fact_count.to_le_bytes());
+    hasher.update(b"\0admitted\0");
+    for fact_id in graph.ids() {
+        hasher.update(fact_id.as_bytes());
+        let fact = graph
+            .get(fact_id)
+            .ok_or_else(|| Error::Other(format!("semantic fact {fact_id} disappeared")))?;
+        serde_json::to_writer(DigestWriter(&mut hasher), fact)
+            .map_err(|error| Error::Other(format!("semantic identity encoding failed: {error}")))?;
+        hasher.update([0]);
+    }
+    hasher.update(b"\0unresolved-count\0");
+    hasher.update(unresolved_fact_count.to_le_bytes());
+    hasher.update(b"\0unresolved\0");
+    for (fact_id, fact) in graph.quarantined() {
+        hasher.update(fact_id.as_bytes());
+        serde_json::to_writer(DigestWriter(&mut hasher), fact)
+            .map_err(|error| Error::Other(format!("semantic identity encoding failed: {error}")))?;
+        hasher.update([0]);
+    }
+    let state_digest = hasher.finalize();
+    let mut state_commitment = [0; 32];
+    state_commitment.copy_from_slice(&state_digest);
+    let wire = SemanticStateIdentityWire {
+        context_id,
+        admitted_fact_count,
+        unresolved_fact_count,
+        projection_commitment: crate::semantic::store::projection_commitment_for_graph(graph),
+        state_commitment,
+    };
+    let measurement = crate::resource::measure_serialized_mailbox_item::<
+        crate::semantic::SemanticStateIdentity,
+    >(&wire)
+    .map_err(|error| Error::Other(format!("semantic identity measurement refused: {error}")))?;
+    let scope = state.local_application_resource_scope().map_err(|error| {
+        Error::Other(format!("semantic identity resource scope refused: {error}"))
+    })?;
+    let funding = scope
+        .acquire(measurement.into_claim())
+        .map_err(|error| Error::Other(format!("semantic identity admission refused: {error}")))?;
+    Ok(crate::semantic::SemanticStateIdentity::new(
+        context_id,
+        admitted_fact_count,
+        unresolved_fact_count,
+        wire.projection_commitment,
+        wire.state_commitment,
+        funding,
     ))
-    .map_err(|_| Error::Other("signed fact bundle was not a durable exchange".into()))?;
-    super::semantic_ingress::reduce(state, exchange, None).await;
-    Ok(())
+}
+
+fn signed_facts_commitment(facts: &[SignedFact]) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    for fact in facts {
+        serde_json::to_writer(DigestWriter(&mut hasher), fact)
+            .map_err(|error| Error::Other(format!("submitted fact encoding failed: {error}")))?;
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let mut commitment = [0; 32];
+    commitment.copy_from_slice(&digest);
+    Ok(commitment)
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn bootstrap_root(instance_root: Option<&Path>) -> Result<PathBuf> {

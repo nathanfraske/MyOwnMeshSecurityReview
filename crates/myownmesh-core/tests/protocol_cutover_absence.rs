@@ -1,6 +1,6 @@
 //! Protocol-v2 hard-cutover controls for retired roster/network wire tags.
 
-use myownmesh_core::protocol::{FactBundleMessage, FactInventory, FactRequest, MeshMessage};
+use myownmesh_core::protocol::{FactInventory, FactPageMessage, FactRequest, MeshMessage};
 use myownmesh_core::semantic::{FactId, MeshContextId};
 
 #[test]
@@ -27,7 +27,12 @@ fn current_fact_coordination_tags_round_trip_at_mesh_message_decode() {
     let messages = [
         MeshMessage::FactInventory(FactInventory::new(context, [second, first])),
         MeshMessage::FactRequest(FactRequest::new(context, [second, first])),
-        MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() }),
+        MeshMessage::FactPage(FactPageMessage {
+            context_id: context,
+            facts: Vec::new(),
+            next_cursor: None,
+            complete: true,
+        }),
     ];
 
     for message in messages {
@@ -41,7 +46,7 @@ fn current_fact_coordination_tags_round_trip_at_mesh_message_decode() {
             (MeshMessage::FactRequest(expected), MeshMessage::FactRequest(actual)) => {
                 assert_eq!(&actual, expected);
             }
-            (MeshMessage::FactBundle(expected), MeshMessage::FactBundle(actual)) => {
+            (MeshMessage::FactPage(expected), MeshMessage::FactPage(actual)) => {
                 assert_eq!(&actual, expected);
             }
             _ => panic!("current fact message changed wire variant"),

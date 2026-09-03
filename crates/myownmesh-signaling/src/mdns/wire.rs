@@ -7,7 +7,7 @@
 //! tested in any environment, including CI containers with no
 //! multicast. The socket lifecycle lives in [`super::driver`].
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::SignalingMessage;
 
@@ -107,7 +107,7 @@ pub fn parse_advert(
 /// ed25519 mutual-auth handshake over the DTLS channel the SDP
 /// bootstraps remains the real gate; a forged frame can at worst
 /// waste a handshake attempt.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Frame {
     pub v: u8,
     /// Room handle — receivers drop frames for rooms they aren't in,
@@ -116,6 +116,55 @@ pub struct Frame {
     pub from: String,
     pub to: String,
     pub msg: SignalingMessage,
+}
+
+impl<'de> Deserialize<'de> for Frame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(mut object) = value else {
+            return Err(serde::de::Error::custom("mDNS frame must be a JSON object"));
+        };
+        for field in object.keys() {
+            if !matches!(field.as_str(), "v" | "room" | "from" | "to" | "msg") {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown mDNS frame field '{field}'"
+                )));
+            }
+        }
+        let v = object
+            .remove("v")
+            .ok_or_else(|| serde::de::Error::custom("mDNS frame is missing v"))?;
+        let room = object
+            .remove("room")
+            .ok_or_else(|| serde::de::Error::custom("mDNS frame is missing room"))?;
+        let from = object
+            .remove("from")
+            .ok_or_else(|| serde::de::Error::custom("mDNS frame is missing from"))?;
+        let to = object
+            .remove("to")
+            .ok_or_else(|| serde::de::Error::custom("mDNS frame is missing to"))?;
+        let msg = object
+            .remove("msg")
+            .ok_or_else(|| serde::de::Error::custom("mDNS frame is missing msg"))?;
+        if !object.is_empty() {
+            return Err(serde::de::Error::custom("mDNS frame has unknown fields"));
+        }
+        Ok(Self {
+            v: serde_json::from_value(v)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+            room: serde_json::from_value(room)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+            from: serde_json::from_value(from)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+            to: serde_json::from_value(to)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+            msg: serde_json::from_value(msg)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?,
+        })
+    }
 }
 
 /// Encode a frame as one JSON line (no trailing newline — the writer
@@ -327,5 +376,16 @@ mod tests {
             "canonical-self",
             only_canonical
         ));
+    }
+
+    #[test]
+    fn frame_rejects_unknown_outer_and_nested_fields() {
+        let outer = r#"{"v":1,"room":"roomA","from":"peer-1","to":"peer-2","msg":{"kind":"announce","peer_id":"peer-1"},"legacy":true}"#;
+        assert!(decode_frame(outer).is_err(), "unknown outer fields refuse");
+        let nested = r#"{"v":1,"room":"roomA","from":"peer-1","to":"peer-2","msg":{"kind":"announce","peer_id":"peer-1","accepted":true}}"#;
+        assert!(
+            decode_frame(nested).is_err(),
+            "unknown nested fields refuse"
+        );
     }
 }

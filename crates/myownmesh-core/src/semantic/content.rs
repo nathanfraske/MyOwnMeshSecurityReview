@@ -17,7 +17,6 @@ use super::FactId;
 #[serde(rename_all = "snake_case")]
 pub enum FactDomain {
     Governance,
-    Participation,
     EvictionProof,
 }
 
@@ -25,7 +24,6 @@ impl FactDomain {
     pub(crate) fn tag(self) -> &'static str {
         match self {
             Self::Governance => "governance",
-            Self::Participation => "participation",
             Self::EvictionProof => "eviction_proof",
         }
     }
@@ -232,7 +230,6 @@ pub enum AttestationDecision {
 pub enum ExclusiveCell {
     Role { subject: DeviceId },
     Membership { subject: DeviceId },
-    OpenParticipation { subject: DeviceId },
     Decision { proposal: FactId },
 }
 
@@ -243,10 +240,6 @@ impl ExclusiveCell {
 
     pub fn membership(subject: DeviceId) -> Self {
         Self::Membership { subject }
-    }
-
-    pub fn open_participation(subject: DeviceId) -> Self {
-        Self::OpenParticipation { subject }
     }
 
     pub fn decision(proposal: FactId) -> Self {
@@ -263,10 +256,6 @@ impl ExclusiveCell {
                 out.tag("membership");
                 out.device(subject);
             }
-            Self::OpenParticipation { subject } => {
-                out.tag("open_participation");
-                out.device(subject);
-            }
             Self::Decision { proposal } => {
                 out.tag("decision");
                 out.id(*proposal);
@@ -280,7 +269,6 @@ impl fmt::Display for ExclusiveCell {
         match self {
             Self::Role { subject } => write!(f, "role:{subject}"),
             Self::Membership { subject } => write!(f, "membership:{subject}"),
-            Self::OpenParticipation { subject } => write!(f, "open_participation:{subject}"),
             Self::Decision { proposal } => write!(f, "decision:{proposal}"),
         }
     }
@@ -306,12 +294,6 @@ pub enum FactBody {
     /// both are needed to restore session admission.
     MembershipAdmit {
         target: DeviceId,
-    },
-    /// Self-authored Open participation.  Presentation labels are local UI
-    /// data and are intentionally not signed into membership authority.
-    OpenParticipation {
-        device_id: DeviceId,
-        joined: bool,
     },
     EvictionProof {
         target: DeviceId,
@@ -391,7 +373,6 @@ impl FactBody {
 
     pub fn domain(&self) -> FactDomain {
         match self {
-            Self::OpenParticipation { .. } => FactDomain::Participation,
             Self::EvictionProof { .. } | Self::SelfStandDown { .. } => FactDomain::EvictionProof,
             _ => FactDomain::Governance,
         }
@@ -408,9 +389,6 @@ impl FactBody {
             ],
             Self::MembershipAdmit { target } => {
                 vec![ExclusiveCell::membership(target.clone())]
-            }
-            Self::OpenParticipation { device_id, .. } => {
-                vec![ExclusiveCell::open_participation(device_id.clone())]
             }
             Self::EvictionProof { .. } | Self::SelfStandDown { .. } => Vec::new(),
             Self::Attestation { proposal, .. } => vec![ExclusiveCell::decision(*proposal)],
@@ -432,9 +410,7 @@ impl FactBody {
             Self::Resolution { cell, .. } => {
                 let mut subjects = vec![author.clone()];
                 match cell {
-                    ExclusiveCell::Role { subject }
-                    | ExclusiveCell::Membership { subject }
-                    | ExclusiveCell::OpenParticipation { subject } => {
+                    ExclusiveCell::Role { subject } | ExclusiveCell::Membership { subject } => {
                         subjects.push(subject.clone())
                     }
                     ExclusiveCell::Decision { .. } => {}
@@ -444,7 +420,6 @@ impl FactBody {
             Self::AuthorityLineageResolution { subject, .. } => {
                 vec![author.clone(), subject.clone()]
             }
-            _ => Vec::new(),
         };
         subjects.sort();
         subjects.dedup();
@@ -500,11 +475,6 @@ impl FactBody {
             Self::MembershipAdmit { target } => {
                 out.tag("membership_admit");
                 out.device(target);
-            }
-            Self::OpenParticipation { device_id, joined } => {
-                out.tag("open_participation");
-                out.device(device_id);
-                out.bool(*joined);
             }
             Self::EvictionProof { target, evidence } => {
                 out.tag("eviction_proof");
@@ -683,10 +653,6 @@ mod tests {
         assert_eq!(
             ExclusiveCell::role(id.clone()).to_string(),
             format!("role:{id}")
-        );
-        assert_eq!(
-            ExclusiveCell::open_participation(id.clone()).to_string(),
-            format!("open_participation:{id}")
         );
     }
 }

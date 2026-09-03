@@ -4,13 +4,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode, TurnCredential,
-    TurnServer as IceTurnServer, TurnServiceConfig,
+    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode,
+    TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::transport_lab::{
-    attach_local, channel, join_open_participation, spawn_network,
-};
+use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
@@ -47,7 +45,9 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
         label: label.to_string(),
         kind: Default::default(),
         scheduler: SchedulerPolicyConfig::default(),
+        semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),
         stun_servers: Vec::new(),
@@ -56,7 +56,6 @@ fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkC
             username: Some("arc03-user".to_string()),
             credential: Some("arc03-password".to_string()),
         }],
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve,
     }
@@ -320,9 +319,6 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Alice engine starts");
-    join_open_participation(&alice)
-        .await
-        .expect("Alice joins Open participation");
     let (bob, bob_driver) = spawn_network(
         network_config("bob", turn_url.clone(), true),
         Arc::clone(&bob_id),
@@ -330,9 +326,6 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Bob engine starts");
-    join_open_participation(&bob)
-        .await
-        .expect("Bob joins Open participation");
 
     let mut alice_events = alice.events_tx.subscribe();
     let mut bob_events = bob.events_tx.subscribe();
@@ -431,9 +424,6 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Carol engine starts");
-    join_open_participation(&carol)
-        .await
-        .expect("Carol joins Open participation");
     let (dave, dave_driver) = spawn_network(
         network_config("dave", turn_url, false),
         Arc::clone(&dave_id),
@@ -441,9 +431,6 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     )
     .await
     .expect("Dave engine starts");
-    join_open_participation(&dave)
-        .await
-        .expect("Dave joins Open participation");
     let mut carol_events = carol.events_tx.subscribe();
     let mut dave_events = dave.events_tx.subscribe();
     let negative_broker = LocalBroker::new();

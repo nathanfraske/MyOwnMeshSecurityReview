@@ -21,10 +21,11 @@ The application does not parse, construct, cache, reconcile, or route durable me
 MyOwnMesh supplies:
 
 - exact MeshContext and Device ID binding;
-- Open or Closed durable participation semantics;
+- ephemeral Open participation and Closed durable governance semantics;
 - durable fact construction, validation, storage, reconciliation, and compaction;
 - typed signaling for durable facts and ephemeral transport control;
-- candidate discovery, racing, connectivity checks, and transport recovery;
+- candidate discovery, bounded remote ICE-candidate application, connectivity
+  checks, and transport recovery;
 - direct, TURN, generic opaque relay, and eligible Closed member-relay connectors;
 - bounded speculative pre-authentication work;
 - fresh channel-bound endpoint authentication;
@@ -71,7 +72,10 @@ MeshRosterView {
 }
 ```
 
-For Open, the roster is the durable state derived from accepted unambiguous self-participation facts.
+For Open, the roster is a local runtime projection from exact-context
+handshake and key-possession observations; Open has no base durable semantic
+fact. Join, leave, presence, and reconnect observations for Open and Closed
+remain runtime state and never enter semantic history.
 
 For Closed, the roster is the durable state derived from the locally accepted Closed governance proof.
 
@@ -83,7 +87,7 @@ For Closed, the roster is the durable state derived from the locally accepted Cl
 PeerReachabilityView {
     mesh_context,
     device_id,
-    durable_participation_or_authorization,
+    durable_closed_authorization_projection,
     signaling_observation,
     transport_observations,
     session_state,
@@ -241,7 +245,8 @@ MyOwnMesh may perform these tasks concurrently:
 1. validate the local principal;
 2. inspect the current local Open or Closed durable state;
 3. exchange typed connection intent and candidate control;
-4. gather and race direct, TURN, generic relay, and eligible Closed member-relay candidates;
+4. gather connector candidates and apply the admitted queued remote ICE
+   candidates through the bounded planner;
 5. create bounded speculative transport state;
 6. establish one or more working channels;
 7. perform fresh endpoint authentication over each candidate channel that reaches that stage;
@@ -279,9 +284,16 @@ AuthenticatedPeerSession
 
 ### 5.1 Open
 
-Any authentic Device ID may self-participate in Open without sponsorship or pair permission.
+Any authentic Device ID may participate in Open without sponsorship or pair
+permission, but only ephemerally: the exact-context endpoint handshake and
+Device-key possession are required, and Open creates zero base durable
+semantic facts.
 
-Open participation permits MyOwnMesh to perform bounded negotiation and candidate work with authentic participants. Endpoint authentication remains mandatory. The application grants no feature merely because a mesh session exists.
+Open participation permits MyOwnMesh to perform bounded negotiation and
+candidate work with authentic participants. Endpoint authentication remains
+mandatory. Runtime join, leave, presence, and reconnect never enter semantic
+history for Open or Closed. The application grants no feature merely because
+a mesh session exists.
 
 Resource overload is reported as overload or unavailability, not as Closed-style authorization denial.
 
@@ -306,13 +318,16 @@ MyOwnMesh owns transport recovery. The application does not select a new relay o
 A live session may have one or more authenticated channels. When the active carrier degrades or fails, MyOwnMesh may:
 
 1. keep any usable authenticated channel active;
-2. gather and race replacement candidates;
+2. gather replacement candidates and apply admitted remote ICE candidates
+   through the connector's bounded planner;
 3. authenticate a replacement channel;
 4. add it to the live session;
 5. change local outbound selection;
 6. retire or retain old channels.
 
-No persistent path ledger or monotonic session generation is required.
+No persistent transport-path ledger or monotonic transport-session generation
+is required. This does not weaken the separate Closed semantic ledger:
+transport join, leave, presence, and reconnect events never become its facts.
 
 The session handle may remain stable across a successful internal handoff. A profile may instead issue a replacement handle when required by its cryptographic or process boundary. In either case, an old public identifier alone cannot authorize use.
 
@@ -328,9 +343,9 @@ Direct and TURN-carried sessions expose the same remote Device ID and applicatio
 
 TURN is a packet carrier. It may observe addresses, packet sizes, timing, and the metadata required by its function. It cannot become the endpoint or application authority under the endpoint cryptographic premises.
 
-### 7.2 Generic opaque relay
+### 7.2 Generic opaque relay (removed)
 
-A generic relay carries opaque endpoint packets for one exact endpoint pair. It has finite allocation, buffer, retry, and bandwidth limits and no application-recipient fanout.
+The unowned generic opaque relay is not a supported V4 carrier. Opaque fallback is provided only by the bounded, visibly identified Closed member-relay path below.
 
 ### 7.3 Closed member relay
 
@@ -345,7 +360,10 @@ AuthenticatedPeerSession(A, C)
 
 B is not anonymous. B may deny or degrade availability and observe metadata, but cannot read or author accepted A-C application plaintext under the endpoint cryptographic premises.
 
-A Closed member relay may be attempted immediately, raced with other carriers, or retained as backup. The application does not decide when it is used.
+A Closed member relay may be opened through its explicit route-bound setup when
+the local owner policy selects it. The current profile does not claim automatic
+racing with other carrier families or automatic backup selection, and the
+application does not receive raw route authority.
 
 ![Closed member relay and handoff](diagrams/04-closed-member-relay-handoff.svg)
 
@@ -510,7 +528,22 @@ The component that allocates or retains a protected resource acquires its finite
 
 A granted claim is an admission decision, not a guarantee that the underlying resource can be obtained. Depending on the provider a deployment installs, admission may prove bookkeeping only. Allocation therefore remains fallible: an admitted operation can still fail on the real resource, and an application must handle that failure rather than treat a granted lease as a promise of success.
 
-The application does not choose low-level connector counters, resource weights, quotas, or shares. One finite process grant is shared by all Mesh scopes, and unused capacity is borrowable. Adding scopes cannot multiply that grant.
+The application does not choose low-level connector counters, resource weights,
+quotas, or shares. One finite process grant is shared by all Mesh scopes, and
+unused capacity is borrowable. Adding scopes cannot multiply that grant. The
+Closed semantic ledger has separate owner-selected finite limits for fact
+count, bytes, causal edges, per-author usage, proof work, and indexed database
+bytes; these prevent semantic admission from exceeding its local persistence
+budget and are not connector quotas.
+
+Closed facts persist through indexed `O(delta)` commits and exact reopen
+identity; Open lifecycle activity creates no semantic ledger facts or churn.
+For the `StorageBytes` dimension, one process-accounted claim is
+`B = M + W + S + R`: main database, WAL, shared-memory/sidecar, and explicit
+reserve bytes. Named-file or VFS accounting is not proof of backing disk
+capacity, filesystem metadata capacity, or `ENOSPC` behavior. The shipped
+compaction boundary is bounded checkpointing only; a full-copy `VACUUM`
+requires separately funded temporary-copy, metadata, and cleanup custody.
 
 The basal application-visible contract is a set of properties, not a scheduling algorithm:
 
@@ -533,9 +566,22 @@ Reliable streams, interactive real-time flows, delayed satellite delivery, and s
 
 ## 15. Acceptance gates
 
-The application integration passes only when:
+These are necessary acceptance gates, not a final compliance result. Final
+compliance remains pending until durable runs provide evidence for Open/Closed
+separation, scale and exact `N+1` refusal, duplicate/no-op invariance, exact
+Closed restart/reopen identity, deterministic fault/crash reconciliation, and
+terminal provider/resource baselines. Source or unit evidence alone is not a
+final compliance PASS. The application integration requires:
 
 - every application object names one exact mesh context;
+- Open lifecycle activity creates no semantic ledger facts or churn;
+- Closed facts persist by indexed `O(delta)` commits and reopen with exact
+  semantic identity;
+- duplicate/no-op delivery leaves semantic projection, storage, and provider
+  usage unchanged;
+- scale and exact `N+1` refusal are measured without side effects;
+- deterministic fault/crash/reopen outcomes and terminal resource baselines
+  are recorded;
 - Open permits authentic self-participation without sponsorship;
 - Closed promotion requires the selected current authorization proof;
 - raw durable facts and ephemeral signaling constructors are absent from the ordinary API;
@@ -544,9 +590,9 @@ The application integration passes only when:
 - no application payload is sent or delivered before channel promotion;
 - a working socket alone never becomes a peer session;
 - every session proves the exact remote Device on the exact channel;
-- direct, TURN, generic relay, and Closed member relay preserve the same endpoint identity;
+- direct, TURN, and Closed member relay preserve the same endpoint identity;
 - carrier diagnostics are separate from peer identity and application authorization;
-- recovery does not require a persistent path ledger or monotonic session generation;
+- recovery does not require a persistent transport-path ledger or monotonic transport session generation;
 - stale or foreign-principal handles fail before payload use;
 - signaling never becomes a generic application-data bus;
 - explicit application intermediaries remain explicit endpoints;
@@ -554,7 +600,9 @@ The application integration passes only when:
 - another object is admitted whenever the provider grants its exact claim, without a basal product-count ceiling;
 - resource refusal identifies pressure or unavailability, never Open or Closed authorization;
 - Mesh scopes share one process grant and cannot multiply capacity;
-- no basal weights, quotas, reserved shares, or partitions exist;
+- no basal provider weights, reserved shares, or partitions exist; any
+  owner-selected Closed semantic ledger limits are explicit persistence policy,
+  not provider shares;
 - no basal pending-demand ordering, rotation rule, or per-scope demand cardinality is required, and no application-visible type encodes one;
 - the selected provider documents its own demand-selection policy and shows that the policy alone mints no capacity;
 - every refusal names the unavailable resource dimension and is never an arbitrary or undeclared limit;

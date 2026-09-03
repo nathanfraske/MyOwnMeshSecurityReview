@@ -20,7 +20,8 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 use crate::config::ClosedRelayPolicyConfig;
 use crate::identity::Identity;
 use crate::protocol::relay::{
-    OpaqueRelayPacket, RelayKeyShare, OPAQUE_RELAY_NONCE_BYTES, OPAQUE_RELAY_VERSION,
+    ClosedRelayRoute, OpaqueRelayPacket, RelayKeyShare, OPAQUE_RELAY_NONCE_BYTES,
+    OPAQUE_RELAY_VERSION,
 };
 use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 use crate::runtime::session_broker::SessionValidityWitness;
@@ -1040,6 +1041,23 @@ pub struct OpaqueRelaySession {
 }
 
 impl OpaqueRelaySession {
+    /// Check an established endpoint session against one complete typed relay
+    /// route without consuming sequence or replay state.  The endpoint pair,
+    /// context, and session coordinate come from this unforgeable session;
+    /// the relay identity is accepted only as part of the independently
+    /// validated complete route and can never select a peer or address here.
+    /// Allocation generations remain the relay registry's exact fence, so an
+    /// established route must carry a nonzero generation before this seam is
+    /// usable for allocation admission.
+    pub(crate) fn matches_route(&self, route: &ClosedRelayRoute) -> bool {
+        route.validate().is_ok()
+            && route.allocation_epoch != 0
+            && self.mesh == route.context_id
+            && self.session_id == route.session_id
+            && ((self.local_id == route.requester && self.peer_id == route.target)
+                || (self.local_id == route.target && self.peer_id == route.requester))
+    }
+
     pub(crate) fn seal(
         &mut self,
         plaintext: &[u8],
@@ -1257,6 +1275,70 @@ mod tests {
                 .expect("safe plaintext boundary adds the AEAD tag"),
             usize::try_from(plaintext + crate::protocol::relay::CLOSED_RELAY_AEAD_TAG_BYTES)
                 .expect("safe boundary fits usize")
+        );
+    }
+
+    #[test]
+    fn endpoint_session_route_validator_is_read_only_and_generation_fenced() {
+        let profile = ClosedRelayPolicyConfig::default();
+        let requester = Identity::ephemeral();
+        let target = Identity::ephemeral();
+        let context = MeshContextId::from_bytes([12; 32]);
+        let requester_id = DeviceId::from_canonical_str(requester.public_id()).expect("requester");
+        let target_id = DeviceId::from_canonical_str(target.public_id()).expect("target");
+        let relay_id =
+            DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay");
+        let session_id = [13; 16];
+        let (requester_pending, requester_share) = PendingEndpointKeyAgreement::begin(
+            &requester,
+            context,
+            target_id.clone(),
+            session_id,
+            &profile,
+        )
+        .expect("requester share");
+        let (target_pending, target_share) = PendingEndpointKeyAgreement::begin(
+            &target,
+            context,
+            requester_id.clone(),
+            session_id,
+            &profile,
+        )
+        .expect("target share");
+        let requester_session = requester_pending
+            .finish(&target_share)
+            .expect("requester session");
+        let _target_session = target_pending
+            .finish(&requester_share)
+            .expect("target session");
+        let route = ClosedRelayRoute::with_epoch(
+            context,
+            requester_id.clone(),
+            relay_id.clone(),
+            target_id.clone(),
+            session_id,
+            1,
+        );
+        assert!(requester_session.matches_route(&route));
+        assert!(
+            !requester_session.matches_route(&ClosedRelayRoute::with_epoch(
+                context,
+                requester_id.clone(),
+                relay_id.clone(),
+                target_id.clone(),
+                session_id,
+                0,
+            ))
+        );
+        assert!(
+            !requester_session.matches_route(&ClosedRelayRoute::with_epoch(
+                MeshContextId::from_bytes([14; 32]),
+                requester_id,
+                relay_id,
+                target_id,
+                session_id,
+                1,
+            ))
         );
     }
 

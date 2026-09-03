@@ -19,8 +19,7 @@ use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
 use crate::engine::state::{NetworkCmd, NetworkState};
 use crate::engine::{
-    create_network_in_mesh_scope, import_network_in_mesh_scope, join_open_participation,
-    spawn_network_in_mesh_scope,
+    create_network_in_mesh_scope, import_network_in_mesh_scope, spawn_network_in_mesh_scope,
 };
 use crate::error::{ClosedRelayError, Error, Result};
 use crate::events::{MeshEvent, MeshPhase};
@@ -62,6 +61,7 @@ pub struct ReconcileStatus {
     pub network_id_changed: bool,
     pub signaling_changed: bool,
     pub closed_relay_changed: bool,
+    pub semantic_policy_changed: bool,
     pub scheduler_changed: bool,
     pub event_capacity_changed: bool,
     pub connection_trace_capacity_changed: bool,
@@ -241,15 +241,6 @@ impl MeshHandle {
             &self.mesh.inner.local_application_resources,
         )
         .await?;
-        if let Err(error) = join_open_participation(&state).await {
-            state.request_shutdown();
-            if let Err(join_error) = driver.await {
-                return Err(Error::Other(format!(
-                    "{error}; network driver cleanup failed: {join_error}"
-                )));
-            }
-            return Err(error);
-        }
         self.finish_joined_network(config, state, driver).await
     }
 
@@ -436,6 +427,16 @@ impl ClosedRelayChannel {
         self.session_id
     }
 
+    /// The exact allocation epoch captured by this endpoint session.
+    ///
+    /// This is an observation coordinate for replacement-generation controls,
+    /// not authority or key material.  A stale endpoint may still retain its
+    /// original number, which lets a caller prove that a later allocation did
+    /// not accept work from the earlier generation.
+    pub fn allocation_epoch(&self) -> u64 {
+        self.session.metadata().allocation_epoch
+    }
+
     /// Encrypt and send one plaintext through the exact endpoint session.
     pub async fn send(&self, plaintext: &[u8]) -> Result<()> {
         self.session
@@ -462,15 +463,55 @@ impl ClosedRelayChannel {
 }
 
 impl JoinedNetwork {
-    /// Import signed semantic facts through this network's durable reducer.
+    /// Import one bounded semantic fact page through the durable reducer and
+    /// return the resulting deterministic graph identity.
     ///
-    /// The bundle is checked for canonical signatures and the exact verified
-    /// bootstrap context before it enters the reducer. Semantic authorization,
-    /// dependency quarantine, custody, and projection remain owned by the
-    /// canonical `FactGraph`; successful return means the bundle was handed to
-    /// that durable reducer, not that every fact has projected yet.
-    pub async fn import_signed_facts(&self, facts: Vec<crate::semantic::SignedFact>) -> Result<()> {
-        crate::engine::lifecycle::import_signed_facts(&self.state, facts).await
+    /// The page is checked for its exact protocol byte/count bounds, canonical
+    /// signatures, and verified bootstrap context before it enters the
+    /// reducer. Semantic authorization, dependency quarantine, custody, and
+    /// projection remain owned by the canonical `FactGraph`.
+    pub async fn import_semantic_fact_page(
+        &self,
+        page: crate::semantic::SemanticFactPage,
+    ) -> Result<crate::semantic::SemanticStateIdentity> {
+        crate::engine::lifecycle::import_semantic_fact_page(&self.state, page).await
+    }
+
+    /// Export one provider-funded page of canonical signed facts in stable
+    /// FactId order. The exclusive cursor and protocol-derived bounds make
+    /// every retained response finite and resumable.
+    pub fn export_semantic_fact_page(
+        &self,
+        request: crate::semantic::SemanticFactPageRequest,
+    ) -> Result<crate::semantic::SemanticFactPage> {
+        crate::engine::lifecycle::export_semantic_fact_page(&self.state, request)
+    }
+
+    /// Inspect the deterministic identity of this network's canonical graph,
+    /// including unresolved custody and the projected authority commitment.
+    pub fn semantic_state_identity(&self) -> Result<crate::semantic::SemanticStateIdentity> {
+        crate::engine::lifecycle::semantic_state_identity(&self.state)
+    }
+
+    /// Compact and reopen the exact durable semantic state owned by this
+    /// network. The canonical state owner performs verification and only then
+    /// replaces the live graph, so a failed compaction leaves it unchanged.
+    pub fn compact_semantic_state(&self) -> Result<()> {
+        self.state.compact_semantic_state()
+    }
+
+    /// Export the verified Closed bootstrap record that owns this network.
+    /// Open and Silent networks deliberately refuse because they have no
+    /// authority-bearing bootstrap record to export.
+    pub fn export_bootstrap_record(&self) -> Result<crate::semantic::BootstrapRecord> {
+        match self.state.verified_bootstrap().policy() {
+            crate::semantic::VerifiedProjectPolicy::Closed(_) => {
+                Ok(self.state.verified_bootstrap_record().clone())
+            }
+            crate::semantic::VerifiedProjectPolicy::Open => Err(Error::Other(
+                "open network has no Closed bootstrap record".into(),
+            )),
+        }
     }
 
     pub fn network_id(&self) -> &str {
@@ -545,6 +586,7 @@ impl JoinedNetwork {
             network_id_changed: current.network_id != next.network_id,
             signaling_changed: current.signaling != next.signaling,
             closed_relay_changed: current.closed_relay != next.closed_relay,
+            semantic_policy_changed: current.semantic_policy != next.semantic_policy,
             scheduler_changed: current.scheduler != next.scheduler,
             event_capacity_changed: current.event_capacity != next.event_capacity,
             connection_trace_capacity_changed: current.connection_trace_capacity
@@ -1013,12 +1055,6 @@ impl JoinedNetwork {
     /// the driver to exit, and drops the entry. After leave, the
     /// `JoinedNetwork` is no longer usable.
     pub async fn leave(self) -> Result<()> {
-        if matches!(
-            self.state.verified_bootstrap().policy(),
-            crate::semantic::VerifiedProjectPolicy::Open
-        ) {
-            crate::engine::governance::leave_open_participation(&self.state).await?;
-        }
         self.shutdown().await
     }
 
@@ -1253,9 +1289,8 @@ pub struct PeerInfo {
     /// How far this peer's wall clock reads from ours (ms; positive = the
     /// peer is ahead), estimated passively from the heartbeat pings it
     /// already sends (RTT-corrected median over a short window). `None`
-    /// until its first inbound ping. `#[serde(default)]` so a snapshot
-    /// from an older daemon still decodes.
-    #[serde(default)]
+    /// until its first inbound ping. The current status schema requires this
+    /// field, including when its value is `None`.
     pub clock_skew_ms: Option<i64>,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
@@ -1405,5 +1440,36 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, Error::ConnectorPolicyRequired));
+    }
+
+    #[test]
+    fn peer_info_requires_the_current_clock_skew_field() {
+        let snapshot = PeerInfo {
+            device_id: "peer".into(),
+            status: PeerStatus::Offline,
+            tier: ConnectionTier::Steady,
+            rtt_ms: None,
+            clock_skew_ms: None,
+            label: String::new(),
+            capabilities: None,
+            local_shelved: false,
+            remote_shelved: false,
+            authenticated: false,
+            device_suffix: String::new(),
+            verification_code_received: None,
+            verification_code_sent: None,
+            local_approve_sent: false,
+            remote_approve_seen: false,
+            needs_turn: false,
+            local_candidates: IceCandidateStats::default(),
+            remote_candidates: IceCandidateStats::default(),
+            selected_pair: None,
+        };
+        let mut value = serde_json::to_value(snapshot).expect("peer snapshot serializes");
+        value
+            .as_object_mut()
+            .expect("peer snapshot is an object")
+            .remove("clock_skew_ms");
+        assert!(serde_json::from_value::<PeerInfo>(value).is_err());
     }
 }

@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
+    TopologyMode,
 };
-use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::{MeshEvent, PeerEvent};
 use myownmesh_signaling::local::LocalBroker;
@@ -27,13 +28,14 @@ fn silent_network(id: &str) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -56,17 +58,10 @@ async fn silent_peers_are_sighted_but_do_not_connect_until_dialed() {
         spawn_network(silent_network("alice"), alice_id.clone(), transport.clone())
             .await
             .expect("alice engine");
-    join_open_participation(&alice_state)
-        .await
-        .expect("alice open participation");
     let (bob_state, _bob_driver) =
         spawn_network(silent_network("bob"), bob_id.clone(), transport.clone())
             .await
             .expect("bob engine");
-    join_open_participation(&bob_state)
-        .await
-        .expect("bob open participation");
-
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
 

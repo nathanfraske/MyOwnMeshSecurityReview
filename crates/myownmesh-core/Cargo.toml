@@ -42,17 +42,15 @@ required-features = ["transport-lab"]
 myownmesh-signaling = { workspace = true }
 
 tokio = { workspace = true }
-tokio-util = { workspace = true }
-tokio-stream = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
-pin-project-lite = { workspace = true }
 
 webrtc = { workspace = true }
 
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
+rusqlite = { workspace = true }
 
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
@@ -75,6 +73,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 if-addrs = "0.15"
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

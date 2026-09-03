@@ -37,9 +37,9 @@ raw characterization material, not a release-evidence assertion.
 
 The architecture has five cooperating mechanisms:
 
-1. **Durable semantic state** stores and derives long-lived mesh meaning, such as Open participation, Closed governance, durable capability grants, and optional application contract facts.
+1. **Durable semantic state** stores and derives long-lived Closed governance meaning. Open participation is runtime-only and does not enter this ledger; any reviewed application contract domain is separate from the base ledger.
 2. **Signaling** moves durable facts and ephemeral transport-control messages through any suitable signaling medium.
-3. **The connector runtime** performs actual networking work: discovery, candidate gathering, candidate racing, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery.
+3. **The connector runtime** performs actual networking work: discovery, candidate gathering, bounded application of admitted remote ICE candidates, connectivity checks, relay allocation, transport handshakes, measurement, migration, and recovery. The current remote-candidate planner is not a cross-family direct/TURN/Closed-relay racer.
 4. **Endpoint authentication and the session broker** promote a working channel into an application-usable peer session only after exact Device authentication and current mesh policy checks.
 5. **Applications** exchange payload only through a live authenticated session capability.
 
@@ -88,24 +88,45 @@ Transport properties affect:
 - metadata exposure;
 - cost, power, and resource use.
 
-They do not, by themselves, establish Device identity, Open participation, Closed authorization, or application authority.
+They do not, by themselves, establish Device identity, ephemeral Open participation, Closed authorization, or application authority.
 
 ## 3. Durable semantic state
 
 The durable semantic subsystem stores only facts whose meaning must survive transport loss, process restart, reordering, duplication, and delayed delivery.
 
-The core durable fact families are:
+The base ledger is a durable Closed authority/governance ledger. Its retained
+fact classes are:
 
 ```text
 DurableFact =
-    OpenParticipation
-    | ClosedGovernance
-    | DurableCapabilityGrant
-    | DurableCapabilityRevocation
-    | OptionalApplicationContractFact
+    RoleGrant
+    | RoleRevoke
+    | Evict
+    | MembershipAdmit
+    | EvictionProof
+    | SelfStandDown
+    | Attestation
+    | Resolution
+    | AuthorityLineageResolution
 ```
 
-A concrete profile may define a smaller closed set. New fact families require an adopted typed domain definition. There is no arbitrary opaque fact body in the core.
+`RoleGrant` and `RoleRevoke` retain the governed role state; `MembershipAdmit`
+and `Evict` retain the member decision; `EvictionProof` retains the evidence
+that makes an eviction admissible; `SelfStandDown` and `Attestation` retain
+explicitly typed governance evidence; and `Resolution` plus
+`AuthorityLineageResolution` retain the cited heads needed to resolve an
+exclusive cell or its complete cross-cell lineage. A concrete Closed profile
+may select a smaller set, but every selected class needs an adopted typed
+definition. Reviewed application contract facts, if enabled, use a separate
+explicitly selected domain and are not base Closed authority. There is no
+arbitrary opaque fact body in the base ledger.
+
+Open has zero base durable semantic facts. An Open device participates
+ephemerally only after an exact-context handshake proves possession of the
+corresponding Device key. Presence, join, leave, reconnect, candidate, and
+session observations for both Open and Closed are runtime evidence and never
+become semantic history. They may update a local read-only reachability or
+roster projection, but they cannot create authority.
 
 Every durable fact has:
 
@@ -132,24 +153,30 @@ In this specification, **projection means deterministic semantic derivation**. I
 
 `Project` may derive:
 
-- the local Open roster view;
 - the local Closed authorization view;
 - durable capability state;
 - explicit ambiguity in an exclusive durable semantic cell;
 - optional application contract state.
 
 It does not derive a live route, a working socket, a current relay allocation, a congestion state, or an `Online` boolean.
+The local Open runtime-participant view is maintained outside `Project`; Open
+topology, join/leave/reconnect, and session lifecycle never create or churn
+semantic ledger facts.
 
 ### 3.1 Open
 
-Open is permissionless self-participation.
+Open is permissionless ephemeral self-participation. It has no base-ledger
+fact or durable admission record.
 
 ```text
-Valid self-authored OpenParticipation(Present)
-    -> the author may project as an Open participant
+Valid exact-context handshake with Device-key possession
+    -> the endpoint may participate in the local Open runtime
 ```
 
-No sponsor, founder, quorum, pair grant, signaling service, application, identity-count vote, proof of work, or existing participant approves the Device ID.
+No sponsor, founder, quorum, pair grant, signaling service, application,
+identity-count vote, proof of work, or existing participant approves the
+Device ID. A live Open session, presence observation, leave, or reconnect is
+not written to semantic history and is not an authority input.
 
 Resource pressure may refuse or evict local work. That is a typed resource or availability result, not an authorization denial.
 
@@ -175,14 +202,73 @@ Only exclusive same-cell competitors are a no-go for singular authority. They re
 
 ### 3.4 Retention and compaction
 
-The durable store need not retain complete history. It may replace resolved history with a verified, independently reopenable semantic basis that preserves:
+The Closed ledger retains exact history by default. It may delete semantic
+history only after an archive or an authority-ratified checkpoint provides a
+verified, independently reopenable basis. A checkpoint must preserve:
 
 - current durable state;
 - unresolved exclusive conflicts;
 - exact continuation validation required by the adopted domain;
 - evidence still required by live guards or pending durable effects.
 
-Facts continue to reference facts. A compaction base is verification evidence, not an author or causal event.
+Facts continue to reference facts. A compaction base is verification evidence,
+not an author or causal event. The shipped compaction boundary is bounded
+checkpointing only: it may checkpoint or truncate WAL within the owner-funded
+StorageBytes claim, but it does not claim a full-copy SQLite `VACUUM`. A full
+copy or rewrite requires separately funded custody for its temporary copy,
+metadata, and cleanup. Checkpointing is not silent time-based eviction or
+semantic pruning, and no wall-clock age alone expires, removes, or rewrites a
+fact.
+
+### 3.5 Ledger admission, quarantine, and growth
+
+The owner selects finite ledger limits independently for fact count, encoded
+fact bytes, causal-edge count, per-author count/bytes, proof-verification
+work, and indexed database bytes. The selected limits are configuration and
+are recorded with the store; they are not hidden protocol constants and are
+not inferred from an Open or Closed default.
+
+Before every semantic mutation, the reducer computes the complete delta,
+including the candidate fact, its encoded bytes, every new causal edge,
+author-specific usage, proof work, indexes, and database pages. The exact
+`N+1` request is refused before any graph, projection, ACK, identity, or
+authority change when any owner-selected limit would be crossed. Refusal is
+typed and leaves the prior state unchanged; it cannot be converted into an
+identity change or a successful acknowledgement.
+
+A fact whose dependencies are not present enters a finite,
+dependency-indexed quarantine only after its own shape and author checks pass.
+Quarantine entries and reverse dependency indexes consume the same count,
+byte, edge, per-author, proof, and database claims. Duplicate delivery is
+idempotent; a dependency failure or proof failure releases that exact
+quarantine custody. There is no unbounded retry queue, global event cache, or
+timer-based eviction.
+
+The persistent implementation is a local-only indexed SQLite store with one
+semantic writer on one dedicated blocking thread and one ordinary SQLite
+connection using SQLite's default VFS, WAL journaling, and `FULL` synchronous
+durability. SQLite owns file locking, recovery, WAL reuse, and automatic
+checkpointing; MyOwnMesh owns semantic admission, quotas, and the writer
+lifetime. For the
+StorageBytes dimension, one process-accounted claim is `B = M + W + S + R`:
+main database bytes, WAL bytes, shared-memory/sidecar bytes, and explicit
+reserve. Named-file containment or VFS accounting does not establish backing
+disk capacity, filesystem metadata capacity, or ENOSPC behavior; those remain
+unobservable or residual until an exact provider contract proves them. Readers
+may inspect snapshots, but only the single writer mutates the graph,
+quarantine indexes, checkpoint metadata, or retention boundary. A deployment
+may choose smaller owner limits, but it may not claim more than the configured
+database budget.
+
+For selected limits `C` (facts), `B` (encoded bytes), `E` (edges), `A` (per
+author), `P` (proof work), and `D` (database bytes), the worst admitted live
+ledger is bounded by the corresponding finite claim vector; an operational
+growth estimate is the sum of `C` fact/index records, `B` payload bytes, `E`
+edge/index records, and the selected SQLite/WAL/checkpoint overhead inside
+`D`. Failure spam is bounded by the same pre-mutation vector and per-author
+limits: rejected `N+1` attempts allocate no semantic record, no ACK, and no
+new authority. A failed cleanup retains the exact charged claim until an
+owner-observed terminal path settles it.
 
 Opening stored durable state never recreates live sockets, channels, keys, reachability observations, connector objects, session handles, or resource reservations from a prior runtime.
 
@@ -244,7 +330,8 @@ The connector may:
 - probe addresses;
 - open or accept sockets;
 - allocate bounded TURN or member-relay state;
-- race candidates;
+- apply admitted queued remote ICE candidates through the bounded connector
+  planner;
 - perform a transport handshake;
 - measure whether packets pass;
 - detect failure and clean up.
@@ -264,7 +351,12 @@ MyOwnMesh does not maintain a parallel global route table. A connector may keep 
 
 ### 5.1 Attempt, connector, and resource cardinality
 
-One connection attempt is a cancellation, race, and aggregate-resource owner. It may own several connector candidates. One WebRTC connector candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE agent may gather, receive, and check many internal ICE candidates and candidate pairs.
+One connection attempt is a cancellation and aggregate-resource owner. It may
+own several connector candidates, but the current remote-ICE application
+planner is not evidence of cross-connector racing. One WebRTC connector
+candidate owns exactly one `RTCPeerConnection` and its one ICE agent. That ICE
+agent may gather, receive, and check many internal ICE candidates and candidate
+pairs.
 
 These relationships describe ownership, not product-wide maximum counts. Basal MyOwnMesh defines no fixed semantic ceiling for Mesh runtimes, peers, attempts, sessions, or real-time flows. A finite host still has finite resources, so creating any of these objects is fallible. Admission succeeds only when the applicable resource provider grants the object's finite composite claim. Refusal is typed resource pressure or unavailability, never an Open or Closed authorization result.
 
@@ -535,7 +627,7 @@ A useful view may include:
 
 ```text
 PeerReachabilityView {
-    durable_participation_or_authorization_state,
+    durable_closed_authorization_projection,
     signaling_response_observation,
     candidate_and_channel_observations,
     authenticated_session_state,
@@ -611,7 +703,7 @@ MyOwnMesh is therefore not a transport-removed ledger and not a blockchain-shape
 6. **Projection is durable semantic derivation only.** It does not create or forecast routes.
 7. **No route ledger is required.** Candidate, route, channel, and handoff state are live connector state unless a separate application domain explicitly chooses otherwise.
 8. **A working socket is not a session.** Endpoint authentication, mesh policy, local principal, and resources are required for promotion.
-9. **Carrier is not peer identity.** Direct, TURN, generic relay, and Closed member relay preserve the same authenticated endpoint relationship.
+9. **Carrier is not peer identity.** Direct, TURN, and Closed member relay preserve the same authenticated endpoint relationship.
 10. **No anonymous member relay.** A Closed member relay is visibly attributable to its Device identity.
 11. **No relay-authorized handoff.** Relays cannot add, select, or retire an application-usable channel.
 12. **Signaling and payload remain disjoint.** No ordinary application path can use signaling as a generic message bus.
@@ -634,11 +726,21 @@ Owner review must select and test:
 5. The supported signaling carriers and ephemeral transport-control schemas.
 6. Connector profiles and required egress environments.
 7. Endpoint-authentication and channel-binding protocols.
-8. Direct, TURN, generic relay, and Closed member-relay requirements.
+8. Direct, TURN, and Closed member-relay requirements.
 9. Resource-provider integration: the provider actually used in each deployment form, its structural limits, its host isolation domains, and any optional local resource ceiling.
 10. Reachability observation and local path-selection policies.
 11. Session-handle sharing, recovery, and application lifecycle behavior.
 12. Measurements used for performance characterization, provider-cost estimation, regression detection, opaque-allocation discovery, and optional deployment policy.
+
+Required measurable evidence is separate from these owner selections. Before
+architecture compliance is called complete, durable runs must exercise: scale
+and exact `N+1` refusal for Open and Closed paths; Open/Closed separation with
+no runtime lifecycle fact; duplicate/no-op delivery with unchanged projection
+and storage usage; restart reconstruction of the exact Closed projection with
+no revived live handles; bounded checkpoint/reopen behavior; and terminal
+provider/resource baselines after success, refusal, failure, and shutdown.
+Source inspection or a unit result alone is not a compliance PASS, and this
+document records no final PASS without those durable runs.
 
 Item 9 is delivered as a provider and integration report, not as a dossier of chosen numbers. For each provider and deployment form, that report names which resource dimensions the provider exposes exactly, which are conservatively claimable, which are isolatable in a host-enforced domain, and which remain unobservable residuals. It records the concrete scheduling policy that provider implements, together with the evidence that the policy preserves the basal properties in section 5.1.
 

@@ -123,22 +123,6 @@ impl FactContent {
         }
     }
 
-    pub fn open_participation(
-        mesh_context: MeshContextId,
-        device_id: DeviceId,
-        joined: bool,
-        parents: Vec<FactId>,
-    ) -> Self {
-        let author = device_id.clone();
-        Self::new(
-            FactDomain::Participation,
-            mesh_context,
-            FactBody::OpenParticipation { device_id, joined },
-            author,
-            parents,
-        )
-    }
-
     /// Construct canonical content from the graph's exact exclusive-cell
     /// witness.  Callers may add authority/evidence support explicitly; body
     /// support (evidence, attestation inputs, and cited resolution heads) is
@@ -231,10 +215,9 @@ impl FactContent {
             }
         }
         match &self.body {
-            FactBody::OpenParticipation { device_id, .. }
-            | FactBody::SelfStandDown { device_id, .. } => {
+            FactBody::SelfStandDown { device_id, .. } => {
                 if self.author != *device_id {
-                    return Err(SemanticError::InvalidOpenAuthor);
+                    return Err(SemanticError::InvalidStandDownProof);
                 }
             }
             FactBody::Attestation { signer, .. } => {
@@ -336,11 +319,10 @@ mod tests {
             .expect("bootstrap");
         let context = bootstrap.context_id();
         let content = FactContent::new(
-            FactDomain::Participation,
+            FactDomain::Governance,
             context,
-            FactBody::OpenParticipation {
-                device_id: device.clone(),
-                joined: true,
+            FactBody::RoleRevoke {
+                target: device.clone(),
             },
             device,
             Vec::new(),
@@ -358,7 +340,15 @@ mod tests {
             VerifiedBootstrap::create_closed("mesh-nested-wire", vec![key.clone()], [0; 32])
                 .expect("bootstrap")
                 .context_id();
-        let content = FactContent::open_participation(context, device, true, Vec::new());
+        let content = FactContent::new(
+            FactDomain::Governance,
+            context,
+            FactBody::RoleRevoke {
+                target: device.clone(),
+            },
+            device,
+            Vec::new(),
+        );
         let fact = SignedFact::sign(content, &key).expect("canonical fact");
 
         let mut content_wire = serde_json::to_value(&fact.content).unwrap();
@@ -374,29 +364,6 @@ mod tests {
         let mut signed_wire = serde_json::to_value(&fact).unwrap();
         signed_wire["legacy"] = serde_json::json!(true);
         assert!(serde_json::from_value::<SignedFact>(signed_wire).is_err());
-    }
-
-    #[test]
-    fn open_participation_does_not_sign_a_display_label() {
-        let key = key();
-        let device = device(&key);
-        let context = VerifiedBootstrap::create_closed("mesh-a", vec![key.clone()], [0; 32])
-            .expect("bootstrap")
-            .context_id();
-        let content = FactContent::new(
-            FactDomain::Participation,
-            context,
-            FactBody::OpenParticipation {
-                device_id: device.clone(),
-                joined: true,
-            },
-            device,
-            Vec::new(),
-        );
-        let encoded = content.canonical_bytes();
-        assert!(!encoded
-            .windows(b"label".len())
-            .any(|window| window == b"label"));
     }
 
     #[test]
@@ -436,25 +403,10 @@ mod tests {
     }
 
     #[test]
-    fn participation_cannot_claim_governance_domain() {
-        let key = key();
-        let device = device(&key);
-        let context = VerifiedBootstrap::create_closed("mesh-a", vec![key], [0; 32])
-            .expect("bootstrap")
-            .context_id();
-        let content = FactContent::new(
-            FactDomain::Governance,
-            context,
-            FactBody::OpenParticipation {
-                device_id: device.clone(),
-                joined: true,
-            },
-            device,
-            Vec::new(),
-        );
-        assert!(matches!(
-            content.validate(),
-            Err(crate::semantic::SemanticError::DomainMismatch)
-        ));
+    fn unknown_semantic_kind_is_rejected_before_graph_admission() {
+        let unsupported = serde_json::json!({
+            "kind": "future_semantic_kind",
+        });
+        assert!(serde_json::from_value::<FactBody>(unsupported).is_err());
     }
 }

@@ -235,6 +235,8 @@ pub fn derive_task_custody_plan(
 /// driver creates identity, provider state, sockets, or tasks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NostrTimingConfig {
+    /// Maximum time allowed for one TCP/TLS/WebSocket connection attempt.
+    pub connect_timeout: Duration,
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
     pub reconnect_max_attempts: u32,
@@ -248,6 +250,7 @@ pub struct NostrTimingConfig {
 impl NostrTimingConfig {
     pub fn validate(&self) -> Result<(), crate::Error> {
         let millisecond_fields = [
+            ("connect_timeout", self.connect_timeout),
             ("reconnect_initial", self.reconnect_initial),
             ("reconnect_max", self.reconnect_max),
             ("announcer_cancel_quantum", self.announcer_cancel_quantum),
@@ -631,7 +634,7 @@ where
     let cancel_token_for_task = cancel_token.clone();
     cancellers.push(cancel_token);
     tasks.push(tokio::spawn(async move {
-        run_outbound_pump_v2(shared_for_outbound, cancel_token_for_task).await;
+        run_outbound_pump(shared_for_outbound, cancel_token_for_task).await;
     }));
 
     // Spawn the global announce task. Single ticker per driver
@@ -1033,13 +1036,19 @@ fn jittered_ms(base_ms: u64, jitter_percent: u64, seed: &str, salt: u64) -> u64 
     hasher.update(salt.to_le_bytes());
     let digest = hasher.finalize();
     let raw = u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"));
-    // Map to [-jitter, +jitter] of base.
-    let span = base_ms.saturating_mul(jitter_percent.saturating_mul(2)) / 100;
-    if span == 0 {
+    // Map to [-jitter, +jitter] of base using a wide intermediate. A valid
+    // owner policy may select any u64 millisecond value; doing this in u64
+    // would make `span + 1` and the final sum wrap at the boundary.
+    let base = u128::from(base_ms);
+    let jitter = u128::from(jitter_percent);
+    let lower = base.saturating_mul(100u128.saturating_sub(jitter)) / 100;
+    let upper = base.saturating_mul(100u128.saturating_add(jitter)) / 100;
+    let width = upper.saturating_sub(lower);
+    if width == 0 {
         return base_ms;
     }
-    let offset = raw % (span + 1);
-    base_ms.saturating_sub(base_ms.saturating_mul(jitter_percent) / 100) + offset
+    let offset = u128::from(raw) % (width + 1);
+    lower.saturating_add(offset).min(u128::from(u64::MAX)) as u64
 }
 
 fn reconnect_base_ms(attempt: u32, timing: &NostrTimingConfig) -> u64 {
@@ -1062,9 +1071,53 @@ fn reconnect_base_ms(attempt: u32, timing: &NostrTimingConfig) -> u64 {
         .min(max_ms)
 }
 
+fn next_reconnect_attempt(attempt: u32, max_attempts: u32) -> u32 {
+    attempt.saturating_add(1).min(max_attempts)
+}
+
 struct RelaySessionCancellation<'a> {
     flag: &'a std::sync::atomic::AtomicBool,
     wake: &'a Notify,
+}
+
+enum RelayDialOutcome<T, E> {
+    Connected(T),
+    Failed(E),
+    TimedOut,
+    Cancelled,
+}
+
+/// Keep a pending socket handshake bounded by the owner-selected deadline
+/// while retaining the same cancellation and shutdown linearization as the
+/// session writer. The generic future makes a pending dial deterministic in
+/// the focused controls without creating a real socket or task.
+async fn await_relay_dial<F, T, E>(
+    dial: F,
+    timeout: Duration,
+    cancellation: &RelaySessionCancellation<'_>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> RelayDialOutcome<T, E>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let cancel_notified = cancellation.wake.notified();
+    tokio::pin!(cancel_notified);
+    cancel_notified.as_mut().enable();
+    if cancellation.flag.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
+        return RelayDialOutcome::Cancelled;
+    }
+    tokio::select! {
+        result = tokio::time::timeout(timeout, dial) => match result {
+            Ok(Ok(value)) => RelayDialOutcome::Connected(value),
+            Ok(Err(error)) => RelayDialOutcome::Failed(error),
+            Err(_) => RelayDialOutcome::TimedOut,
+        },
+        changed = shutdown_rx.changed() => {
+            let _ = changed;
+            RelayDialOutcome::Cancelled
+        }
+        _ = &mut cancel_notified => RelayDialOutcome::Cancelled,
+    }
 }
 
 #[derive(Debug)]
@@ -1133,18 +1186,15 @@ async fn run_relay(
         if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
-        let cancel_notified = cancel_wake.notified();
-        let connect = tokio::select! {
-            result = tokio_tungstenite::connect_async_with_config(
-                &url,
-                Some(websocket_config()),
-                false,
-            ) => result,
-            _ = shutdown_rx.changed() => return,
-            _ = cancel_notified => return,
-        };
+        let connect = await_relay_dial(
+            tokio_tungstenite::connect_async_with_config(&url, Some(websocket_config()), false),
+            shared.timing.connect_timeout,
+            &cancellation,
+            &mut shutdown_rx,
+        )
+        .await;
         match connect {
-            Ok((stream, _)) => {
+            RelayDialOutcome::Connected((stream, _)) => {
                 if consecutive_failures > 0 {
                     info!(
                         relay = %short(&url),
@@ -1227,30 +1277,46 @@ async fn run_relay(
                     }
                 }
             }
-            Err(e) => {
+            RelayDialOutcome::Failed(e) => {
                 if consecutive_failures == 0 {
                     warn!(relay = %short(&url), "relay connect failed: {e}");
                 } else {
                     debug!(
                         relay = %short(&url),
-                        attempt = consecutive_failures + 1,
+                        attempt = consecutive_failures.saturating_add(1),
                         "relay still failing: {e}"
                     );
                 }
                 consecutive_failures = consecutive_failures.saturating_add(1);
             }
+            RelayDialOutcome::TimedOut => {
+                if consecutive_failures == 0 {
+                    warn!(relay = %short(&url), "relay connect timed out after {:?}", shared.timing.connect_timeout);
+                } else {
+                    debug!(
+                        relay = %short(&url),
+                        attempt = consecutive_failures.saturating_add(1),
+                        "relay connect still timing out after {:?}",
+                        shared.timing.connect_timeout
+                    );
+                }
+                consecutive_failures = consecutive_failures.saturating_add(1);
+            }
+            RelayDialOutcome::Cancelled => return,
         }
         if cancel.load(std::sync::atomic::Ordering::SeqCst) || *shutdown_rx.borrow() {
             return;
         }
-        // Reconnect backoff: 2 / 4 / 8 / 16 / 32 s capped at 60 s — the
-        // increment precedes the shift, so a 1 s wait is unreachable —
-        // then jittered by the configured percentage per node so a shared outage (relay restart,
-        // site-wide blip) doesn't recover as a synchronized redial herd.
+        // Reconnect backoff doubles from the owner-configured initial delay
+        // until the owner-configured maximum — the increment precedes the
+        // shift — then applies the configured percentage per node so a shared
+        // outage (relay restart, site-wide blip) doesn't recover as a
+        // synchronized redial herd.
         // A forced-reconnect bump cuts the wait short so resume-from-sleep
         // recovery doesn't sit through a backoff that accrued while the
         // host was suspended.
-        backoff_attempt = (backoff_attempt + 1).min(shared.timing.reconnect_max_attempts);
+        backoff_attempt =
+            next_reconnect_attempt(backoff_attempt, shared.timing.reconnect_max_attempts);
         let base_ms = reconnect_base_ms(backoff_attempt, &shared.timing);
         let wait_ms = jittered_ms(
             base_ms,
@@ -1822,13 +1888,6 @@ fn handle_inbound_frame(
             let envelope: SignalingEnvelope =
                 serde_json::from_str(&event.content).map_err(|e| e.to_string())?;
 
-            // Skip messages directed to a different recipient.
-            if let Some(to) = &envelope.to {
-                if to != &shared.device_id {
-                    return Ok(());
-                }
-            }
-
             // Enforce the presence/negotiation kind split on receive.
             // This is the receive-side half of the replay fix: a
             // stored-kind event can be replayed from history, so we
@@ -1840,6 +1899,9 @@ fn handle_inbound_frame(
             // as a remote description against dead ICE credentials.
             match envelope.msg {
                 SignalingMessage::Announce { peer_id } => {
+                    if envelope.to != shared.room_handle {
+                        return Ok(());
+                    }
                     if event.kind != SIGNALING_EVENT_KIND {
                         trace!(
                             relay = %short(url),
@@ -1864,6 +1926,9 @@ fn handle_inbound_frame(
                         .map_err(|_| INBOUND_SINK_CLOSED.to_string())?;
                 }
                 SignalingMessage::Leave { peer_id } => {
+                    if envelope.to != shared.room_handle {
+                        return Ok(());
+                    }
                     // Departure rides the ephemeral kind like the rest of
                     // the live negotiation traffic — a stored-kind "leave"
                     // would be stale history, so drop it.
@@ -1886,6 +1951,9 @@ fn handle_inbound_frame(
                         .map_err(|_| INBOUND_SINK_CLOSED.to_string())?;
                 }
                 other => {
+                    if envelope.to != shared.device_id {
+                        return Ok(());
+                    }
                     if event.kind != SIGNALING_EPHEMERAL_KIND {
                         trace!(
                             relay = %short(url),
@@ -1939,14 +2007,46 @@ fn handle_inbound_frame(
     Ok(())
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct SignalingEnvelope {
     from: String,
-    /// Recipient device id, or None for a broadcast (announce).
-    #[serde(default)]
-    to: Option<String>,
+    /// Required recipient: a device id for directed negotiation, or the room
+    /// handle for an explicit presence/leave broadcast.
+    to: String,
     #[serde(flatten)]
     msg: SignalingMessage,
+}
+
+impl<'de> serde::Deserialize<'de> for SignalingEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let serde_json::Value::Object(mut object) = value else {
+            return Err(serde::de::Error::custom(
+                "signaling envelope must be a JSON object",
+            ));
+        };
+        let from = object
+            .remove("from")
+            .ok_or_else(|| serde::de::Error::custom("signaling envelope is missing from"))?;
+        let to = object
+            .remove("to")
+            .ok_or_else(|| serde::de::Error::custom("signaling envelope is missing to"))?;
+        let from: String = serde_json::from_value(from)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        let to: String = serde_json::from_value(to)
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        if to.is_empty() {
+            return Err(serde::de::Error::custom(
+                "signaling envelope recipient must not be empty",
+            ));
+        }
+        let msg = serde_json::from_value(serde_json::Value::Object(object))
+            .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+        Ok(Self { from, to, msg })
+    }
 }
 
 /// The one announce builder — the periodic ticker, the per-session
@@ -1956,7 +2056,7 @@ struct SignalingEnvelope {
 fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     let envelope = SignalingEnvelope {
         from: shared.device_id.clone(),
-        to: None,
+        to: shared.room_handle.clone(),
         msg: SignalingMessage::Announce {
             peer_id: shared.device_id.clone(),
         },
@@ -1970,10 +2070,7 @@ fn build_announce_event(shared: &DriverShared) -> NostrEvent {
     )
 }
 
-async fn run_outbound_pump_v2(
-    shared: Arc<DriverShared>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
+async fn run_outbound_pump(shared: Arc<DriverShared>, cancel: Arc<std::sync::atomic::AtomicBool>) {
     let mut rx_guard = shared.outbound.lock().await;
     let Some(mut rx) = rx_guard.take() else {
         return;
@@ -2050,7 +2147,7 @@ fn translate_outbound_event(shared: &DriverShared, outbound: NostrOutbound) -> N
         NostrOutbound::Leave => {
             let envelope = SignalingEnvelope {
                 from: shared.device_id.clone(),
-                to: None,
+                to: shared.room_handle.clone(),
                 msg: SignalingMessage::Leave {
                     peer_id: shared.device_id.clone(),
                 },
@@ -2069,7 +2166,7 @@ fn translate_outbound_event(shared: &DriverShared, outbound: NostrOutbound) -> N
         NostrOutbound::DirectedToPeer { to, msg } => {
             let envelope = SignalingEnvelope {
                 from: shared.device_id.clone(),
-                to: Some(to.clone()),
+                to: to.clone(),
                 msg,
             };
             make_event(
@@ -2101,13 +2198,19 @@ mod tests {
     use crate::nostr::delivery::UnmeteredDeliveryProvider;
     use crate::nostr::event::NostrIdentity;
     use crate::OwnedSignal;
-    use futures::task::{Context, Poll};
+    use futures::task::{noop_waker, Context, Poll};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     // Only the controls build channels now: the driver itself takes an
     // `OutboundSource` and an `InboundSink`, and owns no queue in either
     // direction.
     use tokio::sync::mpsc;
+
+    fn poll_to_pending<F: std::future::Future>(future: Pin<&mut F>) {
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(future.poll(&mut context), Poll::Pending));
+    }
 
     fn panicking_task(
         message: &'static str,
@@ -2144,6 +2247,26 @@ mod tests {
     }
 
     struct RefusingCustodian;
+
+    struct PendingDialWitness {
+        polled: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl std::future::Future for PendingDialWitness {
+        type Output = Result<(), ()>;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polled.store(true, Ordering::SeqCst);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDialWitness {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
 
     impl TaskCustodian for RefusingCustodian {
         fn reserve(&self, _slots: usize) -> Result<Box<dyn TaskReservation>, TaskCustodyError> {
@@ -2338,6 +2461,7 @@ mod tests {
     fn recovery_timing_policy_is_checked_and_deterministic() {
         let timing = test_timing();
         assert!(timing.validate().is_ok());
+        assert_eq!(timing.connect_timeout, Duration::from_secs(30));
         assert_eq!(timing.reconnect_initial, Duration::from_secs(2));
         assert_eq!(reconnect_base_ms(0, &timing), 0);
         assert_eq!(reconnect_base_ms(1, &timing), 2_000);
@@ -2363,6 +2487,9 @@ mod tests {
         assert!(invalid.validate().is_err());
         invalid = timing;
         invalid.reconnect_initial = Duration::ZERO;
+        assert!(invalid.validate().is_err());
+        invalid = timing;
+        invalid.connect_timeout = Duration::ZERO;
         assert!(invalid.validate().is_err());
         invalid = timing;
         invalid.reconnect_max = Duration::MAX;
@@ -2507,6 +2634,131 @@ mod tests {
                 .count(),
             1,
             "exactly one open announcement"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relay_dial_hits_checked_deadline() {
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let result = await_relay_dial(
+            std::future::pending::<Result<(), ()>>(),
+            Duration::from_millis(1),
+            &cancellation,
+            &mut shutdown_rx,
+        )
+        .await;
+        assert!(matches!(result, RelayDialOutcome::TimedOut));
+    }
+
+    #[tokio::test]
+    async fn pending_relay_dial_cancels_before_deadline() {
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut dial = Box::pin(await_relay_dial(
+            PendingDialWitness {
+                polled: Arc::clone(&polled),
+                dropped: Arc::clone(&dropped),
+            },
+            Duration::from_secs(30),
+            &cancellation,
+            &mut shutdown_rx,
+        ));
+        poll_to_pending(dial.as_mut());
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "dial must reach Poll::Pending"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        cancel_wake.notify_waiters();
+        assert!(matches!(dial.await, RelayDialOutcome::Cancelled));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "cancel must drop the dial witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relay_dial_cancels_when_shutdown_is_signaled() {
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut dial = Box::pin(await_relay_dial(
+            PendingDialWitness {
+                polled: Arc::clone(&polled),
+                dropped: Arc::clone(&dropped),
+            },
+            Duration::from_secs(30),
+            &cancellation,
+            &mut shutdown_rx,
+        ));
+        poll_to_pending(dial.as_mut());
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "dial must reach Poll::Pending"
+        );
+        shutdown_tx
+            .send(true)
+            .expect("shutdown receiver remains live");
+        assert!(matches!(dial.await, RelayDialOutcome::Cancelled));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "shutdown must drop the dial witness"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_relay_dial_simultaneous_cancel_and_shutdown_is_cancelled() {
+        let cancel = AtomicBool::new(false);
+        let cancel_wake = Notify::new();
+        let cancellation = RelaySessionCancellation {
+            flag: &cancel,
+            wake: &cancel_wake,
+        };
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut dial = Box::pin(await_relay_dial(
+            PendingDialWitness {
+                polled: Arc::clone(&polled),
+                dropped: Arc::clone(&dropped),
+            },
+            Duration::from_secs(30),
+            &cancellation,
+            &mut shutdown_rx,
+        ));
+        poll_to_pending(dial.as_mut());
+        assert!(
+            polled.load(Ordering::SeqCst),
+            "dial must reach Poll::Pending"
+        );
+        cancel.store(true, Ordering::SeqCst);
+        cancel_wake.notify_waiters();
+        shutdown_tx
+            .send(true)
+            .expect("shutdown receiver remains live");
+        assert!(matches!(dial.await, RelayDialOutcome::Cancelled));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "simultaneous cancellation must drop the dial witness"
         );
     }
 
@@ -2946,6 +3198,7 @@ mod tests {
 
     fn test_timing() -> NostrTimingConfig {
         NostrTimingConfig {
+            connect_timeout: Duration::from_secs(30),
             reconnect_initial: Duration::from_secs(2),
             reconnect_max: Duration::from_secs(60),
             reconnect_max_attempts: 6,
@@ -2964,7 +3217,7 @@ mod tests {
     fn announce_frame_for(peer: &str, signer: &NostrIdentity) -> (String, String) {
         let envelope = SignalingEnvelope {
             from: peer.into(),
-            to: None,
+            to: "test-room".into(),
             msg: SignalingMessage::Announce {
                 peer_id: peer.into(),
             },
@@ -3082,7 +3335,7 @@ mod tests {
         // different id (NIP-01 events are content-addressed).
         let envelope = SignalingEnvelope {
             from: peer_pub.clone(),
-            to: None,
+            to: "test-room".into(),
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
             },
@@ -3133,7 +3386,7 @@ mod tests {
     fn offer_frame_for(peer: &str, to: &str, signer: &NostrIdentity, kind: u16) -> String {
         let envelope = SignalingEnvelope {
             from: peer.into(),
-            to: Some(to.into()),
+            to: to.into(),
             msg: SignalingMessage::Offer {
                 peer_id: peer.into(),
                 offer_id: "off-1".into(),
@@ -3149,6 +3402,20 @@ mod tests {
             1_700_000_000,
         );
         serde_json::json!(["EVENT", "sub-1", serde_json::to_value(&event).unwrap()]).to_string()
+    }
+
+    #[test]
+    fn nostr_envelope_requires_recipient_and_rejects_unknown_fields() {
+        let missing_recipient = r#"{"from":"peer-a","kind":"announce","peer_id":"peer-a"}"#;
+        assert!(
+            serde_json::from_str::<SignalingEnvelope>(missing_recipient).is_err(),
+            "Nostr envelopes must carry an explicit current recipient"
+        );
+        let unknown = r#"{"from":"peer-a","to":"test-room","kind":"announce","peer_id":"peer-a","accepted":true}"#;
+        assert!(
+            serde_json::from_str::<SignalingEnvelope>(unknown).is_err(),
+            "ignored envelope/message fields must not decode"
+        );
     }
 
     /// A live offer on the ephemeral kind is delivered to the engine.
@@ -3221,7 +3488,7 @@ mod tests {
         let peer_pub = peer_signer.pubkey_hex().to_string();
         let envelope = SignalingEnvelope {
             from: peer_pub.clone(),
-            to: None,
+            to: "test-room".into(),
             msg: SignalingMessage::Announce {
                 peer_id: peer_pub.clone(),
             },
@@ -3328,5 +3595,22 @@ mod tests {
             "three nodes shouldn't share one jitter offset"
         );
         assert_eq!(jittered_ms(0, 15, "x", 0), 0, "zero base stays zero");
+    }
+
+    #[test]
+    fn reconnect_attempt_and_jitter_boundaries_do_not_wrap() {
+        assert_eq!(next_reconnect_attempt(u32::MAX, u32::MAX), u32::MAX);
+        assert_eq!(next_reconnect_attempt(u32::MAX - 1, u32::MAX), u32::MAX);
+        let wide = jittered_ms(u64::MAX, 100, "boundary", u64::MAX);
+        assert_eq!(
+            wide,
+            jittered_ms(u64::MAX, 100, "boundary", u64::MAX),
+            "wide jitter arithmetic remains deterministic at the boundary"
+        );
+
+        let mut timing = test_timing();
+        timing.reconnect_initial = Duration::from_millis(u64::MAX);
+        timing.reconnect_max = Duration::from_millis(u64::MAX);
+        assert_eq!(reconnect_base_ms(u32::MAX, &timing), u64::MAX);
     }
 }

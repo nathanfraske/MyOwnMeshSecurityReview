@@ -328,7 +328,7 @@ pub(super) async fn on_channel_seq_admitted(
                 Some(reason)
                     if state
                         .peers
-                        .retire_exact_session(dispatch.logical_operation()) =>
+                        .retire_exact_session(dispatch.logical_reply_operation()) =>
                 {
                     trace!(
                         peer = %super::short_peer(owner.device_id()),

@@ -45,7 +45,7 @@ export function commandFailure(error: unknown): CommandFailure {
     try {
       value = JSON.parse(value);
     } catch {
-      return { message: value };
+      return { message: String(value) };
     }
   }
   if (value && typeof value === "object") {
@@ -282,18 +282,18 @@ function createMeshClient() {
    *  stale cache that would resurrect what was wiped. `restart_app` never
    *  resolves (the app is replaced), so this call ends by relaunching. */
   async function forgetAllNetworksAndRestart() {
-    await resetAndRestart("mesh_forget_all_networks");
+    await resetAndRestart(() => invoke("mesh_forget_all_networks"));
   }
 
   /** Danger Zone: factory reset — wipe this device's entire state (identity,
    *  config, every network) and reboot into a brand-new identity. */
   async function factoryResetAndRestart() {
-    await resetAndRestart("mesh_factory_reset");
+    await resetAndRestart(() => invoke("mesh_factory_reset"));
   }
 
-  async function resetAndRestart(command: "mesh_forget_all_networks" | "mesh_factory_reset") {
+  async function resetAndRestart(operation: () => Promise<unknown>) {
     try {
-      await runMutation(() => invoke(command));
+      await runMutation(operation);
     } catch (error) {
       if (!isOutcomeUnknown(error)) throw error;
       // The daemon may already have applied the reset and closed its

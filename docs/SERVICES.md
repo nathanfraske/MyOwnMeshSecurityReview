@@ -12,6 +12,12 @@ This page describes device-wide hosted services. A network-scoped Closed
 opaque member relay is a separate capability described below; it is not a
 hosted service endpoint and is not exposed as a public infrastructure URL.
 
+Hosted-service adverts, presence, joins, leaves, reconnects, and listener
+health are runtime transport observations. They never enter the semantic
+ledger or create Open participation or Closed authority. Closed governance
+facts remain in the owner-selected durable ledger; service configuration and
+topology remain local configuration/projection.
+
 A device is **any combination** of a mesh node and these hosted
 services. A dedicated box can be pure infrastructure (signaling +
 STUN + TURN, not itself a member). The hosted services are **off by
@@ -38,7 +44,10 @@ TURN (advertising itself purely as an edge / ingress-egress point) and
 joins no networks itself.
 
 Toggling `node` live joins or leaves every configured network in place;
-no restart needed.
+no restart needed. Those runtime membership transitions are not durable
+semantic facts; on Open they are authenticated only by the exact-context
+handshake and Device-key possession, while Closed admission still requires
+the current Closed governance projection.
 
 ### Network-scoped Closed opaque member relay
 
@@ -83,7 +92,9 @@ joiner discovers everyone already in the room; negotiation events
 offer can't bind a fresh connection. The relay does not verify event
 signatures. It is a forwarder, and the mesh runs its own ed25519 mutual
 auth over the resulting WebRTC channel, so a forged Nostr event buys an
-attacker nothing but a failed handshake.
+attacker nothing but a failed handshake. This bounded service-cache retention
+is not semantic-ledger retention and never silently evicts or prunes a
+durable Closed fact.
 
 #### Intelligent coordination
 
@@ -184,7 +195,7 @@ Services live under `services` in `~/.myownmesh/config.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "services": {
     "node":      { "enabled": true },
     "signaling": {
@@ -223,13 +234,57 @@ Closed relay policy is selected per network rather than under `services`:
 
 ```json
 {
+  "version": 2,
   "networks": [{
     "id": "home",
     "network_id": "my-cool-mesh",
+    "kind": "closed",
+    "semantic_policy": {
+      "max_fact_encoded_bytes": 65535,
+      "max_dependencies_per_fact": 64,
+      "max_authority_uses_per_fact": 32,
+      "max_authority_predecessors_per_use": 64,
+      "max_admitted_facts": 100000,
+      "max_admitted_bytes": 134217728,
+      "max_quarantined_facts": 4096,
+      "max_quarantined_bytes": 16777216,
+      "max_quarantined_facts_per_author": 256,
+      "max_quarantined_bytes_per_author": 4194304,
+      "max_retained_facts_per_author": 10000,
+      "max_retained_bytes_per_author": 16777216,
+      "max_dependency_edges": 1000000,
+      "max_ready_batch": 256,
+      "max_pending_proofs": 10000,
+      "max_pending_proof_bytes": 16777216,
+      "max_proof_records": 100000,
+      "max_proof_bytes": 67108864,
+      "max_proof_links": 100000,
+      "max_author_usage_rows": 100000,
+      "max_provisional_rows": 100000,
+      "max_transaction_dirty_main_pages": 1024,
+      "max_uncheckpointed_wal_frames": 1018,
+      "max_freelist_pages": 1024,
+      "max_fragmented_pages": 1024,
+      "max_main_journal_bytes": 8388608,
+      "max_database_bytes": 2147483648,
+      "max_wal_bytes": 8413072,
+      "wal_checkpoint_threshold_bytes": 4194192,
+      "emergency_reserve_bytes": 8388608
+    },
     "closed_relay": { "enabled": true }
   }]
 }
 ```
+
+`semantic_policy` is the complete owner-selected semantic storage policy.
+Its logical named-file and lifecycle maxima cover the main database,
+`MainJournal`, WAL/SHM, dirty transactions, provisional state, and checkpoint
+frames, proof records/links, and per-author retention. The default
+`max_wal_bytes` reserves 1,018 retained frames plus one 1,024-page transaction;
+`wal_checkpoint_threshold_bytes` selects SQLite's automatic-checkpoint frame
+count. SQLite's default VFS owns locking, recovery, WAL reuse, and checkpoint
+execution. These are logical process-local reservations, not physical-capacity
+guarantees: an operating-system `ENOSPC` can still occur.
 
 The remaining `closed_relay` bounds are owner-selected finite values. A
 member is admitted as a relay only after the Closed projection and both

@@ -293,6 +293,11 @@ impl PreAuthAttemptPermit {
 
     /// Reserve the opening claim before asynchronous connector construction.
     /// The attempt permit remains available for other racing candidates.
+    ///
+    /// This lossy Option adapter exists only for in-crate fixtures. Production
+    /// callers use [`Self::reserve_connector_candidate_checked`] so provider
+    /// pressure remains distinct from an attempt that retired in the race.
+    #[cfg(test)]
     pub(crate) fn reserve_connector_candidate(
         &self,
         claim: ConnectorCandidateResourceClaim,
@@ -302,9 +307,9 @@ impl PreAuthAttemptPermit {
             .flatten()
     }
 
-    /// Typed provider admission used by the connector owner. Compatibility
-    /// call sites may temporarily map this error to `None`, but the resource
-    /// dimension is preserved here.
+    /// Typed provider admission used by the connector owner. A retired
+    /// attempt returns `Ok(None)`; provider pressure remains the typed
+    /// `Err(ResourceUnavailable)` path and is never collapsed by production.
     pub(crate) fn reserve_connector_candidate_checked(
         &self,
         claim: ConnectorCandidateResourceClaim,

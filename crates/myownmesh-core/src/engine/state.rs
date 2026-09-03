@@ -81,7 +81,7 @@ use crate::transport::webrtc::{
 };
 use crate::transport::{LocalIceCandidate, Transport};
 use parking_lot::{Mutex, RwLock};
-use tokio::sync::{broadcast, oneshot, watch, Notify};
+use tokio::sync::{broadcast, oneshot, watch, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 #[cfg(test)]
@@ -696,8 +696,17 @@ pub struct NetworkState {
     pub(crate) session_broker: Option<SessionBroker>,
 
     pub config: RwLock<NetworkConfig>,
+    /// The validated semantic envelope is fixed for this live owner.  It is
+    /// retained separately from the mutable network configuration so a
+    /// shutdown purge reacquires the exact same process StorageBytes claim
+    /// that was admitted before the durable slot was opened.
+    semantic_storage_claim: ResourceClaim,
     pub topology: RwLock<TopologyMode>,
     pub topology_impl: RwLock<Box<dyn Topology>>,
+    /// The one bounded route planner and replay owner for this network.
+    /// Its child resource scope makes every retained replay identity part of
+    /// this network's provider-funded lifetime rather than an unfunded cache.
+    pub(crate) routing: super::routing::RoutingState,
 
     pub(crate) peers: PeerRegistry,
     pub roster: RwLock<Roster>,
@@ -757,6 +766,15 @@ pub struct NetworkState {
     /// semantic work.  The guard is never held across an async transport
     /// await; callers receive a funded, exact send witness instead.
     durable_publication_gate: Mutex<()>,
+    /// Bounds the number of blocking durable admissions per network.  The
+    /// permit is acquired before the blocking closure is spawned and is held
+    /// until that closure has completed, so admission order remains the
+    /// journal/publication order rather than an unbounded executor queue.
+    durable_admission_lane: Arc<Semaphore>,
+    #[cfg(test)]
+    durable_admission_active: AtomicU64,
+    #[cfg(test)]
+    durable_admission_max: AtomicU64,
     durable_provisional: Mutex<Vec<ProvisionalCustody>>,
     durable_proof_outbox: DurableProofOutbox,
     pub current_phase: RwLock<MeshPhase>,
@@ -964,7 +982,7 @@ pub struct NetworkState {
     ///
     /// Test and transport-lab observation only. It is absent from ordinary
     /// production builds and has no effect on receipt admission or custody.
-    #[cfg(any(test, feature = "transport-lab"))]
+    #[cfg(all(test, feature = "transport-lab"))]
     pub(crate) depart_observed_gate: DepartObservedGate,
 
     /// One action to run inside a handler run's start, between its early
@@ -1209,15 +1227,47 @@ impl NetworkState {
                 config.kind
             )));
         }
+        let semantic_policy = config
+            .semantic_policy()
+            .map_err(|error| Error::Network(format!("semantic policy rejected: {error}")))?;
+        let routing_policy_config = config
+            .routing_policy()
+            .map_err(|error| Error::Network(format!("routing policy rejected: {error}")))?;
+        let routing_policy = super::routing::RoutingPolicy::checked(
+            usize::try_from(routing_policy_config.max_next_hops).map_err(|_| {
+                Error::Network("routing policy max_next_hops does not fit usize".into())
+            })?,
+            usize::try_from(routing_policy_config.max_parallel_routes).map_err(|_| {
+                Error::Network("routing policy max_parallel_routes does not fit usize".into())
+            })?,
+            routing_policy_config.max_envelope_bytes,
+            usize::try_from(routing_policy_config.max_dedup_entries).map_err(|_| {
+                Error::Network("routing policy max_dedup_entries does not fit usize".into())
+            })?,
+            routing_policy_config.max_dedup_bytes,
+            u8::try_from(routing_policy_config.max_hop_budget).map_err(|_| {
+                Error::Network("routing policy max_hop_budget does not fit u8".into())
+            })?,
+        )
+        .map_err(|error| Error::Network(format!("routing policy rejected: {error}")))?;
+        let routing = super::routing::RoutingState::try_new(&local_resources, routing_policy)?;
         config
             .scheduler_policy()
             .map_err(|error| Error::Network(format!("scheduler policy rejected: {error}")))?;
         let mesh_context_id = verified_bootstrap.context_id();
 
+        // Storage is one process-owned claim for the complete semantic slot
+        // envelope (database, WAL, SHM, and emergency reserve).  Acquire it
+        // before any semantic path, VFS, or writer lock can be touched.  A
+        // provider refusal therefore remains the typed resource-pressure
+        // error and leaves no partially-created durable slot behind.
         let pinned: std::collections::HashSet<String> =
             config.pinned_peers.iter().cloned().collect();
         let persistence_root = instance_root.as_deref();
-        let roster = crate::roster::load_at(persistence_root, &config.network_id)?;
+        // The roster is advisory metadata only.  Start with an empty keyed
+        // projection and restore canonical semantic state before consulting
+        // any on-disk labels or timestamps.
+        let roster = crate::roster::empty_for_at(persistence_root, &config.network_id);
         // Topology is connector/deployment policy, not a canonical
         // authority-bearing fact. It therefore remains local configuration.
         let effective_topology = config.topology.clone();
@@ -1342,14 +1392,22 @@ impl NetworkState {
         let durable_root = instance_root
             .clone()
             .unwrap_or(crate::dirs::data_dir()?.join("mesh"));
-        let durable_semantic_store = DurableSemanticStore::new(durable_root, &config.id);
+        let durable_semantic_store =
+            DurableSemanticStore::with_policy(durable_root, &config.id, semantic_policy);
+        let semantic_storage_claim = durable_semantic_store
+            .storage_claim()
+            .map_err(|error| Error::Network(format!("semantic storage envelope: {error}")))?;
+        let semantic_storage_lease = local_resources.acquire(semantic_storage_claim)?;
         let durable_semantic_owner = Arc::new(
             durable_semantic_store
-                .open_writable()
+                .open_writable_funded(semantic_storage_lease)
                 .map_err(|error| Error::Network(format!("open semantic slot: {error}")))?,
         );
-        let durable_proof_outbox =
-            DurableProofOutbox::from_owner(Arc::clone(&durable_semantic_owner));
+        let durable_proof_outbox = DurableProofOutbox::from_owner_with_policy(
+            Arc::clone(&durable_semantic_owner),
+            semantic_policy,
+        )
+        .map_err(|error| Error::Network(format!("open semantic proof outbox: {error}")))?;
         let (initial_graph, durable_provisional) =
             match durable_semantic_owner.restore(&verified_bootstrap) {
                 Ok(restored) => (
@@ -1357,7 +1415,10 @@ impl NetworkState {
                     restored.provisional_custody().to_vec(),
                 ),
                 Err(crate::semantic::store::DurableStoreError::Missing { .. }) => {
-                    let graph = crate::semantic::FactGraph::from_bootstrap(&verified_bootstrap);
+                    let graph = crate::semantic::FactGraph::from_bootstrap_with_policy(
+                        &verified_bootstrap,
+                        semantic_policy,
+                    );
                     durable_semantic_owner
                         .commit(&graph, Vec::new())
                         .map_err(|error| {
@@ -1381,8 +1442,10 @@ impl NetworkState {
             resource_scope,
             session_broker,
             config: RwLock::new(config.clone()),
+            semantic_storage_claim,
             topology: RwLock::new(effective_topology),
             topology_impl: RwLock::new(topology_impl),
+            routing,
             peers: PeerRegistry::new(local_device_id),
             roster: RwLock::new(roster),
             fact_graph,
@@ -1407,6 +1470,11 @@ impl NetworkState {
             }),
             durable_semantic_owner,
             durable_publication_gate: Mutex::new(()),
+            durable_admission_lane: Arc::new(Semaphore::new(1)),
+            #[cfg(test)]
+            durable_admission_active: AtomicU64::new(0),
+            #[cfg(test)]
+            durable_admission_max: AtomicU64::new(0),
             durable_provisional: Mutex::new(durable_provisional),
             durable_proof_outbox,
             current_phase: RwLock::new(MeshPhase::Joining),
@@ -1451,7 +1519,7 @@ impl NetworkState {
             rpc_send_boundary: RpcSendBoundary::default(),
             #[cfg(test)]
             rpc_handler_start_boundary: RpcSendBoundary::default(),
-            #[cfg(any(test, feature = "transport-lab"))]
+            #[cfg(all(test, feature = "transport-lab"))]
             depart_observed_gate: DepartObservedGate::default(),
             #[cfg(test)]
             rpc_handler_precommit_action: Mutex::new(None),
@@ -1462,6 +1530,11 @@ impl NetworkState {
             conn_trace_tx,
             conn_trace_force_on,
         });
+        // Read advisory labels only after the canonical graph/store has been
+        // restored. Corrupt or unavailable metadata becomes an empty cache and
+        // cannot block authority startup.
+        *state.roster.write() =
+            crate::roster::load_advisory_at(persistence_root, &state.network_id);
         // Rebuild the compatibility roster from the restored canonical graph
         // before the state becomes observable. The roster is UI metadata only;
         // no admission decision may depend on its persisted bytes.
@@ -1802,19 +1875,20 @@ impl NetworkState {
             .retire_exact(session_id, generation)
     }
 
-    pub(crate) fn settle_closed_relay_exact(
+    /// Request terminal settlement under the exact allocation generation.
+    /// If a checkout currently owns the handle, the registry marks that slot
+    /// closing and wakes the checkout; its owner Drop then completes the same
+    /// generation's settlement without allowing successor substitution.
+    pub(crate) fn request_terminal_closed_relay_exact(
         &self,
         session_id: [u8; 16],
         generation: &super::closed_relay::ClosedRelayGeneration,
-    ) -> std::result::Result<
-        crate::runtime::relay::ClosedRelayTerminal,
-        crate::runtime::relay::ClosedRelayRefusal,
-    > {
+    ) -> std::result::Result<bool, crate::runtime::relay::ClosedRelayRefusal> {
         self.closed_relay_allocations
             .lock()
             .as_mut()
             .ok_or(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive)?
-            .settle_exact(session_id, generation)
+            .request_terminal_exact(session_id, generation)
     }
 
     /// Shutdown fence for the driver owner. Every immediately-owned slot is
@@ -1873,11 +1947,25 @@ impl NetworkState {
         if let Some(registry) = self.closed_relay_closing.lock().as_mut() {
             retired += registry.remove_stale(self);
         }
-        if let Some(registry) = self.closed_relay_endpoints.lock().as_mut() {
-            retired += registry.remove_stale(self);
+        let stale_endpoints = self
+            .closed_relay_endpoints
+            .lock()
+            .as_mut()
+            .map(|registry| registry.take_stale(self))
+            .unwrap_or_default();
+        retired += stale_endpoints.len();
+        for session in stale_endpoints {
+            session.cancel_consumer();
         }
-        if let Some(registry) = self.closed_relay_target_accepts.lock().as_mut() {
-            retired += registry.remove_stale(self);
+        let stale_accepts = self
+            .closed_relay_target_accepts
+            .lock()
+            .as_mut()
+            .map(|registry| registry.take_stale(self))
+            .unwrap_or_default();
+        retired += stale_accepts.len();
+        for session in stale_accepts {
+            session.cancel_consumer();
         }
         retired
     }
@@ -1909,6 +1997,7 @@ impl NetworkState {
             let mut tasks = self.closed_relay_pending_expiries.lock();
             let Some(tasks) = tasks.as_mut() else {
                 expiry.cancel();
+                let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
                 return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
             };
             let mut index = 0;
@@ -1927,6 +2016,7 @@ impl NetworkState {
             let mut tasks = self.closed_relay_pending_expiries.lock();
             let Some(tasks) = tasks.as_mut() else {
                 expiry.cancel();
+                let _ = self.take_closed_relay_pending_if_epoch(session_id, allocation_epoch);
                 return Err(crate::runtime::relay::ClosedRelayRefusal::OwnerNotLive);
             };
             tasks.extend(pending);
@@ -2399,7 +2489,7 @@ impl NetworkState {
     /// Reach the one-shot DepartObserved control gate. In an ordinary build
     /// this compiles to no behavior because the gate is not part of the state.
     pub(crate) async fn reach_depart_observed_gate(&self) {
-        #[cfg(any(test, feature = "transport-lab"))]
+        #[cfg(all(test, feature = "transport-lab"))]
         self.depart_observed_gate.reach().await;
     }
 
@@ -2457,7 +2547,7 @@ impl NetworkState {
 /// makes a release concurrent with arrival observable rather than a lost
 /// `Notify` wake. Consuming the arm before announcing entry makes only one
 /// receipt park, even if several receipt tasks reach the hook together.
-#[cfg(any(test, feature = "transport-lab"))]
+#[cfg(all(test, feature = "transport-lab"))]
 #[derive(Default)]
 pub(crate) struct DepartObservedGate {
     armed: std::sync::atomic::AtomicBool,
@@ -2465,7 +2555,7 @@ pub(crate) struct DepartObservedGate {
     release_notify: tokio::sync::Notify,
 }
 
-#[cfg(any(test, feature = "transport-lab"))]
+#[cfg(all(test, feature = "transport-lab"))]
 impl DepartObservedGate {
     pub(crate) async fn reach(&self) {
         use std::sync::atomic::Ordering;
@@ -2633,10 +2723,6 @@ impl RpcSendBoundary {
     pub(crate) fn finished(&self) -> usize {
         self.finished.load(std::sync::atomic::Ordering::SeqCst)
     }
-
-    /// Keep the legacy test callsite source-compatible; task completion is the
-    /// only observable boundary this control needs.
-    pub(crate) fn mark_semantic_finished(&self) {}
 }
 
 /// Records one handler task's end, **after** that task's lease has been
@@ -2692,74 +2778,159 @@ impl NetworkState {
             .map_err(|error| Error::Network(format!("durable semantic owner unavailable: {error}")))
     }
 
-    /// Admit one canonical fact only after the resulting authoritative state
-    /// has been durably committed. The live graph is swapped after
-    /// publication, so a writer/serialization/checksum failure cannot expose
-    /// an effect that will disappear on restart. Quarantined facts are also
-    /// persisted as unresolved dependencies with one exact custody claim; they
-    /// are not projected or advertised until a later parent admission resolves
-    /// them.
+    /// Admit one canonical fact through a journal under the publication gate.
+    /// The journal's tentative graph mutation is invisible to readers while
+    /// this write lock is held; a durable failure consumes the journal's exact
+    /// rollback before the lock is released. Quarantined facts are persisted as
+    /// unresolved dependencies with one exact custody claim; they are not
+    /// projected or advertised until a later parent admission resolves them.
     pub(crate) fn admit_fact_durably(
         &self,
         fact: crate::semantic::SignedFact,
     ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
+        self.admit_fact_durably_with_delta(fact)
+            .map(|(admission, changed, _delta)| (admission, changed))
+    }
+
+    pub(crate) fn admit_fact_durably_with_delta(
+        &self,
+        fact: crate::semantic::SignedFact,
+    ) -> Result<(
+        crate::semantic::Admission,
+        Vec<crate::semantic::SignedFact>,
+        crate::semantic::SemanticDelta,
+    )> {
+        // Open presence is deliberately not a semantic ledger.  Keep this
+        // invariant at the state boundary as well as in FactGraph validation
+        // so a reconnect/leave or future ingress caller cannot reach the
+        // durable owner before the policy refusal is observed.
+        if matches!(
+            self.verified_bootstrap.policy(),
+            crate::semantic::VerifiedProjectPolicy::Open
+        ) {
+            return Err(Error::Other(
+                "Open networks do not admit durable semantic facts".into(),
+            ));
+        }
         let _publication = self.durable_publication_gate.lock();
         let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
-        let before: std::collections::BTreeSet<_> = live.ids().cloned().collect();
-        let mut candidate = live.clone();
-        let fact_id = fact.id;
-        let admission = candidate
-            .admit(fact)
+        let expected_base_projection = live.projection_commitment_root();
+        let journal = live
+            .admit_journaled(fact)
             .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
-        if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
-            let mut candidate_provisional = self.durable_provisional.lock().clone();
-            if !candidate_provisional
-                .iter()
-                .any(|claim| claim.fact_id == fact_id)
-            {
-                candidate_provisional.push(ProvisionalCustody::new(fact_id, "semantic-ingress"));
-            }
-            self.durable_semantic_owner
-                .commit(&candidate, candidate_provisional.clone())
-                .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
-            *live = candidate;
-            *self.durable_provisional.lock() = candidate_provisional;
-            return Ok((admission, Vec::new()));
+        let admission = journal.admission().clone();
+        if matches!(admission, crate::semantic::Admission::AlreadyPresent) {
+            journal.commit();
+            return Ok((
+                admission,
+                Vec::new(),
+                crate::semantic::SemanticDelta::default(),
+            ));
         }
-        if matches!(admission, crate::semantic::Admission::Inserted) {
-            if let Err(error) = candidate.retry_quarantined() {
-                if matches!(
-                    error,
-                    crate::semantic::SemanticError::ContextMismatch { .. }
-                ) {
-                    return Err(Error::Other(format!(
-                        "quarantined semantic fact context rejected: {error}"
-                    )));
+
+        let provisional_additions: Vec<ProvisionalCustody> = journal
+            .delta()
+            .provisional_added()
+            .iter()
+            .copied()
+            .map(|fact_id| ProvisionalCustody::new(fact_id, "semantic-ingress"))
+            .collect();
+        let projection_commitment = journal.graph().projection_commitment_root();
+        if let Err(error) = self.durable_semantic_owner.commit_semantic_delta(
+            self.mesh_context_id,
+            journal.delta(),
+            expected_base_projection,
+            projection_commitment,
+            &provisional_additions,
+        ) {
+            journal.rollback();
+            return Err(Error::Network(format!("semantic delta commit: {error}")));
+        }
+
+        let changed_admitted = journal
+            .delta()
+            .rows()
+            .iter()
+            .filter(|row| row.status() == crate::semantic::SemanticFactStatus::Admitted)
+            .map(|row| row.fact().clone())
+            .collect();
+        let semantic_delta = journal.delta().clone();
+        let provisional_removed = journal.delta().provisional_removed().to_vec();
+        journal.commit();
+
+        {
+            let mut provisional = self.durable_provisional.lock();
+            for fact_id in provisional_removed {
+                provisional.retain(|claim| claim.fact_id != fact_id);
+            }
+            for claim in &provisional_additions {
+                if !provisional
+                    .iter()
+                    .any(|current| current.fact_id == claim.fact_id)
+                {
+                    provisional.push(claim.clone());
                 }
-                // retry_quarantined removes a ready fact before validating its
-                // authority.  A rejected fact is therefore an exact terminal
-                // outcome: publish the remaining candidate and settle its
-                // custody instead of allowing that stale entry to starve all
-                // later admissions.
             }
-            let mut candidate_provisional = self.durable_provisional.lock().clone();
-            let unresolved: std::collections::BTreeSet<_> =
-                candidate.quarantined().map(|(id, _)| *id).collect();
-            candidate_provisional.retain(|claim| unresolved.contains(&claim.fact_id));
-            self.durable_semantic_owner
-                .commit(&candidate, candidate_provisional.clone())
-                .map_err(|error| Error::Network(format!("semantic snapshot commit: {error}")))?;
-            let newly_inserted = candidate
-                .ids()
-                .filter(|id| !before.contains(*id))
-                .filter_map(|id| candidate.get(id).cloned())
-                .collect();
-            *live = candidate;
-            *self.durable_provisional.lock() = candidate_provisional;
-            return Ok((admission, newly_inserted));
         }
-        Ok((admission, Vec::new()))
+        Ok((admission, changed_admitted, semantic_delta))
+    }
+
+    /// Run one durable admission on the blocking executor behind this
+    /// network's single bounded lane.  The synchronous method above remains
+    /// available to the bootstrap/ingress paths that already execute on a
+    /// dedicated synchronous boundary; every async proposal path acquires
+    /// this permit before spawning and holds it through journal commit or
+    /// rollback.
+    pub(crate) async fn admit_fact_durably_with_delta_async(
+        self: &Arc<Self>,
+        fact: crate::semantic::SignedFact,
+    ) -> Result<(
+        crate::semantic::Admission,
+        Vec<crate::semantic::SignedFact>,
+        crate::semantic::SemanticDelta,
+    )> {
+        let permit = self
+            .durable_admission_lane
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Network("durable admission lane closed".into()))?;
+        let state = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            let active = state
+                .durable_admission_active
+                .fetch_add(1, Ordering::SeqCst)
+                + 1;
+            #[cfg(test)]
+            state
+                .durable_admission_max
+                .fetch_max(active, Ordering::SeqCst);
+            let result = state.admit_fact_durably_with_delta(fact);
+            #[cfg(test)]
+            state
+                .durable_admission_active
+                .fetch_sub(1, Ordering::SeqCst);
+            result
+        })
+        .await
+        .map_err(|error| Error::Network(format!("durable admission worker failed: {error}")))?
+    }
+
+    pub(crate) async fn admit_fact_durably_async(
+        self: &Arc<Self>,
+        fact: crate::semantic::SignedFact,
+    ) -> Result<(crate::semantic::Admission, Vec<crate::semantic::SignedFact>)> {
+        self.admit_fact_durably_with_delta_async(fact)
+            .await
+            .map(|(admission, changed, _delta)| (admission, changed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn durable_admission_max_for_test(&self) -> u64 {
+        self.durable_admission_max.load(Ordering::SeqCst)
     }
 
     /// Re-verify and compact the exact production-owned semantic snapshot.
@@ -2797,10 +2968,16 @@ impl NetworkState {
                 "durable semantic purge requires completed network shutdown".into(),
             ));
         }
+        // The startup claim was deliberately released at the shutdown
+        // fence.  Purge gets a fresh exact B claim and transfers it directly
+        // into the owner operation, which holds it together with WriterLease
+        // for the complete slot purge.  There is no release/reacquire gap
+        // while the semantic path is being removed.
+        let storage_lease = self.local_resources.acquire(self.semantic_storage_claim)?;
         let _publication = self.durable_publication_gate.lock();
         let _semantic_fence = self.fact_graph.write();
         self.durable_semantic_owner
-            .purge()
+            .purge_funded(storage_lease)
             .map_err(|error| Error::Network(format!("semantic snapshot purge: {error}")))
     }
 
@@ -5469,7 +5646,11 @@ impl NetworkState {
     /// transition any active session — call
     /// It never emits a transport approval frame.
     pub(super) fn refresh_roster_projection(&self, device_id: &str, label: &str) -> Result<()> {
-        self.refresh_roster_projection_with(device_id, label, crate::roster::save)
+        self.refresh_roster_projection_with(device_id, label, |candidate| {
+            let mut affected = std::collections::BTreeSet::new();
+            affected.insert(crate::signing::pubkey_part(device_id).to_string());
+            crate::roster::save_affected(candidate, &affected)
+        })
     }
 
     fn refresh_roster_projection_with<F>(&self, device_id: &str, label: &str, save: F) -> Result<()>
@@ -5488,9 +5669,10 @@ impl NetworkState {
                 "canonical projection does not admit roster projection".into(),
             ));
         }
-        // Save a detached candidate before publishing it in memory.  A failed
-        // atomic write must not leave this process claiming a projection that
-        // a restart cannot recover.
+        // Save a detached candidate before publishing it in memory. The
+        // production closure above writes only the affected keyed record; a
+        // failed atomic write must not leave this process claiming a
+        // projection that a restart cannot recover.
         let mut roster = self.roster.write();
         let mut candidate = roster.clone();
         crate::roster::add_peer_in(&mut candidate, device_id, label);
@@ -5524,13 +5706,16 @@ impl NetworkState {
     /// Return the compatibility/UI roster filtered by the canonical graph.
     /// Persisted rows provide display metadata only and never authorize.
     pub(crate) fn canonical_roster_view(&self) -> Vec<crate::roster::AuthorizedPeer> {
-        self.roster
+        let mut view = self
+            .roster
             .read()
             .authorized_devices
             .iter()
             .filter(|peer| self.is_rostered(&peer.device_id))
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        view.sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        view
     }
 
     /// Total count of peers in any state.
@@ -6066,36 +6251,20 @@ mod shutdown_task_registry_tests {
 
 #[cfg(test)]
 mod roster_projection_tests {
-    use super::*;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
-
     #[test]
-    fn v4_projection_save_failure_does_not_publish_memory_candidate() {
+    fn v4_projection_refresh_persists_only_the_affected_key() {
         let state =
             crate::engine::build_test_closed_state("projection-save-before-commit", [0x2b; 32]);
         let device_id = state.identity.public_id().to_string();
         state.roster.write().authorized_devices.clear();
-        let attempted = Arc::new(AtomicBool::new(false));
-        let attempted_by_save = Arc::clone(&attempted);
-        let expected_device_id = device_id.clone();
-
-        let error = state
-            .refresh_roster_projection_with(&device_id, "owner", move |candidate| {
-                attempted_by_save.store(true, Ordering::SeqCst);
-                assert!(candidate
-                    .authorized_devices
-                    .iter()
-                    .any(|entry| entry.device_id == expected_device_id));
-                Err(Error::Roster("injected projection save failure".into()))
-            })
-            .expect_err("failed persistence must refuse the projection");
-
-        assert!(attempted.load(Ordering::SeqCst));
-        assert!(matches!(error, Error::Roster(_)));
-        assert!(state.roster.read().authorized_devices.is_empty());
+        state
+            .refresh_roster_projection(&device_id, "owner")
+            .expect("canonical projection should persist its keyed metadata");
+        let roster = state.roster.read();
+        assert!(roster
+            .authorized_devices
+            .iter()
+            .any(|entry| entry.device_id == device_id));
     }
 }
 

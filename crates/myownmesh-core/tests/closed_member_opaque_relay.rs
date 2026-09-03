@@ -6,11 +6,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
+    SignalingConfig, TopologyMode,
 };
 use myownmesh_core::resource::ResourceReport;
 use myownmesh_core::semantic::VerifiedBootstrap;
-use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, FactGraph, Role, SignedFact};
+use myownmesh_core::semantic::{
+    DeviceId, FactBody, FactContent, FactGraph, MeshContextId, Role, SignedFact,
+};
 use myownmesh_core::{
     ConnectorCallbackPolicy, FiniteResourceProvider, Identity, Mesh, MeshConfig, ResourceClaim,
     ResourceClass, ResourceProviderPort, TransportLabCallbackWorkload,
@@ -18,6 +21,19 @@ use myownmesh_core::{
 };
 
 const STAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn semantic_fact_page(
+    context_id: MeshContextId,
+    facts: &[SignedFact],
+) -> myownmesh_core::semantic::SemanticFactPage {
+    serde_json::from_value(serde_json::json!({
+        "context_id": context_id,
+        "facts": facts,
+        "next_cursor": null,
+        "complete": true,
+    }))
+    .expect("strict semantic page decodes")
+}
 
 async fn bounded_value<T>(
     stage: &'static str,
@@ -157,7 +173,7 @@ fn connector_policy(session_identity: &str) -> WebRtcConnectorCapablePolicy {
         .checked_scale(2)
         .and_then(|claim| claim.checked_scale(connector_count.get()))
         .expect("two maximum-frame JSON claims per connector are representable");
-    let claim = myownmesh_core::transport_lab_connector_fixture_grant(
+    let relay_grant = myownmesh_core::transport_lab_connector_fixture_grant(
         &[
             profile.clone(),
             profile.clone(),
@@ -213,6 +229,39 @@ fn connector_policy(session_identity: &str) -> WebRtcConnectorCapablePolicy {
         .expect("the finite remote-description grant is representable"),
     )
     .expect("the combined finite connector grant is representable");
+    let semantic_policy = SemanticPolicyConfig::default();
+    let semantic_storage_owner_count = 3_u64;
+    let semantic_storage_claim = ResourceClaim::single(
+        ResourceClass::StorageBytes,
+        semantic_policy.max_database_bytes,
+    );
+    let semantic_storage_grant =
+        FiniteResourceProvider::reservation_planning_charge(semantic_storage_claim)
+            .expect("three-node semantic storage reservation is representable")
+            .checked_scale(semantic_storage_owner_count)
+            .expect("three-node semantic storage capacity is representable");
+    let expected_storage_bytes = semantic_policy
+        .max_database_bytes
+        .checked_mul(semantic_storage_owner_count)
+        .expect("three-node semantic storage bytes are representable");
+    assert_eq!(
+        semantic_storage_grant.amount(ResourceClass::StorageBytes),
+        expected_storage_bytes,
+        "semantic storage is funded exactly once per live network owner"
+    );
+    assert_eq!(
+        semantic_storage_grant.amount(ResourceClass::OpaqueDependencyResidual),
+        semantic_storage_owner_count,
+        "semantic storage reserves exactly one provider record per live owner"
+    );
+    let claim = relay_grant
+        .checked_add(semantic_storage_grant)
+        .expect("relay and semantic grants combine without overflow");
+    assert_eq!(
+        claim.amount(ResourceClass::StorageBytes),
+        expected_storage_bytes,
+        "the three-node provider has no hidden storage slack"
+    );
     let resources = ResourceProviderPort::new(FiniteResourceProvider::new(claim))
         .expect("the finite provider accounts for its process scope");
     WebRtcConnectorCapablePolicy::new(resources, profile)
@@ -226,6 +275,8 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         connection_trace_capacity: 512,
         label: id.into(),
         kind: NetworkKind::Closed,
+        semantic_policy: Default::default(),
+        routing_policy: RoutingPolicyConfig::default(),
         scheduler: Default::default(),
         topology: TopologyMode::Star { hub: relay.into() },
         signaling: SignalingConfig::default(),
@@ -237,7 +288,6 @@ fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
         },
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -370,17 +420,17 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     // member. No engine/runtime/key state is used by this control.
     bounded_result(
         "import Alice membership facts",
-        alice_net.import_signed_facts(signed_members.clone()),
+        alice_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
     )
     .await?;
     bounded_result(
         "import relay membership facts",
-        relay_net.import_signed_facts(signed_members.clone()),
+        relay_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
     )
     .await?;
     bounded_result(
         "import Carol membership facts",
-        carol_net.import_signed_facts(signed_members),
+        carol_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
     )
     .await?;
     for network in [&alice_net, &relay_net, &carol_net] {

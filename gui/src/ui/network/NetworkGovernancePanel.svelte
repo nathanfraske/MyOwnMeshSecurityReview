@@ -110,7 +110,9 @@
     error = null;
     try {
       const result = await governance.mfaDisable(network.config_id, disableCode.trim());
-      if (!result.ok) throw new Error(result.reason ?? "MFA disable refused");
+      if (!result.ok) {
+        throw new Error("reason" in result ? result.reason : "MFA disable refused");
+      }
       enrolled = false;
       disableCode = "";
       notice = "Authenticator disabled.";

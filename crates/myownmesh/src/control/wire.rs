@@ -107,6 +107,40 @@ pub enum Request {
     NetworkAdd {
         config: NetworkConfig,
     },
+    /// Create a new Closed network. The daemon mints the creation nonce and
+    /// persists the signed bootstrap before registering the runtime.
+    NetworkCreateClosed {
+        config: NetworkConfig,
+    },
+    /// Import one exact signed Closed bootstrap under the caller-selected
+    /// local config id and an explicit context fence.
+    NetworkImportClosed {
+        config: NetworkConfig,
+        expected_context_id: myownmesh_core::semantic::MeshContextId,
+        bootstrap: myownmesh_core::semantic::BootstrapRecord,
+    },
+    /// Export the verified bootstrap record for a joined Closed network.
+    NetworkBootstrapExport {
+        network: String,
+    },
+    /// Export one provider-funded, receive-safe page of canonical semantic
+    /// facts.  The cursor is exclusive and the two limits are validated by
+    /// the core facade against its receive-frame ceiling.
+    SemanticFactPageExport {
+        network: String,
+        request: myownmesh_core::semantic::SemanticFactPageRequest,
+    },
+    /// Import one bounded semantic fact page.  Wire deserialization carries
+    /// no lease; the joined-network facade reacquires exact provider funding
+    /// before reducing the page.
+    SemanticFactPageImport {
+        network: String,
+        page: myownmesh_core::semantic::SemanticFactPage,
+    },
+    /// Inspect the deterministic semantic identity of one joined network.
+    SemanticStateIdentity {
+        network: String,
+    },
     /// Remove a network: take it out of the registry, `leave()` the
     /// engine driver, drop the signaling handle, and persist the
     /// updated config.json. Idempotent — removing an unknown id is
@@ -280,6 +314,40 @@ pub enum Request {
     GovernanceMfaDisable {
         network: String,
         code: String,
+    },
+
+    // ---- bounded Closed relay capability --------------------------
+    /// Open an opaque endpoint session through one authenticated member.
+    ClosedRelayOpen {
+        network: String,
+        relay: String,
+        target: String,
+    },
+    /// Accept one queued authenticated endpoint offer, waiting only for the
+    /// caller-provided duration.
+    ClosedRelayAccept {
+        network: String,
+        wait_ms: u64,
+    },
+    /// Send one bounded opaque plaintext through a daemon-held capability.
+    ClosedRelaySend {
+        handle: String,
+        payload: Vec<u8>,
+    },
+    /// Receive one opaque plaintext from a daemon-held capability, waiting
+    /// only for the caller-provided duration.
+    ClosedRelayRecv {
+        handle: String,
+        wait_ms: u64,
+    },
+    /// Consume one exact relay capability and close its endpoint session.
+    ClosedRelayClose {
+        handle: String,
+    },
+    /// Return deterministic generation and configured/active allocation
+    /// evidence for one daemon-held capability.
+    ClosedRelayState {
+        handle: String,
     },
 
     // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------

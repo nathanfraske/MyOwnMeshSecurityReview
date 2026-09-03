@@ -90,10 +90,6 @@ pub struct PeerStateData {
     pub status: PeerStatus,
     pub tier: ConnectionTier,
     pub authenticated: bool,
-    /// Profile identifiers the peer advertised in its `hello` (see
-    /// `protocol::features`). Empty until the hello lands. Endpoint
-    /// authentication requires the one exact current profile identifier.
-    pub features: Vec<String>,
     /// Attempt-owned funding for the peer-supplied Hello representation kept
     /// here until this connector is retired. This is deliberately not copied
     /// into snapshots: it is ownership, not diagnostic state.
@@ -302,7 +298,6 @@ impl Default for PeerStateData {
             status: PeerStatus::Sighted,
             tier: ConnectionTier::Steady,
             authenticated: false,
-            features: Vec::new(),
             hello_retention: None,
             local_approve_sent: false,
             remote_approve_seen: false,
@@ -1322,7 +1317,11 @@ impl PeerConnection {
         mesh_context: &str,
         policy_admits: bool,
     ) -> Option<SpeculativePromotion> {
-        if self.registry_retired() || !policy_admits || self.unpromoted_offer_in_flight() {
+        if self.registry_retired()
+            || !policy_admits
+            || !self.application_capability_admits()
+            || self.unpromoted_offer_in_flight()
+        {
             return None;
         }
         let (
@@ -1775,14 +1774,14 @@ impl PeerConnection {
     }
 
     pub(super) fn mark_media_renegotiation(&self, worker: &Arc<WebRtcConnectorWorker>) -> bool {
-        if !self.owns_authenticated_worker(worker) {
+        if !self.application_capability_admits() || !self.owns_authenticated_worker(worker) {
             return false;
         }
         let mut pending = self.media_renegotiation_worker.lock();
         // Retirement may have removed this exact channel after the optimistic
         // check above. Re-prove ownership while holding the coalescing slot so a
         // stale caller cannot repopulate it after retirement clears the slot.
-        if !self.owns_authenticated_worker(worker) {
+        if !self.application_capability_admits() || !self.owns_authenticated_worker(worker) {
             return false;
         }
         match pending.as_ref() {
@@ -2088,7 +2087,7 @@ impl PeerConnection {
         // retirement must destroy it before the slot can report `Current`;
         // otherwise a later operation would reuse a session minted under an
         // admission the mesh has already withdrawn.
-        if self.registry_retired() || !policy_admits {
+        if self.registry_retired() || !policy_admits || !self.application_capability_admits() {
             self.promoted_session.clear();
             return Promotion::Refused;
         }
@@ -2289,6 +2288,9 @@ impl PeerConnection {
             &mut crate::runtime::peer_session::PeerSessionState,
         ) -> R,
     ) -> Option<R> {
+        if !self.application_capability_admits() {
+            return None;
+        }
         self.promoted_session.with_live(|bundle| {
             let (session, app) = bundle.app_mut()?;
             Some(effect(session, app))
@@ -2342,6 +2344,9 @@ impl PeerConnection {
             &Arc<WebRtcConnectorWorker>,
         ) -> R,
     ) -> Option<R> {
+        if !self.application_capability_admits() {
+            return None;
+        }
         let worker = self.current_worker()?;
         let live = worker.live_connector_incarnation()?.clone();
         self.promoted_session.with_live(|bundle| {
@@ -2363,6 +2368,9 @@ impl PeerConnection {
             &Arc<WebRtcConnectorWorker>,
         ) -> R,
     ) -> Option<R> {
+        if !self.application_capability_admits() {
+            return None;
+        }
         let live = worker.live_connector_incarnation()?.clone();
         self.promoted_session.with_live_worker(
             worker,
@@ -2382,6 +2390,9 @@ impl PeerConnection {
             &str,
         ) -> R,
     ) -> Option<R> {
+        if !self.application_capability_admits() {
+            return None;
+        }
         let live = worker.live_connector_incarnation()?.clone();
         self.promoted_session.with_live_worker_and_correlation(
             worker,
@@ -2423,6 +2434,51 @@ impl PeerConnection {
             return true;
         }
         self.promoted_session.is_installed()
+    }
+
+    /// The single application admission predicate for this exact connection.
+    ///
+    /// Authentication alone is intentionally insufficient: a live data
+    /// channel, an Endpoint Auth response, and an installed capability are
+    /// transport proofs, not approval. Conversely, status alone is retained
+    /// policy history and can survive replacement without a live capability.
+    /// Application/RPC/reliable/realtime/governance/routing/media promotion and
+    /// lending therefore use this conjunction at their connection boundary.
+    /// The authenticated-but-pending durable semantic exception is owned by the
+    /// registry's separate, explicitly scoped admission path.
+    fn application_capability_admits(&self) -> bool {
+        if self.registry_retired() || !self.has_authenticated_channel() {
+            return false;
+        }
+        let data = self.state.read();
+        data.authenticated && matches!(data.status, PeerStatus::Active | PeerStatus::Shelved)
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn application_admission_requires_authenticated_approved_capability() {
+        let peer = PeerConnection::new("pre-auth-peer".to_string(), None);
+        assert!(!peer.application_capability_admits());
+
+        peer.install_authenticated_channel_for_test();
+        assert!(!peer.application_capability_admits());
+
+        {
+            let mut state = peer.state.write();
+            state.authenticated = true;
+            state.status = PeerStatus::PendingApproval;
+        }
+        assert!(!peer.application_capability_admits());
+
+        {
+            let mut state = peer.state.write();
+            state.status = PeerStatus::Active;
+        }
+        assert!(peer.application_capability_admits());
     }
 }
 

@@ -71,6 +71,28 @@ pub enum Request {
     NetworkAdd {
         config: serde_json::Value,
     },
+    NetworkCreateClosed {
+        config: serde_json::Value,
+    },
+    NetworkImportClosed {
+        config: serde_json::Value,
+        expected_context_id: serde_json::Value,
+        bootstrap: serde_json::Value,
+    },
+    NetworkBootstrapExport {
+        network: String,
+    },
+    SemanticFactPageExport {
+        network: String,
+        request: serde_json::Value,
+    },
+    SemanticFactPageImport {
+        network: String,
+        page: serde_json::Value,
+    },
+    SemanticStateIdentity {
+        network: String,
+    },
     NetworkRemove {
         network: String,
         #[serde(default)]
@@ -293,6 +315,30 @@ pub enum Request {
         code: String,
     },
 
+    ClosedRelayOpen {
+        network: String,
+        relay: String,
+        target: String,
+    },
+    ClosedRelayAccept {
+        network: String,
+        wait_ms: u64,
+    },
+    ClosedRelaySend {
+        handle: String,
+        payload: Vec<u8>,
+    },
+    ClosedRelayRecv {
+        handle: String,
+        wait_ms: u64,
+    },
+    ClosedRelayClose {
+        handle: String,
+    },
+    ClosedRelayState {
+        handle: String,
+    },
+
     // ---- self-update ----------------------------------------------
     UpdateStatus,
     UpdateCheck,
@@ -319,6 +365,9 @@ impl Request {
                 | Self::NetworkIdGenerate
                 | Self::NetworkIdNormalize { .. }
                 | Self::ConfigShow
+                | Self::NetworkBootstrapExport { .. }
+                | Self::SemanticFactPageExport { .. }
+                | Self::SemanticStateIdentity { .. }
                 | Self::ServicesStatus
                 | Self::EventsSubscribe
                 | Self::TraceSubscribe { .. }
@@ -935,6 +984,9 @@ mod tests {
             "network_id_generate",
             "network_id_normalize",
             "config_show",
+            "network_bootstrap_export",
+            "semantic_fact_page_export",
+            "semantic_state_identity",
             "services_status",
             "events_subscribe",
             "trace_subscribe",
@@ -943,7 +995,7 @@ mod tests {
             "update_status",
         ];
         let requests = fixture_requests();
-        assert_eq!(requests.len(), 51);
+        assert_eq!(requests.len(), 63);
         for request in requests {
             let encoded = serde_json::to_value(&request).expect("request serializes");
             let tag = encoded
@@ -978,6 +1030,28 @@ mod tests {
             Request::ConfigShow,
             Request::NetworkAdd {
                 config: serde_json::json!({"id":"local","network_id":"net"}),
+            },
+            Request::NetworkCreateClosed {
+                config: serde_json::json!({"id":"local","network_id":"net"}),
+            },
+            Request::NetworkImportClosed {
+                config: serde_json::json!({"id":"local","network_id":"net"}),
+                expected_context_id: serde_json::json!([0; 32]),
+                bootstrap: serde_json::json!({}),
+            },
+            Request::NetworkBootstrapExport {
+                network: "net".into(),
+            },
+            Request::SemanticFactPageExport {
+                network: "net".into(),
+                request: serde_json::json!({"cursor":null,"limit":1}),
+            },
+            Request::SemanticFactPageImport {
+                network: "net".into(),
+                page: serde_json::json!({"facts":[]}),
+            },
+            Request::SemanticStateIdentity {
+                network: "net".into(),
             },
             Request::NetworkRemove {
                 network: "net".into(),
@@ -1168,6 +1242,29 @@ mod tests {
                 network: "net".into(),
                 code: "123456".into(),
             },
+            Request::ClosedRelayOpen {
+                network: "net".into(),
+                relay: "relay".into(),
+                target: "target".into(),
+            },
+            Request::ClosedRelayAccept {
+                network: "net".into(),
+                wait_ms: 10,
+            },
+            Request::ClosedRelaySend {
+                handle: "handle".into(),
+                payload: vec![1, 2, 3],
+            },
+            Request::ClosedRelayRecv {
+                handle: "handle".into(),
+                wait_ms: 10,
+            },
+            Request::ClosedRelayClose {
+                handle: "handle".into(),
+            },
+            Request::ClosedRelayState {
+                handle: "handle".into(),
+            },
             Request::UpdateStatus,
             Request::UpdateCheck,
             Request::UpdateApply,
@@ -1191,6 +1288,12 @@ mod tests {
             "network_id_normalize",
             "config_show",
             "network_add",
+            "network_create_closed",
+            "network_import_closed",
+            "network_bootstrap_export",
+            "semantic_fact_page_export",
+            "semantic_fact_page_import",
+            "semantic_state_identity",
             "network_remove",
             "forget_all_networks",
             "factory_reset",
@@ -1227,6 +1330,12 @@ mod tests {
             "governance_mfa_abort",
             "governance_mfa_status",
             "governance_mfa_disable",
+            "closed_relay_open",
+            "closed_relay_accept",
+            "closed_relay_send",
+            "closed_relay_recv",
+            "closed_relay_close",
+            "closed_relay_state",
             "update_status",
             "update_check",
             "update_apply",

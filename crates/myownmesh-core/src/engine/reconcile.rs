@@ -25,6 +25,10 @@
 //!   no in-place "switch relays" path (the bridge's outbound receiver is
 //!   taken once), so changing relays means recreating the driver. Rare —
 //!   venues keep a stable relay set and rotate only credentials.
+//! - `semantic_policy`: admission indexes, durable proof history, and
+//!   database reservations are constructed from this policy at startup;
+//!   changing them in place would make existing ownership accounting
+//!   ambiguous, so the exact runtime must be replaced.
 
 use std::sync::Arc;
 
@@ -36,16 +40,19 @@ use super::state::NetworkState;
 /// Returns `true` when the new config differs from the current one in a
 /// way that can't be applied to a running network — `network_id`
 /// (a different network), `signaling` (the relay set the Nostr driver
-/// is bound to), `closed_relay` (the provider-backed runtime profile), or
-/// any construction-time scheduler/broadcast capacity. STUN/TURN, topology,
+/// is bound to), `closed_relay` (the provider-backed runtime profile),
+/// `semantic_policy` (the admission/store resource envelope), or any
+/// construction-time scheduler/broadcast capacity. STUN/TURN, topology,
 /// label, roster, and auto-approve are all applied in place by [`apply_hot`]
 /// without dropping peers.
-/// Changes to `closed_relay` require restart because its provider-backed
-/// runtime profile is fixed when `NetworkState` is constructed.
+/// Changes to `closed_relay` and `semantic_policy` require restart because
+/// their provider-backed/resource-accounting profiles are fixed when
+/// `NetworkState` is constructed.
 pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
     current.network_id != next.network_id
         || current.signaling != next.signaling
         || current.closed_relay != next.closed_relay
+        || current.semantic_policy != next.semantic_policy
         || current.scheduler != next.scheduler
         || current.event_capacity != next.event_capacity
         || current.connection_trace_capacity != next.connection_trace_capacity
@@ -53,7 +60,7 @@ pub fn requires_restart(current: &NetworkConfig, next: &NetworkConfig) -> bool {
 
 /// Apply the hot-reloadable subset of config without tearing down
 /// sessions: STUN/TURN servers (picked up by the next connection),
-/// topology, label, roster path, and auto-approve. Anything left to a
+/// topology, label, and auto-approve. Anything left to a
 /// restart is gated by [`requires_restart`].
 pub fn apply_hot(state: &Arc<NetworkState>, next: NetworkConfig) -> Result<()> {
     {
@@ -66,7 +73,6 @@ pub fn apply_hot(state: &Arc<NetworkState>, next: NetworkConfig) -> Result<()> {
         cfg.label = next.label;
         cfg.topology = next.topology.clone();
         cfg.auto_approve = next.auto_approve;
-        cfg.roster_path = next.roster_path;
         // ICE servers are read fresh per `open_peer`, so updating them
         // here is enough — live peers keep their current connection and
         // the next connect/reconnect uses the new servers.
@@ -150,6 +156,10 @@ mod tests {
         let mut traces = current.clone();
         traces.connection_trace_capacity += 1;
         assert!(requires_restart(&current, &traces));
+
+        let mut semantic = current.clone();
+        semantic.semantic_policy.max_proof_bytes += 1;
+        assert!(requires_restart(&current, &semantic));
     }
 
     #[test]
@@ -176,6 +186,15 @@ mod tests {
 
         assert!(apply_hot(&state, next).is_err());
         assert_eq!(state.config.read().event_capacity, current.event_capacity);
+
+        let mut semantic = current.clone();
+        semantic.semantic_policy.max_proof_bytes += 1;
+        assert!(apply_hot(&state, semantic).is_err());
+        assert_eq!(
+            state.config.read().semantic_policy,
+            current.semantic_policy,
+            "semantic policy changes must not hot-apply"
+        );
     }
 
     #[test]

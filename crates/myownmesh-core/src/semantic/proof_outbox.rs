@@ -11,8 +11,11 @@ use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use super::store::{DurableSemanticOwner, DurableSemanticStore, DurableStoreError};
+#[cfg(test)]
+use super::store::DurableSemanticStore;
+use super::store::{DurableSemanticOwner, DurableStoreError};
 use super::{DeviceId, FactId, MeshContextId};
+use crate::config::SemanticPolicyConfig;
 use std::sync::Arc;
 
 const PROOF_DELIVERY_DOMAIN: &[u8] = b"myownmesh-semantic-v4-proof-delivery-v1";
@@ -197,30 +200,57 @@ impl ProofRecord {
 #[derive(Debug, Clone)]
 pub struct DurableProofOutbox {
     backend: ProofOutboxBackend,
+    #[cfg(test)]
+    policy: SemanticPolicyConfig,
 }
 
 #[derive(Debug, Clone)]
 enum ProofOutboxBackend {
+    #[cfg(test)]
     Store(DurableSemanticStore),
     Owner(Arc<DurableSemanticOwner>),
 }
 
 impl DurableProofOutbox {
-    /// Construct an outbox addressing the same durable semantic slot as the
-    /// corresponding [`DurableSemanticStore`].
-    pub fn new(instance_root: impl Into<std::path::PathBuf>, local_slot: impl AsRef<str>) -> Self {
-        Self {
-            backend: ProofOutboxBackend::Store(DurableSemanticStore::new(
+    /// Construct a direct-store fixture with the already validated network
+    /// semantic lifetime policy. This constructor exists only for this
+    /// module's unit tests: a direct store has no provider-backed
+    /// `StorageBytes` custody and therefore must never be a production
+    /// mutation path. Production callers attach through
+    /// [`Self::from_owner_with_policy`].
+    #[cfg(test)]
+    pub fn with_policy(
+        instance_root: impl Into<std::path::PathBuf>,
+        local_slot: impl AsRef<str>,
+        policy: SemanticPolicyConfig,
+    ) -> Result<Self, ProofOutboxError> {
+        let policy = checked_policy(policy)?;
+        Ok(Self {
+            backend: ProofOutboxBackend::Store(DurableSemanticStore::with_policy(
                 instance_root,
                 local_slot,
+                policy,
             )),
-        }
+            #[cfg(test)]
+            policy,
+        })
     }
 
-    pub(crate) fn from_owner(owner: Arc<DurableSemanticOwner>) -> Self {
-        Self {
+    /// Attach an outbox to an existing semantic owner with the network's
+    /// checked policy.
+    pub(crate) fn from_owner_with_policy(
+        owner: Arc<DurableSemanticOwner>,
+        policy: SemanticPolicyConfig,
+    ) -> Result<Self, ProofOutboxError> {
+        #[cfg(test)]
+        let policy = checked_policy(policy)?;
+        #[cfg(not(test))]
+        checked_policy(policy)?;
+        Ok(Self {
             backend: ProofOutboxBackend::Owner(owner),
-        }
+            #[cfg(test)]
+            policy,
+        })
     }
 
     /// Enumerate only still-pending records for the exact authenticated
@@ -238,24 +268,33 @@ impl DurableProofOutbox {
     /// is refused without changing the existing custody.
     pub fn enqueue(&self, record: ProofRecord) -> Result<ProofRecord, ProofOutboxError> {
         record.validate()?;
-        let mut result = record.clone();
-        let context_id = record.context_id;
-        self.mutate_proof_records(context_id, |records| {
-            if let Some(existing) = records
-                .iter()
-                .find(|existing| existing.delivery_id == record.delivery_id)
-            {
-                if !same_delivery_payload(existing, &record) {
-                    return Err(DurableStoreError::ProofConflict);
-                }
-                result = existing.clone();
-                return Ok(());
+        match &self.backend {
+            #[cfg(test)]
+            ProofOutboxBackend::Store(_) => {
+                let mut result = record.clone();
+                let context_id = record.context_id;
+                self.mutate_proof_records(context_id, |records| {
+                    if let Some(existing) = records
+                        .iter()
+                        .find(|existing| existing.delivery_id == record.delivery_id)
+                    {
+                        if !same_delivery_payload(existing, &record) {
+                            return Err(DurableStoreError::ProofConflict);
+                        }
+                        result = existing.clone();
+                        return Ok(());
+                    }
+                    records.push(record.clone());
+                    records.sort_by_key(|record| record.delivery_id);
+                    enforce_proof_limits(records, &self.policy)?;
+                    Ok(())
+                })?;
+                Ok(result)
             }
-            records.push(record.clone());
-            records.sort_by_key(|record| record.delivery_id);
-            Ok(())
-        })?;
-        Ok(result)
+            ProofOutboxBackend::Owner(owner) => {
+                owner.enqueue_proof(record).map_err(ProofOutboxError::from)
+            }
+        }
     }
 
     /// Atomically rebind a pending delivery after an authenticated live
@@ -278,35 +317,55 @@ impl DurableProofOutbox {
                 "proof owner and binding are required".into(),
             ));
         }
-        match self
-            .proof_records(context_id)?
-            .into_iter()
-            .find(|record| record.delivery_id == delivery_id)
-            .ok_or(ProofOutboxError::NotFound)?
-            .state
-        {
-            ProofRecordState::Pending => {}
-            ProofRecordState::Settled => return Err(ProofOutboxError::AlreadySettled),
-            ProofRecordState::Superseded => return Err(ProofOutboxError::AlreadySuperseded),
+        match &self.backend {
+            #[cfg(test)]
+            ProofOutboxBackend::Store(_) => {
+                match self
+                    .proof_records(context_id)?
+                    .into_iter()
+                    .find(|record| record.delivery_id == delivery_id)
+                    .ok_or(ProofOutboxError::NotFound)?
+                    .state
+                {
+                    ProofRecordState::Pending => {}
+                    ProofRecordState::Settled => return Err(ProofOutboxError::AlreadySettled),
+                    ProofRecordState::Superseded => {
+                        return Err(ProofOutboxError::AlreadySuperseded)
+                    }
+                }
+                let mut rebound = None;
+                self.mutate_proof_records(context_id, |records| {
+                    let record = records
+                        .iter_mut()
+                        .find(|record| record.delivery_id == delivery_id)
+                        .ok_or(DurableStoreError::ProofNotFound)?;
+                    if record.state != ProofRecordState::Pending {
+                        return Err(DurableStoreError::ProofSettled);
+                    }
+                    if record.owner != expected_owner || record.binding != expected_binding {
+                        return Err(DurableStoreError::StaleProofBinding);
+                    }
+                    record.owner = new_owner.clone();
+                    record.binding = new_binding.clone();
+                    rebound = Some(record.clone());
+                    enforce_proof_limits(records, &self.policy)?;
+                    Ok(())
+                })?;
+                rebound.ok_or_else(|| {
+                    ProofOutboxError::InvalidRecord("rebind produced no record".into())
+                })
+            }
+            ProofOutboxBackend::Owner(owner) => owner
+                .rebind_proof(
+                    context_id,
+                    delivery_id,
+                    expected_owner,
+                    expected_binding,
+                    new_owner,
+                    new_binding,
+                )
+                .map_err(ProofOutboxError::from),
         }
-        let mut rebound = None;
-        self.mutate_proof_records(context_id, |records| {
-            let record = records
-                .iter_mut()
-                .find(|record| record.delivery_id == delivery_id)
-                .ok_or(DurableStoreError::ProofNotFound)?;
-            if record.state != ProofRecordState::Pending {
-                return Err(DurableStoreError::ProofSettled);
-            }
-            if record.owner != expected_owner || record.binding != expected_binding {
-                return Err(DurableStoreError::StaleProofBinding);
-            }
-            record.owner = new_owner.clone();
-            record.binding = new_binding.clone();
-            rebound = Some(record.clone());
-            Ok(())
-        })?;
-        rebound.ok_or_else(|| ProofOutboxError::InvalidRecord("rebind produced no record".into()))
     }
 
     /// Settle one exact delivery identity.  Repeated settlement is a no-op;
@@ -316,23 +375,32 @@ impl DurableProofOutbox {
         context_id: MeshContextId,
         delivery_id: ProofDeliveryId,
     ) -> Result<bool, ProofOutboxError> {
-        let mut settled = false;
-        self.mutate_proof_records(context_id, |records| {
-            if let Some(record) = records
-                .iter_mut()
-                .find(|record| record.delivery_id == delivery_id)
-            {
-                match record.state {
-                    ProofRecordState::Pending => {
-                        record.state = ProofRecordState::Settled;
-                        settled = true;
+        match &self.backend {
+            #[cfg(test)]
+            ProofOutboxBackend::Store(_) => {
+                let mut settled = false;
+                self.mutate_proof_records(context_id, |records| {
+                    if let Some(record) = records
+                        .iter_mut()
+                        .find(|record| record.delivery_id == delivery_id)
+                    {
+                        match record.state {
+                            ProofRecordState::Pending => {
+                                record.state = ProofRecordState::Settled;
+                                settled = true;
+                            }
+                            ProofRecordState::Settled | ProofRecordState::Superseded => {}
+                        }
                     }
-                    ProofRecordState::Settled | ProofRecordState::Superseded => {}
-                }
+                    enforce_proof_limits(records, &self.policy)?;
+                    Ok(())
+                })?;
+                Ok(settled)
             }
-            Ok(())
-        })?;
-        Ok(settled)
+            ProofOutboxBackend::Owner(owner) => owner
+                .settle_proof(context_id, delivery_id)
+                .map_err(ProofOutboxError::from),
+        }
     }
 
     /// Retire one obsolete Pending delivery without representing an
@@ -351,26 +419,40 @@ impl DurableProofOutbox {
                 "proof replacement must have a distinct delivery identity".into(),
             ));
         }
-        let mut superseded = false;
-        self.mutate_proof_records(context_id, |records| {
-            let record = records
-                .iter_mut()
-                .find(|record| record.delivery_id == delivery_id)
-                .ok_or(DurableStoreError::ProofNotFound)?;
-            if &record.target != expected_target {
-                return Err(DurableStoreError::StaleProofTarget);
+        match &self.backend {
+            #[cfg(test)]
+            ProofOutboxBackend::Store(_) => {
+                let mut superseded = false;
+                self.mutate_proof_records(context_id, |records| {
+                    let record = records
+                        .iter_mut()
+                        .find(|record| record.delivery_id == delivery_id)
+                        .ok_or(DurableStoreError::ProofNotFound)?;
+                    if &record.target != expected_target {
+                        return Err(DurableStoreError::StaleProofTarget);
+                    }
+                    match record.state {
+                        ProofRecordState::Pending => {
+                            record.state = ProofRecordState::Superseded;
+                            superseded = true;
+                        }
+                        ProofRecordState::Settled => return Err(DurableStoreError::ProofSettled),
+                        ProofRecordState::Superseded => {}
+                    }
+                    enforce_proof_limits(records, &self.policy)?;
+                    Ok(())
+                })?;
+                Ok(superseded)
             }
-            match record.state {
-                ProofRecordState::Pending => {
-                    record.state = ProofRecordState::Superseded;
-                    superseded = true;
-                }
-                ProofRecordState::Settled => return Err(DurableStoreError::ProofSettled),
-                ProofRecordState::Superseded => {}
-            }
-            Ok(())
-        })?;
-        Ok(superseded)
+            ProofOutboxBackend::Owner(owner) => owner
+                .supersede_proof(
+                    context_id,
+                    delivery_id,
+                    expected_target,
+                    replacement_delivery_id,
+                )
+                .map_err(ProofOutboxError::from),
+        }
     }
 
     fn proof_records(
@@ -378,11 +460,17 @@ impl DurableProofOutbox {
         context_id: MeshContextId,
     ) -> Result<Vec<ProofRecord>, DurableStoreError> {
         match &self.backend {
-            ProofOutboxBackend::Store(store) => store.proof_records(context_id),
+            #[cfg(test)]
+            ProofOutboxBackend::Store(store) => {
+                let records = store.proof_records(context_id)?;
+                enforce_proof_limits(&records, &self.policy)?;
+                Ok(records)
+            }
             ProofOutboxBackend::Owner(owner) => owner.proof_records(context_id),
         }
     }
 
+    #[cfg(test)]
     fn mutate_proof_records<F>(
         &self,
         context_id: MeshContextId,
@@ -393,11 +481,86 @@ impl DurableProofOutbox {
     {
         match &self.backend {
             ProofOutboxBackend::Store(store) => store.mutate_proof_records(context_id, mutation),
-            ProofOutboxBackend::Owner(owner) => owner.mutate_proof_records(context_id, mutation),
+            ProofOutboxBackend::Owner(_) => Err(DurableStoreError::InvalidProof(
+                "test-only direct-store mutation helper cannot use an owner backend".into(),
+            )),
         }
     }
 }
 
+fn checked_policy(policy: SemanticPolicyConfig) -> Result<SemanticPolicyConfig, ProofOutboxError> {
+    policy
+        .checked()
+        .map_err(|error| ProofOutboxError::Policy(error.to_string()))
+}
+
+#[cfg(test)]
+fn canonical_record_bytes(record: &ProofRecord) -> Result<u64, ProofOutboxError> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| ProofOutboxError::Serialization(error.to_string()))?;
+    u64::try_from(bytes.len()).map_err(|_| {
+        ProofOutboxError::LimitExceeded("proof record encoded bytes exceed u64 accounting")
+    })
+}
+
+#[cfg(test)]
+fn enforce_proof_limits(
+    records: &[ProofRecord],
+    policy: &SemanticPolicyConfig,
+) -> Result<(), DurableStoreError> {
+    let mut total_count = 0u64;
+    let mut pending_count = 0u64;
+    let mut total_bytes = 0u64;
+    let mut pending_bytes = 0u64;
+    for record in records {
+        let encoded_bytes = serde_json::to_vec(record).map_err(DurableStoreError::Serialization)?;
+        let encoded_bytes = u64::try_from(encoded_bytes.len()).map_err(|_| {
+            DurableStoreError::LimitExceeded("proof record encoded bytes exceed u64 accounting")
+        })?;
+        total_count = total_count
+            .checked_add(1)
+            .ok_or(DurableStoreError::LimitExceeded(
+                "proof record count overflow",
+            ))?;
+        total_bytes =
+            total_bytes
+                .checked_add(encoded_bytes)
+                .ok_or(DurableStoreError::LimitExceeded(
+                    "proof record bytes overflow",
+                ))?;
+        if record.is_pending() {
+            pending_count =
+                pending_count
+                    .checked_add(1)
+                    .ok_or(DurableStoreError::LimitExceeded(
+                        "pending proof count overflow",
+                    ))?;
+            pending_bytes = pending_bytes.checked_add(encoded_bytes).ok_or(
+                DurableStoreError::LimitExceeded("pending proof bytes overflow"),
+            )?;
+        }
+    }
+    if total_count > policy.max_proof_records {
+        return Err(DurableStoreError::LimitExceeded("proof record count"));
+    }
+    if total_bytes > policy.max_proof_bytes {
+        return Err(DurableStoreError::LimitExceeded("proof record bytes"));
+    }
+    if pending_count > policy.max_pending_proofs {
+        return Err(DurableStoreError::LimitExceeded("pending proof count"));
+    }
+    if pending_bytes > policy.max_pending_proof_bytes {
+        return Err(DurableStoreError::LimitExceeded("pending proof bytes"));
+    }
+    if total_bytes > policy.max_database_bytes {
+        return Err(DurableStoreError::LimitExceeded(
+            "proof record retained bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn same_delivery_payload(left: &ProofRecord, right: &ProofRecord) -> bool {
     left.version == right.version
         && left.context_id == right.context_id
@@ -429,6 +592,12 @@ pub enum ProofOutboxError {
     StaleBinding,
     #[error("proof delivery target is stale")]
     StaleTarget,
+    #[error("proof outbox policy rejected: {0}")]
+    Policy(String),
+    #[error("proof outbox limit exceeded: {0}")]
+    LimitExceeded(&'static str),
+    #[error("proof record serialization failed: {0}")]
+    Serialization(String),
     #[error("durable proof outbox storage failed: {0}")]
     Storage(String),
 }
@@ -444,6 +613,8 @@ impl From<DurableStoreError> for ProofOutboxError {
             DurableStoreError::ProofSettled => Self::AlreadySettled,
             DurableStoreError::StaleProofBinding => Self::StaleBinding,
             DurableStoreError::StaleProofTarget => Self::StaleTarget,
+            DurableStoreError::LimitExceeded(reason) => Self::LimitExceeded(reason),
+            DurableStoreError::Serialization(error) => Self::Serialization(error.to_string()),
             error => Self::Storage(error.to_string()),
         }
     }
@@ -470,9 +641,15 @@ mod tests {
         root
     }
 
-    fn shared_owner_fixture() -> (
+    fn checked_default_policy() -> SemanticPolicyConfig {
+        SemanticPolicyConfig::default()
+            .checked()
+            .expect("test semantic policy is valid")
+    }
+
+    fn shared_owner_components() -> (
         std::path::PathBuf,
-        Arc<DurableProofOutbox>,
+        Arc<DurableSemanticOwner>,
         MeshContextId,
         ProofRecord,
     ) {
@@ -502,7 +679,6 @@ mod tests {
         let store = DurableSemanticStore::new(&root, "slot");
         store.commit(&graph, Vec::new()).expect("snapshot");
         let owner = Arc::new(store.open_writable().expect("shared owner"));
-        let outbox = Arc::new(DurableProofOutbox::from_owner(owner));
         let record = ProofRecord::pending(
             bootstrap.context_id(),
             device,
@@ -511,8 +687,213 @@ mod tests {
             "race-binding",
         )
         .expect("record");
+        (root, owner, bootstrap.context_id(), record)
+    }
+
+    fn shared_owner_fixture() -> (
+        std::path::PathBuf,
+        Arc<DurableProofOutbox>,
+        MeshContextId,
+        ProofRecord,
+    ) {
+        let (root, owner, context, record) = shared_owner_components();
+        let outbox = Arc::new(
+            DurableProofOutbox::from_owner_with_policy(owner, checked_default_policy())
+                .expect("checked owner policy"),
+        );
         outbox.enqueue(record.clone()).expect("enqueue");
-        (root, outbox, bootstrap.context_id(), record)
+        (root, outbox, context, record)
+    }
+
+    fn second_target_record(context: MeshContextId, fact_ids: &[FactId]) -> ProofRecord {
+        let key = SigningKey::from_bytes(&[10; 32]);
+        let target =
+            DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).expect("target");
+        ProofRecord::pending(
+            context,
+            target,
+            fact_ids.to_vec(),
+            "second-owner",
+            "second-binding",
+        )
+        .expect("second record")
+    }
+
+    fn policy_for_pending_limits(
+        max_pending_proofs: u64,
+        max_pending_proof_bytes: u64,
+    ) -> SemanticPolicyConfig {
+        SemanticPolicyConfig {
+            max_fact_encoded_bytes: 1,
+            max_pending_proofs,
+            max_pending_proof_bytes,
+            max_ready_batch: max_pending_proofs,
+            ..SemanticPolicyConfig::default()
+        }
+    }
+
+    fn policy_for_total_limits(
+        max_proof_records: u64,
+        max_proof_bytes: u64,
+    ) -> SemanticPolicyConfig {
+        SemanticPolicyConfig {
+            max_fact_encoded_bytes: 1,
+            max_pending_proofs: 1,
+            max_pending_proof_bytes: 65_535,
+            max_ready_batch: 1,
+            max_proof_records,
+            max_proof_bytes,
+            ..SemanticPolicyConfig::default()
+        }
+    }
+
+    #[test]
+    fn pending_limits_measure_exact_records_and_refuse_before_mutation() {
+        let (root, owner, context, first) = shared_owner_components();
+        let second = second_target_record(context, &first.fact_ids);
+        let first_bytes = canonical_record_bytes(&first).expect("first record bytes");
+        let second_bytes = canonical_record_bytes(&second).expect("second record bytes");
+        let exact_bytes = first_bytes
+            .checked_add(second_bytes)
+            .expect("test record bytes fit");
+        let policy = policy_for_pending_limits(2, exact_bytes);
+        let outbox = DurableProofOutbox::from_owner_with_policy(owner, policy)
+            .expect("exact pending policy");
+
+        assert_eq!(outbox.enqueue(first.clone()).expect("first enqueue"), first);
+        assert_eq!(
+            outbox.enqueue(first.clone()).expect("identical replay"),
+            first
+        );
+        assert_eq!(
+            outbox
+                .pending(context)
+                .expect("pending after identical replay")
+                .len(),
+            1,
+            "byte-identical replay must not grow the outbox"
+        );
+        assert_eq!(
+            outbox.enqueue(second.clone()).expect("exact byte grant"),
+            second
+        );
+        let pending = outbox.pending(context).expect("exact pending set");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|record| canonical_record_bytes(record).expect("record bytes"))
+                .sum::<u64>(),
+            exact_bytes,
+            "the accepted set consumes the exact measured grant"
+        );
+        drop(outbox);
+        let _ = std::fs::remove_dir_all(root);
+
+        let (short_root, short_owner, short_context, short_first) = shared_owner_components();
+        let short_second = second_target_record(short_context, &short_first.fact_ids);
+        let short_first_bytes = canonical_record_bytes(&short_first).expect("first bytes");
+        let short_second_bytes = canonical_record_bytes(&short_second).expect("second bytes");
+        let short_policy = policy_for_pending_limits(
+            2,
+            short_first_bytes
+                .checked_add(short_second_bytes)
+                .expect("short test bytes fit")
+                - 1,
+        );
+        let short_outbox = DurableProofOutbox::from_owner_with_policy(short_owner, short_policy)
+            .expect("one-unit-short policy");
+        short_outbox
+            .enqueue(short_first.clone())
+            .expect("first short-grant enqueue");
+        assert!(matches!(
+            short_outbox.enqueue(short_second),
+            Err(ProofOutboxError::LimitExceeded("pending proof bytes"))
+        ));
+        assert_eq!(
+            short_outbox
+                .pending(short_context)
+                .expect("pending after refused enqueue"),
+            vec![short_first],
+            "one-unit-short refusal must leave the durable set unchanged"
+        );
+        drop(short_outbox);
+        let _ = std::fs::remove_dir_all(short_root);
+
+        let (count_root, count_owner, count_context, count_first) = shared_owner_components();
+        let count_second = second_target_record(count_context, &count_first.fact_ids);
+        let count_outbox = DurableProofOutbox::from_owner_with_policy(
+            count_owner,
+            policy_for_pending_limits(1, 65_535),
+        )
+        .expect("count-limited policy");
+        count_outbox
+            .enqueue(count_first.clone())
+            .expect("count-limited first enqueue");
+        assert!(matches!(
+            count_outbox.enqueue(count_second),
+            Err(ProofOutboxError::LimitExceeded("pending proof count"))
+        ));
+        assert_eq!(
+            count_outbox
+                .pending(count_context)
+                .expect("pending after count refusal"),
+            vec![count_first]
+        );
+        drop(count_outbox);
+        let _ = std::fs::remove_dir_all(count_root);
+
+        let (history_root, history_owner, history_context, history_first) =
+            shared_owner_components();
+        let history_second = second_target_record(history_context, &history_first.fact_ids);
+        let history_outbox = DurableProofOutbox::from_owner_with_policy(
+            history_owner,
+            policy_for_total_limits(1, 65_535),
+        )
+        .expect("total-count-limited policy");
+        history_outbox
+            .enqueue(history_first.clone())
+            .expect("total-count first enqueue");
+        assert!(matches!(
+            history_outbox.enqueue(history_second),
+            Err(ProofOutboxError::LimitExceeded("proof record count"))
+        ));
+        assert_eq!(
+            history_outbox
+                .pending(history_context)
+                .expect("pending after total-count refusal"),
+            vec![history_first]
+        );
+        drop(history_outbox);
+        let _ = std::fs::remove_dir_all(history_root);
+
+        let (bytes_root, bytes_owner, bytes_context, bytes_first) = shared_owner_components();
+        let bytes_second = second_target_record(bytes_context, &bytes_first.fact_ids);
+        let bytes_total = canonical_record_bytes(&bytes_first)
+            .expect("history first bytes")
+            .checked_add(canonical_record_bytes(&bytes_second).expect("history second bytes"))
+            .expect("history bytes fit")
+            - 1;
+        let bytes_outbox = DurableProofOutbox::from_owner_with_policy(
+            bytes_owner,
+            policy_for_total_limits(2, bytes_total),
+        )
+        .expect("total-byte-limited policy");
+        bytes_outbox
+            .enqueue(bytes_first.clone())
+            .expect("total-byte first enqueue");
+        assert!(matches!(
+            bytes_outbox.enqueue(bytes_second),
+            Err(ProofOutboxError::LimitExceeded("proof record bytes"))
+        ));
+        assert_eq!(
+            bytes_outbox
+                .pending(bytes_context)
+                .expect("pending after total-byte refusal"),
+            vec![bytes_first]
+        );
+        drop(bytes_outbox);
+        let _ = std::fs::remove_dir_all(bytes_root);
     }
 
     #[test]
@@ -572,7 +953,8 @@ mod tests {
         let store = DurableSemanticStore::new(&root, "slot");
         store.commit(&graph, Vec::new()).expect("snapshot");
 
-        let outbox = DurableProofOutbox::new(&root, "slot");
+        let outbox = DurableProofOutbox::with_policy(&root, "slot", checked_default_policy())
+            .expect("checked outbox policy");
         let record = ProofRecord::pending(
             bootstrap.context_id(),
             device,
@@ -680,7 +1062,9 @@ mod tests {
             ),
             Err(ProofOutboxError::AlreadySuperseded)
         ));
-        let superseded_reopen = DurableProofOutbox::new(&root, "slot");
+        let superseded_reopen =
+            DurableProofOutbox::with_policy(&root, "slot", checked_default_policy())
+                .expect("checked outbox policy");
         let superseded_records = superseded_reopen
             .proof_records(bootstrap.context_id())
             .expect("superseded tombstone reopen");
@@ -696,7 +1080,8 @@ mod tests {
             .commit(&graph, Vec::new())
             .expect("graph commit preserves proof");
 
-        let reopened = DurableProofOutbox::new(&root, "slot");
+        let reopened = DurableProofOutbox::with_policy(&root, "slot", checked_default_policy())
+            .expect("checked outbox policy");
         assert_eq!(
             reopened.pending(bootstrap.context_id()).expect("reopen"),
             vec![rebound.clone()]
@@ -711,7 +1096,9 @@ mod tests {
             .pending(bootstrap.context_id())
             .expect("settled pending")
             .is_empty());
-        let settled_reopen = DurableProofOutbox::new(&root, "slot");
+        let settled_reopen =
+            DurableProofOutbox::with_policy(&root, "slot", checked_default_policy())
+                .expect("checked outbox policy");
         let settled_records = settled_reopen
             .proof_records(bootstrap.context_id())
             .expect("settled tombstone reopen");

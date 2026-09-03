@@ -43,13 +43,6 @@ pub fn peer_supports(peer_features: &[String], feature: &str) -> bool {
     peer_features.iter().any(|candidate| candidate == feature)
 }
 
-/// Resolve the one current closed profile without permitting a version or
-/// feature downgrade. Protocol version is a hard wire gate; the feature list
-/// remains an exact endpoint-auth precondition after that gate succeeds.
-pub fn supports_current_profile(protocol: u32, peer_features: &[String]) -> bool {
-    protocol == crate::PROTOCOL_VERSION && peer_supports(peer_features, Feature::ENDPOINT_AUTH_V1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,23 +60,5 @@ mod tests {
     #[test]
     fn hello_advertises_only_the_current_endpoint_profile() {
         assert_eq!(ADVERTISED_FEATURES, &[Feature::ENDPOINT_AUTH_V1]);
-    }
-
-    #[test]
-    fn current_profile_requires_exact_version_and_feature() {
-        let advertised = vec![Feature::ENDPOINT_AUTH_V1.to_string()];
-        assert!(supports_current_profile(
-            crate::PROTOCOL_VERSION,
-            &advertised
-        ));
-        assert!(!supports_current_profile(
-            crate::PROTOCOL_VERSION.saturating_sub(1),
-            &advertised
-        ));
-        assert!(!supports_current_profile(
-            crate::PROTOCOL_VERSION.saturating_add(1),
-            &advertised
-        ));
-        assert!(!supports_current_profile(crate::PROTOCOL_VERSION, &[]));
     }
 }

@@ -46,7 +46,7 @@ use myownmesh_signaling::local::{LocalBroker, LocalInbound, LocalOutbound};
 use myownmesh_signaling::mdns::discovery::{DiscoveryBackend, MdnsTimingProfile};
 use myownmesh_signaling::mdns::driver::{
     AliasProvider, AliasRefusal, AliasRetention, ConnectionIdentityRetention, ConnectionRetention,
-    DiscoveryRetention, MdnsLimits, PeerRetention,
+    DiscoveryRetention, DriverCustodyPlan, MdnsLimits, PeerRetention,
 };
 use myownmesh_signaling::mdns::{
     self as mdns_driver, MdnsDriverConfig, MdnsDriverHandle, MdnsInbound, MdnsOutbound,
@@ -568,8 +568,7 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         frame_bytes: usize,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
         // When the signaling driver invokes this seam, it is before decoding a
-        // relay frame. Do not inherit the compatibility zero-content attempt-
-        // map reservation: the raw frame is the peer-controlled allocation,
+        // relay frame. The raw frame is the peer-controlled allocation,
         // and its exact byte length must consume finite provider custody before
         // parsing begins.
         // This begins at the core adapter; pre-core WebSocket, mDNS, and Nostr
@@ -582,6 +581,22 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         // fresh process-local source to the already claimed physical emission;
         // refusal routing can therefore ignore attempt/event aliases.
         let _ = self.guard.bind_admission_source(source, attempt);
+    }
+
+    fn reserve_admission_source(
+        &self,
+        _attempt: &str,
+        _event: &myownmesh_signaling::nostr::event::NostrEvent,
+        _retention: DeliveryRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(0, "admission source")
+    }
+
+    fn reserve_session_identity(
+        &self,
+        retention: myownmesh_signaling::nostr::delivery::SessionRetention,
+    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
+        self.lease_for_bytes(retention.session_identity_bytes, "session identity")
     }
 
     fn reserve_session_record(
@@ -598,16 +613,6 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         retention: myownmesh_signaling::nostr::delivery::SessionRetention,
     ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
         self.lease_for_bytes(retention.session_set_node_bytes, "session set node")
-    }
-
-    fn reserve_session_set_growth(
-        &self,
-        _session: RelaySessionId,
-        _retention: myownmesh_signaling::nostr::delivery::SessionRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        // Compatibility growth is the same allocation as the canonical
-        // session entry. Charge it exactly once in `reserve_session_entry`.
-        self.lease_for_bytes(0, "session set growth alias")
     }
 
     fn reserve_session_entry(
@@ -641,17 +646,6 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
         self.lease_for_bytes(retention.attempt_key_bytes, "attempt key")
     }
 
-    fn reserve_attempt_map_growth(
-        &self,
-        _attempt: &str,
-        _event: &myownmesh_signaling::nostr::event::NostrEvent,
-        _retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        // Compatibility growth is the same allocation as the canonical
-        // attempt entry. Charge it exactly once in `reserve_attempt_entry`.
-        self.lease_for_bytes(0, "attempt map growth alias")
-    }
-
     fn reserve_attempt_entry(
         &self,
         _attempt: &str,
@@ -682,18 +676,6 @@ impl DeliveryProvider for CoreNostrDeliveryProvider {
             .checked_add(retention.structural_entry_bytes)
             .ok_or_else(|| DeliveryRefusal::Provider("EVENT retention overflow".to_string()))?;
         self.lease_for_bytes(bytes, "relay delivery")
-    }
-
-    fn reserve_relay_map_growth(
-        &self,
-        _attempt: &str,
-        _session: RelaySessionId,
-        _event: &myownmesh_signaling::nostr::event::NostrEvent,
-        _retention: DeliveryRetention,
-    ) -> Result<Box<dyn DeliveryLease>, DeliveryRefusal> {
-        // Compatibility growth is the same allocation as the canonical relay
-        // entry. Charge it exactly once in `reserve_relay_entry`.
-        self.lease_for_bytes(0, "relay map growth alias")
     }
 
     fn reserve_relay_entry(
@@ -1071,6 +1053,23 @@ fn mdns_limits_from_policy(policy: &crate::config::MdnsPolicyConfig) -> Option<M
     })
 }
 
+fn mdns_custodian_plan(
+    backend: DiscoveryBackend,
+    retention: DiscoveryRetention,
+    driver_plan: DriverCustodyPlan,
+) -> Option<DriverCustodyPlan> {
+    if matches!(backend, DiscoveryBackend::System) {
+        if retention.native_worker_slots == 0 {
+            return None;
+        }
+        let mut plan = driver_plan;
+        plan.backend_observer_slots = retention.native_worker_slots;
+        Some(plan)
+    } else {
+        Some(driver_plan)
+    }
+}
+
 fn nostr_timing_from_policy(
     policy: &crate::config::NostrTimingPolicyConfig,
 ) -> Option<NostrTimingConfig> {
@@ -1078,6 +1077,7 @@ fn nostr_timing_from_policy(
         return None;
     }
     Some(NostrTimingConfig {
+        connect_timeout: Duration::from_millis(policy.connect_timeout_ms),
         reconnect_initial: Duration::from_millis(policy.reconnect_initial_ms),
         reconnect_max: Duration::from_millis(policy.reconnect_max_ms),
         reconnect_max_attempts: policy.reconnect_max_attempts,
@@ -1956,6 +1956,20 @@ fn attach_mdns_with(
         limits,
     };
 
+    // The system backend reserves native worker custody through the same
+    // lifecycle owner. Its native workers are not Tokio observer tasks, but
+    // the injected discovery seam still requires an exact reservation from
+    // the owner's bounded semaphore before DNS-SD starts. Keep the embedded
+    // plan untouched; only the system branch maps its checked native-worker
+    // envelope into the owner reservation dimension.
+    let Some(custodian_plan) = mdns_custodian_plan(backend, retention, driver_plan) else {
+        warn!(
+            network = %state.network_id,
+            "mDNS system driver refused: empty native-worker custody envelope"
+        );
+        return None;
+    };
+
     // The mDNS driver receives an application-owned terminal custodian before
     // it can reserve or spawn its supervisor/reaper handles. This keeps the
     // dedicated observer runtime, primary/backend/reaper reservations, and
@@ -1964,7 +1978,7 @@ fn attach_mdns_with(
     let task_custodian = match MdnsTaskCustodian::reserve_with_plan(
         scope.clone(),
         outer_driver_task_slots,
-        Some(driver_plan),
+        Some(custodian_plan),
     ) {
         Ok(custodian) => custodian,
         Err(error) => {
@@ -1976,11 +1990,7 @@ fn attach_mdns_with(
         }
     };
     let backend_custodian_owner: Option<Arc<dyn TaskCustodian>> =
-        if matches!(backend, DiscoveryBackend::Embedded) {
-            Some(Arc::clone(&task_custodian) as Arc<dyn TaskCustodian>)
-        } else {
-            None
-        };
+        Some(Arc::clone(&task_custodian) as Arc<dyn TaskCustodian>);
 
     let device_id = state.identity.public_id().to_string();
 
@@ -3226,6 +3236,7 @@ mod tests {
     #[test]
     fn nostr_timing_translation_preserves_owner_values_and_rejects_zero() {
         let policy = crate::config::NostrTimingPolicyConfig {
+            connect_timeout_ms: 17,
             reconnect_initial_ms: 19,
             reconnect_max_ms: 23,
             reconnect_max_attempts: 29,
@@ -3236,6 +3247,7 @@ mod tests {
             announcer_cancel_quantum_ms: 47,
         };
         let timing = nostr_timing_from_policy(&policy).expect("sentinel timing translates");
+        assert_eq!(timing.connect_timeout, Duration::from_millis(17));
         assert_eq!(timing.reconnect_initial, Duration::from_millis(19));
         assert_eq!(timing.reconnect_max, Duration::from_millis(23));
         assert_eq!(timing.reconnect_max_attempts, 29);
@@ -3599,6 +3611,47 @@ mod tests {
     }
 
     #[test]
+    fn core_mdns_system_plan_funds_native_workers_before_backend_start() {
+        let limits = myownmesh_signaling::mdns::discovery::DiscoveryLimits::default();
+        let retention = DiscoveryRetention::from_backend(limits, DiscoveryBackend::System)
+            .expect("system retention has a checked native-worker envelope");
+        let driver_plan =
+            mdns_driver::driver::checked_driver_custody_plan(limits, DiscoveryBackend::System)
+                .expect("system driver plan is checked");
+        let system_plan = mdns_custodian_plan(DiscoveryBackend::System, retention, driver_plan)
+            .expect("nonempty native-worker custody is required");
+        assert_eq!(
+            system_plan.backend_observer_slots, retention.native_worker_slots,
+            "the system backend reservation must cover every native worker"
+        );
+
+        let embedded_retention =
+            DiscoveryRetention::from_backend(limits, DiscoveryBackend::Embedded)
+                .expect("embedded retention has a checked envelope");
+        let embedded_plan =
+            mdns_driver::driver::checked_driver_custody_plan(limits, DiscoveryBackend::Embedded)
+                .expect("embedded driver plan is checked");
+        assert_eq!(
+            mdns_custodian_plan(
+                DiscoveryBackend::Embedded,
+                embedded_retention,
+                embedded_plan
+            ),
+            Some(embedded_plan),
+            "embedded custody mapping must remain unchanged"
+        );
+
+        let empty = DiscoveryRetention {
+            native_worker_slots: 0,
+            ..retention
+        };
+        assert!(
+            mdns_custodian_plan(DiscoveryBackend::System, empty, driver_plan).is_none(),
+            "an empty system worker envelope must refuse before startup"
+        );
+    }
+
+    #[test]
     fn emissions_are_distinct_even_when_attempts_are_reused() {
         let first = SignalingEmissionId::next().expect("emission id");
         let second = SignalingEmissionId::next().expect("emission id");
@@ -3808,17 +3861,6 @@ mod tests {
             .take_signaling_outbound_rx()
             .expect("the control takes the engine outbound receiver");
 
-        let local_device =
-            crate::semantic::DeviceId::from_canonical_str(state.identity.public_id())
-                .expect("the fixture local identity is canonical");
-        super::super::admit_canonical_test_fact(
-            &state,
-            crate::semantic::FactBody::OpenParticipation {
-                device_id: local_device,
-                joined: true,
-            },
-        );
-
         let remote_identities = [
             crate::identity::Identity::ephemeral(),
             crate::identity::Identity::ephemeral(),
@@ -3828,26 +3870,6 @@ mod tests {
             .iter()
             .map(|identity| identity.public_id().to_string())
             .collect();
-        for identity in &remote_identities {
-            let device = crate::semantic::DeviceId::from_canonical_str(identity.public_id())
-                .expect("the fixture remote identity is canonical");
-            let fact = crate::semantic::SignedFact::sign(
-                crate::semantic::FactContent::open_participation(
-                    state.mesh_context_id(),
-                    device,
-                    true,
-                    Vec::new(),
-                ),
-                identity.signing_key(),
-            )
-            .expect("the fixture remote participation fact signs");
-            state
-                .authoritative_fact_graph()
-                .write()
-                .admit(fact)
-                .expect("the fixture remote participation fact admits");
-        }
-
         let mut fixtures = Vec::new();
         for device in &remote_devices {
             fixtures.push(super::super::insert_promoted_peer(&state, device).await);

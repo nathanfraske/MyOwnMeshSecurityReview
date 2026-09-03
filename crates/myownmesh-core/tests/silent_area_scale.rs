@@ -33,13 +33,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
+    TopologyMode,
 };
 use myownmesh_core::engine::connection::PeerStatus;
 use myownmesh_core::engine::transport_lab::NetworkState;
-use myownmesh_core::engine::transport_lab::{
-    attach_local, channel, join_open_participation, spawn_network,
-};
+use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
 use myownmesh_signaling::local::LocalBroker;
@@ -59,13 +58,14 @@ fn silent_cfg(id: &str) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Silent,
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -84,9 +84,6 @@ async fn spawn_node(label: &str, transport: &Transport, broker: &LocalBroker) ->
     let (state, driver) = spawn_network(silent_cfg(label), identity, transport.clone())
         .await
         .unwrap_or_else(|e| panic!("{label} engine: {e}"));
-    join_open_participation(&state)
-        .await
-        .unwrap_or_else(|e| panic!("{label} open participation: {e}"));
     attach_local(&state, broker);
     Node {
         state,

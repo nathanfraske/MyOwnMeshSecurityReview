@@ -10,12 +10,13 @@ instead: `cargo install --path crates/myownmesh` then
 
 ## 1. Dependencies
 
-Depend on the matching `myownmesh-core` release. `LocalBroker` is re-exported
-by the core facade for the supported in-process carrier:
+Depend on the exact `myownmesh-core` release tag selected for your deployment.
+The repository tag is the source distribution; replace `vX.Y.Z` below with the
+chosen tag:
 
 ```toml
 [dependencies]
-myownmesh-core = "0.3.2"
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX.Y.Z" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -63,7 +64,6 @@ let net = mesh.join(NetworkConfig {
     closed_relay: ClosedRelayPolicyConfig::default(), // disabled by default
     stun_servers: Default::default(),
     turn_servers: Default::default(),
-    roster_path: None,
     pinned_peers: Vec::new(),
     auto_approve: false,
 }).await?;
@@ -76,14 +76,21 @@ network's typed attach method:
 let _drivers = net.attach_signaling()?;
 ```
 
-For a supported in-process carrier, use `LocalBroker`. It still traverses the
-normal bounded ingress, authentication, and promotion path:
+`LocalBroker` is a `transport-lab`-only control seam, not an advertised
+production carrier. When compiling an integration control with that feature,
+it still traverses the bounded ingress, authentication, and promotion path:
 
 ```rust
 use myownmesh_core::LocalBroker;
 
 let broker = LocalBroker::new();
 net.attach_local(&broker);
+```
+
+For example, run the maintained two-peer control with:
+
+```bash
+cargo test -p myownmesh-core --features transport-lab --test two_peer_handshake -- --nocapture
 ```
 
 ## 4. Subscribe to events
@@ -194,6 +201,15 @@ println!("grant={grant_id}, revoke={revoke_id}, eviction={eviction_id}");
 Each method returns the resulting semantic `FactId` after the current
 authority and exact network context have been checked. The optional MFA value
 is passed as the final argument when the deployment requires it.
+
+The base ledger is durable Closed authority/governance only. Open networks
+have zero base durable semantic facts: an exact-context handshake and Device
+key possession authenticate ephemeral participation. Join, leave, presence,
+and reconnect are runtime observations for both Open and Closed and never
+become semantic history. The owner-selected ledger limits (fact count, bytes,
+causal edges, per-author usage, proof work, and indexed database bytes) are
+checked before mutation; the exact `N+1` request is refused without changing
+the graph, projection, ACK, identity, or authority.
 
 ## 8. Closed-member opaque relay
 

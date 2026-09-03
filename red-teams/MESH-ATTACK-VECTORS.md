@@ -30,7 +30,25 @@ working channel
     -> AuthenticatedPeerSession
 ```
 
-The target durable fact families are limited to long-lived semantic state such as Open participation, Closed governance, durable capability grants and revocations, and reviewed application contract facts. Ordinary candidates, route selection, path handoff, connectivity checks, relay allocation liveness, and packet flow are live connector state.
+The base durable fact families are Closed authority/governance only:
+`RoleGrant`, `RoleRevoke`, `Evict`, `MembershipAdmit`, `EvictionProof`,
+`SelfStandDown`, `Attestation`, `Resolution`, and
+`AuthorityLineageResolution`. Open has zero base durable semantic facts.
+Exact-context handshake and Device-key possession establish ephemeral Open
+participation. Runtime join, leave, presence, and reconnect for both Open and
+Closed are live observations, never semantic history. Reviewed application
+contract domains remain explicitly separate. Ordinary candidates, route
+selection, path handoff, connectivity checks, relay allocation liveness, and
+packet flow are live connector state.
+
+The owner selects finite fact-count, canonical-byte, causal-edge, per-author
+count/bytes and retained lifetime, proof-work,
+eligible-signer-quarantine, total-proof-history, and indexed SQLite/WAL-reserve
+ceilings. The exact `N+1` delta is refused before any
+semantic mutation, ACK, identity, or authority change. Duplicate delivery is
+a semantic no-op. Exact history remains until an archive or
+authority-ratified checkpoint permits deletion; checkpoint and `VACUUM` are
+physical reclamation only and no timer silently prunes semantic history.
 
 Signaling includes both durable semantic exchange and ephemeral transport control. Neither category carries ordinary application payload.
 
@@ -68,7 +86,7 @@ The suite includes:
 - a fresh authentic key without Closed authorization;
 - an admitted malicious endpoint;
 - a carrier that drops, delays, reorders, duplicates, injects, replays, or censors;
-- a malicious TURN, generic relay, or Closed member relay;
+- a malicious TURN or Closed member relay;
 - a restrictive network;
 - a malicious or unprivileged local application principal;
 - identity rotation intended to bypass per-identity resource accounting;
@@ -137,17 +155,37 @@ Alter every state-deriving durable field, Fact ID, author key, signature, mesh c
 
 **Pass:** Only the exact canonical signed positive control reaches durable projection. Invalid input creates no accepted durable receipt, durable head, or durable effect.
 
+### HYB-001a. Ledger quota and quarantine boundary
+
+Fill each owner-selected ledger dimension to `N`, then submit valid `N+1`
+fact, causal-edge, per-author, proof-history, eligible-signer, quarantine,
+and database/WAL-reserve candidates, including a duplicate Fact ID and a
+semantic no-op.
+
+**Pass:** The complete delta is refused before graph, projection, ACK,
+identity, or authority mutation. Missing-parent candidates use only the
+bounded dependency index; duplicate and no-op candidates do not extend exact
+history. Per-author retained lifetime caps and proof-work limits are enforced
+without timer deletion. SQLite remains local-only, single-writer, WAL/FULL,
+and physical checkpoint/`VACUUM` reclamation cannot delete semantic history
+without an archive or authority-ratified checkpoint. Failed cleanup retains
+the exact charge.
+
 ### HYB-002. Carrier non-authorship
 
 Deliver a valid A-authored fact through a B-controlled carrier and a B-authored carrier envelope that claims A.
 
 **Pass:** The valid fact remains authored by A. The carrier claim grants no authorship.
 
-### HYB-003. Open permissionless positive control
+### HYB-003. Open ephemeral permissionless positive control
 
-Have a fresh Device key publish valid self-authored Open participation.
+Have a fresh Device key complete an exact-context endpoint handshake proving
+key possession, without publishing a durable participation record.
 
-**Pass:** It may project as an Open participant without sponsor, pair grant, identity vote, or application approval, subject only to protocol validation and local resource admission.
+**Pass:** It may participate ephemerally without sponsor, pair grant,
+identity vote, or application approval, subject only to endpoint protocol
+validation and local resource admission. No durable fact, join, leave, or
+presence record is created.
 
 ### HYB-004. Closed unauthorized key
 
@@ -175,7 +213,8 @@ Open the same durable basis after normal restart, long storage, copy, and transp
 
 ### HYB-008. Open-to-Closed separation
 
-Replay Open participation and application-like claims into a Closed context.
+Replay an Open handshake/observation and application-like claims into a Closed
+context.
 
 **Pass:** Only the selected Closed governance proof supplies Closed authority.
 
@@ -197,7 +236,9 @@ Attempt to place a marked application byte string into every public durable and 
 
 Disconnect signaling carriers, remove mDNS advertisements, and send service-authored Leave messages.
 
-**Pass:** Carrier events affect delivery and transport observations only. They cannot synthesize Open withdrawal, Closed removal, or session closure.
+**Pass:** Carrier events affect delivery and transport observations only. They
+cannot synthesize a durable Open fact, runtime withdrawal authority, Closed
+removal, or session closure.
 
 ### HYB-012. Connected censoring carrier
 
@@ -227,7 +268,7 @@ Use many fresh keys and unauthenticated hints to create candidate work.
 
 ### HYB-016. Candidate racing
 
-Make direct, TURN, generic relay, and Closed member-relay candidates complete in different orders and with different quality.
+Make direct, TURN, and Closed member-relay candidates complete in different orders and with different quality.
 
 **Pass:** The connector may use the first or locally preferred promotable channel. No durable route record or exhaustive-failure proof is required.
 
@@ -305,13 +346,14 @@ Exercise messages, RPC, media, datagrams, and every application send API in ever
 
 ### HYB-026. Current policy loss
 
-After promotion, accept an applicable Open withdrawal or Closed removal and race it against queued sends and callbacks.
+After promotion, accept an applicable runtime Open departure or Closed removal
+and race it against queued sends and callbacks.
 
 **Pass:** New protected use fails after the committed policy change. Cleanup remains possible. A later re-add or re-presentation requires a newly valid session promotion, not revival of the old handle.
 
 ## 11. Relay tests
 
-### HYB-027. Adversarial TURN and generic relay
+### HYB-027. Adversarial TURN and Closed member relay
 
 Drop, delay, duplicate, reorder, truncate, and modify endpoint ciphertext. Attempt endpoint substitution.
 
@@ -383,7 +425,7 @@ Let A temporarily send over D while C still sends over B.
 
 ### HYB-038. Cross-protocol listener confusion
 
-Co-locate signaling, TURN, generic relay, Closed member relay, and application service endpoints. Send each message type to every wrong listener.
+Co-locate signaling, TURN, Closed member relay, and application service endpoints. Send each message type to every wrong listener.
 
 **Pass:** No cross-parser or cross-effect substitution occurs. Co-location claims no physical compromise isolation that deployment does not provide.
 
@@ -407,7 +449,7 @@ Receive a fresh signed presence response while every data connector fails.
 
 **Pass:** Reachability view shows the exact evidence classes and returns no viable peer transport.
 
-### HYB-042. Path is not durable participation
+### HYB-042. Path is not durable authority
 
 Keep a working authenticated channel while delivering a durable withdrawal or Closed removal.
 

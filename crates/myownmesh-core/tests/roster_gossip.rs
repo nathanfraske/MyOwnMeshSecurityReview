@@ -1,16 +1,18 @@
 #![cfg(feature = "transport-lab")]
 
-//! End-to-end engine integration test: roster persistence + peer projection.
+//! End-to-end engine integration test: canonical roster projection.
 //!
-//! Covers the contract that mutual active participation persists, while an
+//! Covers the contract that mutual active participation updates the advisory
+//! projection, while an
 //! absent non-participant cannot be approved or authorize others through
 //! peer projection:
 //!
 //!   1. When two peers complete the bilateral approve handshake and the
-//!      link goes ACTIVE, each side persists the other into its roster —
+//!      link goes ACTIVE, each side updates keyed advisory metadata —
 //!      even on an `auto_approve` network where no human clicked Approve.
-//!      (Before this landed, auto-approved peers reached ACTIVE but were
-//!      never remembered — the "we keep losing our roster" symptom.)
+//!      (Before this landed, auto-approved peers reached ACTIVE but their
+//!      projection was not refreshed — the "we keep losing our roster"
+//!      symptom.)
 //!
 //!   2. An approval attempt for a peer that isn't directly connected and has
 //!      no current self-authored participation is refused. It must not mutate
@@ -22,8 +24,8 @@
 //! engine keys its data dir off the process-global `MYOWNMESH_HOME` env
 //! var (see the SAFETY note in `two_peer_handshake.rs`). Two parallel
 //! `#[test]`s here would race that var. Running the scenarios in sequence
-//! under one `MYOWNMESH_HOME` keeps them isolated (distinct network_ids ⇒
-//! distinct roster files) without that race.
+//! under one `MYOWNMESH_HOME` keeps them isolated by distinct network IDs
+//! without that race.
 //!
 //! Companion to `two_peer_handshake.rs` (open-network handshake) and
 //! `closed_network_governance.rs` (canonical signed facts).
@@ -32,12 +34,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::governance::propose_role_grant;
-use myownmesh_core::engine::transport_lab::{
-    attach_local, join_open_participation, spawn_network, NetworkState,
-};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network, NetworkState};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::Role;
 use myownmesh_core::transport::Transport;
@@ -53,17 +53,18 @@ fn fresh_network(id: &str, network_id: &str) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         // Auto-approve fires the wire-level approve automatically so both
         // peers reach ACTIVE without a human Approve click — which is the
-        // exact path we want to prove now persists the roster on its own.
+        // exact path we want to prove now refreshes the projection on its own.
         auto_approve: true,
     }
 }
@@ -121,9 +122,6 @@ async fn bring_up_pair(
     )
     .await
     .expect("spawn a");
-    join_open_participation(&a_state)
-        .await
-        .expect("a open participation");
     let (b_state, b_driver) = spawn_network(
         fresh_network(&b_config_id, network_id),
         b_id.clone(),
@@ -131,10 +129,6 @@ async fn bring_up_pair(
     )
     .await
     .expect("spawn b");
-    join_open_participation(&b_state)
-        .await
-        .expect("b open participation");
-
     let mut a_events = a_state.events_tx.subscribe();
     let mut b_events = b_state.events_tx.subscribe();
 
@@ -148,16 +142,16 @@ async fn bring_up_pair(
 }
 
 #[tokio::test]
-async fn roster_persists_on_mutual_approve_and_absent_approval_stays_rejected() {
+async fn roster_projection_converges_on_mutual_approve_and_absent_approval_stays_rejected() {
     // One MYOWNMESH_HOME for the whole test; distinct network_ids below
-    // keep the two scenarios' roster files apart. It remains alive until every
+    // keep the two scenarios' projection metadata apart. It remains alive until every
     // production driver has been explicitly shut down and joined.
     let tmp = tempfile::tempdir().expect("tempdir");
     std::env::set_var("MYOWNMESH_HOME", tmp.path());
 
     let transport = support::test_transport();
 
-    // --- Scenario 1: the double handshake persists the roster ---------
+    // --- Scenario 1: the double handshake converges the projection -----
     let (a1, a1_id, b1, b1_id, broker1, a1_driver, b1_driver) =
         bring_up_pair("roster-projection-persist", &transport).await;
     assert!(

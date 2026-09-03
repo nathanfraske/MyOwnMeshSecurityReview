@@ -12,8 +12,7 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::events::DropReason;
 use crate::protocol::{
-    FactBundleMessage, FactInventory, FactRequest, MeshMessage, ProofAckMessage,
-    ProofDeliveryMessage,
+    FactInventory, FactPageMessage, FactRequest, MeshMessage, ProofAckMessage, ProofDeliveryMessage,
 };
 use crate::semantic::{DeviceId, FactBody, FactContent, FactId, SignedFact};
 
@@ -50,74 +49,19 @@ fn signed_fact(
         .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))
 }
 
-fn admit_authored_fact(state: &Arc<EngineState>, fact: &SignedFact) -> Result<()> {
-    let (admission, _) = state.admit_fact_durably(fact.clone())?;
+async fn admit_authored_fact(
+    state: &Arc<EngineState>,
+    fact: &SignedFact,
+) -> Result<crate::semantic::SemanticDelta> {
+    let (admission, _, delta) = state
+        .admit_fact_durably_with_delta_async(fact.clone())
+        .await?;
     if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
         return Err(Error::Other(
             "authored semantic fact is missing a causal parent".into(),
         ));
     }
-    Ok(())
-}
-
-/// Author one explicit Open participation lifecycle fact for this device.
-///
-/// Join and rejoin are durable `joined: true` facts; leave is a durable
-/// `joined: false` fact. The graph supplies the current participation/authority
-/// heads, so refresh and carrier observation can never manufacture a fresh
-/// presence fact with an empty causal witness.
-fn author_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<SignedFact> {
-    if !matches!(
-        state.verified_bootstrap().policy(),
-        crate::semantic::VerifiedProjectPolicy::Open
-    ) {
-        return Err(Error::Other(
-            "Open participation is unavailable on a Closed network".into(),
-        ));
-    }
-    let device_id = canonical_device(state.identity.public_id())?;
-    signed_fact(
-        state,
-        FactBody::OpenParticipation { device_id, joined },
-        Vec::new(),
-    )
-}
-
-async fn commit_open_self_participation(state: &Arc<EngineState>, joined: bool) -> Result<FactId> {
-    let fact = author_open_self_participation(state, joined)?;
-    admit_authored_fact(state, &fact)?;
-    apply_canonical_projection_checked(state)?;
-    broadcast_fact_inventory(state).await;
-    broadcast(state, MeshMessage::Fact(fact.clone())).await;
-    Ok(fact.id)
-}
-
-/// Explicit local Open-network lifecycle join.
-pub(crate) async fn join_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
-    commit_open_self_participation(state, true).await
-}
-
-/// Explicit local Open-network lifecycle leave. Refresh, carrier loss,
-/// process death, and shutdown deliberately never call this function.
-pub(crate) async fn leave_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
-    commit_open_self_participation(state, false).await
-}
-
-/// Explicit local Open-network lifecycle rejoin, causally following the last
-/// participation head rather than manufacturing an independent presence fact.
-pub(crate) async fn rejoin_open_participation(state: &Arc<EngineState>) -> Result<FactId> {
-    commit_open_self_participation(state, true).await
-}
-
-/// Return the complete proof material for the currently effective positive
-/// Open-participation value. A projection value may be a `Resolution`, not the
-/// terminal `OpenParticipation` fact itself, so forwarding only that value
-/// leaves a fresh peer unable to validate the decision.
-fn current_open_participation_bundle(state: &Arc<EngineState>) -> Option<Vec<SignedFact>> {
-    let device_id = canonical_device(state.identity.public_id()).ok()?;
-    let graph = state.authoritative_fact_graph();
-    let bundle = graph.read().open_participation_bundle(&device_id);
-    bundle
+    Ok(delta)
 }
 
 /// Return the complete causal proof for the current closed-network eviction of
@@ -135,16 +79,6 @@ fn current_eviction_proof_bundle(
     let graph = state.authoritative_fact_graph();
     let bundle = graph.read().eviction_proof_bundle(&target);
     bundle
-}
-
-/// Compatibility hook retained for the handshake module. Participation is an
-/// explicit local lifecycle operation now; handshake promotion may only forward
-/// an already-admitted positive fact and must never author a join.
-pub(super) async fn announce_open_participation(state: &Arc<EngineState>, owner: &PeerOwnerToken) {
-    let Some(bundle) = current_open_participation_bundle(state) else {
-        return;
-    };
-    let _ = super::send_pending_open_participation(state, owner, &bundle).await;
 }
 
 /// Strip the display suffix (`-XXXXX`) from a Device ID. The
@@ -169,7 +103,22 @@ pub(super) fn canonical_policy_admits_from(
     let Ok(remote) = crate::semantic::DeviceId::from_canonical_str(remote_device_id) else {
         return false;
     };
-    graph.admits_policy_session(bootstrap, &local, &remote)
+    if graph.context_id() != bootstrap.context_id() {
+        return false;
+    }
+    if local == remote {
+        return false;
+    }
+    let evaluator = graph.evaluator();
+    if evaluator.is_stood_down(&local) || evaluator.is_stood_down(&remote) {
+        return false;
+    }
+    match bootstrap.policy() {
+        crate::semantic::VerifiedProjectPolicy::Open => true,
+        crate::semantic::VerifiedProjectPolicy::Closed(_) => {
+            evaluator.admits_closed_session(&local, &remote)
+        }
+    }
 }
 
 #[derive(Default)]
@@ -177,7 +126,6 @@ struct CanonicalProjection {
     roles: BTreeMap<String, crate::semantic::Role>,
     evicted: BTreeSet<String>,
     stood_down: BTreeSet<String>,
-    open_participation: BTreeMap<String, bool>,
 }
 
 /// Convert the sealed semantic projection into the read-only roster shape. The
@@ -186,8 +134,8 @@ struct CanonicalProjection {
 fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjection {
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
-    let projection = graph.projection();
     let evaluator = graph.evaluator();
+    let projection = evaluator.projection();
     let mut result = CanonicalProjection::default();
 
     let mut subjects = BTreeSet::new();
@@ -197,8 +145,7 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
     for (cell, _) in projection.cells() {
         match cell {
             crate::semantic::ExclusiveCell::Role { subject }
-            | crate::semantic::ExclusiveCell::Membership { subject }
-            | crate::semantic::ExclusiveCell::OpenParticipation { subject } => {
+            | crate::semantic::ExclusiveCell::Membership { subject } => {
                 subjects.insert(subject.clone());
             }
             crate::semantic::ExclusiveCell::Decision { .. } => {}
@@ -215,18 +162,11 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
         let role = evaluator.effective_authorized_role(&subject);
         let membership = evaluator.effective_membership(&subject);
         let stood_down = evaluator.is_stood_down(&subject);
-        let open_participation = evaluator.effective_open_participation(&subject);
-
         if membership == Some(false) {
             result.evicted.insert(subject_string.clone());
         }
         if stood_down {
             result.stood_down.insert(subject_string.clone());
-        }
-        if let Some(joined) = open_participation {
-            result
-                .open_participation
-                .insert(subject_string.clone(), joined);
         }
         if let Some(role) = role {
             if membership != Some(false) && !stood_down {
@@ -244,13 +184,43 @@ fn canonical_projection_snapshot(state: &Arc<EngineState>) -> CanonicalProjectio
     result
 }
 
+fn canonical_projection_for_subjects(
+    state: &Arc<EngineState>,
+    subjects: &BTreeSet<DeviceId>,
+) -> CanonicalProjection {
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let evaluator = graph.evaluator();
+    let mut result = CanonicalProjection::default();
+    for subject in subjects {
+        let subject_string = subject.to_string();
+        let role = evaluator.effective_authorized_role(subject);
+        let membership = evaluator.effective_membership(subject);
+        let stood_down = evaluator.is_stood_down(subject);
+        if membership == Some(false) {
+            result.evicted.insert(subject_string.clone());
+        }
+        if stood_down {
+            result.stood_down.insert(subject_string.clone());
+        }
+        if let Some(role) = role {
+            if membership != Some(false) && !stood_down {
+                result.roles.insert(subject_string, role);
+            }
+        }
+    }
+    result
+}
+
 pub(crate) fn apply_canonical_projection_checked(state: &Arc<EngineState>) -> Result<bool> {
-    apply_canonical_projection_with(state, crate::roster::save)
+    apply_canonical_projection_with(state, |candidate, affected| {
+        crate::roster::save_affected(candidate, affected)
+    })
 }
 
 fn apply_canonical_projection_with<F>(state: &Arc<EngineState>, save: F) -> Result<bool>
 where
-    F: FnOnce(&crate::roster::Roster) -> Result<()>,
+    F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
 {
     let projection = canonical_projection_snapshot(state);
     let CanonicalProjection {
@@ -261,6 +231,11 @@ where
     } = projection;
     let roster_changed = {
         let mut roster = state.roster.write();
+        let previous_keys = roster
+            .authorized_devices
+            .iter()
+            .map(|peer| peer.device_id.clone())
+            .collect::<BTreeSet<_>>();
         let mut candidate = roster.clone();
         let mut changed = false;
         for (pubkey, role) in &roles {
@@ -280,12 +255,105 @@ where
         });
         changed |= before != candidate.authorized_devices.len();
         if changed {
-            save(&candidate)?;
+            let affected_keys = previous_keys
+                .into_iter()
+                .chain(
+                    candidate
+                        .authorized_devices
+                        .iter()
+                        .map(|peer| peer.device_id.clone()),
+                )
+                .collect::<BTreeSet<_>>();
+            save(&candidate, &affected_keys)?;
             *roster = candidate;
         }
         Ok(changed)
     };
     roster_changed
+}
+
+/// Apply only the exact roster subjects returned by a journal delta. The
+/// roster remains a projection cache: unaffected rows are retained, while an
+/// affected subject is inserted, updated, or removed from its current typed
+/// semantic result. This avoids enumerating the full projection per fact.
+pub(crate) fn apply_canonical_projection_delta_checked(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) -> Result<bool> {
+    apply_canonical_projection_delta_with_projection(state, delta).map(|(changed, _)| changed)
+}
+
+fn apply_canonical_projection_delta_with_projection(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) -> Result<(bool, CanonicalProjection)> {
+    apply_canonical_projection_delta_with_projection_and_save(
+        state,
+        delta,
+        |roster, affected_keys| crate::roster::save_affected(roster, affected_keys),
+    )
+}
+
+fn apply_canonical_projection_delta_with_projection_and_save<F>(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+    save: F,
+) -> Result<(bool, CanonicalProjection)>
+where
+    F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
+{
+    let projection = canonical_projection_for_subjects(state, delta.affected_subjects());
+    let CanonicalProjection {
+        roles,
+        evicted,
+        stood_down,
+    } = projection;
+    let mut roster = state.roster.write();
+    let affected_keys = delta
+        .affected_subjects()
+        .iter()
+        .map(|subject| pk(subject))
+        .collect::<BTreeSet<_>>();
+    let before = roster.authorized_devices.snapshot_keys(&affected_keys);
+    let mut changed = false;
+    for subject in delta.affected_subjects() {
+        let pubkey = pk(subject);
+        if let Some(role) = roles.get(subject.to_string().as_str()) {
+            if !crate::roster::is_authorized(&roster, &pubkey) {
+                crate::roster::add_peer_in(&mut roster, &pubkey, "");
+                changed = true;
+            }
+            changed |= crate::roster::set_role_in(&mut roster, &pubkey, *role);
+        } else if evicted.contains(&subject.to_string())
+            || stood_down.contains(&subject.to_string())
+        {
+            let before_len = roster.authorized_devices.len();
+            crate::roster::remove_peer_in(&mut roster, &pubkey);
+            changed |= before_len != roster.authorized_devices.len();
+        } else {
+            // A canonical role/membership removal also removes the stale
+            // projection row, but never touches unrelated subjects.
+            let before_len = roster.authorized_devices.len();
+            crate::roster::remove_peer_in(&mut roster, &pubkey);
+            changed |= before_len != roster.authorized_devices.len();
+        }
+    }
+    if changed {
+        if let Err(error) = save(&roster, &affected_keys) {
+            roster
+                .authorized_devices
+                .restore_snapshot(&affected_keys, &before);
+            return Err(error);
+        }
+    }
+    Ok((
+        changed,
+        CanonicalProjection {
+            roles,
+            evicted,
+            stood_down,
+        },
+    ))
 }
 
 /// Iterate active peers — those whose data channel is ACTIVE +
@@ -304,8 +372,16 @@ fn active_peer_ids(state: &Arc<EngineState>) -> Vec<String> {
 fn inventory_peer_owners(state: &Arc<EngineState>) -> Vec<PeerOwnerToken> {
     state.peers.owners_snapshot(|peer| {
         let data = peer.state.read();
-        data.authenticated && peer.current_worker().is_some()
+        inventory_owner_is_eligible(
+            data.status,
+            data.authenticated,
+            peer.current_worker().is_some(),
+        )
     })
+}
+
+fn inventory_owner_is_eligible(status: PeerStatus, authenticated: bool, has_worker: bool) -> bool {
+    authenticated && has_worker && matches!(status, PeerStatus::Active | PeerStatus::Shelved)
 }
 
 async fn broadcast(state: &Arc<EngineState>, msg: MeshMessage) {
@@ -352,6 +428,8 @@ struct FactInventoryCursor {
     cursor: Option<FactId>,
     finished: bool,
     invalid: bool,
+    #[cfg(test)]
+    visited_candidates: usize,
 }
 
 impl FactInventoryCursor {
@@ -359,29 +437,57 @@ impl FactInventoryCursor {
         if self.finished || self.invalid {
             return None;
         }
-        let mut fact_ids = Vec::new();
-        let graph = self.graph.read();
-        for fact_id in graph.ids_after(self.cursor) {
-            let mut candidate_ids = fact_ids.clone();
-            candidate_ids.push(*fact_id);
-            let candidate = FactInventory::new(self.context_id, candidate_ids);
-            let encoded_len = match serde_json::to_vec(&MeshMessage::FactInventory(candidate)) {
-                Ok(encoded) => encoded.len(),
-                Err(_) => {
-                    self.invalid = true;
-                    return None;
-                }
-            };
-            if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
-                if fact_ids.is_empty() {
-                    self.invalid = true;
-                    return None;
-                }
-                break;
+        // The empty envelope establishes the exact fixed overhead, including
+        // the context encoding and the two array delimiters. Each FactId is
+        // then serialized once and added to one checked running total; this
+        // avoids cloning and re-encoding the entire candidate page for every
+        // graph entry while the graph read guard is held.
+        let empty_len = match serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+            self.context_id,
+            std::iter::empty(),
+        ))) {
+            Ok(encoded) => encoded.len(),
+            Err(_) => {
+                self.invalid = true;
+                return None;
             }
-            fact_ids.push(*fact_id);
-        }
-        drop(graph);
+        };
+        let fact_ids = {
+            let mut fact_ids = Vec::new();
+            let mut encoded_len = empty_len;
+            let graph = self.graph.read();
+            for fact_id in graph.ids_after(self.cursor) {
+                #[cfg(test)]
+                {
+                    self.visited_candidates = self.visited_candidates.saturating_add(1);
+                }
+                let id_len = match serde_json::to_vec(fact_id) {
+                    Ok(encoded) => encoded.len(),
+                    Err(_) => {
+                        self.invalid = true;
+                        return None;
+                    }
+                };
+                let separator_len = if fact_ids.is_empty() { 0 } else { 1 };
+                let candidate_len = encoded_len
+                    .checked_add(separator_len)
+                    .and_then(|length| length.checked_add(id_len));
+                let Some(candidate_len) = candidate_len else {
+                    self.invalid = true;
+                    return None;
+                };
+                if candidate_len > crate::protocol::RECEIVE_FRAME_BYTES {
+                    if fact_ids.is_empty() {
+                        self.invalid = true;
+                        return None;
+                    }
+                    break;
+                }
+                fact_ids.push(*fact_id);
+                encoded_len = candidate_len;
+            }
+            fact_ids
+        };
         if fact_ids.is_empty() {
             self.finished = true;
             return None;
@@ -393,6 +499,11 @@ impl FactInventoryCursor {
     fn is_valid(&self) -> bool {
         !self.invalid
     }
+
+    #[cfg(test)]
+    fn visited_candidates(&self) -> usize {
+        self.visited_candidates
+    }
 }
 
 fn local_fact_inventory_cursor(state: &Arc<EngineState>) -> FactInventoryCursor {
@@ -402,6 +513,8 @@ fn local_fact_inventory_cursor(state: &Arc<EngineState>) -> FactInventoryCursor 
         cursor: None,
         finished: false,
         invalid: false,
+        #[cfg(test)]
+        visited_candidates: 0,
     }
 }
 
@@ -420,6 +533,83 @@ pub async fn broadcast_fact_inventory(state: &Arc<EngineState>) {
         }
         if !inventory.is_valid() {
             tracing::debug!(peer = %owner.device_id(), "fact inventory cannot fit the exact receive-safe frame boundary");
+        }
+    }
+}
+
+fn delta_inventory_pages(
+    context_id: crate::semantic::MeshContextId,
+    delta: &crate::semantic::SemanticDelta,
+) -> Option<Vec<FactInventory>> {
+    let mut ids = BTreeSet::new();
+    for row in delta.rows() {
+        if row.status() == crate::semantic::SemanticFactStatus::Admitted {
+            ids.insert(row.fact().id);
+        }
+    }
+    ids.extend(delta.promoted().iter().copied());
+
+    let mut pages = Vec::new();
+    let mut current = Vec::new();
+    let empty_len = serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+        context_id,
+        std::iter::empty(),
+    )))
+    .ok()?
+    .len();
+    let mut encoded_len = empty_len;
+    for id in ids {
+        let id_len = serde_json::to_vec(&id).ok()?.len();
+        let separator_len = if current.is_empty() { 0 } else { 1 };
+        let candidate_len = encoded_len
+            .checked_add(separator_len)
+            .and_then(|length| length.checked_add(id_len))?;
+        if candidate_len > crate::protocol::RECEIVE_FRAME_BYTES {
+            if current.is_empty() {
+                return None;
+            }
+            pages.push(FactInventory::new(context_id, std::mem::take(&mut current)));
+            encoded_len = empty_len;
+            let single_len = encoded_len.checked_add(id_len)?;
+            if single_len > crate::protocol::RECEIVE_FRAME_BYTES {
+                return None;
+            }
+            current.push(id);
+            encoded_len = single_len;
+        } else {
+            current.push(id);
+            encoded_len = candidate_len;
+        }
+    }
+    if !current.is_empty() {
+        pages.push(FactInventory::new(context_id, current));
+    }
+    Some(pages)
+}
+
+async fn broadcast_fact_inventory_delta(
+    state: &Arc<EngineState>,
+    delta: &crate::semantic::SemanticDelta,
+) {
+    let Some(pages) = delta_inventory_pages(state.mesh_context_id(), delta) else {
+        tracing::debug!("semantic delta inventory exceeds the exact receive-safe frame boundary");
+        return;
+    };
+    if pages.is_empty() {
+        return;
+    }
+    for owner in inventory_peer_owners(state) {
+        for page in &pages {
+            if let Err(error) =
+                super::send_to_peer_owner(state, &owner, &MeshMessage::FactInventory(page.clone()))
+                    .await
+            {
+                tracing::debug!(
+                    peer = %owner.device_id(),
+                    %error,
+                    "fact delta inventory broadcast send failed"
+                );
+            }
         }
     }
 }
@@ -511,8 +701,9 @@ pub(super) async fn on_fact_request(
             continue;
         };
         page_facts.push(fact);
-        let Some(encoded_len) = FactBundleMessage::encoded_len_for_facts(&page_facts) else {
-            tracing::debug!(peer = %route.owner().device_id(), "fact bundle page could not be sized");
+        let Some(encoded_len) = fact_page_encoded_len(state.mesh_context_id(), &page_facts, false)
+        else {
+            tracing::debug!(peer = %route.owner().device_id(), "fact page could not be sized");
             return;
         };
         if encoded_len > crate::protocol::RECEIVE_FRAME_BYTES {
@@ -521,7 +712,7 @@ pub(super) async fn on_fact_request(
                 match send_single_fact_page(state, route, last).await {
                     Ok(true) => continue,
                     Ok(false) => {
-                        tracing::debug!(peer = %route.owner().device_id(), "fact bundle and single fact exceed the exact receive-safe frame boundary");
+                        tracing::debug!(peer = %route.owner().device_id(), "fact page and single fact exceed the exact receive-safe frame boundary");
                         // This exact fact cannot cross the receive boundary.
                         // It is not a transport failure: continue the request
                         // so later individually transmittable facts are not
@@ -534,25 +725,25 @@ pub(super) async fn on_fact_request(
                     }
                 }
             }
-            if send_fact_bundle_page(state, route, std::mem::take(&mut page_facts))
+            if send_fact_page(state, route, std::mem::take(&mut page_facts), false)
                 .await
                 .is_err()
             {
                 tracing::debug!(
                     peer = %route.owner().device_id(),
-                    "fact bundle reply send failed"
+                    "fact page reply send failed"
                 );
                 return;
             }
             page_facts.push(last);
-            if FactBundleMessage::encoded_len_for_facts(&page_facts)
+            if fact_page_encoded_len(state.mesh_context_id(), &page_facts, false)
                 .is_none_or(|length| length > crate::protocol::RECEIVE_FRAME_BYTES)
             {
                 let last = page_facts.pop().expect("the just-added fact is present");
                 match send_single_fact_page(state, route, last).await {
                     Ok(true) => {}
                     Ok(false) => {
-                        tracing::debug!(peer = %route.owner().device_id(), "fact bundle and single fact exceed the exact receive-safe frame boundary");
+                        tracing::debug!(peer = %route.owner().device_id(), "fact page and single fact exceed the exact receive-safe frame boundary");
                         // Skip only this untransmittable fact. A later
                         // request item still deserves its own exact attempt.
                     }
@@ -565,28 +756,42 @@ pub(super) async fn on_fact_request(
         }
     }
     if !page_facts.is_empty()
-        && send_fact_bundle_page(state, route, page_facts)
+        && send_fact_page(state, route, page_facts, true)
             .await
             .is_err()
     {
-        tracing::debug!(peer = %route.owner().device_id(), "fact bundle reply send failed");
+        tracing::debug!(peer = %route.owner().device_id(), "fact page reply send failed");
     }
 }
 
-async fn send_fact_bundle_page(
+async fn send_fact_page(
     state: &Arc<EngineState>,
     route: &LogicalSessionOperation,
     facts: Vec<crate::semantic::SignedFact>,
+    complete: bool,
 ) -> Result<()> {
-    super::send_logical_reply(
-        state,
-        route,
-        &MeshMessage::FactBundle(FactBundleMessage { facts }),
-    )
-    .await
+    let next_cursor = (!complete)
+        .then(|| facts.last().map(|fact| fact.id))
+        .flatten();
+    let page = FactPageMessage::new(state.mesh_context_id(), facts, next_cursor, complete)
+        .map_err(Error::Other)?;
+    super::send_logical_reply(state, route, &MeshMessage::FactPage(page)).await
 }
 
-/// Send one canonical fact when its one-item bundle envelope would be too
+fn fact_page_encoded_len(
+    context_id: crate::semantic::MeshContextId,
+    facts: &[crate::semantic::SignedFact],
+    complete: bool,
+) -> Option<usize> {
+    let next_cursor = (!complete)
+        .then(|| facts.last().map(|fact| fact.id))
+        .flatten();
+    FactPageMessage::new(context_id, facts.to_vec(), next_cursor, complete)
+        .ok()?
+        .encoded_len()
+}
+
+/// Send one canonical fact when its one-item page envelope would be too
 /// large. The standalone `fact` frame has a different envelope and may still
 /// fit the exact receive boundary; refusing only after checking that frame
 /// preserves later requested IDs instead of abandoning the whole request.
@@ -606,15 +811,15 @@ async fn send_single_fact_page(
     Ok(true)
 }
 
-/// Verify that any eviction material in a reduced bundle agrees with the
+/// Verify that any eviction material in a reduced page agrees with the
 /// canonical projection before it can be acknowledged.  Ordinary governance
-/// and participation bundles have no target-level acknowledgement condition;
+/// ordinary governance pages have no target-level acknowledgement condition;
 /// eviction closures do.  In particular, a signed proof is not acknowledged
 /// merely because its bytes entered the graph: the exact target must be stood
 /// down by the resulting authoritative projection.  The plain `Evict` closure
 /// used during a denied handshake is checked against the corresponding
 /// membership tombstone instead.
-pub(super) fn fact_bundle_projection_is_verified(
+pub(super) fn fact_page_projection_is_verified(
     state: &Arc<EngineState>,
     facts: &[SignedFact],
 ) -> bool {
@@ -628,7 +833,7 @@ pub(super) fn fact_bundle_projection_is_verified(
 /// The wire identity is checked by `ProofDeliveryMessage::validate`; this
 /// predicate adds the receiver's exact mesh-context fence and requires the
 /// delivery target itself to be represented by the resulting canonical
-/// stand-down/eviction projection. A valid bundle for some other target can
+/// stand-down/eviction projection. A valid page for some other target can
 /// therefore never settle this delivery.
 pub(super) fn proof_delivery_projection_is_verified(
     state: &Arc<EngineState>,
@@ -644,15 +849,15 @@ pub(super) fn proof_delivery_projection_is_verified(
     verified
 }
 
-/// A FactBundle acknowledgement is the receiver's exact current inventory on
-/// the same logical route that requested the bundle.  It is deliberately an
+/// A FactPage acknowledgement is the receiver's exact current inventory on
+/// the same logical route that requested the page.  It is deliberately an
 /// inventory rather than a new authority fact: the sender learns which signed
 /// facts actually entered our graph and can request any remaining causal
 /// dependencies, while the route only selects where the coordination reply is
 /// sent.  This also works for a disconnected/offline proof source when the
 /// next exact session is established; no heartbeat or carrier observation is
 /// treated as acknowledgement.
-pub(super) async fn acknowledge_fact_bundle(
+pub(super) async fn acknowledge_fact_page(
     state: &Arc<EngineState>,
     route: &LogicalSessionOperation,
 ) {
@@ -664,13 +869,13 @@ pub(super) async fn acknowledge_fact_bundle(
             tracing::debug!(
                 peer = %route.owner().device_id(),
                 %error,
-                "fact bundle acknowledgement send failed"
+                "fact page acknowledgement send failed"
             );
             break;
         }
     }
     if !inventory.is_valid() {
-        tracing::debug!(peer = %route.owner().device_id(), "fact bundle acknowledgement exceeds the exact receive-safe frame boundary");
+        tracing::debug!(peer = %route.owner().device_id(), "fact page acknowledgement exceeds the exact receive-safe frame boundary");
     }
 }
 
@@ -744,11 +949,7 @@ async fn send_pending_role_grant(
 
 /// Ask the exact current pending installation to run the ordinary approval
 /// send/recheck after its canonical RoleGrant projection has committed.
-async fn request_pending_approval(
-    state: &Arc<EngineState>,
-    peer_id: &str,
-    _echo_open_participation: bool,
-) {
+async fn request_pending_approval(state: &Arc<EngineState>, peer_id: &str) {
     let Some(owner) = state.peers.owner(peer_id) else {
         return;
     };
@@ -777,14 +978,13 @@ async fn commit_proposal(
 ) -> Result<FactId> {
     crate::custody::require(&state.network_id, mfa_code)?;
     let fact = signed_fact(state, body, Vec::new())?;
-    admit_authored_fact(state, &fact)?;
-    apply_canonical_projection_checked(state)?;
-    broadcast_fact_inventory(state).await;
+    let delta = admit_authored_fact(state, &fact).await?;
+    let (_, projected) = apply_canonical_projection_delta_with_projection(state, &delta)?;
+    broadcast_fact_inventory_delta(state, &delta).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
     if let FactBody::RoleGrant { target, role } = &fact.content.body {
         if *role == crate::semantic::Role::Member
-            && canonical_projection_snapshot(state).roles.get(&pk(target))
-                == Some(&crate::semantic::Role::Member)
+            && projected.roles.get(&pk(target)) == Some(&crate::semantic::Role::Member)
         {
             if let Some(owner) = send_pending_role_grant(state, target, &fact).await {
                 super::handshake::reevaluate_after_role_grant(state, &owner).await;
@@ -861,9 +1061,9 @@ pub async fn propose_membership_admit(
         },
         Vec::new(),
     )?;
-    admit_authored_fact(state, &fact)?;
-    apply_canonical_projection_checked(state)?;
-    broadcast_fact_inventory(state).await;
+    let delta = admit_authored_fact(state, &fact).await?;
+    apply_canonical_projection_delta_checked(state, &delta)?;
+    broadcast_fact_inventory_delta(state, &delta).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
     Ok(fact.id)
 }
@@ -879,8 +1079,10 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    let admission = state.admit_fact_durably(fact.clone());
-    let (admission, _) = match admission {
+    let admission = state
+        .admit_fact_durably_with_delta_async(fact.clone())
+        .await;
+    let (admission, _, delta) = match admission {
         Ok(admission) => admission,
         Err(error) => {
             diag(
@@ -899,7 +1101,7 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         );
         return;
     }
-    if let Err(error) = apply_canonical_projection_checked(state) {
+    if let Err(error) = apply_canonical_projection_delta_checked(state, &delta) {
         diag(
             state,
             crate::events::DiagLevel::Warn,
@@ -921,14 +1123,12 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
         | FactBody::Attestation { target, .. } => {
             super::reconcile_terminal_recovery_policy(state, target);
         }
-        FactBody::OpenParticipation { device_id, .. }
-        | FactBody::SelfStandDown { device_id, .. } => {
+        FactBody::SelfStandDown { device_id, .. } => {
             super::reconcile_terminal_recovery_policy(state, device_id);
         }
         FactBody::Resolution { cell, .. } => match cell {
             crate::semantic::ExclusiveCell::Role { subject }
-            | crate::semantic::ExclusiveCell::Membership { subject }
-            | crate::semantic::ExclusiveCell::OpenParticipation { subject } => {
+            | crate::semantic::ExclusiveCell::Membership { subject } => {
                 super::reconcile_terminal_recovery_policy(state, subject);
             }
             crate::semantic::ExclusiveCell::Decision { .. } => {}
@@ -937,28 +1137,15 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
             super::reconcile_terminal_recovery_policy(state, subject);
         }
     }
-    broadcast_fact_inventory(state).await;
+    broadcast_fact_inventory_delta(state, &delta).await;
     match &fact.content.body {
         FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
-            request_pending_approval(state, &fact.content.author, false).await;
-        }
-        FactBody::OpenParticipation {
-            device_id,
-            joined: true,
-        } => {
-            request_pending_approval(state, device_id, true).await;
+            request_pending_approval(state, &fact.content.author).await;
         }
         _ => {}
     }
 }
 
-// ---- retired roster wire hooks -------------------------------------
-//
-// The roster remains a local semantic projection. Legacy lifecycle call
-// sites are retained as no-op hooks; canonical signed facts are the only
-// authority and no unsigned roster wire frame is emitted or consumed.
-//
-// No roster summary is broadcast; this retired hook area is intentionally empty.
 // ---- eviction enforcement -------------------------------------------
 //
 // The signed log is a closed network's tombstone: an `Evict` in the
@@ -1063,13 +1250,16 @@ pub(super) async fn deny_if_evicted(
     // provider-funded writes, and either refusal leaves the proof available for
     // the next inventory/request exchange rather than changing the decision.
     if let Some(bundle) = current_eviction_proof_bundle(state, device_id) {
-        let message = MeshMessage::FactBundle(crate::protocol::FactBundleMessage {
-            facts: bundle.clone(),
-        });
-        let proof_result = match super::send_pending_open_participation(state, owner, &bundle).await
-        {
+        let message = FactPageMessage::new(state.mesh_context_id(), bundle.clone(), None, true)
+            .map(MeshMessage::FactPage);
+        let proof_result = match super::send_pending_semantic_facts(state, owner, &bundle).await {
             Ok(()) => Ok(()),
-            Err(_) => super::send_to_peer_owner(state, owner, &message).await,
+            Err(_) => match message {
+                Ok(message) => super::send_to_peer_owner(state, owner, &message).await,
+                Err(error) => Err(Error::Other(format!(
+                    "eviction proof fact page refused: {error}"
+                ))),
+            },
         };
         if let Err(error) = proof_result {
             tracing::debug!(
@@ -1102,96 +1292,42 @@ pub(super) async fn deny_if_evicted(
 mod governance_projection_controls {
     use super::*;
 
-    /// The pending-peer path carries a real causal proof, not whichever
-    /// terminal body happens to be visible at the sender.  A fork is refused
-    /// until the local author resolves it; once resolved, a fresh graph can
-    /// admit the complete bundle and project the same positive value.
+    static CONCURRENT_LANE_FIXTURE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     #[tokio::test]
-    async fn open_participation_forwards_conflict_resolution_to_a_fresh_graph() {
-        let state = crate::engine::build_test_state("open-proof-forwarding");
-        crate::engine::join_open_participation(&state)
-            .await
-            .expect("explicit local join admits");
-        let local = DeviceId::from_canonical_str(state.identity.public_id())
-            .expect("fixture identity is canonical");
-        let cell = crate::semantic::ExclusiveCell::open_participation(local.clone());
-        let initial = {
-            let graph = state.authoritative_fact_graph();
-            let graph = graph.read();
-            let id = graph
-                .projection()
-                .value(&cell)
-                .expect("join projects a value");
-            graph.get(&id).cloned().expect("join remains stored")
-        };
-
-        let branch = |joined: bool| {
-            let content = FactContent::open_participation(
-                state.mesh_context_id(),
-                local.clone(),
-                joined,
-                vec![initial.id],
-            );
-            SignedFact::sign(content, state.identity.signing_key())
-                .expect("self-authored branch signs")
-        };
-        let left = branch(false);
-        let right = branch(true);
-        {
-            let graph = state.authoritative_fact_graph();
-            let mut graph = graph.write();
-            graph.admit(left.clone()).expect("negative branch admits");
-            graph.admit(right.clone()).expect("positive branch admits");
-        }
-        assert!(
-            current_open_participation_bundle(&state).is_none(),
-            "a joined true/false conflict has no forwardable value"
+    async fn concurrent_role_grants_use_one_bounded_durable_lane() {
+        let fixture_id = CONCURRENT_LANE_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state = crate::engine::build_test_closed_state(
+            &format!(
+                "concurrent-role-grant-lane-{}-{fixture_id}",
+                std::process::id()
+            ),
+            [0x43; 32],
         );
+        let target_a = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target_b = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
 
-        let mut cited = vec![left.id, right.id];
-        cited.sort();
-        let resolution = {
-            let graph = state.authoritative_fact_graph();
-            let graph = graph.read();
-            let body = FactBody::Resolution {
-                cell: cell.clone(),
-                cited_heads: cited.clone(),
-                selected_head: right.id,
-            };
-            let witness = graph.authoring_witness(&body, &local);
-            let content =
-                FactContent::from_authoring_witness(&graph, body, &witness, std::iter::empty());
-            SignedFact::sign(content, state.identity.signing_key())
-                .expect("self-authored resolution signs")
-        };
-        state
-            .authoritative_fact_graph()
-            .write()
-            .admit(resolution.clone())
-            .expect("self resolution admits");
-
-        let bundle = current_open_participation_bundle(&state)
-            .expect("resolved positive value has a forwardable proof");
-        let bundle_ids: BTreeSet<_> = bundle.iter().map(|fact| fact.id).collect();
-        assert!(bundle_ids.contains(&resolution.id));
-        assert!(bundle_ids.contains(&left.id));
-        assert!(bundle_ids.contains(&right.id));
-        assert!(bundle_ids.contains(&initial.id));
-        assert!(bundle
-            .iter()
-            .all(|fact| { fact.content.mesh_context == state.mesh_context_id() }));
-
-        let mut fresh = crate::semantic::FactGraph::from_bootstrap(state.verified_bootstrap());
-        for fact in bundle {
-            fresh
-                .admit(fact)
-                .expect("fresh graph accepts proof material");
-            let _ = fresh.retry_quarantined();
-        }
+        let (grant_a, grant_b) = tokio::join!(
+            propose_role_grant(&state, &target_a, crate::semantic::Role::Member, None),
+            propose_role_grant(&state, &target_b, crate::semantic::Role::Member, None),
+        );
+        assert!(
+            grant_a.is_ok(),
+            "first concurrent grant failed: {grant_a:?}"
+        );
+        assert!(
+            grant_b.is_ok(),
+            "second concurrent grant failed: {grant_b:?}"
+        );
         assert_eq!(
-            fresh.evaluator().effective_open_participation(&local),
-            Some(true),
-            "the proof bundle alone reconstructs the resolved joined value"
+            state.durable_admission_max_for_test(),
+            1,
+            "the blocking admission lane must never run two workers at once"
         );
     }
 
@@ -1226,7 +1362,7 @@ mod governance_projection_controls {
 
         let attempted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let attempted_by_save = Arc::clone(&attempted);
-        let error = apply_canonical_projection_with(&state, move |_| {
+        let error = apply_canonical_projection_with(&state, move |_, _| {
             attempted_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
             Err(Error::Roster(
                 "injected projection persistence failure".into(),
@@ -1237,10 +1373,152 @@ mod governance_projection_controls {
         assert!(matches!(error, Error::Roster(_)));
         assert!(state.roster.read().authorized_devices.is_empty());
 
-        let changed = apply_canonical_projection_with(&state, |_| Ok(()))
+        let changed = apply_canonical_projection_with(&state, |_, _| Ok(()))
             .expect("a successful persistence boundary must commit the projection");
         assert!(changed);
         assert!(!state.roster.read().authorized_devices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn indexed_delta_role_change_avoids_roster_scan_and_restores_on_save_failure(
+    ) -> Result<()> {
+        let state = crate::engine::build_test_closed_state("indexed-roster-delta", [0x2c; 32]);
+        let first_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let second_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        propose_role_grant(&state, &first_target, crate::semantic::Role::Member, None)
+            .await
+            .expect("first target grant admits");
+        propose_role_grant(&state, &second_target, crate::semantic::Role::Member, None)
+            .await
+            .expect("second target grant admits");
+        {
+            let mut roster = state.roster.write();
+            for index in 0..2_048 {
+                crate::roster::add_peer_in(
+                    &mut roster,
+                    &format!("unrelated-{index:04}"),
+                    "unrelated",
+                );
+            }
+        }
+
+        let second_fact = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: canonical_device(&first_target).expect("first target is canonical"),
+                role: crate::semantic::Role::Controller,
+            },
+            Vec::new(),
+        )?;
+        let (_, _, second_delta) = state
+            .admit_fact_durably_with_delta_async(second_fact)
+            .await
+            .expect("second target role change admits");
+        crate::roster::AuthorizedDevices::reset_test_counters();
+        let roster_role = |target: &str| -> Option<crate::semantic::Role> {
+            let pubkey = crate::signing::pubkey_part(target);
+            let roster = state.roster.read();
+            let entries: &[crate::roster::AuthorizedPeer] =
+                std::ops::Deref::deref(&roster.authorized_devices);
+            entries
+                .iter()
+                .find(|peer| peer.device_id == pubkey)
+                .map(|peer| peer.role)
+        };
+        let before_success = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        let (changed, _) = apply_canonical_projection_delta_with_projection(&state, &second_delta)
+            .expect("indexed existing-subject projection succeeds");
+        assert!(changed);
+        assert_eq!(
+            crate::roster::AuthorizedDevices::test_counters(),
+            (0, 0),
+            "existing-subject role change must not scan or rebuild the roster"
+        );
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before_success,
+            "role-only projection metadata is intentionally not serialized"
+        );
+        assert_eq!(
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Controller),
+            "the role change updates the keyed in-memory row"
+        );
+
+        let failure_fact = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: canonical_device(&second_target).expect("second target is canonical"),
+                role: crate::semantic::Role::Controller,
+            },
+            Vec::new(),
+        )?;
+        let (_, _, failure_delta) = state
+            .admit_fact_durably_with_delta_async(failure_fact)
+            .await
+            .expect("failure-path role change admits");
+        let before_failure = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        let before_failure_role = roster_role(&second_target);
+        crate::roster::AuthorizedDevices::reset_test_counters();
+        let error = match apply_canonical_projection_delta_with_projection_and_save(
+            &state,
+            &failure_delta,
+            |_, _| {
+                Err(Error::Roster(
+                    "injected projection persistence failure".into(),
+                ))
+            },
+        ) {
+            Ok(_) => panic!("injected save failure must reach the caller"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::Roster(_)));
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before_failure,
+            "indexed rollback restores exact serialized bytes"
+        );
+        assert_eq!(
+            roster_role(&second_target),
+            before_failure_role,
+            "indexed rollback restores the affected in-memory role"
+        );
+        assert_eq!(
+            crate::roster::AuthorizedDevices::test_counters(),
+            (0, 0),
+            "existing-subject rollback must not scan or rebuild the roster"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_projection_reconciliation_includes_removed_disk_keys() {
+        let state = crate::engine::build_test_closed_state("projection-stale-key", [0x2b; 32]);
+        let stale = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(&mut state.roster.write(), &stale, "stale");
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_by_save = Arc::clone(&captured);
+        let changed = apply_canonical_projection_with(&state, move |_, affected| {
+            *captured_by_save.lock().unwrap() = Some(affected.clone());
+            Ok(())
+        })
+        .expect("projection reconciliation succeeds");
+        assert!(
+            changed,
+            "the stale advisory row is removed from the candidate"
+        );
+        assert!(captured
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|keys| keys.contains(&crate::signing::pubkey_part(&stale).to_string())));
+        assert!(!crate::roster::is_authorized(&state.roster.read(), &stale));
     }
 
     #[test]
@@ -1257,10 +1535,14 @@ mod governance_projection_controls {
         for index in 0..2_048u64 {
             let mut parent = [0u8; 32];
             parent[..8].copy_from_slice(&index.to_be_bytes());
-            let content = FactContent::open_participation(
+            let content = FactContent::new(
+                crate::semantic::FactDomain::Governance,
                 context_id,
+                FactBody::RoleGrant {
+                    target: author.clone(),
+                    role: crate::semantic::Role::Member,
+                },
                 author.clone(),
-                index % 2 == 0,
                 vec![FactId::from_bytes(parent)],
             );
             let fact = SignedFact::sign(content, state.identity.signing_key())
@@ -1275,12 +1557,17 @@ mod governance_projection_controls {
             cursor: None,
             finished: false,
             invalid: false,
+            visited_candidates: 0,
         };
         let mut page_count = 0;
         let mut observed = BTreeSet::new();
+        let mut first_page = None;
 
         while let Some(page) = cursor.next_page() {
             page_count += 1;
+            if first_page.is_none() {
+                first_page = Some(page.clone());
+            }
             let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
                 .expect("inventory page serializes");
             assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
@@ -1292,8 +1579,220 @@ mod governance_projection_controls {
         assert!(page_count >= 2, "control must exercise multiple pages");
         assert_eq!(observed.len(), expected_ids);
         assert!(
+            cursor.visited_candidates() >= expected_ids
+                && cursor.visited_candidates() <= expected_ids + page_count,
+            "inventory sizing visits each candidate once plus at most one lookahead per page"
+        );
+        let first_page = first_page.expect("the nonempty graph produces a first page");
+        let first_len = serde_json::to_vec(&MeshMessage::FactInventory(first_page.clone()))
+            .expect("the exact-boundary page serializes")
+            .len();
+        let next_id = {
+            let graph = cursor.graph.read();
+            let candidate = graph
+                .ids_after(first_page.fact_ids().last().copied())
+                .next()
+                .copied()
+                .expect("the control has a max-plus-one candidate");
+            candidate
+        };
+        let mut max_plus_one_ids = first_page.fact_ids().to_vec();
+        max_plus_one_ids.push(next_id);
+        let max_plus_one_len = serde_json::to_vec(&MeshMessage::FactInventory(FactInventory::new(
+            context_id,
+            max_plus_one_ids,
+        )))
+        .expect("the max-plus-one candidate serializes")
+        .len();
+        assert!(
+            first_len <= crate::protocol::RECEIVE_FRAME_BYTES,
+            "the exact maximum page fits the receive-safe boundary"
+        );
+        assert!(
+            max_plus_one_len > crate::protocol::RECEIVE_FRAME_BYTES,
+            "the max-plus-one candidate is refused before page construction"
+        );
+        assert!(
             cursor.next_page().is_none(),
             "a drained cursor is quiescent"
         );
+    }
+
+    #[test]
+    fn delta_inventory_splits_bounded_pages_without_unrelated_ids() {
+        let state = crate::engine::build_test_state("delta-inventory-page-controls");
+        let mut delta = crate::semantic::SemanticDelta::default();
+        let expected = (0..2_048u64)
+            .map(|index| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(index + 1).to_be_bytes());
+                let id = FactId::from_bytes(bytes);
+                delta.push_promoted_for_test(id);
+                id
+            })
+            .collect::<BTreeSet<_>>();
+
+        let pages = delta_inventory_pages(state.mesh_context_id(), &delta)
+            .expect("all fixed-size IDs fit in bounded pages");
+        assert!(
+            pages.len() > 1,
+            "control must exercise multiple delta pages"
+        );
+        let observed = pages
+            .iter()
+            .flat_map(|page| {
+                let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                    .expect("inventory page serializes");
+                assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+                assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+                page.fact_ids().iter().copied()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn delta_inventory_excludes_authenticated_pending_owners() {
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::PendingApproval,
+            true,
+            true
+        ));
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::Active,
+            false,
+            true
+        ));
+        assert!(!inventory_owner_is_eligible(
+            PeerStatus::Active,
+            true,
+            false
+        ));
+        assert!(inventory_owner_is_eligible(PeerStatus::Active, true, true));
+        assert!(inventory_owner_is_eligible(PeerStatus::Shelved, true, true));
+    }
+
+    /// Exercise the real registry snapshot rather than testing the eligibility
+    /// predicate in isolation.  The promoted fixtures retain their native
+    /// workers and event receivers, so `current_worker()` is the same live
+    /// worker the production inventory path observes.
+    #[cfg(test)]
+    #[tokio::test]
+    #[ignore = "opens local WebRTC objects; run explicitly in the isolated harness"]
+    async fn inventory_peer_owners_snapshots_only_live_authenticated_workers() {
+        let state = crate::engine::build_test_state("inventory-owner-registry-control");
+
+        let active = crate::engine::insert_promoted_peer(&state, "inventory-active").await;
+        let shelved = crate::engine::insert_promoted_peer(&state, "inventory-shelved").await;
+        shelved.peer.state.write().status = PeerStatus::Shelved;
+
+        let pending = crate::engine::insert_promoted_peer(&state, "inventory-pending").await;
+        pending.peer.state.write().status = PeerStatus::PendingApproval;
+
+        let unauthenticated =
+            crate::engine::insert_promoted_peer(&state, "inventory-unauthenticated").await;
+        unauthenticated.peer.state.write().authenticated = false;
+
+        crate::engine::insert_session_less_peer(&state, "inventory-no-worker", None);
+        let no_worker = state
+            .peers
+            .get("inventory-no-worker")
+            .expect("the connector-less peer was installed");
+        {
+            let mut data = no_worker.state.write();
+            data.status = PeerStatus::Active;
+            data.authenticated = true;
+        }
+
+        let mut observed = inventory_peer_owners(&state)
+            .into_iter()
+            .map(|owner| owner.device_id().to_string())
+            .collect::<Vec<_>>();
+        observed.sort();
+        assert_eq!(
+            observed,
+            vec![
+                "inventory-active".to_string(),
+                "inventory-shelved".to_string()
+            ]
+        );
+
+        // Keep every owner and receiver alive through the snapshot.  Dropping
+        // one here would retire the native worker and make the control pass for
+        // the wrong reason.
+        drop((active, shelved, pending, unauthenticated, no_worker));
+    }
+
+    #[tokio::test]
+    async fn delta_inventory_mixes_admitted_rows_and_promoted_ids() {
+        let state = crate::engine::build_test_state("delta-inventory-mixed-control");
+        let target_a = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let target_b = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        let fact_a = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: DeviceId::from_canonical_str(&target_a).expect("target A is canonical"),
+                role: crate::semantic::Role::Member,
+            },
+            Vec::new(),
+        )
+        .expect("fact A signs");
+        let fact_b = signed_fact(
+            &state,
+            FactBody::RoleGrant {
+                target: DeviceId::from_canonical_str(&target_b).expect("target B is canonical"),
+                role: crate::semantic::Role::Member,
+            },
+            Vec::new(),
+        )
+        .expect("fact B signs");
+        let admitted_a = fact_a.id;
+        let admitted_b = fact_b.id;
+        let delta_a = admit_authored_fact(&state, &fact_a)
+            .await
+            .expect("fact A admits");
+        let delta_b = admit_authored_fact(&state, &fact_b)
+            .await
+            .expect("fact B admits");
+        let promoted_a = FactId::from_bytes([0xa1; 32]);
+        let promoted_b = FactId::from_bytes([0xb2; 32]);
+        assert_ne!(admitted_a, promoted_a);
+        assert_ne!(admitted_b, promoted_b);
+
+        let mut delta = crate::semantic::SemanticDelta::default();
+        // Use rows returned by real durable admissions, then deliberately
+        // reverse them and repeat/reorder the promoted IDs.  The page builder
+        // must canonicalize the union rather than preserve producer insertion
+        // order or emit duplicates.
+        for row in delta_b.rows().iter().chain(delta_a.rows().iter()) {
+            delta.push_row_for_test(row.clone());
+        }
+        delta.push_promoted_for_test(promoted_b);
+        delta.push_promoted_for_test(admitted_a);
+        delta.push_promoted_for_test(promoted_a);
+        delta.push_promoted_for_test(admitted_b);
+        delta.push_promoted_for_test(promoted_b);
+        delta.push_promoted_for_test(admitted_a);
+
+        let pages = delta_inventory_pages(state.mesh_context_id(), &delta)
+            .expect("the mixed bounded delta fits");
+        let observed = pages
+            .iter()
+            .flat_map(|page| {
+                let encoded = serde_json::to_vec(&MeshMessage::FactInventory(page.clone()))
+                    .expect("inventory page serializes");
+                assert!(encoded.len() <= crate::protocol::RECEIVE_FRAME_BYTES);
+                assert!(page.fact_ids().windows(2).all(|pair| pair[0] < pair[1]));
+                page.fact_ids().iter().copied()
+            })
+            .collect::<Vec<_>>();
+        let expected = BTreeSet::from([admitted_a, admitted_b, promoted_a, promoted_b]);
+        assert_eq!(observed, expected.iter().copied().collect::<Vec<_>>());
+        assert_eq!(observed.iter().copied().collect::<BTreeSet<_>>(), expected);
+        assert!(!observed.contains(&FactId::from_bytes([0xc3; 32])));
     }
 }

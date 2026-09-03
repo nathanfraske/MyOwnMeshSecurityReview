@@ -29,7 +29,7 @@ pub use task_custodian::{
 };
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// How a driver came by the device id in a presence or withdrawal report.
 ///
@@ -698,17 +698,13 @@ impl<T> std::fmt::Debug for InboundSink<T> {
 ///
 /// Candidate payloads carry the full RTCIceCandidateInit-equivalent
 /// shape so the receiving WebRTC stack can apply them verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalingMessage {
     /// Presence. Carries the announcing device and nothing else.
     ///
-    /// It used to carry a capability list too, so a receiver could discover
-    /// whether the whole room spoke the recipient-tagged shape and widen its
-    /// subscription if not. That negotiation is gone: the cutover is hard, peers
-    /// are same-build, and there is no downgrade for a capability list to
-    /// select. Announces from a build that still sends one decode fine — serde
-    /// ignores the field — and nothing reads it.
+    /// The hard-cut wire has no capability negotiation. Unknown fields are
+    /// rejected by the strict decoder below rather than silently ignored.
     Announce { peer_id: String },
     /// The offer that opens one connection attempt.
     ///
@@ -742,19 +738,16 @@ pub enum SignalingMessage {
     /// One ICE candidate for an attempt in progress. `offer_id` carries the
     /// same attempt correlation — see [`Self::Offer`].
     ///
-    /// `default` because a candidate's correlation is newer than the field's
-    /// two siblings; an old frame without one decodes to the empty string,
-    /// which correlates with nothing and is simply not de-duplicated.
+    /// `offer_id` is required because a candidate without its attempt
+    /// correlation cannot be safely associated with a live session. The ICE
+    /// fields below remain optional because the WebRTC candidate-init shape
+    /// genuinely permits them to be absent.
     Candidate {
         peer_id: String,
         candidate: String,
-        #[serde(default)]
         offer_id: String,
-        #[serde(default)]
         sdp_mid: Option<String>,
-        #[serde(default)]
         sdp_mline_index: Option<u16>,
-        #[serde(default)]
         username_fragment: Option<String>,
     },
     /// A peer left the room. Sent two ways, both as a pure accelerator over
@@ -781,6 +774,166 @@ pub enum SignalingMessage {
     /// hint that may arrive first, and the backstops behind it are exact
     /// connector closure and the heartbeat timeout.
     Leave { peer_id: String },
+}
+
+fn required_signaling_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<String, String> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("signaling {field} must be a string"))
+}
+
+fn optional_signaling_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<Option<String>, String> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("signaling {field} must be a string or null")),
+    }
+}
+
+fn optional_signaling_u16(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> std::result::Result<Option<u16>, String> {
+    match object.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|_| format!("signaling {field} must be a u16 or null")),
+    }
+}
+
+fn strict_signaling_object(
+    value: serde_json::Value,
+    fields: &[&str],
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, String> {
+    let serde_json::Value::Object(object) = value else {
+        return Err("signaling message must be a JSON object".into());
+    };
+    for field in object.keys() {
+        if field != "kind" && !fields.contains(&field.as_str()) {
+            return Err(format!("unknown signaling field '{field}'"));
+        }
+    }
+    Ok(object)
+}
+
+fn decode_signaling_message(
+    value: serde_json::Value,
+) -> std::result::Result<SignalingMessage, String> {
+    let kind = value
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "signaling message kind is required".to_string())?;
+    match kind.as_str() {
+        "announce" => {
+            let object = strict_signaling_object(value, &["peer_id"])?;
+            Ok(SignalingMessage::Announce {
+                peer_id: required_signaling_string(&object, "peer_id")?,
+            })
+        }
+        "offer" => {
+            let object = strict_signaling_object(value, &["peer_id", "offer_id", "sdp"])?;
+            Ok(SignalingMessage::Offer {
+                peer_id: required_signaling_string(&object, "peer_id")?,
+                offer_id: required_signaling_string(&object, "offer_id")?,
+                sdp: required_signaling_string(&object, "sdp")?,
+            })
+        }
+        "answer" => {
+            let object = strict_signaling_object(value, &["peer_id", "offer_id", "sdp"])?;
+            Ok(SignalingMessage::Answer {
+                peer_id: required_signaling_string(&object, "peer_id")?,
+                offer_id: required_signaling_string(&object, "offer_id")?,
+                sdp: required_signaling_string(&object, "sdp")?,
+            })
+        }
+        "candidate" => {
+            let object = strict_signaling_object(
+                value,
+                &[
+                    "peer_id",
+                    "candidate",
+                    "offer_id",
+                    "sdp_mid",
+                    "sdp_mline_index",
+                    "username_fragment",
+                ],
+            )?;
+            Ok(SignalingMessage::Candidate {
+                peer_id: required_signaling_string(&object, "peer_id")?,
+                candidate: required_signaling_string(&object, "candidate")?,
+                offer_id: required_signaling_string(&object, "offer_id")?,
+                sdp_mid: optional_signaling_string(&object, "sdp_mid")?,
+                sdp_mline_index: optional_signaling_u16(&object, "sdp_mline_index")?,
+                username_fragment: optional_signaling_string(&object, "username_fragment")?,
+            })
+        }
+        "leave" => {
+            let object = strict_signaling_object(value, &["peer_id"])?;
+            Ok(SignalingMessage::Leave {
+                peer_id: required_signaling_string(&object, "peer_id")?,
+            })
+        }
+        _ => Err(format!("unknown signaling message kind '{kind}'")),
+    }
+}
+
+impl<'de> Deserialize<'de> for SignalingMessage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        decode_signaling_message(serde_json::Value::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod signaling_wire_tests {
+    use super::SignalingMessage;
+
+    #[test]
+    fn candidate_keeps_optional_ice_fields_but_requires_attempt_id() {
+        let candidate = r#"{"kind":"candidate","peer_id":"peer-a","candidate":"candidate:1" ,"offer_id":"attempt-1"}"#;
+        let decoded: SignalingMessage = serde_json::from_str(candidate).expect("candidate");
+        assert!(matches!(decoded, SignalingMessage::Candidate {
+            offer_id,
+            sdp_mid: None,
+            sdp_mline_index: None,
+            username_fragment: None,
+            ..
+        } if offer_id == "attempt-1"));
+
+        let missing_attempt =
+            r#"{"kind":"candidate","peer_id":"peer-a","candidate":"candidate:1"}"#;
+        assert!(
+            serde_json::from_str::<SignalingMessage>(missing_attempt).is_err(),
+            "a candidate without attempt ownership must refuse"
+        );
+    }
+
+    #[test]
+    fn signaling_messages_reject_ignored_legacy_fields() {
+        let announce = r#"{"kind":"announce","peer_id":"peer-a","capabilities":["recipient"]}"#;
+        assert!(
+            serde_json::from_str::<SignalingMessage>(announce).is_err(),
+            "ignored capability fields must not decode"
+        );
+        let offer = r#"{"kind":"offer","peer_id":"peer-a","offer_id":"attempt-1","sdp":"v=0","accepted":true}"#;
+        assert!(
+            serde_json::from_str::<SignalingMessage>(offer).is_err(),
+            "offer ownership/acceptance fields must not decode"
+        );
+    }
 }
 
 /// Per-relay health snapshot. Diagnostic-only — surfaced via the

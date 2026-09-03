@@ -18,9 +18,15 @@
 use std::sync::Arc;
 
 use myownmesh_core::services::{ServiceAdvert, ServiceRole};
-use myownmesh_core::{CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ServicesConfig};
+use myownmesh_core::{
+    CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ResourceClaim, ResourceClass,
+    ResourceLease, ServicesConfig,
+};
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
 use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
+use myownmesh_signaling::{
+    DedicatedTaskCustodian, TaskCustodian, TaskCustodyError, TaskReservation,
+};
 use serde::Serialize;
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
@@ -71,6 +77,53 @@ struct ManagerState {
     stun: Option<StunServerHandle>,
     turn: Option<TurnServerHandle>,
     signaling: Option<SignalingServerHandle>,
+}
+
+/// Keeps the signaling task owner and its process-resource charge together.
+/// The signaling crate owns task observation; the daemon owns the exact
+/// provider lease and releases it only after the server closes that owner.
+struct ScopedSignalingCustodian {
+    inner: Arc<DedicatedTaskCustodian>,
+    _lease: ResourceLease,
+}
+
+impl TaskCustodian for ScopedSignalingCustodian {
+    fn reserve(
+        &self,
+        slots: usize,
+    ) -> std::result::Result<Box<dyn TaskReservation>, TaskCustodyError> {
+        self.inner.reserve(slots)
+    }
+
+    fn progress(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.progress()
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
+fn make_signaling_custodian(
+    scope: &myownmesh_core::LocalApplicationResourceScope,
+    limits: &myownmesh_signaling::server::Limits,
+) -> std::result::Result<Arc<dyn TaskCustodian>, String> {
+    let slots = SignalingServer::required_task_custody_slots(limits)
+        .map_err(|error| format!("signaling custody sizing: {error}"))?;
+    let slots = u64::try_from(slots)
+        .map_err(|_| "signaling custody sizing exceeds provider range".to_string())?;
+    let lease = scope
+        .acquire(ResourceClaim::single(ResourceClass::WorkerOrTask, slots))
+        .map_err(|error| format!("signaling custody resource scope: {error}"))?;
+    let inner = DedicatedTaskCustodian::new(
+        usize::try_from(slots)
+            .map_err(|_| "signaling custody sizing exceeds platform range".to_string())?,
+    )
+    .map_err(|error| format!("signaling task custodian: {error:?}"))?;
+    Ok(Arc::new(ScopedSignalingCustodian {
+        inner,
+        _lease: lease,
+    }))
 }
 
 /// Status snapshot for the control protocol / CLI / GUI.
@@ -262,10 +315,12 @@ impl ServiceManager {
         // reconfigure); each constructor consumes its clone and retains its
         // own startup lease until its terminal shutdown path.
         let run_standalone_stun = desired.stun.enabled && !desired.turn.enabled;
-        let needs_service_scope = (run_standalone_stun
-            && (g.stun.is_none()
-                || g.config.stun != desired.stun
-                || g.config.turn != desired.turn))
+        let needs_service_scope = (desired.signaling.enabled
+            && (g.signaling.is_none() || g.config.signaling != desired.signaling))
+            || (run_standalone_stun
+                && (g.stun.is_none()
+                    || g.config.stun != desired.stun
+                    || g.config.turn != desired.turn))
             || (desired.turn.enabled && (g.turn.is_none() || g.config.turn != desired.turn));
         let service_scope = if needs_service_scope {
             match self.mesh.local_application_resource_scope() {
@@ -348,18 +403,31 @@ impl ServiceManager {
                 }
             }
             if desired.signaling.enabled {
-                match SignalingServer::start(
-                    &desired.signaling.bind,
-                    desired.signaling.port,
-                    desired.signaling.limits.clone(),
-                )
-                .await
-                {
-                    Ok(h) => g.signaling = Some(h),
-                    Err(e) => {
-                        warn!("signaling service failed to start: {e}");
-                        failures.push(format!("signaling start: {e}"));
+                if let Some(scope) = service_scope.clone() {
+                    match make_signaling_custodian(&scope, &desired.signaling.limits) {
+                        Ok(custodian) => {
+                            match SignalingServer::start_with_custodian(
+                                &desired.signaling.bind,
+                                desired.signaling.port,
+                                desired.signaling.limits.clone(),
+                                custodian,
+                            )
+                            .await
+                            {
+                                Ok(h) => g.signaling = Some(h),
+                                Err(error) => {
+                                    warn!("signaling service failed to start: {error}");
+                                    failures.push(format!("signaling start: {error}"));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!("signaling service custody failed: {error}");
+                            failures.push(format!("signaling start: {error}"));
+                        }
                     }
+                } else {
+                    failures.push("signaling start: service resource scope unavailable".into());
                 }
             }
         }

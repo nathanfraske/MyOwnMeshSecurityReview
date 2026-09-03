@@ -29,6 +29,8 @@
 //!   - `ping` / `pong` for keepalive
 //!   - `rpc_request` / `rpc_response` / `rpc_stream_chunk` /
 //!     `rpc_stream_end` for embedder-defined request/response calls
+//!   - `routed_application` for signed, context-bound application payloads
+//!     carried across the bounded topology-selected hop chain
 //!   - Application data over typed user-defined channels (see
 //!     [`crate::events`])
 //!
@@ -53,7 +55,7 @@ pub use departure::{
     DEPARTURE_CORRELATION_WIRE_CHARS,
 };
 pub use facts::{
-    CanonicalFact, FactBundleMessage, FactContent, FactId, FactInventory, FactRequest,
+    CanonicalFact, FactContent, FactId, FactInventory, FactPageMessage, FactRequest,
     ProofAckMessage, ProofDeliveryMessage, SignedFact,
 };
 pub use features::{Feature, ADVERTISED_FEATURES};
@@ -68,7 +70,10 @@ pub use rpc::{
     CapabilitiesUpdateMessage, CapabilityAdvert, RpcRequestMessage, RpcResponseMessage,
     RpcStreamChunkMessage, RpcStreamEndMessage,
 };
-pub use topology::{ShelveMessage, UnshelveMessage};
+pub use topology::{
+    ClosedRoutedPayload, RoutedApplicationEnvelope, RoutedApplicationError,
+    RoutedApplicationLimits, RoutedHop, ShelveMessage, UnshelveMessage,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -178,7 +183,7 @@ pub(crate) fn encode_departure_receipt_exact(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameAdmission {
     Protocol,
-    /// A canonical signed fact or fact bundle. These frames are durable
+    /// A canonical signed fact or bounded fact page. These frames are durable
     /// semantic traffic, not application payload: a later admission seam may
     /// carry them to an authenticated PendingApproval peer without widening
     /// that peer's access to inventory, requests, or realtime application
@@ -255,7 +260,7 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
         // frames with a durable semantic identity. Keep this exact set distinct from every
         // inventory/request/application kind; those remain Application
         // and retain their existing failure policies below.
-        "fact" | "fact_bundle" | "proof_delivery" | "proof_ack" => ClassifiedFrame {
+        "fact" | "fact_page" | "proof_delivery" | "proof_ack" => ClassifiedFrame {
             admission: FrameAdmission::DurableFact,
             on_failure: FailurePolicy::EndSession,
         },
@@ -281,6 +286,14 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
         "channel" => ClassifiedFrame {
             admission: FrameAdmission::Application,
             on_failure: FailurePolicy::DropFrame,
+        },
+        // Routed application envelopes carry their own authenticated origin
+        // and bounded hop chain. They are still application traffic: the
+        // current authenticated carrier must be admitted before decoding or
+        // forwarding one.
+        "routed_application" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
         },
         _ => ClassifiedFrame {
             admission: FrameAdmission::Application,
@@ -376,6 +389,9 @@ pub enum MeshMessage {
     ClosedRelayControl(ClosedRelayControl),
     /// Opaque ciphertext for one exact Closed relay route.
     ClosedRelayData(ClosedRelayData),
+    /// Signed, context-bound application traffic carried across a bounded
+    /// topology-selected hop chain.
+    RoutedApplication(RoutedApplicationEnvelope),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),
@@ -384,9 +400,8 @@ pub enum MeshMessage {
     // -- closed-network semantic facts --
     /// One independently verifiable canonical V4 authority fact.
     Fact(SignedFact),
-    /// A set of canonical V4 authority facts. Each element is verified and
-    /// reduced separately; bundle membership itself is not authority.
-    FactBundle(FactBundleMessage),
+    /// A bounded exact-context page of canonical V4 authority facts.
+    FactPage(FactPageMessage),
     /// Non-authoritative exact-context inventory of known FactIds.
     FactInventory(FactInventory),
     /// Non-authoritative exact-context request for signed facts by FactId.
@@ -573,7 +588,14 @@ mod tests {
                 on_failure: FailurePolicy::DropFrame,
             })
         );
-        for fact_kind in ["fact", "fact_bundle", "proof_delivery", "proof_ack"] {
+        assert_eq!(
+            classify_frame(br#"{"kind":"routed_application","payload":[}}"#),
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Application,
+                on_failure: FailurePolicy::EndSession,
+            })
+        );
+        for fact_kind in ["fact", "fact_page", "proof_delivery", "proof_ack"] {
             assert_eq!(
                 classify_frame(format!(r#"{{"kind":"{fact_kind}","payload":[}}"#).as_bytes()),
                 Some(ClassifiedFrame {
@@ -614,6 +636,7 @@ mod tests {
             "rpc_stream_end",
             "channel_seq",
             "channel_ack",
+            "routed_application",
         ] {
             assert_eq!(
                 classify(kind).admission,
@@ -631,6 +654,49 @@ mod tests {
         for kind in ["hello", "auth_response", "approve", "deny"] {
             assert_eq!(classify(kind).admission, FrameAdmission::Protocol);
         }
+    }
+
+    #[test]
+    fn routed_application_round_trips_as_application_and_rejects_unknown_fields() {
+        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let origin = crate::semantic::DeviceId::from_public_key_bytes(
+            *origin_key.verifying_key().as_bytes(),
+        )
+        .expect("origin device id");
+        let destination = crate::semantic::DeviceId::from_public_key_bytes(
+            *destination_key.verifying_key().as_bytes(),
+        )
+        .expect("destination device id");
+        let envelope = RoutedApplicationEnvelope::new(
+            crate::semantic::MeshContextId::from_bytes([23; 32]),
+            origin,
+            destination,
+            [24; 16],
+            1,
+            ClosedRoutedPayload::ChannelFrame {
+                channel: "protocol-test".into(),
+                payload: serde_json::json!({"probe": true}),
+            },
+            &origin_key,
+        )
+        .expect("routed envelope");
+        envelope.verify().expect("origin envelope verifies");
+
+        let message = MeshMessage::RoutedApplication(envelope.clone());
+        let encoded = serde_json::to_vec(&message).expect("routed message serializes");
+        assert!(String::from_utf8_lossy(&encoded).contains(r#""kind":"routed_application""#));
+        let decoded: MeshMessage =
+            serde_json::from_slice(&encoded).expect("routed message decodes");
+        let MeshMessage::RoutedApplication(decoded) = decoded else {
+            panic!("decoded message changed routed variant");
+        };
+        assert_eq!(decoded, envelope);
+        decoded.verify().expect("decoded envelope verifies");
+
+        let mut unknown = serde_json::to_value(MeshMessage::RoutedApplication(envelope)).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(unknown).is_err());
     }
 
     /// Only the best-effort delivery is droppable, and the acknowledged one is
@@ -709,28 +775,56 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fact_bundle_round_trips() {
-        let msg = MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() });
+    fn canonical_fact_page_round_trips() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let device =
+            crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+                .unwrap();
+        let context = crate::semantic::MeshContextId::from_bytes([14; 32]);
+        let fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::new(
+                crate::semantic::FactDomain::Governance,
+                context,
+                crate::semantic::FactBody::RoleRevoke {
+                    target: device.clone(),
+                },
+                device,
+                Vec::new(),
+            ),
+            &key,
+        )
+        .unwrap();
+        let page = FactPageMessage::new(context, vec![fact], None, true).unwrap();
+        let msg = MeshMessage::FactPage(page);
         let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""kind":"fact_bundle""#));
+        assert!(s.contains(r#""kind":"fact_page""#));
         let back: MeshMessage = serde_json::from_str(&s).unwrap();
         match back {
-            MeshMessage::FactBundle(bundle) => {
-                assert!(bundle.facts.is_empty());
+            MeshMessage::FactPage(page) => {
+                assert_eq!(page.context_id, context);
+                assert_eq!(page.facts.len(), 1);
+                assert!(page.complete);
             }
-            _ => panic!("did not round-trip as FactBundle"),
+            _ => panic!("did not round-trip as FactPage"),
         }
     }
 
     #[test]
-    fn non_empty_fact_round_trips_and_rejects_outer_or_nested_unknown_fields() {
+    fn durable_fact_round_trips_and_rejects_unknown_wire_fields() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
         let device =
             crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
                 .unwrap();
         let context = crate::semantic::MeshContextId::from_bytes([12; 32]);
-        let content =
-            crate::semantic::FactContent::open_participation(context, device, true, Vec::new());
+        let content = crate::semantic::FactContent::new(
+            crate::semantic::FactDomain::Governance,
+            context,
+            crate::semantic::FactBody::RoleRevoke {
+                target: device.clone(),
+            },
+            device.clone(),
+            Vec::new(),
+        );
         let fact = crate::semantic::SignedFact::sign(content, &key).unwrap();
         let message = MeshMessage::Fact(fact.clone());
 
@@ -745,6 +839,14 @@ mod tests {
         let mut nested_wire = serde_json::to_value(&message).unwrap();
         nested_wire["content"]["legacy"] = serde_json::json!(true);
         assert!(serde_json::from_value::<MeshMessage>(nested_wire).is_err());
+
+        let unsupported_body = serde_json::json!({
+            "kind": "future_semantic_kind",
+        });
+        assert!(
+            serde_json::from_value::<crate::semantic::FactBody>(unsupported_body).is_err(),
+            "unsupported semantic kind must be refused by semantic decoding"
+        );
     }
 
     #[test]
@@ -867,10 +969,9 @@ mod tests {
 
     #[test]
     fn a_fact_kind_this_build_implements_and_a_future_one_is_refused() {
-        // A supported peer decodes this exact frame.
+        // The removed unbounded bundle is refused before any durable handler.
         let raw = r#"{"kind":"fact_bundle","facts":[]}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        assert!(matches!(msg, MeshMessage::FactBundle(_)));
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
         // The inverse fails closed: there is no mixed-version live fallback.
         let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
         assert!(serde_json::from_str::<MeshMessage>(raw_future).is_err());

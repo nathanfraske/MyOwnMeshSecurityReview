@@ -499,6 +499,14 @@ impl PeerRegistry {
         )
     }
 
+    /// Check whether a canonical routed origin is admitted by this network's
+    /// bound semantic policy. This performs no peer lookup, session promotion,
+    /// or installation change; the bootstrap-bound FactGraph evaluator remains
+    /// the sole authority for the decision.
+    pub(super) fn routed_origin_policy_admits(&self, origin: &crate::semantic::DeviceId) -> bool {
+        self.policy_admits(origin)
+    }
+
     /// Bind the queue newly minted sessions are announced on.
     ///
     /// Called once, during state construction, by the owner of both this
@@ -2104,7 +2112,7 @@ impl PeerRegistry {
         let defer_retirement = defer_retirement && receipt.is_some();
         RemoteDepartureAdmission::Accepted {
             receipt,
-            operation: dispatch.logical_operation(),
+            operation: dispatch.logical_reply_operation(),
             defer_retirement,
         }
     }
@@ -2353,17 +2361,13 @@ pub(super) struct AdmittedPendingSemanticOperation {
 
 impl AdmittedPendingSemanticOperation {
     /// Validate the already-funded decode result without lending any session
-    /// or application capability.  Every fact in a bundle must name the exact
-    /// mesh context captured at admission.
+    /// or application capability. Every fact page must name the exact mesh
+    /// context captured at admission.
     pub(super) fn accepts_message(&self, message: &crate::protocol::MeshMessage) -> bool {
         match message {
-            crate::protocol::MeshMessage::Fact(fact) => {
-                fact.content.mesh_context.base32() == self.mesh_context.as_str()
+            crate::protocol::MeshMessage::FactPage(page) => {
+                page.context_id.base32() == self.mesh_context.as_str() && page.validate().is_ok()
             }
-            crate::protocol::MeshMessage::FactBundle(bundle) => bundle
-                .facts
-                .iter()
-                .all(|fact| fact.content.mesh_context.base32() == self.mesh_context.as_str()),
             crate::protocol::MeshMessage::ProofDelivery(delivery) => {
                 delivery.context_id.base32() == self.mesh_context.as_str()
                     && delivery.validate().is_ok()
@@ -2537,14 +2541,6 @@ impl AdmittedInboundDispatch {
         LogicalSessionOperation::new(self.owner.clone(), self.witness.clone())
     }
 
-    /// Compatibility spelling for callers that need a generic logical route.
-    /// New durable semantic-reply code should use [`Self::logical_reply_operation`]
-    /// to make the workerless route explicit; channel-local code must use
-    /// [`Self::owner`] or [`Self::exact_channel_operation`].
-    pub(super) fn logical_operation(&self) -> LogicalSessionOperation {
-        self.logical_reply_operation()
-    }
-
     /// Bind the worker captured by the accepting callback to this same
     /// logical witness. The terminal path must use this exact pair; it may
     /// not manufacture a fresh logical witness after the callback returns.
@@ -2552,7 +2548,7 @@ impl AdmittedInboundDispatch {
         &self,
         worker: Arc<crate::transport::WebRtcConnectorWorker>,
     ) -> ExactChannelOperation {
-        self.logical_operation().into_exact_channel(worker)
+        self.logical_reply_operation().into_exact_channel(worker)
     }
 
     /// Run one synchronous application effect on the exact captured peer,

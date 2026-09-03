@@ -9,7 +9,7 @@
 //! to `Active` before listing the canonical roster projection.
 #[cfg(feature = "transport-lab")]
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
 };
 #[cfg(feature = "transport-lab")]
 use myownmesh_core::identity::Identity;
@@ -34,13 +34,14 @@ fn cfg(label: &str, auto_approve: bool) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.into(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
+        routing_policy: RoutingPolicyConfig::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve,
     }

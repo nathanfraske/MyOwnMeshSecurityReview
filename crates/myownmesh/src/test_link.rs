@@ -28,8 +28,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::transport_lab::{attach_local, join_open_participation, spawn_network};
+use myownmesh_core::config::{
+    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode,
+};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network};
 use myownmesh_core::events::{MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -79,12 +81,13 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
         label: id.to_string(),
         kind: Default::default(),
         scheduler: SchedulerPolicyConfig::default(),
+        routing_policy: RoutingPolicyConfig::default(),
+        semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
         closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -154,12 +157,6 @@ pub(crate) async fn two_peer_rpc(
     let (bob_state, bob_driver) = spawn_network(bob_cfg, bob_id.clone(), transport.clone())
         .await
         .expect("bob engine");
-    join_open_participation(&alice_state)
-        .await
-        .expect("Alice joins Open participation");
-    join_open_participation(&bob_state)
-        .await
-        .expect("Bob joins Open participation");
     let alice_rpc = Arc::new(
         myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("Alice's live gateway admits its RPC owner"),

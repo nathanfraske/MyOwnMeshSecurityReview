@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::registry::NetworkRegistry;
+use crate::registry::{ClosedRelayRegistry, NetworkRegistry};
 use crate::services::ServiceManager;
 use crate::supervisor::RuntimeSupervisor;
 
@@ -707,8 +707,10 @@ async fn serve_with_hooks(
     let state = Arc::new(ControlState {
         finished: tokio::sync::Notify::new(),
         ended: std::sync::atomic::AtomicUsize::new(0),
+        abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
+        closed_relays: ClosedRelayRegistry::new(),
         services,
         clients,
         json_line_bytes,
@@ -763,7 +765,10 @@ async fn serve_with_hooks(
             // signal races; see its own note for why that wait terminates
             // without a timer.
             () = state.finished.notified() => {
-                join_finished(&state.ended, &mut accepted).await;
+                let abnormal = join_finished(&state.ended, &mut accepted).await;
+                state
+                    .abnormal_connections
+                    .fetch_add(abnormal, std::sync::atomic::Ordering::AcqRel);
             }
             res = listener.accept() => {
                 match res {
@@ -797,7 +802,10 @@ async fn serve_with_hooks(
                         // one funded node per connection it had *ever* accepted
                         // and would eventually refuse a live client on behalf of
                         // tasks that finished hours ago.
-                        join_finished(&state.ended, &mut accepted).await;
+                        let abnormal = join_finished(&state.ended, &mut accepted).await;
+                        state
+                            .abnormal_connections
+                            .fetch_add(abnormal, std::sync::atomic::Ordering::AcqRel);
                         // The node that will hold this connection's handle,
                         // funded before the task it will name exists. Refused,
                         // the connection is closed here rather than spawned into
@@ -920,13 +928,25 @@ async fn serve_with_hooks(
     // released its admission exactly like one that returned. Each node is freed
     // before its own funding is released, and the list is empty by the time this
     // returns.
-    join_all(&mut accepted).await;
+    let mut shutdown_failures = Vec::new();
+    let abnormal_connections = state
+        .abnormal_connections
+        .load(std::sync::atomic::Ordering::Acquire)
+        .saturating_add(join_all(&mut accepted).await);
+    if abnormal_connections != 0 {
+        shutdown_failures.push(format!(
+            "{abnormal_connections} control connection task(s) ended abnormally"
+        ));
+    }
     let abnormal_watchdogs = state.clients.drain_watchdogs().await;
     if abnormal_watchdogs != 0 {
         warn!(
             abnormal_watchdogs,
             "inbound-stream watchdogs ended abnormally during control shutdown"
         );
+        shutdown_failures.push(format!(
+            "{abnormal_watchdogs} inbound-stream watchdog(s) ended abnormally"
+        ));
     }
     // And then the count, which covers what this list does not: the channel
     // pumps and inbound-stream watchdogs the registry admitted on connections'
@@ -938,18 +958,25 @@ async fn serve_with_hooks(
     // close. A concurrent or late `serve` therefore cannot report success on
     // the strength of having waited for its own handles.
     if !owns_closing {
-        return Err(anyhow::anyhow!(
-            "control surface close was already claimed by another owner"
-        ));
+        shutdown_failures.push("control surface close was already claimed by another owner".into());
     }
-    match state.clients.finish_closed() {
-        crate::ipc::Lifecycle::Closed => {
-            info!("control surface closed");
-            Ok(())
+    if let Err(error) = state.closed_relays.shutdown_all().await {
+        warn!("closed relay capability shutdown failed: {error}");
+        shutdown_failures.push(format!("closed relay shutdown failed: {error}"));
+    }
+    if owns_closing {
+        match state.clients.finish_closed() {
+            crate::ipc::Lifecycle::Closed => {}
+            other => {
+                shutdown_failures.push(format!("control surface did not reach Closed: {other:?}"))
+            }
         }
-        other => Err(anyhow::anyhow!(
-            "control surface did not reach Closed: {other:?}"
-        )),
+    }
+    if shutdown_failures.is_empty() {
+        info!("control surface closed");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(shutdown_failures.join("; ")))
     }
 }
 
@@ -1058,8 +1085,13 @@ struct ControlState {
     /// decremented by the join that consumes it, so it can only be nonzero while
     /// there is really something to reap.
     ended: std::sync::atomic::AtomicUsize,
+    /// Abnormal connection joins observed by background reaping. These are
+    /// retained until shutdown so an earlier panic cannot be forgotten before
+    /// the control surface reports its terminal result.
+    abnormal_connections: std::sync::atomic::AtomicUsize,
     mesh: MeshHandle,
     registry: Arc<NetworkRegistry>,
+    closed_relays: Arc<ClosedRelayRegistry>,
     services: Arc<ServiceManager>,
     clients: crate::ipc::ClientRegistry,
     realtime: RealtimeAdvert,
@@ -1122,8 +1154,10 @@ pub(in crate::control) async fn joinless_control_state() -> Arc<ControlState> {
     Arc::new(ControlState {
         finished: tokio::sync::Notify::new(),
         ended: std::sync::atomic::AtomicUsize::new(0),
+        abnormal_connections: std::sync::atomic::AtomicUsize::new(0),
         mesh,
         registry,
+        closed_relays: ClosedRelayRegistry::new(),
         services,
         clients,
         realtime: RealtimeAdvert {
@@ -1979,6 +2013,165 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     .await
                     .context("network add response line was not admitted")?
                 {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkCreateClosed { config } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("Closed network create result was not admitted")?;
+                let variable =
+                    dispatch::network::network_create_closed(&state, config, owner).await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("Closed network create response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkImportClosed {
+                config,
+                expected_context_id,
+                bootstrap,
+            } => {
+                let owner = ResponseOwner::acquire(&json_lines)
+                    .context("Closed network import result was not admitted")?;
+                let variable = dispatch::network::network_import_closed(
+                    &state,
+                    config,
+                    expected_context_id,
+                    bootstrap,
+                    owner,
+                )
+                .await;
+                match write_variable(&mut writer, &json_lines, &cancel, variable)
+                    .await
+                    .context("Closed network import response line was not admitted")?
+                {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::NetworkBootstrapExport { network } => {
+                let (reply, output) =
+                    dispatch::governance::bootstrap_export(&state, &json_lines, network)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed bootstrap response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticFactPageExport { network, request } => {
+                let (reply, output) = dispatch::governance::semantic_fact_page_export(
+                    &state,
+                    &json_lines,
+                    network,
+                    request,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic fact page response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticFactPageImport { network, page } => {
+                let (reply, output) = dispatch::governance::semantic_fact_page_import(
+                    &state,
+                    &json_lines,
+                    network,
+                    page,
+                )
+                .await?;
+                let line =
+                    AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                        .context("semantic fact page import response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::SemanticStateIdentity { network } => {
+                let (reply, output) =
+                    dispatch::governance::semantic_state_identity(&state, &json_lines, network)?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic state identity response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelayOpen {
+                network,
+                relay,
+                target,
+            } => {
+                let (reply, output) = dispatch::network::closed_relay_open(
+                    &state,
+                    &json_lines,
+                    network,
+                    relay,
+                    target,
+                )
+                .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay open response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelayAccept { network, wait_ms } => {
+                let (reply, output) =
+                    dispatch::network::closed_relay_accept(&state, &json_lines, network, wait_ms)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay accept response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelaySend { handle, payload } => {
+                let (reply, output) =
+                    dispatch::network::closed_relay_send(&state, &json_lines, handle, payload)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay send response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelayRecv { handle, wait_ms } => {
+                let (reply, output) =
+                    dispatch::network::closed_relay_recv(&state, &json_lines, handle, wait_ms)
+                        .await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay receive response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelayClose { handle } => {
+                let (reply, output) =
+                    dispatch::network::closed_relay_close(&state, &json_lines, handle).await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay close response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
+            Request::ClosedRelayState { handle } => {
+                let (reply, output) =
+                    dispatch::network::closed_relay_state(&state, &json_lines, handle).await?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("Closed relay state response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
                     Wrote::Sent => continue,
                     Wrote::Ended => break,
                 }
@@ -3622,12 +3815,13 @@ mod terminal_shutdown_tests {
             label: id.to_string(),
             kind: Default::default(),
             scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
+            routing_policy: myownmesh_core::config::RoutingPolicyConfig::default(),
+            semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology: myownmesh_core::TopologyMode::FullMesh,
             signaling: myownmesh_core::config::SignalingConfig::default(),
             closed_relay: Default::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
-            roster_path: None,
             pinned_peers: Vec::new(),
             auto_approve: true,
         }

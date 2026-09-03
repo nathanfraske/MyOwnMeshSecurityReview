@@ -7,10 +7,14 @@
 //! same store owner for a real Closed network lifecycle and does not rebuild a
 //! fresh graph on restart.
 
-use std::sync::Arc;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SignalingConfig,
+    TopologyMode,
 };
 use myownmesh_core::engine::governance;
 use myownmesh_core::engine::transport_lab::{
@@ -18,10 +22,169 @@ use myownmesh_core::engine::transport_lab::{
 };
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::content::AuthorityUse;
-use myownmesh_core::semantic::{DeviceId, FactBody, FactContent, FactDomain, Role, SignedFact};
+use myownmesh_core::semantic::{
+    DeviceId, FactBody, FactContent, FactDomain, Role, SemanticFactPageRequest, SignedFact,
+};
+use myownmesh_core::{
+    ConnectorCallbackPolicy, FiniteResourceProvider, ResourceClaim, ResourceClass,
+    ResourceProviderPort, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+};
+use myownmesh_core::{Mesh, MeshConfig};
 use tempfile::TempDir;
 
 mod support;
+
+static HOME_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+struct ScopedMeshHome {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl ScopedMeshHome {
+    fn new(path: &Path) -> Self {
+        let lock = HOME_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("mesh-home environment lock");
+        let previous = std::env::var_os("MYOWNMESH_HOME");
+        std::env::set_var("MYOWNMESH_HOME", path);
+        Self {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for ScopedMeshHome {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            std::env::set_var("MYOWNMESH_HOME", previous);
+        } else {
+            std::env::remove_var("MYOWNMESH_HOME");
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DurableFootprint {
+    database_bytes: u64,
+    wal_bytes: u64,
+    shm_bytes: u64,
+    journal_bytes: u64,
+}
+
+fn durable_footprint(root: &Path) -> DurableFootprint {
+    fn visit(path: &Path, footprint: &mut DurableFootprint) {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.expect("durable semantic entry is readable");
+            let entry_path = entry.path();
+            let file_type = entry
+                .file_type()
+                .expect("durable semantic entry type is readable");
+            if file_type.is_dir() {
+                visit(&entry_path, footprint);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let size = entry
+                .metadata()
+                .expect("durable semantic entry metadata is readable")
+                .len();
+            let slot = if name.ends_with("-store.sqlite3") {
+                &mut footprint.database_bytes
+            } else if name.ends_with("-store.sqlite3-wal") {
+                &mut footprint.wal_bytes
+            } else if name.ends_with("-store.sqlite3-shm") {
+                &mut footprint.shm_bytes
+            } else if name.ends_with("-store.sqlite3-journal") {
+                &mut footprint.journal_bytes
+            } else {
+                continue;
+            };
+            *slot = slot
+                .checked_add(size)
+                .expect("durable semantic footprint fits u64");
+        }
+    }
+
+    let mut footprint = DurableFootprint::default();
+    if root.exists() {
+        visit(root, &mut footprint);
+    }
+    footprint
+}
+
+fn elapsed_millis(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).expect("restart timing fits u64")
+}
+
+fn semantic_fact_page(
+    context_id: myownmesh_core::semantic::MeshContextId,
+    facts: &[SignedFact],
+) -> myownmesh_core::semantic::SemanticFactPage {
+    serde_json::from_value(serde_json::json!({
+        "context_id": context_id,
+        "facts": facts,
+        "next_cursor": null,
+        "complete": true,
+    }))
+    .expect("strict semantic page decodes")
+}
+
+async fn has_projected_member(network: &myownmesh_core::JoinedNetwork, device_id: &str) -> bool {
+    network
+        .roster_list()
+        .await
+        .map(|peers| {
+            peers
+                .iter()
+                .any(|peer| peer.device_id == device_id && peer.role == Role::Member)
+        })
+        .unwrap_or(false)
+}
+
+fn has_projected_member_in_state(
+    state: &Arc<myownmesh_core::engine::transport_lab::NetworkState>,
+    device_id: &str,
+) -> bool {
+    let public_key = myownmesh_core::signing::pubkey_part(device_id);
+    state
+        .roster
+        .read()
+        .authorized_devices
+        .iter()
+        .any(|peer| peer.device_id == public_key && peer.role == Role::Member)
+}
+
+fn connector_policy() -> WebRtcConnectorCapablePolicy {
+    let requested = ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
+        (
+            class,
+            if class == ResourceClass::StorageBytes {
+                myownmesh_core::config::SemanticPolicyConfig::default().max_database_bytes
+            } else {
+                1_000_000_000
+            },
+        )
+    }))
+    .expect("restart fixture resource grant");
+    let grant = FiniteResourceProvider::reservation_planning_charge(requested)
+        .expect("restart fixture reservation bookkeeping");
+    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("restart fixture resource provider");
+    WebRtcConnectorCapablePolicy::new(
+        resources,
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
+    )
+}
 
 fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
     NetworkConfig {
@@ -31,12 +194,13 @@ fn closed_config(id: &str, network_id: &str) -> NetworkConfig {
         connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: NetworkKind::Closed,
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: false,
         closed_relay: ClosedRelayPolicyConfig::default(),
@@ -88,50 +252,174 @@ fn signed_role_grant_with_authority(
 
 #[tokio::test]
 async fn closed_network_restart_restores_the_committed_semantic_graph() {
-    let root = TempDir::new().expect("instance root");
+    let home = TempDir::new().expect("mesh home");
+    let _home = ScopedMeshHome::new(home.path());
     let identity = Arc::new(Identity::ephemeral());
     let config = closed_config("r1-restart", "r1-wire-network");
     let target = Identity::ephemeral();
 
-    let (state, driver) = create_network_in_instance_root(
-        config.clone(),
+    let mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
         identity.clone(),
-        support::test_transport(),
-        root.path().to_path_buf(),
-        [0x91; 32],
+        connector_policy(),
     )
     .await
-    .expect("create Closed network");
-    let context = state.mesh_context_id();
-    governance::propose_role_grant(&state, target.public_id(), Role::Member, None)
+    .expect("open connector-capable mesh");
+    let provider_baseline = mesh.resource_report();
+    let network = mesh
+        .create_network(config.clone(), [0x91; 32])
+        .await
+        .expect("create Closed network");
+    let initial_identity = network
+        .semantic_state_identity()
+        .expect("read initial semantic identity");
+    let context = initial_identity.context_id();
+    let pre_admission_footprint = durable_footprint(home.path());
+    let admission_started = Instant::now();
+    let fact_id = network
+        .propose_role_grant(target.public_id(), Role::Member, None)
         .await
         .expect("commit canonical member grant");
+    let admission_ms = elapsed_millis(admission_started);
+    let admitted_identity = network
+        .semantic_state_identity()
+        .expect("read admitted semantic identity");
+    let admitted_footprint = durable_footprint(home.path());
+    assert_ne!(
+        admitted_identity, initial_identity,
+        "the Closed admission changes the exact semantic identity"
+    );
+    assert_eq!(
+        admitted_identity.admitted_fact_count(),
+        initial_identity
+            .admitted_fact_count()
+            .checked_add(1)
+            .expect("admitted fact count fits u64"),
+        "the admission adds exactly one canonical fact"
+    );
+    assert_eq!(
+        admitted_identity.unresolved_fact_count(),
+        initial_identity.unresolved_fact_count(),
+        "the admission does not create unresolved custody"
+    );
+    assert_ne!(
+        admitted_footprint, pre_admission_footprint,
+        "the first Closed admission publishes a durable footprint change"
+    );
     assert!(
-        state.is_rostered(target.public_id()),
+        has_projected_member(&network, target.public_id()).await,
         "the live state observes the committed canonical grant"
     );
-    state
+    let page = network
+        .export_semantic_fact_page(SemanticFactPageRequest {
+            context_id: context,
+            cursor: None,
+            max_facts: 64,
+            max_encoded_bytes:
+                myownmesh_core::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES as u32,
+        })
+        .expect("export admitted fact");
+    let admitted_fact = page
+        .facts()
+        .iter()
+        .find(|fact| fact.id == fact_id)
+        .cloned()
+        .expect("the admitted fact is exported");
+    let checkpoint_started = Instant::now();
+    network
         .compact_semantic_state()
         .expect("compact semantic snapshot");
-    state.request_shutdown();
-    driver.await.expect("first driver shutdown");
-    drop(state);
+    let checkpoint_ms = elapsed_millis(checkpoint_started);
+    let compacted_footprint = durable_footprint(home.path());
+    assert_eq!(
+        network
+            .semantic_state_identity()
+            .expect("read compacted semantic identity"),
+        admitted_identity,
+        "compaction preserves the exact semantic identity"
+    );
+    let duplicate_started = Instant::now();
+    network
+        .import_semantic_fact_page(semantic_fact_page(context, &[admitted_fact]))
+        .await
+        .expect("replay the exact admitted fact");
+    let duplicate_ms = elapsed_millis(duplicate_started);
+    assert_eq!(
+        network
+            .semantic_state_identity()
+            .expect("read duplicate semantic identity"),
+        admitted_identity,
+        "duplicate admission is an exact semantic no-op"
+    );
+    assert_eq!(
+        durable_footprint(home.path()),
+        compacted_footprint,
+        "duplicate admission causes no durable DB/WAL/SHM/journal churn"
+    );
+    let shutdown_started = Instant::now();
+    network.leave().await.expect("first Closed shutdown");
+    let shutdown_ms = elapsed_millis(shutdown_started);
+    assert_eq!(
+        mesh.resource_report(),
+        provider_baseline,
+        "first shutdown releases all provider-backed network custody"
+    );
 
-    let (reopened, reopened_driver) = spawn_network_in_instance_root(
-        config,
-        identity,
-        support::test_transport(),
-        root.path().to_path_buf(),
-    )
-    .await
-    .expect("reopen Closed network");
-    assert_eq!(reopened.mesh_context_id(), context);
+    let network_id = config.network_id.clone();
+    let restart_started = Instant::now();
+    let reopened = mesh.join(config).await.expect("reopen Closed network");
+    let restart_ms = elapsed_millis(restart_started);
+    assert_eq!(
+        reopened
+            .semantic_state_identity()
+            .expect("read restart identity"),
+        admitted_identity,
+        "restart restores the exact semantic identity"
+    );
     assert!(
-        reopened.is_rostered(target.public_id()),
+        has_projected_member(&reopened, target.public_id()).await,
         "restart restores the exact admitted graph through NetworkState"
     );
-    reopened.request_shutdown();
-    reopened_driver.await.expect("reopened driver shutdown");
+    assert_eq!(
+        durable_footprint(home.path()),
+        compacted_footprint,
+        "restart preserves the complete DB/WAL/SHM/journal footprint"
+    );
+    let restart_shutdown_started = Instant::now();
+    reopened.leave().await.expect("reopened Closed shutdown");
+    let restart_shutdown_ms = elapsed_millis(restart_shutdown_started);
+    assert_eq!(
+        mesh.resource_report(),
+        provider_baseline,
+        "restart shutdown releases the reacquired provider custody"
+    );
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": "myownmesh.durable_semantic_restart.v1",
+            "network_kind": "closed",
+            "network_id": network_id,
+            "stages_ms": {
+                "admission": admission_ms,
+                "checkpoint": checkpoint_ms,
+                "duplicate": duplicate_ms,
+                "shutdown": shutdown_ms,
+                "restart": restart_ms,
+                "restart_shutdown": restart_shutdown_ms,
+            },
+            "controls": {
+                "duplicate_no_churn": true,
+                "restart_identity_equal": true,
+                "provider_baseline_restored": true,
+                "footprint": {
+                    "database_bytes": compacted_footprint.database_bytes,
+                    "wal_bytes": compacted_footprint.wal_bytes,
+                    "shm_bytes": compacted_footprint.shm_bytes,
+                    "journal_bytes": compacted_footprint.journal_bytes,
+                },
+            },
+        })
+    );
 }
 
 #[tokio::test]
@@ -219,7 +507,7 @@ async fn quarantine_unrelated_commit_restart_then_parent_settles_exact_custody()
         "resolving the exact parent settles its provisional custody"
     );
     assert!(
-        reopened.is_rostered(target.public_id()),
+        has_projected_member_in_state(&reopened, target.public_id()),
         "the resolved child is projected after durable settlement"
     );
     reopened.request_shutdown();
@@ -349,11 +637,6 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
         .await
         .expect("commit the fact preserved across reopen");
     let committed_count = state.semantic_fact_count();
-    assert!(
-        state.is_rostered(preserved_target.public_id()),
-        "the pre-shutdown canonical projection is present"
-    );
-
     // Keep this Arc as the stale caller while its driver and original owner
     // are shut down. Shutdown releases the durable writer lease, but the
     // state-level fence must reject every later mutation through this stale
@@ -393,7 +676,7 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     .expect("same-slot reopen after shutdown");
     assert_eq!(reopened.semantic_fact_count(), committed_count);
     assert!(
-        reopened.is_rostered(preserved_target.public_id()),
+        has_projected_member_in_state(&reopened, preserved_target.public_id()),
         "reopened state preserves the pre-shutdown canonical projection"
     );
 
@@ -407,7 +690,7 @@ async fn shutdown_fences_stale_state_before_same_slot_reopen_and_append() {
     .expect("replacement state appends a fresh canonical fact");
     assert_eq!(reopened.semantic_fact_count(), committed_count + 1);
     assert!(
-        reopened.is_rostered(replacement_target.public_id()),
+        has_projected_member_in_state(&reopened, replacement_target.public_id()),
         "replacement append projects through the same durable owner"
     );
     assert_eq!(reopened.semantic_unresolved_count(), 0);

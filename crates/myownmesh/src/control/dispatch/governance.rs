@@ -87,6 +87,98 @@ pub(in crate::control) async fn roster_list(
     .context("RosterList response line was not admitted")
 }
 
+/// Export the verified Closed bootstrap record without exposing engine state.
+pub(in crate::control) fn bootstrap_export(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner =
+        ResponseOwner::acquire(admission).context("Closed bootstrap response was not admitted")?;
+    let bootstrap = joined
+        .export_bootstrap_record()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    funded(
+        PreparedReply::Bootstrap(FundedDiagnostic::new(bootstrap, owner)),
+        admission,
+    )
+    .context("Closed bootstrap response line was not admitted")
+}
+
+/// Export one receive-safe, provider-funded semantic fact page.  The core
+/// facade owns cursor, context, signature, and frame-bound validation; this
+/// boundary only binds the result to the authenticated joined network and the
+/// response owner that keeps its page lease alive through serialization.
+pub(in crate::control) fn semantic_fact_page_export(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    request: myownmesh_core::semantic::SemanticFactPageRequest,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner = ResponseOwner::acquire(admission)
+        .context("semantic fact page response was not admitted")?;
+    let page = joined
+        .export_semantic_fact_page(request)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    funded(
+        PreparedReply::SemanticFactPage(FundedDiagnostic::new(page, owner)),
+        admission,
+    )
+    .context("semantic fact page response line was not admitted")
+}
+
+/// Import one bounded semantic fact page through the canonical reducer.  A
+/// deserialized page has no in-process lease, so the core import path
+/// reacquires its exact provider claim before admitting any facts.
+pub(in crate::control) async fn semantic_fact_page_import(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    page: myownmesh_core::semantic::SemanticFactPage,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner = ResponseOwner::acquire(admission)
+        .context("semantic fact page import response was not admitted")?;
+    let identity = joined
+        .import_semantic_fact_page(page)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    funded(
+        PreparedReply::SemanticStateIdentity(FundedDiagnostic::new(identity, owner)),
+        admission,
+    )
+    .context("semantic fact page import response line was not admitted")
+}
+
+/// Inspect one deterministic semantic state identity for a joined network.
+pub(in crate::control) fn semantic_state_identity(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner = ResponseOwner::acquire(admission)
+        .context("semantic state identity response was not admitted")?;
+    let identity = joined
+        .semantic_state_identity()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    funded(
+        PreparedReply::SemanticStateIdentity(FundedDiagnostic::new(identity, owner)),
+        admission,
+    )
+    .context("semantic state identity response line was not admitted")
+}
+
 /// Set the local topology directly.
 pub(in crate::control) async fn topology_set(
     state: &Arc<ControlState>,

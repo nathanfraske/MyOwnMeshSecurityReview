@@ -79,7 +79,7 @@ verify independently before reduction.
 The semantic owner defines the canonical `FactContent` tuple:
 
 ```text
-domain = governance | participation | eviction_proof
+domain = governance | eviction_proof
 mesh_context
 typed FactBody
 author
@@ -89,7 +89,7 @@ sorted causal parent FactIds
 The FactId is the semantic owner's 32-byte SHA-256 digest of its explicit
 length-delimited canonical encoding, domain-separated by `myownmesh-semantic-v4`
 and schema 4. The typed `FactBody` union is exactly `RoleGrant`, `RoleRevoke`,
-`Evict`, `MembershipAdmit`, `OpenParticipation`, `EvictionProof`,
+`Evict`, `MembershipAdmit`, `EvictionProof`,
 `SelfStandDown`, `Attestation`, ordinary cell-local `Resolution`, and typed
 cross-cell `AuthorityLineageResolution`. Ordinary `Resolution` selects only
 one exclusive cell; the AuthorityLineage variant is the only persistent
@@ -99,6 +99,40 @@ exact FactId, and verification recomputes the semantic content digest before
 checking the author's signature. Any change to context, author, body, domain,
 or causal parent set therefore produces a different FactId and cannot retain
 the old signature.
+
+The base ledger is durable Closed authority/governance only. Open has zero
+base durable semantic facts: exact-context endpoint authentication and Device
+key possession establish ephemeral participation. Runtime join, leave,
+presence, and reconnect for either network kind remain local observations and
+never enter semantic history. A roster or reachability view is a projection,
+not an authority source.
+
+The semantic owner selects finite limits for fact count, encoded bytes,
+causal edges, per-author count/bytes, proof-verification work, and indexed
+database bytes. Before a mutation it computes the complete delta and refuses
+the exact `N+1` candidate before changing the graph, projection, ACK,
+identity, or authority. Missing dependencies use a bounded,
+dependency-indexed quarantine; duplicate delivery is idempotent and failed
+proof or cleanup paths retain or release the exact custody rather than
+silently dropping it. Closed facts persist through indexed `O(delta)` commits;
+the local store is single-writer SQLite with WAL and `FULL` synchronous
+durability, and reopen must recover the exact semantic identity. Exact history
+is retained until an archive or authority-ratified checkpoint authorizes
+semantic deletion. For the `StorageBytes` dimension, one process-accounted
+claim is `B = M + W + S + R`: main database, WAL, shared-memory/sidecar, and
+explicit reserve bytes. Named-file or VFS accounting does not prove backing
+disk capacity, filesystem metadata capacity, or `ENOSPC` behavior. The shipped
+compaction boundary is bounded checkpointing only; a full-copy `VACUUM`
+requires separately funded temporary-copy, metadata, and cleanup custody.
+These finite dimensions bound ordinary growth and failure spam: rejected
+attempts consume no fact or ACK, while per-author and proof limits prevent one
+source from exhausting the selected budget.
+
+Final production compliance remains pending until durable runs demonstrate
+Open/Closed separation, scale and exact `N+1` refusal, duplicate/no-op
+invariance, exact Closed restart/reopen identity, deterministic fault/crash
+reconciliation, and terminal provider/resource baselines. Source or unit
+evidence alone is not a final compliance PASS.
 
 There is no roster wire family in protocol version 2: `roster_summary`,
 `roster_request`, and `roster_entries` are retired and absent from
@@ -176,7 +210,7 @@ sides send one, and both are bound into the signed transcript.
 
 ## Closed member relay
 
-Version 1 defines one typed, closed relay wire set. It is not negotiated as an
+Protocol version 2 defines one typed, closed relay wire set. It is not negotiated as an
 optional frame extension: the exact core version gate above must succeed first,
 and the existing `endpoint_auth_v1` profile remains a separate hard
 precondition. The owner-selected `ClosedRelayPolicyConfig.enabled` is

@@ -669,18 +669,28 @@ where
         .map_err(|error| Error::Other(format!("mDNS custodian unavailable: {error:?}")))?;
     let reaper_owner = DedicatedTaskCustodian::new(2)
         .map_err(|error| Error::Other(format!("mDNS reaper custodian unavailable: {error:?}")))?;
-    #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
-    let backend_owner = {
-        let plan = super::discovery::checked_embedded_custody_plan()
-            .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
-        Some(
-            DedicatedTaskCustodian::new(plan.observer_slots).map_err(|error| {
-                Error::Other(format!("mDNS backend custodian unavailable: {error:?}"))
-            })? as Arc<dyn TaskCustodian>,
-        )
+    let backend_owner = match configured_discovery_backend() {
+        DiscoveryBackend::Embedded => {
+            let plan = super::discovery::checked_embedded_custody_plan()
+                .ok_or_else(|| Error::Other("invalid embedded custody plan".into()))?;
+            Some(
+                DedicatedTaskCustodian::new(plan.observer_slots).map_err(|error| {
+                    Error::Other(format!("mDNS backend custodian unavailable: {error:?}"))
+                })? as Arc<dyn TaskCustodian>,
+            )
+        }
+        DiscoveryBackend::System => {
+            let capacity = config
+                .limits
+                .discovery
+                .max_resolve_owners
+                .checked_add(2)
+                .ok_or_else(|| Error::Other("invalid system worker capacity".into()))?;
+            Some(DedicatedTaskCustodian::new(capacity).map_err(|error| {
+                Error::Other(format!("mDNS system custodian unavailable: {error:?}"))
+            })? as Arc<dyn TaskCustodian>)
+        }
     };
-    #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
-    let backend_owner = None;
     start_with_custodian(
         config,
         outbound,
@@ -705,9 +715,12 @@ fn start_discovery_with_custodian(
 #[cfg(any(target_os = "ios", feature = "system-dnssd"))]
 fn start_discovery_with_custodian(
     config: &DiscoveryConfig,
-    _backend_custodian_owner: Option<Arc<dyn TaskCustodian>>,
+    backend_custodian_owner: Option<Arc<dyn TaskCustodian>>,
 ) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
-    Discovery::start(config)
+    let owner = backend_custodian_owner.ok_or_else(|| {
+        Error::Other("system discovery requires provider-funded task custody".into())
+    })?;
+    Discovery::start_with_custodian(config, owner)
 }
 
 /// Start with lifecycle-owned bounded custody for final driver handles.
@@ -2523,7 +2536,15 @@ mod tests {
     fn start_test_discovery(
         cfg: &DiscoveryConfig,
     ) -> crate::Result<(Discovery, mpsc::Receiver<DiscoveryEvent>)> {
-        Discovery::start(cfg)
+        let capacity = cfg
+            .limits
+            .max_resolve_owners
+            .checked_add(2)
+            .expect("system worker capacity is checked by Discovery");
+        let owner = DedicatedTaskCustodian::new(capacity)
+            .expect("system discovery custodian starts")
+            as Arc<dyn TaskCustodian>;
+        Discovery::start_with_custodian(cfg, owner)
     }
 
     fn panicking_task(

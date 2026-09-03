@@ -2,16 +2,17 @@
 //! socket. Wire format is line-delimited JSON; see
 //! [`myownmesh::control`] for the request/response shapes.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use clap::Subcommand;
 use interprocess::local_socket::tokio::prelude::*;
 #[cfg(unix)]
 use interprocess::local_socket::GenericFilePath;
 #[cfg(not(unix))]
 use interprocess::local_socket::GenericNamespaced;
-use myownmesh_core::{NetworkConfig, ServicesConfig};
+use myownmesh_core::{config::SemanticPolicyConfig, NetworkConfig, ServicesConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use myownmesh::control::{Request, Response};
@@ -49,6 +50,77 @@ pub enum CtlCmd {
     /// custody MFA that guards canonical authoring.
     #[command(subcommand)]
     Governance(GovernanceCmd),
+    /// Shipped Closed-network bootstrap and opaque-relay operations.
+    #[command(subcommand)]
+    Closed(ClosedCmd),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClosedCmd {
+    /// Create a canonical Closed bootstrap and join it on the daemon.
+    Create {
+        network_id: String,
+        #[arg(long)]
+        config_id: Option<String>,
+        /// Semantic policy as inline JSON or a JSON file path. Omitted uses
+        /// the canonical finite defaults.
+        #[arg(long)]
+        semantic_policy: Option<String>,
+    },
+    /// Export the canonical signed bootstrap record to stdout.
+    BootstrapExport { network: String },
+    /// Import a canonical bootstrap JSON file under a local network id.
+    Import {
+        network_id: String,
+        bootstrap: PathBuf,
+        #[arg(long)]
+        context_id: String,
+        /// Semantic policy as inline JSON or a JSON file path. Omitted uses
+        /// the canonical finite defaults.
+        #[arg(long)]
+        semantic_policy: Option<String>,
+    },
+    /// Open an opaque endpoint relay capability.
+    RelayOpen {
+        network: String,
+        relay: String,
+        target: String,
+    },
+    /// Accept one queued opaque endpoint relay offer.
+    RelayAccept {
+        network: String,
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u64,
+    },
+    /// Send UTF-8 bytes through an opaque endpoint relay capability.
+    RelaySend { handle: String, payload: String },
+    /// Receive one opaque endpoint relay payload.
+    RelayRecv {
+        handle: String,
+        #[arg(long, default_value_t = 30_000)]
+        wait_ms: u64,
+    },
+    /// Consume and close one opaque endpoint relay capability.
+    RelayClose { handle: String },
+    /// Inspect one relay capability's generation/resource evidence.
+    RelayState { handle: String },
+    /// Export one bounded page of canonical semantic facts.
+    SemanticPage {
+        network: String,
+        /// Lowercase base32 MeshContextId for the joined network.
+        context_id: String,
+        /// Lowercase base32 FactId; the next page starts strictly after it.
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        max_facts: u32,
+        #[arg(long)]
+        max_encoded_bytes: u32,
+    },
+    /// Import one bounded semantic fact page from JSON.
+    SemanticPageImport { network: String, page: PathBuf },
+    /// Inspect the deterministic semantic state identity.
+    SemanticIdentity { network: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -141,6 +213,10 @@ pub enum NetworksCmd {
     /// live daemon. For a custom setup, edit config.json or use the GUI.
     Join {
         network_id: String,
+        /// Semantic policy as inline JSON or a JSON file path. Omitted uses
+        /// the canonical finite defaults.
+        #[arg(long)]
+        semantic_policy: Option<String>,
     },
     /// Leave a network: detaches it on the live daemon and removes it
     /// from config.json. Accepts the network id or local config id.
@@ -193,6 +269,83 @@ pub enum RosterCmd {
     List { network: String },
 }
 
+const SEMANTIC_POLICY_FIELDS: &[&str] = &[
+    "max_fact_encoded_bytes",
+    "max_dependencies_per_fact",
+    "max_authority_uses_per_fact",
+    "max_authority_predecessors_per_use",
+    "max_admitted_facts",
+    "max_admitted_bytes",
+    "max_quarantined_facts",
+    "max_quarantined_bytes",
+    "max_quarantined_facts_per_author",
+    "max_quarantined_bytes_per_author",
+    "max_retained_facts_per_author",
+    "max_retained_bytes_per_author",
+    "max_dependency_edges",
+    "max_ready_batch",
+    "max_pending_proofs",
+    "max_pending_proof_bytes",
+    "max_proof_records",
+    "max_proof_bytes",
+    "max_proof_links",
+    "max_author_usage_rows",
+    "max_provisional_rows",
+    "max_transaction_dirty_main_pages",
+    "max_uncheckpointed_wal_frames",
+    "max_freelist_pages",
+    "max_fragmented_pages",
+    "max_main_journal_bytes",
+    "max_database_bytes",
+    "max_wal_bytes",
+    "wal_checkpoint_threshold_bytes",
+    "emergency_reserve_bytes",
+];
+
+fn apply_semantic_policy(config: &mut NetworkConfig, spec: Option<&str>) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+    config.semantic_policy = parse_semantic_policy(spec)?;
+    Ok(())
+}
+
+fn parse_semantic_policy(spec: &str) -> Result<SemanticPolicyConfig> {
+    let spec = spec.trim();
+    ensure!(!spec.is_empty(), "semantic policy input must not be empty");
+    let value: Value = if spec.starts_with('{') {
+        serde_json::from_str(spec).context("parse semantic policy JSON")?
+    } else {
+        let path = PathBuf::from(spec);
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("read semantic policy {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse semantic policy JSON {}", path.display()))?
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("semantic policy must be a JSON object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !SEMANTIC_POLICY_FIELDS.contains(&field.as_str()))
+    {
+        bail!("unknown semantic policy field '{field}'");
+    }
+    if let Some(field) = SEMANTIC_POLICY_FIELDS
+        .iter()
+        .find(|field| !object.contains_key(**field))
+    {
+        bail!("semantic policy is missing required field '{field}'");
+    }
+    let policy: SemanticPolicyConfig =
+        serde_json::from_value(value).context("decode semantic policy configuration")?;
+    ensure!(
+        policy.validate(),
+        "semantic policy failed canonical checked validation"
+    );
+    Ok(policy)
+}
+
 pub async fn run(cmd: CtlCmd) -> Result<()> {
     let request = match cmd {
         // Services toggles are a read-modify-write against the live
@@ -201,17 +354,128 @@ pub async fn run(cmd: CtlCmd) -> Result<()> {
         // Trace is a long-lived server-push stream, not a single
         // request/response, so it takes a dedicated streaming path.
         CtlCmd::Trace { network } => return run_trace(network).await,
+        CtlCmd::Closed(ClosedCmd::Create {
+            network_id,
+            config_id,
+            semantic_policy,
+        }) => {
+            let network_id = myownmesh_core::identity::normalize_network_id(&network_id)
+                .with_context(|| format!("invalid network id '{network_id}'"))?;
+            let mut config = NetworkConfig::from_network_id(
+                config_id.unwrap_or_else(|| network_id.clone()),
+                network_id,
+            );
+            config.kind = myownmesh_core::config::NetworkKind::Closed;
+            config.closed_relay.enabled = true;
+            apply_semantic_policy(&mut config, semantic_policy.as_deref())?;
+            Request::NetworkCreateClosed { config }
+        }
+        CtlCmd::Closed(ClosedCmd::BootstrapExport { network }) => {
+            Request::NetworkBootstrapExport { network }
+        }
+        CtlCmd::Closed(ClosedCmd::Import {
+            network_id,
+            bootstrap,
+            context_id,
+            semantic_policy,
+        }) => {
+            let network_id = myownmesh_core::identity::normalize_network_id(&network_id)
+                .with_context(|| format!("invalid network id '{network_id}'"))?;
+            let bytes = std::fs::read(&bootstrap)
+                .with_context(|| format!("read bootstrap {}", bootstrap.display()))?;
+            let bootstrap = serde_json::from_slice(&bytes).context("parse bootstrap JSON")?;
+            let context_bytes = data_encoding::BASE32_NOPAD
+                .decode(context_id.as_bytes())
+                .context("decode base32 context id")?;
+            let context_id = <[u8; 32]>::try_from(context_bytes.as_slice())
+                .map(myownmesh_core::semantic::MeshContextId::from_bytes)
+                .map_err(|_| anyhow!("context id must encode exactly 32 bytes"))?;
+            let config = {
+                let mut config = NetworkConfig::from_network_id(network_id.clone(), network_id);
+                config.kind = myownmesh_core::config::NetworkKind::Closed;
+                config.closed_relay.enabled = true;
+                apply_semantic_policy(&mut config, semantic_policy.as_deref())?;
+                config
+            };
+            Request::NetworkImportClosed {
+                config,
+                expected_context_id: context_id,
+                bootstrap,
+            }
+        }
+        CtlCmd::Closed(ClosedCmd::RelayOpen {
+            network,
+            relay,
+            target,
+        }) => Request::ClosedRelayOpen {
+            network,
+            relay,
+            target,
+        },
+        CtlCmd::Closed(ClosedCmd::RelayAccept { network, wait_ms }) => {
+            Request::ClosedRelayAccept { network, wait_ms }
+        }
+        CtlCmd::Closed(ClosedCmd::RelaySend { handle, payload }) => Request::ClosedRelaySend {
+            handle,
+            payload: payload.into_bytes(),
+        },
+        CtlCmd::Closed(ClosedCmd::RelayRecv { handle, wait_ms }) => {
+            Request::ClosedRelayRecv { handle, wait_ms }
+        }
+        CtlCmd::Closed(ClosedCmd::RelayClose { handle }) => Request::ClosedRelayClose { handle },
+        CtlCmd::Closed(ClosedCmd::RelayState { handle }) => Request::ClosedRelayState { handle },
+        CtlCmd::Closed(ClosedCmd::SemanticPage {
+            network,
+            context_id,
+            cursor,
+            max_facts,
+            max_encoded_bytes,
+        }) => {
+            let context_bytes = data_encoding::BASE32_NOPAD
+                .decode(context_id.as_bytes())
+                .context("decode base32 context id")?;
+            let context_id = <[u8; 32]>::try_from(context_bytes.as_slice())
+                .map(myownmesh_core::semantic::MeshContextId::from_bytes)
+                .map_err(|_| anyhow!("context id must encode exactly 32 bytes"))?;
+            let cursor = cursor
+                .map(|value| {
+                    serde_json::from_value::<myownmesh_core::semantic::FactId>(Value::String(value))
+                        .context("parse lowercase base32 fact cursor")
+                })
+                .transpose()?;
+            Request::SemanticFactPageExport {
+                network,
+                request: myownmesh_core::semantic::SemanticFactPageRequest {
+                    context_id,
+                    cursor,
+                    max_facts,
+                    max_encoded_bytes,
+                },
+            }
+        }
+        CtlCmd::Closed(ClosedCmd::SemanticPageImport { network, page }) => {
+            let bytes = std::fs::read(&page)
+                .with_context(|| format!("read semantic fact page {}", page.display()))?;
+            let page = serde_json::from_slice(&bytes).context("parse semantic fact page JSON")?;
+            Request::SemanticFactPageImport { network, page }
+        }
+        CtlCmd::Closed(ClosedCmd::SemanticIdentity { network }) => {
+            Request::SemanticStateIdentity { network }
+        }
         CtlCmd::Status => Request::Status,
         CtlCmd::Networks(NetworksCmd::List) => Request::NetworksList,
-        CtlCmd::Networks(NetworksCmd::Join { network_id }) => {
+        CtlCmd::Networks(NetworksCmd::Join {
+            network_id,
+            semantic_policy,
+        }) => {
             // Normalise client-side so the stored id matches what the
             // engine and `ctl networks list` use, and so an invalid id
             // fails with a clear message before we touch the daemon.
             let network_id = myownmesh_core::identity::normalize_network_id(&network_id)
                 .with_context(|| format!("invalid network id '{network_id}'"))?;
-            Request::NetworkAdd {
-                config: NetworkConfig::from_network_id(network_id.clone(), network_id),
-            }
+            let mut config = NetworkConfig::from_network_id(network_id.clone(), network_id);
+            apply_semantic_policy(&mut config, semantic_policy.as_deref())?;
+            Request::NetworkAdd { config }
         }
         CtlCmd::Networks(NetworksCmd::Leave { network_id }) => Request::NetworkRemove {
             network: network_id,
@@ -1082,6 +1346,36 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn semantic_policy_input_is_complete_strict_and_checked() {
+        let policy = SemanticPolicyConfig::default();
+        let encoded = serde_json::to_string(&policy).expect("default policy serializes");
+        assert_eq!(parse_semantic_policy(&encoded).unwrap(), policy);
+
+        let mut unknown = serde_json::to_value(policy).expect("policy value");
+        unknown["legacy"] = Value::Bool(true);
+        assert!(parse_semantic_policy(&unknown.to_string()).is_err());
+
+        let mut partial = serde_json::to_value(policy).expect("policy value");
+        partial
+            .as_object_mut()
+            .expect("policy object")
+            .remove("max_ready_batch");
+        assert!(parse_semantic_policy(&partial.to_string()).is_err());
+
+        let mut invalid = serde_json::to_value(policy).expect("policy value");
+        invalid["max_ready_batch"] = Value::from(0_u64);
+        assert!(parse_semantic_policy(&invalid.to_string()).is_err());
+    }
+
+    #[test]
+    fn omitted_semantic_policy_keeps_network_defaults() {
+        let mut config = NetworkConfig::from_network_id("id", "network");
+        let defaults = config.semantic_policy;
+        apply_semantic_policy(&mut config, None).expect("omitted policy is valid");
+        assert_eq!(config.semantic_policy, defaults);
+    }
 
     fn enrollment_response(transaction_id: &str) -> Response {
         Response::ok(serde_json::json!({

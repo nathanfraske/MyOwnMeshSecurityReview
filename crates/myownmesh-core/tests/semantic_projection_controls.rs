@@ -4,7 +4,7 @@
 
 use ed25519_dalek::SigningKey;
 
-use myownmesh_core::protocol::FactBundleMessage;
+use myownmesh_core::protocol::FactPageMessage;
 use myownmesh_core::semantic::{
     Admission, AttestationDecision, CellProjection, DeviceId, ExclusiveCell, FactBody, FactContent,
     FactGraph, FactId, Role, SignedFact, VerifiedBootstrap,
@@ -2089,7 +2089,7 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
                 Vec::new(),
             )
         };
-        let candidates = vec![
+        let mut candidates = vec![
             controller_grant.clone(),
             membership.clone(),
             operation.clone(),
@@ -2098,10 +2098,12 @@ fn authority_lineage_selection_round_trips_and_regrant_is_future_only() {
             regrant.clone(),
             future.clone(),
         ];
-        let wire = serde_json::to_vec(&FactBundleMessage { facts: candidates })
-            .expect("durable semantic bundle serializes");
-        let decoded: FactBundleMessage =
-            serde_json::from_slice(&wire).expect("durable semantic bundle restores");
+        candidates.sort_by_key(|fact| fact.id);
+        let page = FactPageMessage::new(bootstrap.context_id(), candidates, None, true)
+            .expect("durable semantic page is bounded");
+        let wire = serde_json::to_vec(&page).expect("durable semantic page serializes");
+        let decoded: FactPageMessage =
+            serde_json::from_slice(&wire).expect("durable semantic page restores");
         assert_eq!(decoded.facts.len(), 7);
 
         let schedules = [

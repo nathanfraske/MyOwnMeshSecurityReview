@@ -99,6 +99,10 @@ pub(super) enum PreparedReply {
     Networks(crate::registry::FundedNetworksList),
     Peers(FundedDiagnostic<Vec<myownmesh_core::PeerInfo>>),
     Roster(FundedDiagnostic<Vec<myownmesh_core::AuthorizedPeer>>),
+    Bootstrap(FundedDiagnostic<myownmesh_core::semantic::BootstrapRecord>),
+    SemanticFactPage(FundedDiagnostic<myownmesh_core::semantic::SemanticFactPage>),
+    SemanticStateIdentity(FundedDiagnostic<myownmesh_core::semantic::SemanticStateIdentity>),
+    ClosedRelay(FundedDiagnostic<ClosedRelayReply>),
     Variable(FundedVariableReply),
 }
 
@@ -370,6 +374,54 @@ impl serde::Serialize for PreparedReply {
                 )?;
                 response.end()
             }
+            Self::Bootstrap(bootstrap) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "bootstrap",
+                        value: &bootstrap.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticFactPage(page) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_fact_page",
+                        value: &page.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticStateIdentity(identity) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_state_identity",
+                        value: &identity.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::ClosedRelay(relay) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "closed_relay",
+                        value: &relay.value,
+                    },
+                )?;
+                response.end()
+            }
             Self::Variable(variable) => variable.serialize(serializer),
         }
     }
@@ -378,6 +430,64 @@ impl serde::Serialize for PreparedReply {
 #[derive(serde::Serialize)]
 struct RosterData<'a> {
     roster: &'a [myownmesh_core::AuthorizedPeer],
+}
+
+/// The only data that crosses the daemon's closed-relay capability boundary.
+/// The session key and engine route remain inside `ClosedRelayChannel`; this
+/// is a bounded control handle plus deterministic observation metadata.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ClosedRelayReply {
+    Opened {
+        handle: String,
+        generation: u64,
+        network: String,
+        peer: String,
+        relay: String,
+        session_id: [u8; 16],
+        allocation_epoch: u64,
+        active_allocations: usize,
+        max_allocations: u64,
+        max_frame_bytes: u64,
+    },
+    Accepted {
+        handle: String,
+        generation: u64,
+        network: String,
+        peer: String,
+        relay: String,
+        session_id: [u8; 16],
+        allocation_epoch: u64,
+        active_allocations: usize,
+        max_allocations: u64,
+        max_frame_bytes: u64,
+    },
+    Sent {
+        handle: String,
+        generation: u64,
+        allocation_epoch: u64,
+        bytes: usize,
+    },
+    Received {
+        handle: String,
+        generation: u64,
+        allocation_epoch: u64,
+        payload: Vec<u8>,
+    },
+    Closed {
+        handle: String,
+        generation: u64,
+        allocation_epoch: u64,
+    },
+    State {
+        handle: String,
+        generation: u64,
+        network: String,
+        allocation_epoch: u64,
+        active_allocations: usize,
+        max_allocations: u64,
+        max_frame_bytes: u64,
+    },
 }
 
 pub(super) enum FundedVariableReply {

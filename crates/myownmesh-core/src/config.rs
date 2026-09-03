@@ -17,8 +17,6 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
-#[cfg(windows)]
-use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,8 +57,9 @@ fn config_transaction_gate() -> &'static Mutex<()> {
 /// The cross-process half of the config transaction fence.
 ///
 /// Unix keeps the lock pathname after release and relies on `flock`'s inode
-/// ownership, while Windows uses a delete-on-close handle. Other platforms
-/// fail closed because a portable crash-release primitive is unavailable.
+/// ownership, while Windows uses a synchronous byte-range lock whose
+/// ownership is released when the handle closes. Other platforms fail closed
+/// because a portable crash-release primitive is unavailable.
 struct ConfigFileLease {
     #[cfg(unix)]
     _file: std::fs::File,
@@ -110,6 +109,24 @@ unsafe extern "system" {
         file: *mut std::ffi::c_void,
         information: *mut WindowsFileInformation,
     ) -> i32;
+    fn LockFileEx(
+        file: *mut std::ffi::c_void,
+        flags: u32,
+        reserved: u32,
+        bytes_low: u32,
+        bytes_high: u32,
+        overlapped: *mut WindowsOverlapped,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct WindowsOverlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut std::ffi::c_void,
 }
 
 impl ConfigFileIdentity {
@@ -191,35 +208,47 @@ impl ConfigFileLease {
 
         #[cfg(windows)]
         {
-            const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                match std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create_new(true)
-                    .share_mode(0)
-                    .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-                    .open(path)
-                {
-                    Ok(file) => break Ok(Self { _file: file }),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if Instant::now() >= deadline {
-                            break Err(Error::Config(format!(
-                                "timed out waiting for config transaction: {}",
-                                path.display()
-                            )));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => {
-                        break Err(Error::Config(format!(
-                            "open config transaction lock {}: {error}",
-                            path.display()
-                        )));
-                    }
-                }
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+            const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .map_err(|error| {
+                    Error::Config(format!(
+                        "open config transaction lock {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            let mut overlapped = WindowsOverlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: 0,
+                offset_high: 0,
+                event: std::ptr::null_mut(),
+            };
+            if unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    LOCKFILE_EXCLUSIVE_LOCK,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            } == 0
+            {
+                return Err(Error::Config(format!(
+                    "lock config transaction {}: {}",
+                    path.display(),
+                    std::io::Error::last_os_error()
+                )));
             }
+            Ok(Self { _file: file })
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -459,6 +488,80 @@ pub struct ClosedRelayPolicyConfig {
     pub shutdown_grace_ms: u64,
 }
 
+/// Owner-selected bounds for topology forwarding. These values fund the
+/// route planner itself; they are not inferred from the current peer count
+/// and are required on the persisted network record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingPolicyConfig {
+    /// Maximum number of next-hop candidates returned for one route.
+    pub max_next_hops: u64,
+    /// Maximum number of route futures that may be active at once.
+    pub max_parallel_routes: u64,
+    /// Maximum complete encoded route envelope accepted by the protocol.
+    pub max_envelope_bytes: u64,
+    /// Maximum retained route identities in the owner-scoped dedup set.
+    pub max_dedup_entries: u64,
+    /// Maximum bytes retained by the owner-scoped dedup set.
+    pub max_dedup_bytes: u64,
+    /// Maximum forwarding hop budget for one route envelope.
+    pub max_hop_budget: u64,
+}
+
+impl Default for RoutingPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_next_hops: 8,
+            max_parallel_routes: 4,
+            max_envelope_bytes: crate::protocol::RECEIVE_FRAME_BYTES as u64,
+            max_dedup_entries: 4_096,
+            max_dedup_bytes: 4 * 1024 * 1024,
+            max_hop_budget: crate::protocol::topology::MAX_ROUTED_HOP_BUDGET as u64,
+        }
+    }
+}
+
+impl RoutingPolicyConfig {
+    /// Validate every route bound before a planner, decoder, dedup set, or
+    /// forwarding task is created.
+    pub fn validate(&self) -> bool {
+        let semaphore_max = match u64::try_from(tokio::sync::Semaphore::MAX_PERMITS) {
+            Ok(max) => max,
+            Err(_) => return false,
+        };
+        let receive_bound = match u64::try_from(crate::protocol::RECEIVE_FRAME_BYTES) {
+            Ok(bound) => bound,
+            Err(_) => return false,
+        };
+        self.max_next_hops > 0
+            && self.max_next_hops <= semaphore_max
+            && self.max_parallel_routes > 0
+            && self.max_parallel_routes <= self.max_next_hops
+            && self.max_parallel_routes <= semaphore_max
+            && self.max_envelope_bytes > 0
+            && self.max_envelope_bytes <= receive_bound
+            && self.max_dedup_entries > 0
+            && self.max_dedup_bytes > 0
+            && self.max_hop_budget > 0
+            && self.max_hop_budget <= u64::from(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET)
+            && usize::try_from(self.max_next_hops).is_ok()
+            && usize::try_from(self.max_parallel_routes).is_ok()
+            && usize::try_from(self.max_envelope_bytes).is_ok()
+            && usize::try_from(self.max_dedup_entries).is_ok()
+            && usize::try_from(self.max_dedup_bytes).is_ok()
+    }
+
+    pub(crate) fn checked(self) -> Result<Self> {
+        if self.validate() {
+            Ok(self)
+        } else {
+            Err(Error::Config(
+                "routing policy contains zero, overflow, or inconsistent values".into(),
+            ))
+        }
+    }
+}
+
 /// A bounded protocol allocation that keeps malformed or hostile config from
 /// asking the relay to construct an unbounded packet buffer.
 pub const MAX_CLOSED_RELAY_PACKET_BYTES: u64 = 1024 * 1024;
@@ -680,6 +783,8 @@ impl Default for SignalingConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct NostrTimingPolicyConfig {
+    /// Maximum owner-selected time for a relay TCP/TLS/WebSocket handshake.
+    pub connect_timeout_ms: u64,
     pub reconnect_initial_ms: u64,
     pub reconnect_max_ms: u64,
     pub reconnect_max_attempts: u32,
@@ -693,6 +798,7 @@ pub struct NostrTimingPolicyConfig {
 impl Default for NostrTimingPolicyConfig {
     fn default() -> Self {
         Self {
+            connect_timeout_ms: 30_000,
             reconnect_initial_ms: 2_000,
             reconnect_max_ms: 60_000,
             reconnect_max_attempts: 6,
@@ -707,7 +813,8 @@ impl Default for NostrTimingPolicyConfig {
 
 impl NostrTimingPolicyConfig {
     pub fn validate(&self) -> bool {
-        self.reconnect_initial_ms > 0
+        self.connect_timeout_ms > 0
+            && self.reconnect_initial_ms > 0
             && self.reconnect_max_ms >= self.reconnect_initial_ms
             && self.reconnect_max_attempts > 0
             && self.jitter_percent <= 100
@@ -753,6 +860,9 @@ pub enum NetworkKind {
 pub struct SchedulerPolicyConfig {
     pub reactive_announce_min_interval_ms: u64,
     pub reoffer_min_interval_ms: u64,
+    /// Owner-selected inbound silence horizon before a peer is treated as a
+    /// liveness/rebuild candidate. This is not an authority decision.
+    pub stale_inbound_timeout_ms: u64,
     pub probe_ttl_ms: u64,
     pub probe_resolve_timeout_ms: u64,
     pub skew_warn_ms: u64,
@@ -788,6 +898,7 @@ impl SchedulerPolicyConfig {
     pub const DEFAULT: Self = Self {
         reactive_announce_min_interval_ms: 1_000,
         reoffer_min_interval_ms: 2_000,
+        stale_inbound_timeout_ms: 25_000,
         probe_ttl_ms: 300_000,
         probe_resolve_timeout_ms: 2_000,
         skew_warn_ms: 10_000,
@@ -818,6 +929,7 @@ impl SchedulerPolicyConfig {
         let nonzero = [
             self.reactive_announce_min_interval_ms,
             self.reoffer_min_interval_ms,
+            self.stale_inbound_timeout_ms,
             self.probe_ttl_ms,
             self.probe_resolve_timeout_ms,
             self.skew_warn_ms,
@@ -876,7 +988,711 @@ impl SchedulerPolicyConfig {
     }
 }
 
+/// Owner-selected bounds for the durable semantic fact graph.
+///
+/// These values are persisted per network so admission and recovery use the
+/// same resource envelope after a restart. They are allocation and retention
+/// limits, not authority: canonical facts still decide membership and roles.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticPolicyConfig {
+    pub max_fact_encoded_bytes: u64,
+    pub max_dependencies_per_fact: u64,
+    pub max_authority_uses_per_fact: u64,
+    pub max_authority_predecessors_per_use: u64,
+    pub max_admitted_facts: u64,
+    pub max_admitted_bytes: u64,
+    pub max_quarantined_facts: u64,
+    pub max_quarantined_bytes: u64,
+    pub max_quarantined_facts_per_author: u64,
+    pub max_quarantined_bytes_per_author: u64,
+    pub max_retained_facts_per_author: u64,
+    pub max_retained_bytes_per_author: u64,
+    pub max_dependency_edges: u64,
+    pub max_ready_batch: u64,
+    pub max_pending_proofs: u64,
+    pub max_pending_proof_bytes: u64,
+    pub max_proof_records: u64,
+    pub max_proof_bytes: u64,
+    pub max_proof_links: u64,
+    pub max_author_usage_rows: u64,
+    pub max_provisional_rows: u64,
+    pub max_transaction_dirty_main_pages: u64,
+    pub max_uncheckpointed_wal_frames: u64,
+    pub max_freelist_pages: u64,
+    pub max_fragmented_pages: u64,
+    pub max_main_journal_bytes: u64,
+    pub max_database_bytes: u64,
+    pub max_wal_bytes: u64,
+    pub wal_checkpoint_threshold_bytes: u64,
+    pub emergency_reserve_bytes: u64,
+}
+
+/// SQLite's default page size used when validating a persisted policy before
+/// a store connection exists.  A store may pass its actual page size to the
+/// checked envelope helpers below.
+pub const SQLITE_DEFAULT_PAGE_SIZE_BYTES: u64 = 4096;
+
+const SQLITE_WAL_HEADER_BYTES: u64 = 32;
+const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
+const SQLITE_SHM_CHUNK_BYTES: u64 = 32_768;
+const SQLITE_SHM_FIRST_CHUNK_FRAMES: u64 = 4_062;
+const SQLITE_SHM_FOLLOWING_CHUNK_FRAMES: u64 = 4_096;
+
+/// The only production provisional-custody owner is the fixed semantic
+/// ingress label.  Keep its UTF-8 byte bound independent of fact payloads.
+pub(crate) const SEMANTIC_INGRESS_OWNER: &str = "semantic-ingress";
+pub(crate) const SEMANTIC_INGRESS_OWNER_MAX_BYTES: u64 = SEMANTIC_INGRESS_OWNER.len() as u64;
+
+/// Canonical semantic schema metadata. Store creation, the capacity planner,
+/// and test-only fault-injection controls consume this exact table/index
+/// spelling; a duplicated hand-written schema description is a drift defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SemanticSchemaTableDescriptor {
+    pub(crate) name: &'static str,
+    pub(crate) columns: &'static [&'static str],
+}
+
+pub(crate) const SEMANTIC_SCHEMA_TABLES: &[SemanticSchemaTableDescriptor] = &[
+    SemanticSchemaTableDescriptor {
+        name: "meta",
+        columns: &["key", "value"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "facts",
+        columns: &["fact_id", "encoded", "status", "author", "domain", "seq"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "semantic_usage",
+        columns: &[
+            "usage_id",
+            "admitted_count",
+            "admitted_bytes",
+            "quarantined_count",
+            "quarantined_bytes",
+            "dependency_edges",
+            "provisional_count",
+            "author_usage_rows",
+            "generation",
+        ],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "author_usage",
+        columns: &[
+            "author",
+            "retained_count",
+            "retained_bytes",
+            "quarantined_count",
+            "quarantined_bytes",
+        ],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "dependencies",
+        columns: &["fact_id", "dep_id"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "provisional",
+        columns: &["fact_id", "owner"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "proofs",
+        columns: &["delivery_id", "encoded", "context_id", "target", "state"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "proof_facts",
+        columns: &["delivery_id", "fact_id"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "commitments",
+        columns: &["name", "value"],
+    },
+    SemanticSchemaTableDescriptor {
+        name: "proof_usage",
+        columns: &[
+            "usage_id",
+            "total_count",
+            "total_bytes",
+            "total_links",
+            "pending_count",
+            "pending_bytes",
+            "generation",
+        ],
+    },
+];
+
+pub(crate) const SEMANTIC_SCHEMA_INDEXES: &[(&str, &str, &[&str])] = &[
+    ("facts_status_idx", "facts", &["status"]),
+    ("facts_author_idx", "facts", &["author"]),
+    ("facts_seq_idx", "facts", &["seq"]),
+    ("facts_domain_seq_idx", "facts", &["domain", "seq"]),
+    ("dependencies_dep_idx", "dependencies", &["dep_id"]),
+    ("proof_facts_fact_idx", "proof_facts", &["fact_id"]),
+];
+
+// Every usage value is persisted as one fixed-width eight-byte BLOB.  Keep
+// these counts adjacent to the canonical descriptors so the page planner
+// cannot silently price a stale column shape.
+pub(crate) const SEMANTIC_USAGE_COLUMN_COUNT: u64 = 9;
+pub(crate) const PROOF_USAGE_COLUMN_COUNT: u64 = 7;
+
+/// Exact semantic workload maxima consumed by the production storage planner.
+/// These are owner-selected persisted bounds, not estimates inferred from a
+/// current database.  Omitting a lifecycle dimension is therefore impossible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticStorageWorkload {
+    pub max_fact_encoded_bytes: u64,
+    pub max_admitted_facts: u64,
+    pub max_quarantined_facts: u64,
+    pub max_admitted_bytes: u64,
+    pub max_quarantined_bytes: u64,
+    pub max_dependency_edges: u64,
+    pub max_author_usage_rows: u64,
+    pub max_proof_records: u64,
+    pub max_proof_bytes: u64,
+    pub max_proof_links: u64,
+    pub max_provisional_rows: u64,
+    pub max_transaction_dirty_main_pages: u64,
+    pub max_uncheckpointed_wal_frames: u64,
+    pub max_freelist_pages: u64,
+    pub max_fragmented_pages: u64,
+    pub max_main_journal_bytes: u64,
+}
+
+/// Checked logical named-file/process-local reservation for one semantic
+/// SQLite database.  This is not a backed-capacity or ENOSPC guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SemanticStorageEnvelope {
+    pub page_size_bytes: u64,
+    pub main_pages: u64,
+    pub main_bytes: u64,
+    pub main_journal_bytes: u64,
+    /// Hard WAL frame capacity, including one transaction's dirty pages.
+    /// This legacy field remains the hard-cap alias used by store consumers.
+    pub wal_frames: u64,
+    /// Hard WAL byte capacity, including one transaction's dirty pages.
+    /// This legacy field remains the hard-cap alias used by store consumers.
+    pub wal_bytes: u64,
+    /// Retained WAL population at which checkpointing is required.
+    pub wal_checkpoint_frames: u64,
+    /// Byte size of the retained/checkpoint WAL population.
+    pub wal_checkpoint_bytes: u64,
+    /// Hard WAL frame capacity after adding the transaction growth bound.
+    pub wal_hard_frames: u64,
+    /// Hard WAL byte capacity after adding the transaction growth bound.
+    pub wal_hard_bytes: u64,
+    pub shm_bytes: u64,
+    pub emergency_reserve_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl Default for SemanticPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_fact_encoded_bytes: 65_535,
+            max_dependencies_per_fact: 64,
+            max_authority_uses_per_fact: 32,
+            max_authority_predecessors_per_use: 64,
+            max_admitted_facts: 100_000,
+            max_admitted_bytes: 128 * 1024 * 1024,
+            max_quarantined_facts: 4_096,
+            max_quarantined_bytes: 16 * 1024 * 1024,
+            max_quarantined_facts_per_author: 256,
+            max_quarantined_bytes_per_author: 4 * 1024 * 1024,
+            max_retained_facts_per_author: 10_000,
+            max_retained_bytes_per_author: 16 * 1024 * 1024,
+            max_dependency_edges: 1_000_000,
+            max_ready_batch: 256,
+            max_pending_proofs: 10_000,
+            max_pending_proof_bytes: 16 * 1024 * 1024,
+            max_proof_records: 100_000,
+            max_proof_bytes: 64 * 1024 * 1024,
+            max_proof_links: 100_000,
+            max_author_usage_rows: 100_000,
+            max_provisional_rows: 100_000,
+            max_transaction_dirty_main_pages: 1024,
+            max_uncheckpointed_wal_frames: 1_018,
+            max_freelist_pages: 1024,
+            max_fragmented_pages: 1024,
+            max_main_journal_bytes: 8 * 1024 * 1024,
+            // The default semantic maxima include 128 MiB of facts, 1M
+            // canonical edges, and 64 MiB of proofs.  The checked page
+            // arithmetic below deliberately charges both packed leaves and
+            // a worst-case overflow stream, so 2 GiB is the first finite
+            // default that can contain those owner-selected maxima.
+            max_database_bytes: 2 * 1024 * 1024 * 1024,
+            // 1,018 retained frames plus 1,024 pages changed by one
+            // transaction, with the 32-byte WAL header charged once.
+            max_wal_bytes: 8_413_072,
+            wal_checkpoint_threshold_bytes: SQLITE_WAL_HEADER_BYTES
+                + 1_018 * (SQLITE_DEFAULT_PAGE_SIZE_BYTES + SQLITE_WAL_FRAME_OVERHEAD_BYTES),
+            emergency_reserve_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
+
+impl SemanticPolicyConfig {
+    fn checked_shm_bytes(wal_frame_count: u64) -> Option<u64> {
+        if wal_frame_count == 0 {
+            return Some(0);
+        }
+        let chunks = if wal_frame_count <= SQLITE_SHM_FIRST_CHUNK_FRAMES {
+            1
+        } else {
+            let remaining = wal_frame_count - SQLITE_SHM_FIRST_CHUNK_FRAMES;
+            remaining
+                .checked_add(SQLITE_SHM_FOLLOWING_CHUNK_FRAMES - 1)?
+                .checked_div(SQLITE_SHM_FOLLOWING_CHUNK_FRAMES)?
+                .checked_add(1)?
+        };
+        SQLITE_SHM_CHUNK_BYTES.checked_mul(chunks)
+    }
+
+    pub fn storage_workload(&self) -> SemanticStorageWorkload {
+        SemanticStorageWorkload {
+            max_fact_encoded_bytes: self.max_fact_encoded_bytes,
+            max_admitted_facts: self.max_admitted_facts,
+            max_quarantined_facts: self.max_quarantined_facts,
+            max_admitted_bytes: self.max_admitted_bytes,
+            max_quarantined_bytes: self.max_quarantined_bytes,
+            max_dependency_edges: self.max_dependency_edges,
+            max_author_usage_rows: self.max_author_usage_rows,
+            max_proof_records: self.max_proof_records,
+            max_proof_bytes: self.max_proof_bytes,
+            max_proof_links: self.max_proof_links,
+            max_provisional_rows: self.max_provisional_rows,
+            max_transaction_dirty_main_pages: self.max_transaction_dirty_main_pages,
+            max_uncheckpointed_wal_frames: self.max_uncheckpointed_wal_frames,
+            max_freelist_pages: self.max_freelist_pages,
+            max_fragmented_pages: self.max_fragmented_pages,
+            max_main_journal_bytes: self.max_main_journal_bytes,
+        }
+    }
+
+    fn checked_schema_pages(
+        page_size_bytes: u64,
+        workload: SemanticStorageWorkload,
+    ) -> Option<u64> {
+        const PAGE_HEADER_BYTES: u64 = 8;
+        const CELL_POINTER_BYTES: u64 = 2;
+        const RECORD_HEADER_BYTES: u64 = 13;
+        const FACT_ID_BYTES: u64 = 32;
+        const DEVICE_KEY_BYTES: u64 = 32;
+        const SQL_INTEGER_BYTES: u64 = 8;
+        const FACT_STATUS_MAX_BYTES: u64 = 11;
+        const FACT_DOMAIN_MAX_BYTES: u64 = 16;
+        const PROOF_STATE_MAX_BYTES: u64 = 12;
+        const META_KEY_MAX_BYTES: u64 = 16;
+        const COMMITMENT_NAME_MAX_BYTES: u64 = 10;
+        let usable = page_size_bytes.checked_sub(PAGE_HEADER_BYTES)?;
+        let leaf_capacity = usable.checked_sub(CELL_POINTER_BYTES)?.max(1);
+        let interior_capacity = (usable / 16).max(2);
+        let checked_sum = |values: &[u64]| -> Option<u64> {
+            values
+                .iter()
+                .try_fold(0u64, |total, value| total.checked_add(*value))
+        };
+        let checked_rows =
+            |rows: u64, bytes_per_row: u64| -> Option<u64> { rows.checked_mul(bytes_per_row) };
+        let object_pages = |rows: u64, payload_bytes: u64| -> Option<u64> {
+            let record = payload_bytes
+                .checked_add(rows.checked_mul(RECORD_HEADER_BYTES)?)?
+                .checked_add(rows.checked_mul(CELL_POINTER_BYTES)?)?;
+            let overflow_payload = usable.checked_sub(4)?.max(1);
+            let overflow = payload_bytes
+                .checked_add(overflow_payload - 1)?
+                .checked_div(overflow_payload)?;
+            let leaves = record
+                .checked_add(leaf_capacity - 1)?
+                .checked_div(leaf_capacity)?
+                .max(1);
+            let interior = leaves
+                .saturating_sub(1)
+                .checked_add(interior_capacity - 1)?
+                .checked_div(interior_capacity)?;
+            leaves
+                .checked_add(interior)?
+                .checked_add(overflow)?
+                .checked_add(1)
+        };
+        let fact_rows = workload
+            .max_admitted_facts
+            .checked_add(workload.max_quarantined_facts)?;
+        let fact_payload = workload
+            .max_admitted_bytes
+            .checked_add(workload.max_quarantined_bytes)?
+            .checked_add(checked_rows(
+                fact_rows,
+                checked_sum(&[
+                    FACT_ID_BYTES,
+                    FACT_STATUS_MAX_BYTES,
+                    DEVICE_KEY_BYTES,
+                    FACT_DOMAIN_MAX_BYTES,
+                    SQL_INTEGER_BYTES,
+                ])?,
+            )?)?;
+        let table_pages = [
+            (
+                2,
+                checked_sum(&[
+                    checked_sum(&[META_KEY_MAX_BYTES, 4])?,
+                    checked_sum(&[10, FACT_ID_BYTES])?,
+                ])?,
+            ),
+            (fact_rows, fact_payload),
+            (
+                1,
+                checked_rows(
+                    1,
+                    SEMANTIC_USAGE_COLUMN_COUNT.checked_mul(SQL_INTEGER_BYTES)?,
+                )?,
+            ),
+            (
+                workload.max_author_usage_rows,
+                checked_rows(
+                    workload.max_author_usage_rows,
+                    DEVICE_KEY_BYTES + 4 * SQL_INTEGER_BYTES,
+                )?,
+            ),
+            (
+                workload.max_dependency_edges,
+                checked_rows(workload.max_dependency_edges, 2 * FACT_ID_BYTES)?,
+            ),
+            (
+                workload.max_provisional_rows,
+                checked_rows(
+                    workload.max_provisional_rows,
+                    checked_sum(&[FACT_ID_BYTES, SEMANTIC_INGRESS_OWNER_MAX_BYTES])?,
+                )?,
+            ),
+            (
+                workload.max_proof_records,
+                workload.max_proof_bytes.checked_add(checked_rows(
+                    workload.max_proof_records,
+                    FACT_ID_BYTES * 3 + PROOF_STATE_MAX_BYTES,
+                )?)?,
+            ),
+            (
+                workload.max_proof_links,
+                checked_rows(workload.max_proof_links, 2 * FACT_ID_BYTES)?,
+            ),
+            (1, checked_sum(&[COMMITMENT_NAME_MAX_BYTES, FACT_ID_BYTES])?),
+            (
+                1,
+                checked_rows(1, PROOF_USAGE_COLUMN_COUNT.checked_mul(SQL_INTEGER_BYTES)?)?,
+            ),
+        ];
+        debug_assert_eq!(table_pages.len(), SEMANTIC_SCHEMA_TABLES.len());
+        let mut pages = 1u64; // page-one database header and schema root.
+        for (rows, record_bytes) in table_pages {
+            pages = pages.checked_add(object_pages(rows, record_bytes)?)?;
+        }
+        // Charge each of the ten PRIMARY KEY autoindex b-trees and six
+        // named secondary indexes as its own object.  Separate roots,
+        // interior rounding, and overflow streams are all retained in the
+        // envelope rather than being hidden by a combined row count.
+        let primary_index_trees = [
+            (2, META_KEY_MAX_BYTES),
+            (fact_rows, FACT_ID_BYTES),
+            (1, SQL_INTEGER_BYTES),
+            (workload.max_author_usage_rows, DEVICE_KEY_BYTES),
+            (workload.max_dependency_edges, 2 * FACT_ID_BYTES),
+            (
+                workload.max_provisional_rows,
+                checked_sum(&[FACT_ID_BYTES, SEMANTIC_INGRESS_OWNER_MAX_BYTES])?,
+            ),
+            (workload.max_proof_records, FACT_ID_BYTES),
+            (workload.max_proof_links, 2 * FACT_ID_BYTES),
+            (1, COMMITMENT_NAME_MAX_BYTES),
+            (1, SQL_INTEGER_BYTES),
+        ];
+        debug_assert_eq!(primary_index_trees.len(), SEMANTIC_SCHEMA_TABLES.len());
+        for (rows, key_bytes) in primary_index_trees {
+            let payload = checked_rows(rows, key_bytes)?;
+            pages = pages.checked_add(object_pages(rows, payload)?)?;
+        }
+        let secondary_index_trees = [
+            (fact_rows, FACT_STATUS_MAX_BYTES),
+            (fact_rows, DEVICE_KEY_BYTES),
+            (fact_rows, SQL_INTEGER_BYTES),
+            (fact_rows, FACT_DOMAIN_MAX_BYTES + SQL_INTEGER_BYTES),
+            (workload.max_dependency_edges, FACT_ID_BYTES),
+            (workload.max_proof_links, FACT_ID_BYTES),
+        ];
+        debug_assert_eq!(secondary_index_trees.len(), SEMANTIC_SCHEMA_INDEXES.len());
+        for (rows, key_bytes) in secondary_index_trees {
+            let payload = checked_rows(rows, key_bytes)?;
+            pages = pages.checked_add(object_pages(rows, payload)?)?;
+        }
+        pages = pages
+            .checked_add(workload.max_transaction_dirty_main_pages)?
+            .checked_add(workload.max_freelist_pages)?
+            .checked_add(workload.max_fragmented_pages)?;
+        Some(pages)
+    }
+
+    /// Compute a checked envelope from exact owner-selected semantic and
+    /// SQLite lifecycle maxima.  Every component is independently charged;
+    /// the emergency reserve is never added to the main budget.
+    pub fn checked_storage_envelope(
+        &self,
+        page_size_bytes: u64,
+        workload: SemanticStorageWorkload,
+    ) -> Result<SemanticStorageEnvelope> {
+        if page_size_bytes == 0 {
+            return Err(Error::Config("SQLite page size must be nonzero".into()));
+        }
+        let values = [
+            workload.max_fact_encoded_bytes,
+            workload.max_admitted_facts,
+            workload.max_quarantined_facts,
+            workload.max_admitted_bytes,
+            workload.max_quarantined_bytes,
+            workload.max_dependency_edges,
+            workload.max_author_usage_rows,
+            workload.max_proof_records,
+            workload.max_proof_bytes,
+            workload.max_proof_links,
+            workload.max_provisional_rows,
+            workload.max_transaction_dirty_main_pages,
+            workload.max_uncheckpointed_wal_frames,
+            workload.max_freelist_pages,
+            workload.max_fragmented_pages,
+            workload.max_main_journal_bytes,
+        ];
+        if values.iter().any(|value| *value == 0)
+            || workload.max_fact_encoded_bytes > self.max_fact_encoded_bytes
+            || workload.max_admitted_facts > self.max_admitted_facts
+            || workload.max_quarantined_facts > self.max_quarantined_facts
+            || workload.max_admitted_bytes > self.max_admitted_bytes
+            || workload.max_quarantined_bytes > self.max_quarantined_bytes
+            || workload.max_dependency_edges > self.max_dependency_edges
+            || workload.max_author_usage_rows > self.max_author_usage_rows
+            || workload.max_proof_records > self.max_proof_records
+            || workload.max_proof_bytes > self.max_proof_bytes
+            || workload.max_proof_links > self.max_proof_links
+            || workload.max_provisional_rows > self.max_provisional_rows
+            || workload.max_transaction_dirty_main_pages > self.max_transaction_dirty_main_pages
+            || workload.max_uncheckpointed_wal_frames > self.max_uncheckpointed_wal_frames
+            || workload.max_freelist_pages > self.max_freelist_pages
+            || workload.max_fragmented_pages > self.max_fragmented_pages
+            || workload.max_main_journal_bytes > self.max_main_journal_bytes
+        {
+            return Err(Error::Config(
+                "semantic storage workload exceeds policy".into(),
+            ));
+        }
+        let frame_bytes = page_size_bytes
+            .checked_add(SQLITE_WAL_FRAME_OVERHEAD_BYTES)
+            .ok_or_else(|| Error::Config("SQLite WAL frame size overflow".into()))?;
+        let wal_checkpoint_frames = workload.max_uncheckpointed_wal_frames;
+        let wal_hard_frames = wal_checkpoint_frames
+            .checked_add(workload.max_transaction_dirty_main_pages)
+            .ok_or_else(|| Error::Config("SQLite WAL frame capacity overflow".into()))?;
+        let wal_checkpoint_bytes = SQLITE_WAL_HEADER_BYTES
+            .checked_add(
+                wal_checkpoint_frames
+                    .checked_mul(frame_bytes)
+                    .ok_or_else(|| Error::Config("SQLite WAL reservation overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Config("SQLite WAL reservation overflow".into()))?;
+        let wal_hard_bytes = SQLITE_WAL_HEADER_BYTES
+            .checked_add(
+                wal_hard_frames
+                    .checked_mul(frame_bytes)
+                    .ok_or_else(|| Error::Config("SQLite WAL hard-cap overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Config("SQLite WAL hard-cap overflow".into()))?;
+        let threshold_payload = self
+            .wal_checkpoint_threshold_bytes
+            .checked_sub(SQLITE_WAL_HEADER_BYTES)
+            .ok_or_else(|| Error::Config("WAL checkpoint threshold is below its header".into()))?;
+        if threshold_payload % frame_bytes != 0
+            || threshold_payload / frame_bytes != wal_checkpoint_frames
+        {
+            return Err(Error::Config(
+                "WAL checkpoint threshold is not aligned to retained WAL frames".into(),
+            ));
+        }
+        if wal_hard_bytes < wal_checkpoint_bytes
+            || wal_checkpoint_bytes.checked_add(
+                workload
+                    .max_transaction_dirty_main_pages
+                    .checked_mul(frame_bytes)
+                    .ok_or_else(|| Error::Config("SQLite WAL growth overflow".into()))?,
+            ) != Some(wal_hard_bytes)
+            || wal_hard_bytes > self.max_wal_bytes
+        {
+            return Err(Error::Config(
+                "WAL retained trigger plus transaction growth exceeds hard ceiling".into(),
+            ));
+        }
+        let shm_bytes = Self::checked_shm_bytes(wal_hard_frames)
+            .ok_or_else(|| Error::Config("SQLite SHM reservation overflow".into()))?;
+        let main_pages = Self::checked_schema_pages(page_size_bytes, workload)
+            .ok_or_else(|| Error::Config("SQLite main page arithmetic overflow".into()))?;
+        let main_bytes = main_pages
+            .checked_mul(page_size_bytes)
+            .ok_or_else(|| Error::Config("SQLite main byte arithmetic overflow".into()))?;
+        let total_bytes = main_bytes
+            .checked_add(workload.max_main_journal_bytes)
+            .and_then(|bytes| bytes.checked_add(wal_hard_bytes))
+            .and_then(|bytes| bytes.checked_add(shm_bytes))
+            .and_then(|bytes| bytes.checked_add(self.emergency_reserve_bytes))
+            .ok_or_else(|| Error::Config("SQLite storage envelope overflow".into()))?;
+        if total_bytes > self.max_database_bytes {
+            return Err(Error::Config(
+                "SQLite storage envelope exceeds policy".into(),
+            ));
+        }
+        Ok(SemanticStorageEnvelope {
+            page_size_bytes,
+            main_pages,
+            main_bytes,
+            main_journal_bytes: workload.max_main_journal_bytes,
+            wal_frames: wal_hard_frames,
+            wal_bytes: wal_hard_bytes,
+            wal_checkpoint_frames,
+            wal_checkpoint_bytes,
+            wal_hard_frames,
+            wal_hard_bytes,
+            shm_bytes,
+            emergency_reserve_bytes: self.emergency_reserve_bytes,
+            total_bytes,
+        })
+    }
+
+    /// Validate all persisted semantic bounds before engine side effects.
+    /// Every field is checked for a representable, nonzero allocation; the
+    /// remaining checks ensure a single fact and all retained stores fit the
+    /// selected database and receive-frame envelopes.
+    pub fn validate(&self) -> bool {
+        let nonzero = [
+            self.max_fact_encoded_bytes,
+            self.max_dependencies_per_fact,
+            self.max_authority_uses_per_fact,
+            self.max_authority_predecessors_per_use,
+            self.max_admitted_facts,
+            self.max_admitted_bytes,
+            self.max_quarantined_facts,
+            self.max_quarantined_bytes,
+            self.max_quarantined_facts_per_author,
+            self.max_quarantined_bytes_per_author,
+            self.max_retained_facts_per_author,
+            self.max_retained_bytes_per_author,
+            self.max_dependency_edges,
+            self.max_ready_batch,
+            self.max_pending_proofs,
+            self.max_pending_proof_bytes,
+            self.max_proof_records,
+            self.max_proof_bytes,
+            self.max_proof_links,
+            self.max_author_usage_rows,
+            self.max_provisional_rows,
+            self.max_transaction_dirty_main_pages,
+            self.max_uncheckpointed_wal_frames,
+            self.max_freelist_pages,
+            self.max_fragmented_pages,
+            self.max_main_journal_bytes,
+            self.max_database_bytes,
+            self.max_wal_bytes,
+            self.wal_checkpoint_threshold_bytes,
+            self.emergency_reserve_bytes,
+        ]
+        .into_iter()
+        .all(|value| value > 0);
+        let platform = [
+            self.max_fact_encoded_bytes,
+            self.max_dependencies_per_fact,
+            self.max_authority_uses_per_fact,
+            self.max_authority_predecessors_per_use,
+            self.max_admitted_facts,
+            self.max_admitted_bytes,
+            self.max_quarantined_facts,
+            self.max_quarantined_bytes,
+            self.max_quarantined_facts_per_author,
+            self.max_quarantined_bytes_per_author,
+            self.max_retained_facts_per_author,
+            self.max_retained_bytes_per_author,
+            self.max_dependency_edges,
+            self.max_ready_batch,
+            self.max_pending_proofs,
+            self.max_pending_proof_bytes,
+            self.max_proof_records,
+            self.max_proof_bytes,
+            self.max_proof_links,
+            self.max_author_usage_rows,
+            self.max_provisional_rows,
+            self.max_transaction_dirty_main_pages,
+            self.max_uncheckpointed_wal_frames,
+            self.max_freelist_pages,
+            self.max_fragmented_pages,
+            self.max_main_journal_bytes,
+            self.max_database_bytes,
+            self.max_wal_bytes,
+            self.wal_checkpoint_threshold_bytes,
+            self.emergency_reserve_bytes,
+        ]
+        .into_iter()
+        .all(|value| usize::try_from(value).is_ok());
+        let receive_bound = u64::try_from(crate::protocol::RECEIVE_FRAME_BYTES)
+            .map(|bound| self.max_fact_encoded_bytes <= bound)
+            .unwrap_or(false);
+        let per_author = self.max_quarantined_facts_per_author <= self.max_quarantined_facts
+            && self.max_quarantined_bytes_per_author <= self.max_quarantined_bytes
+            && self.max_quarantined_facts_per_author <= self.max_retained_facts_per_author
+            && self.max_quarantined_bytes_per_author <= self.max_retained_bytes_per_author;
+        let retained_global = self
+            .max_admitted_facts
+            .checked_add(self.max_quarantined_facts)
+            .map(|facts| self.max_retained_facts_per_author <= facts)
+            .unwrap_or(false)
+            && self
+                .max_admitted_bytes
+                .checked_add(self.max_quarantined_bytes)
+                .map(|bytes| self.max_retained_bytes_per_author <= bytes)
+                .unwrap_or(false);
+        let structural = self.max_dependencies_per_fact <= self.max_dependency_edges
+            && self.max_authority_uses_per_fact <= self.max_dependency_edges
+            && self.max_authority_predecessors_per_use <= self.max_dependency_edges
+            && self.max_ready_batch <= self.max_pending_proofs
+            && self.max_pending_proofs <= self.max_proof_records
+            && self.max_pending_proof_bytes <= self.max_proof_bytes
+            && self.max_fact_encoded_bytes <= self.max_admitted_bytes
+            && self.max_fact_encoded_bytes <= self.max_quarantined_bytes
+            && self.max_fact_encoded_bytes <= self.max_pending_proof_bytes
+            && self.max_fact_encoded_bytes <= self.max_proof_bytes;
+        let storage_relationships = self.wal_checkpoint_threshold_bytes <= self.max_wal_bytes
+            && self.max_transaction_dirty_main_pages <= self.max_database_bytes
+            && self.max_main_journal_bytes <= self.max_database_bytes
+            && self.max_freelist_pages <= self.max_database_bytes / SQLITE_DEFAULT_PAGE_SIZE_BYTES
+            && self.max_fragmented_pages
+                <= self.max_database_bytes / SQLITE_DEFAULT_PAGE_SIZE_BYTES;
+        nonzero
+            && platform
+            && receive_bound
+            && per_author
+            && retained_global
+            && structural
+            && storage_relationships
+            && self
+                .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, self.storage_workload())
+                .is_ok()
+    }
+
+    pub(crate) fn checked(self) -> Result<Self> {
+        if self.validate() {
+            Ok(self)
+        } else {
+            Err(Error::Config(
+                "semantic policy contains zero, overflow, receive-bound, or inconsistent values"
+                    .into(),
+            ))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Local config record id. User-chosen, unique within this
     /// device's config — distinguishes multiple saved entries for
@@ -899,7 +1715,7 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub label: String,
     /// Initial governance kind for this network, matched to the verified
-    /// bootstrap's local shape. Open is the default. Closed enables closed
+    /// bootstrap's local shape. The constructor default is Open. Closed enables closed
     /// membership at bootstrap. Silent is Open
     /// governance plus two connection-behaviour changes — no
     /// auto-dial on presence (co-present peers surface as `Sighted`
@@ -911,13 +1727,17 @@ pub struct NetworkConfig {
     /// only the local shape matched to verified bootstrap on first attach.
     /// Subsequent kind changes come from canonical fact transitions, not from
     /// editing config.json.
-    #[serde(default)]
     pub kind: NetworkKind,
     /// Checked owner-selected timing and watchdog policy for this network.
     #[serde(default)]
     pub scheduler: SchedulerPolicyConfig,
+    /// Checked owner-selected lifetime and storage bounds for semantic facts.
+    pub semantic_policy: SemanticPolicyConfig,
     #[serde(default)]
     pub topology: TopologyMode,
+    /// Checked owner-selected bounds for topology forwarding. This field is
+    /// intentionally required on persisted V4 network records.
+    pub routing_policy: RoutingPolicyConfig,
     #[serde(default)]
     pub signaling: SignalingConfig,
     /// Closed-member opaque relay policy for this network. It is a network
@@ -936,10 +1756,6 @@ pub struct NetworkConfig {
     /// diagnostic if a topology needs TURN and none is reachable.
     #[serde(default = "default_turn_servers")]
     pub turn_servers: Vec<TurnServer>,
-    /// Override the on-disk roster path. Null = use the default
-    /// (`~/.myownmesh/mesh/rosters/{network_id}.json`).
-    #[serde(default)]
-    pub roster_path: Option<PathBuf>,
     /// Peers this node maintains a standing dial for. On a `Silent`
     /// network these are the one exception to "nothing connects until a
     /// deliberate dial": a pinned peer is (re)dialed whenever it
@@ -1037,12 +1853,13 @@ impl NetworkConfig {
             label: String::new(),
             kind: Default::default(),
             scheduler: SchedulerPolicyConfig::default(),
+            semantic_policy: SemanticPolicyConfig::default(),
             topology: Default::default(),
+            routing_policy: RoutingPolicyConfig::default(),
             signaling: Default::default(),
             closed_relay: ClosedRelayPolicyConfig::default(),
             stun_servers: default_stun_servers(),
             turn_servers: default_turn_servers(),
-            roster_path: None,
             pinned_peers: Vec::new(),
             auto_approve: false,
         }
@@ -1052,8 +1869,36 @@ impl NetworkConfig {
     /// effects. Callers must pass this value through rather than substituting
     /// process-wide timing constants.
     pub(crate) fn scheduler_policy(&self) -> Result<SchedulerPolicyConfig> {
+        self.routing_policy()?;
+        self.semantic_policy()?;
         self.validate_ice_servers()?;
         self.scheduler.checked()
+    }
+
+    /// Return this network's checked forwarding bounds before route planning
+    /// or any route-owned allocation is started.
+    pub(crate) fn routing_policy(&self) -> Result<RoutingPolicyConfig> {
+        self.routing_policy.checked()
+    }
+
+    /// Validate the complete policy subset needed before engine construction
+    /// performs side effects. Runtime callers may use the narrower accessors
+    /// when they need only one policy.
+    pub fn validate(&self) -> Result<()> {
+        self.routing_policy()?;
+        self.scheduler_policy()?;
+        Ok(())
+    }
+
+    pub fn checked(self) -> Result<Self> {
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Return the checked semantic lifetime/storage policy before engine
+    /// construction performs side effects.
+    pub(crate) fn semantic_policy(&self) -> Result<SemanticPolicyConfig> {
+        self.semantic_policy.checked()
     }
 }
 
@@ -1349,7 +2194,7 @@ pub struct TurnCredential {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     pub version: u32,
     /// Finite history retained by the mesh-wide MeshEvent broadcaster.
@@ -1359,13 +2204,19 @@ pub struct MeshConfig {
     pub event_capacity: u64,
     /// Override the identity anchor file path. Null = use the default
     /// (`~/.myownmesh/.secrets/identity.json`).
+    #[serde(default)]
     pub identity_path: Option<PathBuf>,
+    #[serde(default)]
     pub auto_update: AutoUpdateConfig,
+    #[serde(default)]
     pub auto_cleanup: AutoCleanupConfig,
+    #[serde(default)]
     pub daemon: DaemonConfig,
     /// Infrastructure services this device hosts for the mesh
     /// (relay / signaling / STUN / TURN). All off by default.
+    #[serde(default)]
     pub services: ServicesConfig,
+    #[serde(default)]
     pub networks: Vec<NetworkConfig>,
 }
 
@@ -1940,6 +2791,11 @@ mod tests {
     };
     use std::thread;
 
+    fn serialized_network(id: &str, network_id: &str) -> serde_json::Value {
+        serde_json::to_value(NetworkConfig::from_network_id(id, network_id))
+            .expect("constructor network config serializes")
+    }
+
     #[test]
     fn scheduler_policy_rejects_zero_overflow_and_bad_order() {
         let valid = SchedulerPolicyConfig::default();
@@ -1951,6 +2807,11 @@ mod tests {
         .validate());
         assert!(!SchedulerPolicyConfig {
             heartbeat_interval_ms: u64::MAX,
+            ..valid
+        }
+        .validate());
+        assert!(!SchedulerPolicyConfig {
+            stale_inbound_timeout_ms: 0,
             ..valid
         }
         .validate());
@@ -1982,6 +2843,411 @@ mod tests {
                 .heartbeat_interval_ms,
             42_000
         );
+    }
+
+    #[test]
+    fn semantic_policy_defaults_are_exact_and_network_serde_requires_it() {
+        let policy = SemanticPolicyConfig::default();
+        assert_eq!(policy.max_fact_encoded_bytes, 65_535);
+        assert_eq!(policy.max_dependencies_per_fact, 64);
+        assert_eq!(policy.max_authority_uses_per_fact, 32);
+        assert_eq!(policy.max_authority_predecessors_per_use, 64);
+        assert_eq!(policy.max_admitted_facts, 100_000);
+        assert_eq!(policy.max_admitted_bytes, 128 * 1024 * 1024);
+        assert_eq!(policy.max_quarantined_facts, 4_096);
+        assert_eq!(policy.max_quarantined_bytes, 16 * 1024 * 1024);
+        assert_eq!(policy.max_quarantined_facts_per_author, 256);
+        assert_eq!(policy.max_quarantined_bytes_per_author, 4 * 1024 * 1024);
+        assert_eq!(policy.max_retained_facts_per_author, 10_000);
+        assert_eq!(policy.max_retained_bytes_per_author, 16 * 1024 * 1024);
+        assert_eq!(policy.max_dependency_edges, 1_000_000);
+        assert_eq!(policy.max_ready_batch, 256);
+        assert_eq!(policy.max_pending_proofs, 10_000);
+        assert_eq!(policy.max_pending_proof_bytes, 16 * 1024 * 1024);
+        assert_eq!(policy.max_proof_records, 100_000);
+        assert_eq!(policy.max_proof_bytes, 64 * 1024 * 1024);
+        assert_eq!(policy.max_main_journal_bytes, 8 * 1024 * 1024);
+        assert_eq!(policy.max_database_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(policy.max_wal_bytes, 8_413_072);
+        assert_eq!(
+            policy.wal_checkpoint_threshold_bytes,
+            SQLITE_WAL_HEADER_BYTES
+                .checked_add(
+                    policy
+                        .max_uncheckpointed_wal_frames
+                        .checked_mul(
+                            SQLITE_DEFAULT_PAGE_SIZE_BYTES + SQLITE_WAL_FRAME_OVERHEAD_BYTES,
+                        )
+                        .expect("default WAL threshold multiplication"),
+                )
+                .expect("default WAL threshold addition")
+        );
+        assert_eq!(policy.wal_checkpoint_threshold_bytes, 4_194_192);
+        assert_eq!(policy.emergency_reserve_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            SEMANTIC_INGRESS_OWNER_MAX_BYTES,
+            SEMANTIC_INGRESS_OWNER.len() as u64
+        );
+        let envelope = policy
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, policy.storage_workload())
+            .expect("default SQLite storage envelope is valid");
+        assert_eq!(envelope.wal_frames, 2_042);
+        assert_eq!(envelope.wal_checkpoint_frames, 1_018);
+        assert_eq!(envelope.wal_hard_frames, 2_042);
+        assert_eq!(envelope.wal_checkpoint_bytes, 4_194_192);
+        assert_eq!(envelope.wal_bytes, 8_413_072);
+        assert_eq!(envelope.wal_hard_bytes, 8_413_072);
+        assert_eq!(envelope.shm_bytes, 32_768);
+        assert!(envelope.main_bytes >= envelope.main_pages * SQLITE_DEFAULT_PAGE_SIZE_BYTES);
+        assert_eq!(
+            envelope.total_bytes,
+            envelope
+                .main_bytes
+                .checked_add(envelope.main_journal_bytes)
+                .and_then(|v| v.checked_add(envelope.wal_bytes))
+                .and_then(|v| v.checked_add(envelope.shm_bytes))
+                .and_then(|v| v.checked_add(envelope.emergency_reserve_bytes))
+                .expect("checked envelope sum")
+        );
+        assert!(
+            envelope.total_bytes <= policy.max_database_bytes,
+            "default schema pricing must fit the configured database envelope"
+        );
+        assert!(policy.validate());
+        assert!(policy.checked().is_ok());
+
+        let network = NetworkConfig::from_network_id("semantic", "semantic-net");
+        assert_eq!(network.semantic_policy, policy);
+        let encoded = serde_json::to_string(&network).expect("semantic policy serializes");
+        let decoded: NetworkConfig =
+            serde_json::from_str(&encoded).expect("semantic policy deserializes");
+        assert_eq!(decoded.semantic_policy, policy);
+    }
+
+    #[test]
+    fn semantic_schema_usage_widths_match_storage_planner() {
+        let semantic_usage = SEMANTIC_SCHEMA_TABLES
+            .iter()
+            .find(|table| table.name == "semantic_usage")
+            .expect("semantic usage descriptor is present");
+        let proof_usage = SEMANTIC_SCHEMA_TABLES
+            .iter()
+            .find(|table| table.name == "proof_usage")
+            .expect("proof usage descriptor is present");
+        assert_eq!(semantic_usage.columns.len(), 9);
+        assert_eq!(proof_usage.columns.len(), 7);
+        assert_eq!(
+            semantic_usage.columns.len(),
+            usize::try_from(SEMANTIC_USAGE_COLUMN_COUNT).expect("usage width fits usize")
+        );
+        assert_eq!(
+            proof_usage.columns.len(),
+            usize::try_from(PROOF_USAGE_COLUMN_COUNT).expect("proof usage width fits usize")
+        );
+        assert_eq!(
+            semantic_usage.columns,
+            &[
+                "usage_id",
+                "admitted_count",
+                "admitted_bytes",
+                "quarantined_count",
+                "quarantined_bytes",
+                "dependency_edges",
+                "provisional_count",
+                "author_usage_rows",
+                "generation",
+            ]
+        );
+        assert_eq!(
+            proof_usage.columns,
+            &[
+                "usage_id",
+                "total_count",
+                "total_bytes",
+                "total_links",
+                "pending_count",
+                "pending_bytes",
+                "generation",
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_policy_sqlite_envelope_has_checked_boundaries() {
+        let mut policy = SemanticPolicyConfig::default();
+        policy.max_uncheckpointed_wal_frames = SQLITE_SHM_FIRST_CHUNK_FRAMES - 1;
+        policy.max_transaction_dirty_main_pages = 1;
+        policy.wal_checkpoint_threshold_bytes = SQLITE_WAL_HEADER_BYTES
+            + (SQLITE_SHM_FIRST_CHUNK_FRAMES - 1)
+                * (SQLITE_DEFAULT_PAGE_SIZE_BYTES + SQLITE_WAL_FRAME_OVERHEAD_BYTES);
+        policy.max_wal_bytes = policy.wal_checkpoint_threshold_bytes
+            + SQLITE_DEFAULT_PAGE_SIZE_BYTES
+            + SQLITE_WAL_FRAME_OVERHEAD_BYTES;
+        let mut workload = policy.storage_workload();
+        let envelope = policy
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
+            .expect("the first SHM chunk boundary is valid");
+        assert_eq!(
+            envelope.wal_checkpoint_frames,
+            SQLITE_SHM_FIRST_CHUNK_FRAMES - 1
+        );
+        assert_eq!(envelope.wal_hard_frames, SQLITE_SHM_FIRST_CHUNK_FRAMES);
+        assert_eq!(envelope.shm_bytes, SQLITE_SHM_CHUNK_BYTES);
+        assert!(policy.wal_checkpoint_threshold_bytes <= envelope.wal_bytes);
+        policy.max_uncheckpointed_wal_frames = SQLITE_SHM_FIRST_CHUNK_FRAMES;
+        policy.wal_checkpoint_threshold_bytes = SQLITE_WAL_HEADER_BYTES
+            + SQLITE_SHM_FIRST_CHUNK_FRAMES
+                * (SQLITE_DEFAULT_PAGE_SIZE_BYTES + SQLITE_WAL_FRAME_OVERHEAD_BYTES);
+        policy.max_wal_bytes = policy.wal_checkpoint_threshold_bytes
+            + SQLITE_DEFAULT_PAGE_SIZE_BYTES
+            + SQLITE_WAL_FRAME_OVERHEAD_BYTES;
+        workload = policy.storage_workload();
+        let envelope = policy
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
+            .expect("one frame beyond the first SHM chunk is valid");
+        assert_eq!(
+            envelope.wal_checkpoint_frames,
+            SQLITE_SHM_FIRST_CHUNK_FRAMES
+        );
+        assert_eq!(envelope.wal_hard_frames, SQLITE_SHM_FIRST_CHUNK_FRAMES + 1);
+        assert_eq!(envelope.shm_bytes, SQLITE_SHM_CHUNK_BYTES * 2);
+        let mut threshold = policy.clone();
+        threshold.wal_checkpoint_threshold_bytes = envelope.wal_checkpoint_bytes + 1;
+        assert!(threshold
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
+            .is_err());
+        workload.max_uncheckpointed_wal_frames = policy.max_uncheckpointed_wal_frames + 1;
+        assert!(policy
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
+            .is_err());
+        assert!(SemanticPolicyConfig::default()
+            .checked_storage_envelope(0, policy.storage_workload())
+            .is_err());
+        assert!(SemanticPolicyConfig::default()
+            .checked_storage_envelope(u64::MAX, policy.storage_workload())
+            .is_err());
+
+        let mut overflow = SemanticPolicyConfig::default();
+        overflow.max_database_bytes = u64::MAX;
+        overflow.emergency_reserve_bytes = u64::MAX;
+        assert!(overflow
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, overflow.storage_workload(),)
+            .is_err());
+    }
+
+    #[test]
+    fn semantic_storage_envelope_has_exact_dimension_and_reserve_controls() {
+        let policy = SemanticPolicyConfig::default();
+        let workload = policy.storage_workload();
+        let envelope = policy
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, workload)
+            .expect("owner maxima are accepted at the boundary");
+        let sum_without_reserve = envelope
+            .main_bytes
+            .checked_add(envelope.main_journal_bytes)
+            .and_then(|v| v.checked_add(envelope.wal_bytes))
+            .and_then(|v| v.checked_add(envelope.shm_bytes))
+            .expect("component sum");
+        assert_eq!(
+            envelope.total_bytes,
+            sum_without_reserve + envelope.emergency_reserve_bytes,
+            "reserve is charged exactly once"
+        );
+
+        macro_rules! reject_n_plus_one {
+            ($field:ident) => {{
+                let mut candidate = workload;
+                candidate.$field = policy.$field + 1;
+                assert!(
+                    policy
+                        .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, candidate)
+                        .is_err(),
+                    "{} N+1 must be refused",
+                    stringify!($field)
+                );
+            }};
+        }
+        reject_n_plus_one!(max_fact_encoded_bytes);
+        reject_n_plus_one!(max_admitted_facts);
+        reject_n_plus_one!(max_quarantined_facts);
+        reject_n_plus_one!(max_admitted_bytes);
+        reject_n_plus_one!(max_quarantined_bytes);
+        reject_n_plus_one!(max_dependency_edges);
+        reject_n_plus_one!(max_author_usage_rows);
+        reject_n_plus_one!(max_proof_records);
+        reject_n_plus_one!(max_proof_bytes);
+        reject_n_plus_one!(max_proof_links);
+        reject_n_plus_one!(max_provisional_rows);
+        reject_n_plus_one!(max_transaction_dirty_main_pages);
+        reject_n_plus_one!(max_uncheckpointed_wal_frames);
+        reject_n_plus_one!(max_freelist_pages);
+        reject_n_plus_one!(max_fragmented_pages);
+        reject_n_plus_one!(max_main_journal_bytes);
+    }
+
+    #[test]
+    fn semantic_policy_rejects_zero_and_relationship_violations() {
+        let valid = SemanticPolicyConfig::default();
+
+        macro_rules! reject_zero {
+            ($field:ident) => {{
+                let mut candidate = valid;
+                candidate.$field = 0;
+                assert!(
+                    !candidate.validate(),
+                    "zero {} must be rejected",
+                    stringify!($field)
+                );
+                assert!(candidate.checked().is_err());
+            }};
+        }
+
+        reject_zero!(max_fact_encoded_bytes);
+        reject_zero!(max_dependencies_per_fact);
+        reject_zero!(max_authority_uses_per_fact);
+        reject_zero!(max_authority_predecessors_per_use);
+        reject_zero!(max_admitted_facts);
+        reject_zero!(max_admitted_bytes);
+        reject_zero!(max_quarantined_facts);
+        reject_zero!(max_quarantined_bytes);
+        reject_zero!(max_quarantined_facts_per_author);
+        reject_zero!(max_quarantined_bytes_per_author);
+        reject_zero!(max_retained_facts_per_author);
+        reject_zero!(max_retained_bytes_per_author);
+        reject_zero!(max_dependency_edges);
+        reject_zero!(max_ready_batch);
+        reject_zero!(max_pending_proofs);
+        reject_zero!(max_pending_proof_bytes);
+        reject_zero!(max_proof_records);
+        reject_zero!(max_proof_bytes);
+        reject_zero!(max_proof_links);
+        reject_zero!(max_author_usage_rows);
+        reject_zero!(max_provisional_rows);
+        reject_zero!(max_transaction_dirty_main_pages);
+        reject_zero!(max_uncheckpointed_wal_frames);
+        reject_zero!(max_freelist_pages);
+        reject_zero!(max_fragmented_pages);
+        reject_zero!(max_main_journal_bytes);
+        reject_zero!(max_database_bytes);
+        reject_zero!(max_wal_bytes);
+        reject_zero!(wal_checkpoint_threshold_bytes);
+        reject_zero!(emergency_reserve_bytes);
+
+        let mut overflow = valid;
+        overflow.max_admitted_bytes = u64::MAX;
+        assert!(
+            !overflow.validate(),
+            "retained-byte addition must be checked"
+        );
+        overflow = valid;
+        overflow.max_fact_encoded_bytes = u64::MAX;
+        assert!(!overflow.validate(), "fact receive ceiling must be checked");
+
+        let mut relation = valid;
+        relation.max_quarantined_facts_per_author = valid.max_quarantined_facts + 1;
+        assert!(
+            !relation.validate(),
+            "per-author fact count cannot exceed global"
+        );
+        relation = valid;
+        relation.max_quarantined_bytes_per_author = valid.max_quarantined_bytes + 1;
+        assert!(
+            !relation.validate(),
+            "per-author bytes cannot exceed global"
+        );
+        relation = valid;
+        relation.max_quarantined_facts_per_author = valid.max_retained_facts_per_author + 1;
+        assert!(
+            !relation.validate(),
+            "quarantine facts cannot exceed retained author cap"
+        );
+        relation = valid;
+        relation.max_quarantined_bytes_per_author = valid.max_retained_bytes_per_author + 1;
+        assert!(
+            !relation.validate(),
+            "quarantine bytes cannot exceed retained author cap"
+        );
+        relation = valid;
+        relation.max_retained_facts_per_author =
+            valid.max_admitted_facts + valid.max_quarantined_facts + 1;
+        assert!(
+            !relation.validate(),
+            "retained facts must fit combined global capacity"
+        );
+        relation = valid;
+        relation.max_retained_bytes_per_author =
+            valid.max_admitted_bytes + valid.max_quarantined_bytes + 1;
+        assert!(
+            !relation.validate(),
+            "retained bytes must fit combined global capacity"
+        );
+        relation = valid;
+        relation.max_dependencies_per_fact = valid.max_dependency_edges + 1;
+        assert!(
+            !relation.validate(),
+            "dependency structure must fit edge budget"
+        );
+        relation = valid;
+        relation.max_authority_uses_per_fact = valid.max_dependency_edges + 1;
+        assert!(
+            !relation.validate(),
+            "authority-use structure must fit edge budget"
+        );
+        relation = valid;
+        relation.max_authority_predecessors_per_use = valid.max_dependency_edges + 1;
+        assert!(
+            !relation.validate(),
+            "authority predecessor structure must fit edge budget"
+        );
+        relation = valid;
+        relation.max_ready_batch = valid.max_pending_proofs + 1;
+        assert!(
+            !relation.validate(),
+            "ready batch must fit pending-proof count"
+        );
+        relation = valid;
+        relation.max_admitted_bytes = valid.max_fact_encoded_bytes - 1;
+        assert!(!relation.validate(), "one fact must fit admitted bytes");
+        relation = valid;
+        relation.max_quarantined_bytes = valid.max_fact_encoded_bytes - 1;
+        assert!(!relation.validate(), "one fact must fit quarantine bytes");
+        relation = valid;
+        relation.max_pending_proof_bytes = valid.max_fact_encoded_bytes - 1;
+        assert!(
+            !relation.validate(),
+            "one fact must fit pending-proof bytes"
+        );
+        relation = valid;
+        relation.max_pending_proofs = valid.max_proof_records + 1;
+        assert!(
+            !relation.validate(),
+            "pending proofs must fit total proof count"
+        );
+        relation = valid;
+        relation.max_pending_proof_bytes = valid.max_proof_bytes + 1;
+        assert!(
+            !relation.validate(),
+            "pending proof bytes must fit total proof bytes"
+        );
+        relation = valid;
+        relation.max_proof_bytes = valid.max_fact_encoded_bytes - 1;
+        assert!(!relation.validate(), "one fact must fit total proof bytes");
+
+        relation = valid;
+        relation.max_wal_bytes = valid.max_wal_bytes - 1;
+        assert!(
+            !relation.validate(),
+            "WAL frame workload must fit the WAL ceiling"
+        );
+        relation = valid;
+        relation.max_database_bytes = valid.emergency_reserve_bytes - 1;
+        assert!(
+            !relation.validate(),
+            "database must retain the emergency reserve"
+        );
+        assert!(valid
+            .checked_storage_envelope(SQLITE_DEFAULT_PAGE_SIZE_BYTES, valid.storage_workload(),)
+            .is_ok());
     }
 
     fn transaction_test_path(label: &str) -> PathBuf {
@@ -2050,6 +3316,32 @@ mod tests {
         assert!(cfg.auto_update.validate().is_ok());
         assert!(cfg.daemon.enabled);
         assert!(cfg.networks.is_empty());
+    }
+
+    #[test]
+    fn mesh_config_requires_explicit_version_and_defaults_only_optional_fields() {
+        assert!(serde_json::from_value::<MeshConfig>(serde_json::json!({})).is_err());
+
+        let mut missing_version = serde_json::to_value(MeshConfig::default()).unwrap();
+        missing_version
+            .as_object_mut()
+            .expect("mesh config serializes as an object")
+            .remove("version");
+        assert!(serde_json::from_value::<MeshConfig>(missing_version).is_err());
+
+        let minimal: MeshConfig = serde_json::from_value(serde_json::json!({
+            "version": CONFIG_VERSION
+        }))
+        .expect("current V4 version is the required field");
+        assert_eq!(minimal, MeshConfig::default());
+
+        let old: MeshConfig = serde_json::from_value(serde_json::json!({ "version": 1 }))
+            .expect("version is syntactically valid before policy refusal");
+        assert!(require_current_version(old).is_err());
+        let future: MeshConfig =
+            serde_json::from_value(serde_json::json!({ "version": CONFIG_VERSION + 1 }))
+                .expect("future version is syntactically valid before policy refusal");
+        assert!(require_current_version(future).is_err());
     }
 
     #[test]
@@ -2155,6 +3447,77 @@ mod tests {
     }
 
     #[test]
+    fn routing_policy_boundaries_are_checked() {
+        let valid = RoutingPolicyConfig::default();
+        assert!(valid.validate());
+        assert_eq!(
+            valid.max_envelope_bytes,
+            crate::protocol::RECEIVE_FRAME_BYTES as u64
+        );
+
+        assert!(!RoutingPolicyConfig {
+            max_next_hops: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!RoutingPolicyConfig {
+            max_parallel_routes: valid.max_next_hops + 1,
+            ..valid
+        }
+        .validate());
+        assert!(!RoutingPolicyConfig {
+            max_envelope_bytes: crate::protocol::RECEIVE_FRAME_BYTES as u64 + 1,
+            ..valid
+        }
+        .validate());
+        assert!(!RoutingPolicyConfig {
+            max_dedup_entries: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!RoutingPolicyConfig {
+            max_dedup_bytes: 0,
+            ..valid
+        }
+        .validate());
+        assert!(!RoutingPolicyConfig {
+            max_hop_budget: 0,
+            ..valid
+        }
+        .validate());
+        assert_eq!(
+            valid.max_hop_budget,
+            crate::protocol::topology::MAX_ROUTED_HOP_BUDGET as u64
+        );
+        assert!(!RoutingPolicyConfig {
+            max_hop_budget: u64::from(crate::protocol::topology::MAX_ROUTED_HOP_BUDGET) + 1,
+            ..valid
+        }
+        .validate());
+
+        let mut network = NetworkConfig::from_network_id("routing", "routing-net");
+        network.routing_policy.max_parallel_routes = network.routing_policy.max_next_hops + 1;
+        assert!(network.validate().is_err());
+    }
+
+    #[test]
+    fn network_serde_requires_routing_policy() {
+        let mut encoded = serde_json::to_value(NetworkConfig::from_network_id(
+            "routing-required",
+            "routing-required-net",
+        ))
+        .expect("network config serializes");
+        encoded
+            .as_object_mut()
+            .expect("network config serializes as an object")
+            .remove("routing_policy");
+        assert!(
+            serde_json::from_value::<NetworkConfig>(encoded).is_err(),
+            "V4 network config must not synthesize missing routing policy"
+        );
+    }
+
+    #[test]
     fn old_hard_alpha_config_is_refused_not_migrated() {
         let old = MeshConfig {
             version: 1,
@@ -2203,6 +3566,7 @@ mod tests {
         assert_eq!(s.redundancy, DEFAULT_SIGNALING_REDUNDANCY);
         assert!(s.denylist.iter().any(|h| h == "relay.damus.io"));
         assert!(s.nostr_timing.validate());
+        assert_eq!(s.nostr_timing.connect_timeout_ms, 30_000);
         assert_eq!(s.nostr_timing.reconnect_initial_ms, 2_000);
         assert_eq!(s.nostr_timing.reconnect_max_ms, 60_000);
     }
@@ -2211,6 +3575,11 @@ mod tests {
     fn nostr_timing_policy_rejects_zero_and_inconsistent_values() {
         let valid = NostrTimingPolicyConfig::default();
         assert!(valid.validate());
+        assert!(!NostrTimingPolicyConfig {
+            connect_timeout_ms: 0,
+            ..valid
+        }
+        .validate());
         assert!(!NostrTimingPolicyConfig {
             reconnect_initial_ms: 0,
             ..valid
@@ -2363,10 +3732,12 @@ mod tests {
 
     #[test]
     fn closed_relay_policy_defaults_disabled_and_roundtrips_bounded_config() {
-        let defaults: NetworkConfig = serde_json::from_str(
-            r#"{"id":"omitted","network_id":"omitted-net","signaling":{"strategy":"none","mdns":false,"servers":[],"redundancy":1,"denylist":[],"public_fallback":false},"stun_servers":[],"turn_servers":[],"pinned_peers":[],"auto_approve":false}"#,
-        )
-        .unwrap();
+        let mut default_json = serialized_network("omitted", "omitted-net");
+        default_json
+            .as_object_mut()
+            .expect("serialized network is an object")
+            .remove("closed_relay");
+        let defaults: NetworkConfig = serde_json::from_value(default_json).unwrap();
         assert_eq!(defaults.closed_relay, ClosedRelayPolicyConfig::default());
 
         let configured = ClosedRelayPolicyConfig {
@@ -2434,15 +3805,26 @@ mod tests {
     }
 
     #[test]
+    fn mesh_config_rejects_unknown_top_level_fields() {
+        let mut value = serde_json::to_value(MeshConfig::default()).unwrap();
+        value
+            .as_object_mut()
+            .expect("mesh config serializes as an object")
+            .insert("legacy_network_state".into(), serde_json::json!({}));
+        assert!(serde_json::from_value::<MeshConfig>(value).is_err());
+    }
+
+    #[test]
     fn network_config_omits_stun_field_picks_up_defaults() {
-        // A user writing a minimal network config without
-        // mentioning stun_servers should get the built-in defaults
-        // rather than launching with zero ICE servers.
-        let json = r#"{
-            "id": "n1",
-            "network_id": "test-net"
-        }"#;
-        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        // A V4 network record may omit this intentionally optional field and
+        // still gets the built-in defaults rather than zero ICE servers.
+        let mut json = serialized_network("n1", "test-net");
+        let object = json
+            .as_object_mut()
+            .expect("serialized network is an object");
+        object.remove("stun_servers");
+        object.remove("turn_servers");
+        let cfg: NetworkConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.stun_servers, default_stun_servers());
         assert!(!cfg.stun_servers.is_empty());
         assert!(cfg.stun_servers[0]
@@ -2458,21 +3840,47 @@ mod tests {
     }
 
     #[test]
-    fn network_kind_silent_round_trips_and_defaults_open() {
+    fn network_kind_silent_round_trips_and_required_fields_are_enforced() {
         // Explicit `"kind": "silent"` decodes to Silent.
-        let json = r#"{ "id": "n1", "network_id": "t", "kind": "silent" }"#;
-        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        let mut json = serialized_network("n1", "t");
+        json.as_object_mut()
+            .expect("serialized network is an object")
+            .insert("kind".into(), serde_json::json!("silent"));
+        let cfg: NetworkConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.kind, NetworkKind::Silent);
         // A round-trip preserves it.
         let s = serde_json::to_string(&cfg).unwrap();
         assert!(s.contains("\"kind\":\"silent\""), "got: {s}");
         let back: NetworkConfig = serde_json::from_str(&s).unwrap();
         assert_eq!(back.kind, NetworkKind::Silent);
-        // An old config that omits `kind` keeps decoding to the default (Open),
-        // so existing networks are untouched.
-        let old = r#"{ "id": "n1", "network_id": "t" }"#;
-        let cfg: NetworkConfig = serde_json::from_str(old).unwrap();
-        assert_eq!(cfg.kind, NetworkKind::Open);
+
+        let mut missing_kind = serialized_network("missing-kind", "t");
+        missing_kind
+            .as_object_mut()
+            .expect("serialized network is an object")
+            .remove("kind");
+        assert!(serde_json::from_value::<NetworkConfig>(missing_kind).is_err());
+
+        let mut missing_policy = serialized_network("missing-policy", "t");
+        missing_policy
+            .as_object_mut()
+            .expect("serialized network is an object")
+            .remove("semantic_policy");
+        assert!(serde_json::from_value::<NetworkConfig>(missing_policy).is_err());
+
+        let mut unknown = serialized_network("unknown", "t");
+        unknown
+            .as_object_mut()
+            .expect("serialized network is an object")
+            .insert("legacy_member_log".into(), serde_json::json!([]));
+        assert!(serde_json::from_value::<NetworkConfig>(unknown).is_err());
+
+        let mut partial_policy = serialized_network("partial-policy", "t");
+        partial_policy
+            .as_object_mut()
+            .expect("serialized network is an object")
+            .insert("semantic_policy".into(), serde_json::json!({}));
+        assert!(serde_json::from_value::<NetworkConfig>(partial_policy).is_err());
     }
 
     #[test]
@@ -2490,8 +3898,11 @@ mod tests {
     #[test]
     fn turn_servers_opt_out_with_empty_array() {
         // An explicit empty array disables the default reference TURN.
-        let json = r#"{ "id": "n1", "network_id": "t", "turn_servers": [] }"#;
-        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        let mut json = serialized_network("n1", "t");
+        json.as_object_mut()
+            .expect("serialized network is an object")
+            .insert("turn_servers".into(), serde_json::json!([]));
+        let cfg: NetworkConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.turn_servers.is_empty());
     }
 
@@ -2576,12 +3987,11 @@ mod tests {
     fn network_config_empty_stun_array_opts_out() {
         // Writing an explicit empty list must remain empty — the
         // defaults only fire when the field is absent.
-        let json = r#"{
-            "id": "n1",
-            "network_id": "test-net",
-            "stun_servers": []
-        }"#;
-        let cfg: NetworkConfig = serde_json::from_str(json).unwrap();
+        let mut json = serialized_network("n1", "test-net");
+        json.as_object_mut()
+            .expect("serialized network is an object")
+            .insert("stun_servers".into(), serde_json::json!([]));
+        let cfg: NetworkConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.stun_servers.is_empty());
     }
 

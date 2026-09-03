@@ -11,6 +11,44 @@ only by naming the exact commit and control that closes it. Explicitly pending
 platform or runtime evidence remains pending and is never inferred from a
 source declaration.
 
+This ledger does not record a final architecture-compliance PASS. Historical
+per-item discharge labels below identify source or focused-control closure;
+durable runtime qualification remains pending until the required scale,
+Open/Closed separation, no-op, restart, crash, and terminal-baseline runs are
+available.
+
+## Canonical ledger invariant
+
+This ledger records the implemented boundary: the base durable ledger contains
+Closed authority/governance facts only. Its retained classes are `RoleGrant`,
+`RoleRevoke`, `Evict`, `MembershipAdmit`, `EvictionProof`, `SelfStandDown`,
+`Attestation`, `Resolution`, and `AuthorityLineageResolution`; an explicitly
+adopted application contract domain remains separate. Open has zero base
+durable semantic facts. Exact-context handshake and Device-key possession
+authenticate ephemeral Open participation. Runtime join, leave, presence, and
+reconnect for both Open and Closed never enter semantic history.
+
+The semantic owner selects finite fact-count, canonical-byte, causal-edge,
+per-author count/bytes and retained lifetime, proof-work,
+eligible-signer-quarantine, total-proof-history, and indexed SQLite/WAL-reserve
+ceilings. It computes the full delta before every
+mutation and refuses the exact `N+1` before changing the graph, projection,
+ACK, identity, or authority. Duplicate delivery is a semantic no-op. Missing
+dependencies use bounded dependency indexes; exact history remains until an
+archive or authority-ratified checkpoint permits semantic deletion. SQLite is
+local-only, single-writer, WAL-backed, and `FULL` synchronous. One dedicated
+blocking worker owns one ordinary SQLite connection; SQLite's default VFS owns
+locking, recovery, WAL reuse, and checkpoints while the semantic layer owns
+admission and quotas. The
+StorageBytes claim is one process-accounted quantity, `B = M + W + S + R`, for
+main database, WAL, shared-memory/sidecar, and explicit reserve bytes. Named
+files or VFS accounting do not prove backing disk, filesystem metadata, or
+ENOSPC behavior. The shipped compaction boundary is bounded checkpointing
+only; a full-copy `VACUUM` requires separately funded temporary-copy,
+metadata, and cleanup custody. Timers never silently prune semantic history.
+These finite ceilings bound ordinary growth and failure spam, while failed
+cleanup retains its exact charge until observation.
+
 ## Recorded closure items
 
 Every item recorded here has a named owner and an explicit closure condition;
@@ -126,13 +164,14 @@ The Windows DACL/SID controls are
 `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and
 `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`.
 
-Status: discharged at exact source head
+Status: source/control closure recorded at exact source head
 `3556a9a5a509b6773898213870f289e6dbb1ff5b`; hosted CI
 `33245879472` completed all six jobs green, including shipped CLI
 transport-lab success on Linux, macOS, and Windows, and Turing's exact-head
-FINAL PASS is recorded. The full unread-response shipped-daemon choreography
+source review was recorded. The full unread-response shipped-daemon choreography
 is Unix-gated; Windows is covered by exact cross-process custody, DACL/SID
-controls, and hosted build/test, not identical crash choreography.
+controls, and hosted build/test, not identical crash choreography. This is not
+final durable architecture qualification.
 
 ### R3 — an offline evicted Device receives a durable proof delivery
 
@@ -168,15 +207,16 @@ and
 Owner: the typed durable-semantic Signaling Node lane together with the durable
 semantic proof owner.
 
-Status: discharged at integration head `6d71567`; hosted CI `33229628657`
-completed all six jobs green and Turing's exact-head source audit is PASS.
+Status: source/control closure recorded at integration head `6d71567`; hosted
+CI `33229628657` completed the listed jobs and Turing's exact-head source audit
+was recorded. Durable runtime qualification remains pending.
 
 ### AuthorityLineage - bounded persistent closure record
 
 **Status: FROZEN at integration head `6d71567`.** Hosted CI
-`33229628657` completed all six jobs green and Turing's exact-head typed source
-audit is PASS. These controls do not amend the R1 discharge or turn an
-unresolved HOLD into an acceptance.
+`33229628657` completed the listed jobs and Turing's exact-head typed source
+audit was recorded. These controls do not amend the R1 discharge, establish
+durable runtime qualification, or turn an unresolved HOLD into an acceptance.
 
 This is a separate, bounded semantic record accompanying the R3 boundary; it
 does not create another state owner or widen the transport lane.
@@ -186,11 +226,11 @@ selector for a multi-head AuthorityUse lineage. Ordinary
 cannot select cross-cell authority heads. A distinct-author Membership payload
 Resolution remains payload-local and cannot join Role lineage. Self-authored
 Closed Membership retains its author AuthorityUse edge and must fork with a
-concurrent Role revoke; an OpenParticipation Resolution remains payload-local
+concurrent Role revoke; an application payload Resolution remains payload-local
 and adds no persistent subject lineage. An unresolved fork stays fail-closed
 and its losing RoleGrant remains inactive. The exact integration-head commit,
 hosted run, and typed-audit evidence are `6d71567`, `33229628657`, and Turing's
-source PASS, respectively.
+source review, respectively; none is final durable architecture qualification.
 
 Within the AuthorityLineage boundary, `FactGraph::selected_authority_branch`
 chooses the unique causally maximal matching typed selector in the sole
@@ -212,7 +252,7 @@ The closure is evidenced by
 `payload_resolution_does_not_join_a_transitive_role_fork`,
 `second_order_payload_resolution_cannot_join_the_role_authority_fork`,
 `second_order_payload_fork_converges_without_authority_join`,
-`open_participation_payload_fork_stays_in_its_ordinary_cell`, and the
+the open-runtime payload-fork control, and the
 `720`-permutation projection control
 `finite_authority_fork_projection_converges_for_every_arrival_permutation`,
 `self_authored_membership_keeps_a_role_authority_fork_explicit`, and
@@ -525,12 +565,42 @@ marked **no provider** rather than assigned guessed byte prices.
 | **Relay per-connection I/O / replay:** server `ConnEntry`, bounded outbound queue, subscriptions, stored replay deque, per-REQ replay vector | `HubInner::handle_event` fan-out; `HubInner::handle_req` stored-plus-live replay; client frames | Per-connection writer; `serve_conn`; `handle_req` sends replay and `EOSE` | Self-hosted `server.rs` is a separate deployment with **no MyOwnMesh `FiniteResourceProvider` scope**. Its limits are server policy/OS accounting, not mesh dimensions | Bounded `try_send`; rate/filter/subscription/message limits reject or drop. Replay dedupes and truncates to `MAX_REPLAY_PER_REQ`; storage admits only replayable events under its cap | `HubInner` owns connection/subscription/presence state; writer owns queued frames; connection owns replay output until send. Unregister and hub shutdown release exact state | `MAX_STORED_EVENTS = 8192`, 15-minute retention, `MAX_REPLAY_PER_REQ = 500`, queue 128, and per-connection limits | No mesh-provider baseline is claimed; baseline is configured store/presence plus empty per-connection queue after pruning |
 | **Server registration / shutdown:** listener accept, `conns`, `ip_counts`, presence ownership, IDs, shutdown watch | Listener accepts socket; `HubInner::register` creates `ConnEntry` | `serve_conn` reader/writer; `HubInner::unregister` removes exact connection and current presence ownership | **No provider:** relay has no semantic mesh slot or attached finite resource scope. OS listener/socket/runtime allocations are outside mesh dimensions | `max_connections_per_ip` refusal sends bounded NOTICE then closes; shutdown, failed upgrade, or closed socket never enters `conns`; successful registration is the sole record admission | `HubInner` owns registration/IP/presence maps; `serve_conn` owns socket; writer owns queue; unregister is terminal cleanup; shutdown watch ends readers and writers | Default `max_connections_per_ip = 64`, plus message/rate/subscription/filter ceilings and OS listener admission | No mesh-provider delta is promised. Server baseline is zero connections, empty IP/presence maps, no writer queues after shutdown; deployment-level OS accounting remains HOLD |
 
-**R1 and HOLD are preserved.** R1 remains discharged at `55bafe5`; this
-matrix does not reopen it. Dependency-owned mDNS and self-hosted-relay
+**R1 and HOLD are preserved.** R1 remains source/control-discharged at
+`55bafe5`; this matrix does not reopen it or claim final architecture
+qualification. Dependency-owned mDNS and self-hosted-relay
 allocations remain qualified until their owning dependency or deployment
 supplies a typed, independently verified accounting boundary. The Nostr
 production path requires an attached `DeliveryProvider`; standalone adapters
 do not establish a production capacity claim.
+
+## Required durable qualification controls
+
+The following controls are required before this ledger can record final
+architecture compliance. Each must use finite owner grants, real durable
+storage or shipped processes as applicable, deterministic stage markers, and
+terminal provider/resource observations; source inspection, a focused unit
+test, or a successful build is not a substitute.
+
+- **Scale and refusal:** exercise Open and Closed workloads through the
+  configured scale and the exact `N+1` refusal, proving refusal before
+  mutation and release to baseline.
+- **Open/Closed separation:** prove Open join, leave, presence, reconnect, and
+  session activity create no durable semantic fact, while Closed governance
+  facts persist through the bounded indexed transaction path.
+- **No-op and duplicate delivery:** deliver the same accepted input again and
+  prove unchanged projection, fact/index counts, StorageBytes accounting, and
+  provider usage.
+- **Restart and crash reconciliation:** reopen the exact Closed slot after
+  clean restart and deterministic pre-COMMIT, COMMIT-boundary, post-COMMIT,
+  and checkpoint cutpoints; classify old, new, or outcome-unknown without
+  claiming rollback from an unobserved error.
+- **Terminal baseline:** after success, typed refusal, malformed input,
+  failed cleanup, and shutdown, observe every owned process/provider claim at
+  its expected baseline or retained failed-cleanup state. No orphan task,
+  queue, handle, WAL, or sidecar may be omitted from the observation.
+
+Until these durable runs are recorded with exact commands, heads, and
+outcomes, this ledger remains an evidence index with qualification pending.
 
 ## Scope ceiling
 
@@ -551,6 +621,6 @@ discharge; this table is an index to that evidence, not its sole copy.
 | Closure item | Discharged at | Closing control |
 | --- | --- | --- |
 | R1 | `55bafe5` (closing subset: `f2a0f31`, `d6dd84d`, `1a8285b`, `f29207d`, `eaba95b`, `57ca3c5`) | `semantic::store::child_process_contention_and_hard_death_release_the_writer`, `semantic::store::lifetime_owner_blocks_second_open_then_reopens_for_append`, `semantic::store::lifetime_owner_preserves_deterministic_graph_and_proof_union`, `durable_semantic_restart::closed_network_restart_restores_the_committed_semantic_graph`, `durable_semantic_restart::shutdown_fences_stale_state_before_same_slot_reopen_and_append` |
-| R2 | `3556a9a5a509b6773898213870f289e6dbb1ff5b` (hosted CI `33245879472`; Turing exact-head FINAL PASS) | `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_disable_refuses_prepared_material_until_explicit_abort`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_endpoint_is_verified_as_exact_owner_only_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_replaces_an_owned_stale_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_non_socket_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_symlink_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_an_accessible_unrelated_parent_without_chmod`, `crates/myownmesh/src/control/listener.rs::tests::windows_pipe_dacl_names_current_token_user_not_owner_rights`, `crates/myownmesh/src/control/listener.rs::tests::windows_current_user_pipe_connects_and_is_accepted`, `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`; full unread-response shipped-daemon choreography is Unix-gated, not identical Windows crash choreography |
-| R3 | `6d71567` (hosted CI `33229628657`; Turing source PASS) | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`, `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`, `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
+| R2 | `3556a9a5a509b6773898213870f289e6dbb1ff5b` (hosted CI `33245879472`; Turing exact-head source review) | `crates/myownmesh/tests/ctl_mfa_transaction_r2.rs::shipped_ctl_mfa_prepare_commit_query_redeliver_and_stale_successor_are_exact`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_cross_process_prepare_race_returns_one_exact_prepared_record`, `crates/myownmesh/tests/custody_recovery_r2.rs::v4_r2_child_hard_death_distinguishes_prepared_from_delivered_enrollment`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_recovers_exact_existing_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_concurrent_prepare_callers_share_one_prepared_material`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_refuses_committed_until_explicit_abort`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_prepare_explicit_abort_permits_fresh_successor`, `crates/myownmesh-core/src/custody.rs::tests::v4_r2_disable_refuses_prepared_material_until_explicit_abort`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_endpoint_is_verified_as_exact_owner_only_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_replaces_an_owned_stale_socket`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_non_socket_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_symlink_without_mutation`, `crates/myownmesh/src/control/listener.rs::tests::unix_control_refuses_an_accessible_unrelated_parent_without_chmod`, `crates/myownmesh/src/control/listener.rs::tests::windows_pipe_dacl_names_current_token_user_not_owner_rights`, `crates/myownmesh/src/control/listener.rs::tests::windows_current_user_pipe_connects_and_is_accepted`, `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_verifies_same_user_pipe_server_before_request`, and `crates/myownmesh/src/cli/ctl.rs::tests::windows_ctl_refuses_mismatched_or_unverifiable_server_sid`; full unread-response shipped-daemon choreography is Unix-gated, not identical Windows crash choreography |
+| R3 | `6d71567` (hosted CI `33229628657`; Turing source review) | `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_pending_proof_is_persisted_before_send_and_replayed_after_restart`, `crates/myownmesh-core/tests/durable_proof_delivery_r3.rs::r3_stale_e0_is_superseded_before_e1_reconnect_replay`, `crates/myownmesh-core/src/engine/mod.rs::v4_b2_speculative_proof_ack_is_bound_to_exact_w1`, `crates/myownmesh-core/tests/closed_network_governance.rs::evicted_offline_device_learns_on_reconnect_and_stands_down` |
 | R4 | `0237f9e02df3ab21131c5612c1b231050c860cc4` (supersedes `7fb4708d01895269b4aff809857b9d6ffe88d6ad`, which supersedes `0b9b5b2c5be60f8204aa2fef4e14259e5d385611`) | `v4_m2_a_carrier_withdrawal_selects_only_an_unpromoted_attempt` (default feature), `v4_m2_a_third_party_lan_claim_creates_no_session_and_moves_nothing_durable` (default feature), `v4_m2_a_carrier_withdrawal_cannot_retire_a_promoted_session` (`transport-lab`) |

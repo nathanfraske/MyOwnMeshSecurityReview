@@ -62,7 +62,9 @@ use tracing::{debug, info, trace, warn};
 use crate::nostr::event::{
     make_event, now_secs, NostrEvent, NostrIdentity, SIGNALING_EPHEMERAL_KIND, SIGNALING_EVENT_KIND,
 };
-use crate::task_custodian::{CustodianReservation, DedicatedTaskCustodian, TaskCustodian};
+#[cfg(test)]
+use crate::task_custodian::DedicatedTaskCustodian;
+use crate::task_custodian::{CustodianReservation, TaskCustodian};
 use crate::{Error, Result};
 
 type WriterRegistry = Arc<Mutex<HashMap<u64, Option<JoinHandle<()>>>>>;
@@ -79,14 +81,30 @@ struct FallbackReaperTasks {
     capacity: usize,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     overflow: Mutex<Option<JoinHandle<()>>>,
+    /// The caller-funded terminal owner used when both the runtime reaper
+    /// channel and this bounded staging area are unavailable.  Keeping this
+    /// owner beside the staging state makes the last-resort path preserve the
+    /// exact handle instead of aborting or detaching it.
+    custodian_owner: Option<Arc<dyn TaskCustodian>>,
 }
 
 impl FallbackReaperTasks {
+    #[cfg(test)]
     fn new(capacity: usize) -> Arc<Self> {
         Arc::new(Self {
             capacity,
             tasks: Mutex::new(Vec::with_capacity(capacity)),
             overflow: Mutex::new(None),
+            custodian_owner: None,
+        })
+    }
+
+    fn with_owner(capacity: usize, custodian_owner: Arc<dyn TaskCustodian>) -> Arc<Self> {
+        Arc::new(Self {
+            capacity,
+            tasks: Mutex::new(Vec::with_capacity(capacity)),
+            overflow: Mutex::new(None),
+            custodian_owner: Some(custodian_owner),
         })
     }
 
@@ -348,7 +366,8 @@ pub struct RelayStatsSnapshot {
     pub events_relayed: u64,
 }
 
-/// A running signaling relay. Constructed via [`SignalingServer::start`].
+/// A running signaling relay. Constructed via
+/// [`SignalingServer::start_with_custodian`].
 pub struct SignalingServer;
 
 struct RegistryTerminal {
@@ -577,10 +596,9 @@ impl Drop for SignalingServerHandle {
 }
 
 /// Abort a task owned by a dropped server, then transfer its exact join handle
-/// to the runtime-owned reaper. The channel capacity is derived from the
-/// maximum number of connection and writer slots, so this synchronous Drop
-/// path never needs to block or detach a task when it runs outside a Tokio
-/// runtime.
+/// to the runtime-owned reaper. Full or closed reaper channels use the
+/// bounded owner-backed staging path; no synchronous wait or detached task is
+/// permitted from `Drop`.
 fn abort_and_join(
     reaper: &TaskReaperSender,
     task: JoinHandle<()>,
@@ -591,34 +609,24 @@ fn abort_and_join(
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(task))
         | Err(tokio::sync::mpsc::error::TrySendError::Closed(task)) => {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                retain_or_overflow(fallback, task, "signaling task");
-            } else {
-                let result = futures::executor::block_on(task);
-                if let Err(error) = result {
-                    if !error.is_cancelled() {
-                        warn!("synchronously reaped signaling fallback task: {error}");
-                    }
-                }
-                #[cfg(test)]
-                record_reaped_fallback();
-            }
+            retain_or_overflow(fallback, task, "signaling task");
         }
     }
 }
 
 fn retain_or_join_fallback(fallback: &Arc<FallbackReaperTasks>, task: JoinHandle<()>) {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        retain_or_overflow(fallback, task, "signaling fallback task");
-    } else {
-        let result = futures::executor::block_on(task);
-        if let Err(error) = result {
-            if !error.is_cancelled() {
-                warn!("synchronously reaped signaling fallback reaper: {error}");
-            }
+    if let Some(owner) = fallback.custodian_owner.as_ref() {
+        let mut reservation = owner.reserve(1).unwrap_or_else(|error| {
+            panic!("signaling fallback custody violated its preflight contract: {error:?}")
+        });
+        if let Err(task) = reservation.submit(task) {
+            panic!(
+                "signaling fallback custodian rejected a preflighted handle; returned handle must remain owned: {:?}",
+                task
+            );
         }
-        #[cfg(test)]
-        record_reaped_fallback();
+    } else {
+        retain_or_overflow(fallback, task, "signaling fallback task");
     }
 }
 
@@ -645,8 +653,37 @@ fn retain_or_overflow(fallback: &Arc<FallbackReaperTasks>, task: JoinHandle<()>,
         Err(task) => task,
     };
     if let Err(task) = fallback.retain_overflow(task) {
-        task.abort();
-        warn!(%context, "signaling fallback custody exhausted after bounded overflow");
+        if let Some(owner) = fallback.custodian_owner.as_ref() {
+            let mut reservation = owner.reserve(1).unwrap_or_else(|error| {
+                panic!(
+                    "signaling terminal custody violated its preflight contract ({context}): {error:?}"
+                )
+            });
+            if let Err(task) = reservation.submit(task) {
+                panic!(
+                    "signaling terminal custodian rejected a preflighted handle ({context}); returned handle must remain owned: {:?}",
+                    task
+                );
+            }
+        } else {
+            // Unit controls construct a deliberately tiny holder without an
+            // external owner to exercise the bounded overflow branch.  Keep
+            // that seam test-only in spirit; production holders always carry
+            // the caller-selected custodian above.
+            #[cfg(test)]
+            {
+                task.abort();
+                warn!(
+                    %context,
+                    "signaling test fallback custody exhausted after bounded overflow"
+                );
+            }
+            #[cfg(not(test))]
+            {
+                let _ = &task;
+                panic!("signaling terminal custody missing caller-funded owner ({context})");
+            }
+        }
     }
 }
 
@@ -700,23 +737,33 @@ async fn reap_owned_tasks(
 }
 
 impl SignalingServer {
+    /// Number of caller-funded task slots needed by one relay.  The first
+    /// term covers every handle which can be transferred synchronously from
+    /// `Drop`; the second covers one exact terminal observer per live
+    /// connection and writer placeholder.
+    pub fn required_task_custody_slots(limits: &Limits) -> Result<usize> {
+        let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
+        registry_capacity
+            .checked_mul(4)
+            .and_then(|capacity| capacity.checked_add(3))
+            .ok_or_else(|| Error::Other("signaling custodian capacity overflow".into()))
+    }
+
     /// Bind a TCP listener and start accepting WebSocket signaling
     /// connections. Returns once the socket is bound; the accept loop
     /// runs in a spawned task.
     pub async fn start(bind: &str, port: u16, limits: Limits) -> Result<SignalingServerHandle> {
-        let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
-        let custody_capacity = registry_capacity
-            .checked_mul(2)
-            .and_then(|capacity| capacity.checked_add(1))
-            .ok_or_else(|| Error::Other("signaling custodian capacity overflow".into()))?;
-        let custodian_owner = DedicatedTaskCustodian::new(custody_capacity)
-            .map_err(|error| Error::Other(format!("signaling custodian unavailable: {error:?}")))?;
-        Self::start_with_custodian(bind, port, limits, custodian_owner).await
+        let _ = (bind, port);
+        limits.validate()?;
+        Err(Error::Other(
+            "signaling startup requires caller-funded task custody; use start_with_custodian"
+                .into(),
+        ))
     }
 
-    /// Start with a lifecycle-owned final-task custodian. Its capacity must
-    /// cover one final reaper plus the server's maximum simultaneous
-    /// connection and writer terminal wrappers.
+    /// Start with a caller-selected lifecycle task custodian. Its capacity
+    /// must satisfy [`Self::required_task_custody_slots`] before any socket
+    /// or worker side effect is admitted.
     pub async fn start_with_custodian(
         bind: &str,
         port: u16,
@@ -727,6 +774,16 @@ impl SignalingServer {
         let writer_stop_timeout = limits.writer_stop_timeout();
         let heartbeat_interval = limits.stats_heartbeat_interval();
         let registry_capacity = Limits::checked_usize(limits.max_connections, "max_connections")?;
+        // Validate the complete finite owner envelope before binding or
+        // spawning.  This includes both synchronous Drop transfers and the
+        // per-registry terminal observers.
+        let custody_capacity = Self::required_task_custody_slots(&limits)?;
+        let probe = custodian_owner.reserve(custody_capacity).map_err(|error| {
+            Error::Other(format!(
+                "signaling task custodian cannot fund required envelope: {error:?}"
+            ))
+        })?;
+        drop(probe);
         let addr = format!("{bind}:{port}");
         let listener = TcpListener::bind(&addr)
             .await
@@ -746,10 +803,11 @@ impl SignalingServer {
             .checked_mul(2)
             .and_then(|capacity| capacity.checked_add(2))
             .ok_or_else(|| Error::Other("signaling task reaper capacity overflow".into()))?;
-        let fallback_reaper_tasks = FallbackReaperTasks::new(
+        let fallback_reaper_tasks = FallbackReaperTasks::with_owner(
             reaper_capacity
                 .checked_add(1)
                 .ok_or_else(|| Error::Other("signaling fallback capacity overflow".into()))?,
+            Arc::clone(&custodian_owner),
         );
         let custodian = custodian_owner.reserve(1).map_err(|error| {
             Error::Other(format!(
@@ -2460,6 +2518,17 @@ mod tests {
         (id, input)
     }
 
+    async fn start_test_server(
+        bind: &str,
+        port: u16,
+        limits: Limits,
+    ) -> Result<SignalingServerHandle> {
+        let capacity = SignalingServer::required_task_custody_slots(&limits)?;
+        let owner = DedicatedTaskCustodian::new(capacity)
+            .map_err(|error| Error::Other(format!("test custodian: {error:?}")))?;
+        SignalingServer::start_with_custodian(bind, port, limits, owner).await
+    }
+
     fn send_event(hub: &Hub, conn_id: u64, event: &NostrEvent) -> bool {
         let frame = serde_json::to_string(&json!(["EVENT", event])).unwrap();
         hub.inner.lock().on_client_message(conn_id, &frame)
@@ -3375,7 +3444,7 @@ mod tests {
         TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
         TEST_WRITER_PARKED.store(false, Ordering::Release);
         TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
-        let server = SignalingServer::start(
+        let server = start_test_server(
             "127.0.0.1",
             0,
             Limits {
@@ -3462,7 +3531,7 @@ mod tests {
         TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
         TEST_WRITER_PARKED.store(false, Ordering::Release);
         TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
-        let server = SignalingServer::start(
+        let server = start_test_server(
             "127.0.0.1",
             0,
             Limits {
@@ -3535,7 +3604,7 @@ mod tests {
         TEST_PARK_NEXT_WRITER.store(true, Ordering::Release);
         TEST_WRITER_PARKED.store(false, Ordering::Release);
         TEST_PANIC_AFTER_WRITER.store(true, Ordering::Release);
-        let server = SignalingServer::start(
+        let server = start_test_server(
             "127.0.0.1",
             0,
             Limits {

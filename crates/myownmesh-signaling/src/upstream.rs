@@ -23,8 +23,8 @@
 //! first thing it does (`run_relay_session`) — subscription state can
 //! never outlive the socket it was opened on, so there is nothing to
 //! "replay" and nothing to forget. Flood control lives at the one
-//! layer that owns reconnection: the per-socket dial backoff in
-//! `run_relay` (2 → 60 s, jittered ±15%). An earlier design carried a
+//! layer that owns reconnection: the owner-configured per-socket dial
+//! backoff in `run_relay`, with owner-configured jitter. An earlier design carried a
 //! separate REQ-level anti-flood schedule (`SubscriptionReplay`); it
 //! was redundant with the socket backoff — a REQ is only ever sent
 //! when a socket was just established, which the backoff already
@@ -52,26 +52,17 @@
 //!
 //! **Our fix:** The signal handler tracks the timestamp of the last
 //! inbound signaling message per peer. If a fresh announce arrives
-//! and the prior gap exceeds 25s (~5× the 5.333s announce cadence),
+//! and the prior gap exceeds the network's checked stale-inbound policy,
 //! the previous connection is treated as a zombie regardless of
 //! reported `connectionState`. Mesh-level identity validation (the
 //! ed25519 auth_response over both pubkeys + nonce) authenticates
 //! the new handshake — no grace window needed at the signaling layer.
 //!
-//! Constant: [`STALE_INBOUND_MS`] (25,000 ms).
+//! The engine owns the threshold as a checked per-network scheduler policy;
+//! the signaling crate supplies no process-wide staleness fallback.
 //!
-//! # 4. Flush stale offer pool on peer drop
-//!
-//! **Problem:** Trystero pre-warms a pool of WebRTC offers (with
-//! gathered ICE candidates). After a local network change, every
-//! pre-cached offer has stale candidates — the remote will ICE-check
-//! our old IP, fail, and never respond.
-//!
-//! **Our fix:** On any peer drop, drain the offer pool so the next
-//! checkout allocates a fresh peer with current candidates. Throttled
-//! to once per 10s so a wave of drops doesn't hammer the gatherer.
-//!
-//! Constant: [`OFFER_POOL_FLUSH_THROTTLE_MS`] (10,000 ms).
+//! Historical offer-pool note: the current engine does not retain a
+//! production offer-pool flush timer.
 //!
 //! # 5. State-transition logging
 //!
@@ -200,20 +191,6 @@
 //! the negotiation is deleted rather than capped.
 //!
 //! Implementation: `desired_filters` in [`super::nostr::driver`].
-
-/// Inbound-message staleness threshold for zombie clearing — see
-/// item 3. Picked at ~5× the legacy 5.333s announce cadence, well
-/// above any single-relay blip (every fresh socket re-REQs first
-/// thing, see item 1).
-pub const STALE_INBOUND_MS: u64 = 25_000;
-
-/// Minimum time between offer-pool flushes — see item 4. A wave
-/// of peer drops within this window collapses to one flush.
-pub const OFFER_POOL_FLUSH_THROTTLE_MS: u64 = 10_000;
-
-/// Disconnected-peer grace window before the engine tears down the
-/// connection. Matches Trystero's `disconnectedPeerGraceMs`.
-pub const DISCONNECTED_PEER_GRACE_MS: u64 = 7_500;
 
 /// Adaptive announce schedule — see `upstream.rs` item 7.
 ///

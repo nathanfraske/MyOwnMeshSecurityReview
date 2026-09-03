@@ -21,8 +21,8 @@ use super::super::{ConnectionCancel, ControlState};
 use super::{funded, unknown_network, Answer};
 use crate::control::framing::{prepare_typed_and_line_building, AdmittedLineOut, FrameAdmission};
 use crate::control::reply::{
-    prepare_reply_then, FundedVariableReply, NetworkLifecycleSummary, OperationReplyData,
-    PreparedReply, ResponseOwner,
+    prepare_reply_then, ClosedRelayReply, FundedDiagnostic, FundedVariableReply,
+    NetworkLifecycleSummary, OperationReplyData, PreparedReply, ResponseOwner,
 };
 
 /// Serialize control-surface mutations that pair a registry transition with
@@ -276,6 +276,421 @@ pub(in crate::control) async fn network_add(
     }
 
     owner.finish(Ok(OperationReplyData::Added(summary)))
+}
+
+/// Register a network that was created or imported through a dedicated core
+/// lifecycle API. This keeps the shipped Closed paths distinct from
+/// `NetworkAdd` while sharing the same attach, advert, rollback, and config
+/// persistence fence.
+async fn register_new_network(
+    state: &Arc<ControlState>,
+    config: NetworkConfig,
+    joined: myownmesh_core::JoinedNetwork,
+    owner: ResponseOwner,
+) -> FundedVariableReply {
+    let summary = NetworkLifecycleSummary {
+        config_id: joined.config_id().to_owned(),
+        network_id: joined.network_id().to_owned(),
+        label: joined.label().to_owned(),
+        phase: joined.current_phase(),
+        topology: joined.current_topology(),
+        restarted: false,
+    };
+    let drivers = match joined.attach_signaling() {
+        Ok(drivers) => drivers,
+        Err(error) => {
+            let message = preserve_shutdown_failure(
+                format!("signaling attach failed: {error}"),
+                joined.shutdown().await.map_err(|error| anyhow!("{error}")),
+            );
+            return owner.finish(Err(message));
+        }
+    };
+    if let Some(refused) = state.registry.insert(joined, drivers).into_refusal() {
+        let refusal_state = refused.state;
+        if let Some(drivers) = refused.drivers {
+            drivers.shutdown().await;
+        }
+        let message = preserve_shutdown_failure(
+            format!("network id is held by a runtime in {refusal_state:?} state"),
+            refused
+                .joined
+                .shutdown()
+                .await
+                .map_err(|error| anyhow!("{error}")),
+        );
+        return owner.finish(Err(message));
+    }
+    let inserted_owner = match state.registry.get(&config.id) {
+        Some(owner) => owner,
+        None => {
+            return owner.finish(Err(
+                "network joined but its registry owner was lost before advert refresh".to_string(),
+            ));
+        }
+    };
+    if let Err(advert_error) = state.services.on_network_added(&config.id).await {
+        let rollback_error = match state
+            .registry
+            .remove_if_current(&config.id, &inserted_owner)
+            .await
+        {
+            RemoveResult::Removed(Ok(())) => None,
+            RemoveResult::Removed(Err(error)) => Some(format!(
+                "network advert rollback teardown reported failure: {error}"
+            )),
+            RemoveResult::AlreadyClosing(observation) => observation
+                .outcome
+                .err()
+                .map(|error| format!("network advert rollback teardown reported failure: {error}")),
+            RemoveResult::NotFound => Some(
+                "network advert rollback lost the exact registry owner before retirement"
+                    .to_string(),
+            ),
+        };
+        state.services.on_network_removed(&config.id).await;
+        let message = format!("network joined but service advert save failed: {advert_error}");
+        return owner.finish(Err(match rollback_error {
+            Some(rollback_error) => format!("{message}; {rollback_error}"),
+            None => message,
+        }));
+    }
+    let persist_config = config.clone();
+    let remove_state = Arc::clone(state);
+    let remove_id = config.id.clone();
+    let withdraw_state = Arc::clone(state);
+    let withdraw_id = config.id.clone();
+    if let Some(message) = persist_or_rollback_added_network(
+        move || persist_network_add(&persist_config),
+        move || async move { remove_state.registry.remove(&remove_id).await },
+        move || async move {
+            withdraw_state
+                .services
+                .on_network_removed(&withdraw_id)
+                .await
+        },
+    )
+    .await
+    {
+        return owner.finish(Err(message));
+    }
+    owner.finish(Ok(OperationReplyData::Added(summary)))
+}
+
+pub(in crate::control) async fn network_create_closed(
+    state: &Arc<ControlState>,
+    config: NetworkConfig,
+    owner: ResponseOwner,
+) -> FundedVariableReply {
+    let _mutation_guard = network_mutation_guard().await;
+    if !matches!(config.kind, myownmesh_core::config::NetworkKind::Closed) {
+        return owner.finish(Err("Closed network creation requires kind=closed".into()));
+    }
+    match state.registry.classify_join(&config.id, &config.network_id) {
+        crate::registry::JoinAdmission::Existing(existing) => {
+            return owner.finish(Err(format!(
+                "network is already joined by config id '{}'",
+                existing.config_id()
+            )));
+        }
+        crate::registry::JoinAdmission::Collision(runtime) => {
+            return owner.finish(Err(format!(
+                "network identity collision: requested pair ({}, {}), owner is in {runtime:?} state",
+                config.id, config.network_id
+            )));
+        }
+        crate::registry::JoinAdmission::Empty => {}
+    }
+    let mut creation_id = [0u8; 32];
+    if let Err(error) = getrandom::getrandom(&mut creation_id) {
+        return owner.finish(Err(format!("Closed bootstrap nonce unavailable: {error}")));
+    }
+    let joined = match state.mesh.create_network(config.clone(), creation_id).await {
+        Ok(joined) => joined,
+        Err(error) => return owner.finish(Err(format!("Closed network creation: {error}"))),
+    };
+    register_new_network(state, config, joined, owner).await
+}
+
+pub(in crate::control) async fn network_import_closed(
+    state: &Arc<ControlState>,
+    config: NetworkConfig,
+    expected_context_id: myownmesh_core::semantic::MeshContextId,
+    bootstrap: myownmesh_core::semantic::BootstrapRecord,
+    owner: ResponseOwner,
+) -> FundedVariableReply {
+    let _mutation_guard = network_mutation_guard().await;
+    if !matches!(config.kind, myownmesh_core::config::NetworkKind::Closed) {
+        return owner.finish(Err("Closed network import requires kind=closed".into()));
+    }
+    match state.registry.classify_join(&config.id, &config.network_id) {
+        crate::registry::JoinAdmission::Existing(existing) => {
+            return owner.finish(Err(format!(
+                "network is already joined by config id '{}'",
+                existing.config_id()
+            )));
+        }
+        crate::registry::JoinAdmission::Collision(runtime) => {
+            return owner.finish(Err(format!(
+                "network identity collision: requested pair ({}, {}), owner is in {runtime:?} state",
+                config.id, config.network_id
+            )));
+        }
+        crate::registry::JoinAdmission::Empty => {}
+    }
+    let joined = match state
+        .mesh
+        .import_network(config.clone(), expected_context_id, bootstrap)
+        .await
+    {
+        Ok(joined) => joined,
+        Err(error) => return owner.finish(Err(format!("Closed network import: {error}"))),
+    };
+    register_new_network(state, config, joined, owner).await
+}
+
+fn relay_failure(admission: &FrameAdmission, message: String) -> Result<Answer> {
+    super::refused_text(message, admission)
+}
+
+fn relay_open_reply(
+    capability: crate::registry::ClosedRelayCapability,
+    active_allocations: usize,
+    owner: ResponseOwner,
+    admission: &FrameAdmission,
+    accepted: bool,
+) -> Result<Answer> {
+    let snapshot = capability.snapshot;
+    let reply = if accepted {
+        ClosedRelayReply::Accepted {
+            handle: capability.handle,
+            generation: snapshot.generation,
+            network: snapshot.network,
+            peer: snapshot.peer,
+            relay: snapshot.relay,
+            session_id: snapshot.session_id,
+            allocation_epoch: snapshot.allocation_epoch,
+            active_allocations,
+            max_allocations: snapshot.max_allocations,
+            max_frame_bytes: snapshot.max_frame_bytes,
+        }
+    } else {
+        ClosedRelayReply::Opened {
+            handle: capability.handle,
+            generation: snapshot.generation,
+            network: snapshot.network,
+            peer: snapshot.peer,
+            relay: snapshot.relay,
+            session_id: snapshot.session_id,
+            allocation_epoch: snapshot.allocation_epoch,
+            active_allocations,
+            max_allocations: snapshot.max_allocations,
+            max_frame_bytes: snapshot.max_frame_bytes,
+        }
+    };
+    funded(
+        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
+        admission,
+    )
+}
+
+pub(in crate::control) async fn closed_relay_open(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    relay: String,
+    target: String,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner =
+        ResponseOwner::acquire(admission).context("Closed relay open response was not admitted")?;
+    let resources = match state.mesh.local_application_resource_scope() {
+        Ok(resources) => resources,
+        Err(error) => {
+            return relay_failure(admission, format!("Closed relay custody scope: {error}"))
+        }
+    };
+    let reservation = match state.closed_relays.reserve(&resources, &joined) {
+        Ok(reservation) => reservation,
+        Err(error) => return relay_failure(admission, error.to_string()),
+    };
+    let channel = match joined.open_closed_relay(&relay, &target).await {
+        Ok(channel) => channel,
+        Err(error) => return relay_failure(admission, format!("Closed relay open: {error}")),
+    };
+    let capability = match reservation.commit(channel) {
+        Ok(capability) => capability,
+        Err(error) => {
+            let close_error = error.channel.close().await.err();
+            let message = match close_error {
+                Some(close_error) => format!("{}; cleanup failed: {close_error}", error.message),
+                None => error.message.to_string(),
+            };
+            return relay_failure(admission, message);
+        }
+    };
+    let active_allocations = state
+        .closed_relays
+        .state(&capability.handle)
+        .await
+        .map(|(_, active)| active)
+        .unwrap_or(0);
+    relay_open_reply(capability, active_allocations, owner, admission, false)
+        .context("Closed relay open response line was not admitted")
+}
+
+pub(in crate::control) async fn closed_relay_accept(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    wait_ms: u64,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner = ResponseOwner::acquire(admission)
+        .context("Closed relay accept response was not admitted")?;
+    let resources = match state.mesh.local_application_resource_scope() {
+        Ok(resources) => resources,
+        Err(error) => {
+            return relay_failure(admission, format!("Closed relay custody scope: {error}"))
+        }
+    };
+    let reservation = match state.closed_relays.reserve(&resources, &joined) {
+        Ok(reservation) => reservation,
+        Err(error) => return relay_failure(admission, error.to_string()),
+    };
+    let channel = match tokio::time::timeout(
+        std::time::Duration::from_millis(wait_ms),
+        joined.accept_closed_relay(),
+    )
+    .await
+    {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => return relay_failure(admission, format!("Closed relay accept: {error}")),
+        Err(_) => return relay_failure(admission, "Closed relay accept wait expired".into()),
+    };
+    let capability = match reservation.commit(channel) {
+        Ok(capability) => capability,
+        Err(error) => {
+            let close_error = error.channel.close().await.err();
+            let message = match close_error {
+                Some(close_error) => format!("{}; cleanup failed: {close_error}", error.message),
+                None => error.message.to_string(),
+            };
+            return relay_failure(admission, message);
+        }
+    };
+    let active_allocations = state
+        .closed_relays
+        .state(&capability.handle)
+        .await
+        .map(|(_, active)| active)
+        .unwrap_or(0);
+    relay_open_reply(capability, active_allocations, owner, admission, true)
+        .context("Closed relay accept response line was not admitted")
+}
+
+pub(in crate::control) async fn closed_relay_send(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    handle: String,
+    payload: Vec<u8>,
+) -> Result<Answer> {
+    let owner =
+        ResponseOwner::acquire(admission).context("Closed relay send response was not admitted")?;
+    let (snapshot, bytes) = match state.closed_relays.send(&handle, &payload).await {
+        Ok(result) => result,
+        Err(error) => return relay_failure(admission, format!("Closed relay send: {error}")),
+    };
+    let reply = ClosedRelayReply::Sent {
+        handle,
+        generation: snapshot.generation,
+        allocation_epoch: snapshot.allocation_epoch,
+        bytes,
+    };
+    funded(
+        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
+        admission,
+    )
+    .context("Closed relay send response line was not admitted")
+}
+
+pub(in crate::control) async fn closed_relay_recv(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    handle: String,
+    wait_ms: u64,
+) -> Result<Answer> {
+    let owner = ResponseOwner::acquire(admission)
+        .context("Closed relay receive response was not admitted")?;
+    let (snapshot, payload) = match state.closed_relays.recv(&handle, wait_ms).await {
+        Ok(result) => result,
+        Err(error) => return relay_failure(admission, format!("Closed relay receive: {error}")),
+    };
+    let reply = ClosedRelayReply::Received {
+        handle,
+        generation: snapshot.generation,
+        allocation_epoch: snapshot.allocation_epoch,
+        payload,
+    };
+    funded(
+        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
+        admission,
+    )
+    .context("Closed relay receive response line was not admitted")
+}
+
+pub(in crate::control) async fn closed_relay_close(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    handle: String,
+) -> Result<Answer> {
+    let owner = ResponseOwner::acquire(admission)
+        .context("Closed relay close response was not admitted")?;
+    let snapshot = match state.closed_relays.close(&handle).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return relay_failure(admission, format!("Closed relay close: {error}")),
+    };
+    let reply = ClosedRelayReply::Closed {
+        handle,
+        generation: snapshot.generation,
+        allocation_epoch: snapshot.allocation_epoch,
+    };
+    funded(
+        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
+        admission,
+    )
+    .context("Closed relay close response line was not admitted")
+}
+
+pub(in crate::control) async fn closed_relay_state(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    handle: String,
+) -> Result<Answer> {
+    let owner = ResponseOwner::acquire(admission)
+        .context("Closed relay state response was not admitted")?;
+    let (snapshot, active_allocations) = match state.closed_relays.state(&handle).await {
+        Ok(result) => result,
+        Err(error) => return relay_failure(admission, format!("Closed relay state: {error}")),
+    };
+    let reply = ClosedRelayReply::State {
+        handle,
+        generation: snapshot.generation,
+        network: snapshot.network,
+        allocation_epoch: snapshot.allocation_epoch,
+        active_allocations,
+        max_allocations: snapshot.max_allocations,
+        max_frame_bytes: snapshot.max_frame_bytes,
+    };
+    funded(
+        PreparedReply::ClosedRelay(FundedDiagnostic::new(reply, owner)),
+        admission,
+    )
+    .context("Closed relay state response line was not admitted")
 }
 
 /// Complete the on-disk half of forgetting a network under its exact owner.
@@ -802,14 +1217,16 @@ pub(in crate::control) async fn network_update(
     let restart = joined.reconcile_status(&config);
     // Name the path taken so a config-driven flap is greppable: a hot-apply
     // keeps every live peer; a restart drops them. Network identity,
-    // signaling, closed-relay profile, scheduler, and broadcaster capacities
-    // force the restart; STUN/TURN remain hot (see `reconcile`).
+    // signaling, closed-relay profile, semantic policy, scheduler, and
+    // broadcaster capacities force the restart; STUN/TURN remain hot (see
+    // `reconcile`).
     info!(
         network = %config.network_id,
         needs_restart = restart.needs_restart,
         signaling_changed = restart.signaling_changed,
         network_id_changed = restart.network_id_changed,
         closed_relay_changed = restart.closed_relay_changed,
+        semantic_policy_changed = restart.semantic_policy_changed,
         scheduler_changed = restart.scheduler_changed,
         event_capacity_changed = restart.event_capacity_changed,
         connection_trace_capacity_changed = restart.connection_trace_capacity_changed,

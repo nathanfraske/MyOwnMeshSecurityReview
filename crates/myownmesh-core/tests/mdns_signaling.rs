@@ -20,12 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    ClosedRelayPolicyConfig, NetworkConfig, SignalingConfig, TopologyMode,
+    ClosedRelayPolicyConfig, NetworkConfig, RoutingPolicyConfig, SignalingConfig, TopologyMode,
 };
 use myownmesh_core::engine::conn_trace::ConnTrace;
-use myownmesh_core::engine::transport_lab::{
-    attach_signaling, join_open_participation, spawn_network,
-};
+use myownmesh_core::engine::transport_lab::{attach_signaling, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::DeviceId;
 use myownmesh_core::{MeshEvent, PeerEvent};
@@ -48,6 +46,22 @@ fn driver_custodian() -> Arc<dyn TaskCustodian> {
 
 fn reaper_custodian() -> Arc<dyn TaskCustodian> {
     DedicatedTaskCustodian::new(2).expect("reaper custodian starts") as Arc<dyn TaskCustodian>
+}
+
+async fn start_test_relay(
+    limits: myownmesh_signaling::server::Limits,
+) -> Result<myownmesh_signaling::server::SignalingServerHandle, myownmesh_signaling::Error> {
+    let capacity =
+        myownmesh_signaling::server::SignalingServer::required_task_custody_slots(&limits)?;
+    let owner = DedicatedTaskCustodian::new(capacity)
+        .map_err(|error| myownmesh_signaling::Error::Other(format!("test custodian: {error:?}")))?;
+    myownmesh_signaling::server::SignalingServer::start_with_custodian(
+        "127.0.0.1",
+        0,
+        limits,
+        owner,
+    )
+    .await
 }
 
 #[cfg(not(any(target_os = "ios", feature = "system-dnssd")))]
@@ -174,13 +188,14 @@ fn network_config(id: &str, network_id: &str, signaling: SignalingConfig) -> Net
         connection_trace_capacity: 512,
         label: id.to_string(),
         kind: Default::default(),
+        semantic_policy: Default::default(),
         scheduler: Default::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling,
         closed_relay: ClosedRelayPolicyConfig::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -495,13 +510,6 @@ async fn two_peers_handshake_over_mdns_only() {
     .await
     .expect("bob engine");
 
-    join_open_participation(&alice_state)
-        .await
-        .expect("alice joins Open participation");
-    join_open_participation(&bob_state)
-        .await
-        .expect("bob joins Open participation");
-
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();
     let mut alice_traces = alice_state.subscribe_conn_trace();
@@ -546,13 +554,9 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
 
     // Self-hosted relay so the Nostr driver needs no public
     // infrastructure either.
-    let relay = myownmesh_signaling::server::SignalingServer::start(
-        "127.0.0.1",
-        0,
-        myownmesh_signaling::server::Limits::default(),
-    )
-    .await
-    .expect("relay");
+    let relay = start_test_relay(myownmesh_signaling::server::Limits::default())
+        .await
+        .expect("relay");
     let relay_url = format!("ws://127.0.0.1:{}", relay.local_addr().port());
 
     let both = SignalingConfig {
@@ -582,13 +586,6 @@ async fn two_peers_handshake_with_nostr_and_mdns_fanout() {
     )
     .await
     .expect("bob engine");
-
-    join_open_participation(&alice_state)
-        .await
-        .expect("alice joins Open participation");
-    join_open_participation(&bob_state)
-        .await
-        .expect("bob joins Open participation");
 
     let mut alice_events = alice_state.events_tx.subscribe();
     let mut bob_events = bob_state.events_tx.subscribe();

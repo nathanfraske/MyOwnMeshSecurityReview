@@ -31,6 +31,12 @@ const expectedRequestVariants = [
   "NetworkIdNormalize",
   "ConfigShow",
   "NetworkAdd",
+  "NetworkCreateClosed",
+  "NetworkImportClosed",
+  "NetworkBootstrapExport",
+  "SemanticFactPageExport",
+  "SemanticFactPageImport",
+  "SemanticStateIdentity",
   "NetworkRemove",
   "ForgetAllNetworks",
   "FactoryReset",
@@ -67,6 +73,12 @@ const expectedRequestVariants = [
   "GovernanceMfaAbort",
   "GovernanceMfaStatus",
   "GovernanceMfaDisable",
+  "ClosedRelayOpen",
+  "ClosedRelayAccept",
+  "ClosedRelaySend",
+  "ClosedRelayRecv",
+  "ClosedRelayClose",
+  "ClosedRelayState",
   "UpdateStatus",
   "UpdateCheck",
   "UpdateApply",
@@ -378,14 +390,14 @@ test("daemon and Tauri Request enums have exhaustive exact wire coverage", () =>
   const tauriVariants = rustVariantNames(tauriClientSource, "Request");
   const expected = [...expectedRequestVariants].sort();
 
-  assert.equal(expected.length, 51);
+  assert.equal(expected.length, 63);
   assert.deepEqual([...new Set(daemonVariants)].sort(), expected);
   assert.deepEqual([...new Set(tauriVariants)].sort(), expected);
-  assert.equal(daemonVariants.length, 51, "daemon Request has duplicate/missing variants");
-  assert.equal(tauriVariants.length, 51, "Tauri Request has duplicate/missing variants");
+  assert.equal(daemonVariants.length, 63, "daemon Request has duplicate/missing variants");
+  assert.equal(tauriVariants.length, 63, "Tauri Request has duplicate/missing variants");
 
   const fixtureVariants = fixtureVariantNames();
-  assert.equal(fixtureVariants.length, 51, "Tauri fixture must cover every variant once");
+  assert.equal(fixtureVariants.length, 63, "Tauri fixture must cover every variant once");
   assert.deepEqual([...new Set(fixtureVariants)].sort(), expected);
 
   for (const source of [daemonWireSource, tauriClientSource]) {
@@ -396,7 +408,7 @@ test("daemon and Tauri Request enums have exhaustive exact wire coverage", () =>
   }
 
   const wireNames = expectedRequestVariants.map(snakeCase);
-  assert.equal(new Set(wireNames).size, 51, "wire operation names must remain unique");
+  assert.equal(new Set(wireNames).size, 63, "wire operation names must remain unique");
   assert.deepEqual(
     fixtureWireTagNames().sort(),
     wireNames.sort(),

@@ -31,12 +31,9 @@ myownmesh-updater = { path = "crates/myownmesh-updater", version = "0.3.2" }
 
 # Async runtime
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs", "signal", "process"] }
-tokio-util = { version = "0.7", features = ["rt", "codec"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 futures = "0.3"
 futures-util = "0.3"
 async-trait = "0.1"
-pin-project-lite = "0.2"
 
 # WebRTC transport
 webrtc = "0.13"
@@ -65,6 +62,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 # Concurrent data structures
 dashmap = "6"
 parking_lot = "0.12"
+rusqlite = { version = "=0.39.0", features = ["bundled", "hooks"] }
 
 # Crypto + encoding
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
@@ -104,7 +102,6 @@ secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
 # Bin
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
-which = "6"
 # Effective-uid check for `service --system` (Unix only). Already in the
 # tree transitively via the webrtc stack; promoting it to a direct dep
 # adds nothing.

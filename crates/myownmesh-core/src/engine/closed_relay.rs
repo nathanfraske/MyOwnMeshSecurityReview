@@ -74,6 +74,46 @@ const ENDPOINT_CONSUMER_UNCLAIMED: u8 = 0;
 const ENDPOINT_CONSUMER_CLAIMED: u8 = 1;
 const ENDPOINT_CONSUMER_CANCELLED: u8 = 2;
 
+/// Test-only evidence for the four production stages that carry one opaque
+/// packet through B.  The compact nibble stream is bounded so diagnostics can
+/// never become an unaccounted queue or retain relay payloads.
+#[cfg(test)]
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum RelayPipelineStage {
+    RelayEnqueued = 1,
+    RelayCheckedOut = 2,
+    RelayForwarded = 3,
+    EndpointDelivered = 4,
+}
+
+#[cfg(test)]
+static RELAY_PIPELINE_WITNESS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn record_relay_pipeline_stage(stage: RelayPipelineStage) {
+    let _ = RELAY_PIPELINE_WITNESS.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        (value <= 0x0fff_ffff_ffff_fff).then_some((value << 4) | stage as u64)
+    });
+}
+
+#[cfg(test)]
+fn reset_relay_pipeline_witness() {
+    RELAY_PIPELINE_WITNESS.store(0, Ordering::Release);
+}
+
+#[cfg(test)]
+fn relay_pipeline_witness() -> u64 {
+    RELAY_PIPELINE_WITNESS.load(Ordering::Acquire)
+}
+
+/// Temporary stage-only output for the serialized production relay probe.
+/// This deliberately emits no packet, route, peer, or error data.
+#[cfg(feature = "transport-lab")]
+fn relay_transport_lab_marker(stage: &'static str) {
+    eprintln!("closed-relay-stage:{stage}");
+}
+
 /// Endpoint-owned opaque session handle. The relay only sees the bounded
 /// ciphertext queues; this handle retains endpoint AEAD state at A or C.
 pub(crate) struct EndpointSession(Arc<EndpointSessionInner>, EndpointSessionRole);
@@ -584,17 +624,15 @@ impl ClosedRelayEndpointRegistry {
         }
     }
 
-    pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
-        let mut removed = 0;
+    pub(crate) fn take_stale(&mut self, state: &NetworkState) -> Vec<EndpointSession> {
+        let mut removed = Vec::new();
         let mut index = 0;
         while index < self.sessions.len() {
             if self.sessions[index].relay_owner_is_current(state) {
                 index += 1;
                 continue;
             }
-            let session = self.sessions.swap_remove(index);
-            session.mark_closed();
-            removed += 1;
+            removed.push(self.sessions.swap_remove(index));
         }
         removed
     }
@@ -685,17 +723,15 @@ impl ClosedRelayTargetAcceptedRegistry {
         }
     }
 
-    pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
-        let mut removed = 0;
+    pub(crate) fn take_stale(&mut self, state: &NetworkState) -> Vec<EndpointSession> {
+        let mut removed = Vec::new();
         let mut index = 0;
         while index < self.ready.len() {
             if self.ready[index].relay_owner_is_current(state) {
                 index += 1;
                 continue;
             }
-            let session = self.ready.remove(index).expect("accepted index is present");
-            session.mark_closed();
-            removed += 1;
+            removed.push(self.ready.remove(index).expect("accepted index is present"));
         }
         removed
     }
@@ -1060,22 +1096,37 @@ impl ClosedRelayRegistry {
             .try_forward_direction(direction, packet)
     }
 
-    pub(crate) fn settle_exact(
+    /// Request terminal settlement for an exact allocation generation.
+    ///
+    /// A receive/forward operation may temporarily own the handle outside the
+    /// registry lock. In that case the slot remains the terminal owner: mark
+    /// it closing and wake the checkout so its Drop path returns and settles
+    /// the exact handle. `Ok(true)` means terminal progress was accepted,
+    /// either by immediate settlement or by that bounded checkout handoff.
+    pub(crate) fn request_terminal_exact(
         &mut self,
         session_id: [u8; 16],
         generation: &ClosedRelayGeneration,
-    ) -> Result<ClosedRelayTerminal, ClosedRelayRefusal> {
+    ) -> Result<bool, ClosedRelayRefusal> {
         let index = self
             .slots
             .iter()
             .position(|slot| {
-                slot.session_id == session_id
-                    && Arc::ptr_eq(&slot.generation, generation)
-                    && slot.handle.is_some()
+                slot.session_id == session_id && Arc::ptr_eq(&slot.generation, generation)
             })
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-        let slot = self.slots.swap_remove(index);
-        settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)
+        if self.slots[index].handle.is_some() {
+            let slot = self.slots.swap_remove(index);
+            settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)?;
+            return Ok(true);
+        }
+        let slot = &mut self.slots[index];
+        slot.closing = true;
+        if let Some(control) = slot.checkout.as_ref() {
+            control.request_close();
+            return Ok(true);
+        }
+        Err(ClosedRelayRefusal::OwnerNotLive)
     }
 
     pub(crate) fn retire_exact(
@@ -1490,7 +1541,7 @@ impl ClosedRelayClosingRegistry {
                 // exact generation fence prevents a successor from being
                 // touched, while runtime settlement installs its provider-
                 // funded non-expiring session tombstone.
-                let _ = state.settle_closed_relay_exact(record.session_id, generation);
+                let _ = state.request_terminal_closed_relay_exact(record.session_id, generation);
             }
             removed += 1;
         }
@@ -1949,7 +2000,7 @@ async fn handle_close(
         ) {
             let record_current = record.is_current(state);
             if let Some(generation) = record.allocation_generation.as_ref() {
-                let _ = state.settle_closed_relay_exact(*session_id, generation);
+                let _ = state.request_terminal_closed_relay_exact(*session_id, generation);
             } else {
                 // A pending Open has no allocation generation yet. Its
                 // handshake custody is nevertheless exact and must be
@@ -1998,7 +2049,7 @@ async fn handle_close(
             let _ = state.cancel_closed_relay_close(*session_id);
             let _ = state.take_closed_relay_pending(*session_id);
             if let Some(generation) = allocation_generation.as_ref() {
-                let _ = state.settle_closed_relay_exact(*session_id, generation);
+                let _ = state.request_terminal_closed_relay_exact(*session_id, generation);
             }
             let _ = send_control_to_owner(state, owner, control).await;
             return Err(error);
@@ -2089,8 +2140,8 @@ pub(crate) async fn settle_closed_relay_abandonment(
     }
     if let Some(generation) = abandonment.allocation_generation.as_ref() {
         settled |= state
-            .settle_closed_relay_exact(abandonment.route.session_id, generation)
-            .is_ok();
+            .request_terminal_closed_relay_exact(abandonment.route.session_id, generation)
+            .is_ok_and(|requested| requested);
     }
     if settled {
         Ok(())
@@ -2346,6 +2397,9 @@ pub(crate) async fn open_endpoint(
     canonical_route_admitted(state, &requester, &relay, &target)?;
     let capacity = endpoint_capacity(state)?;
     let profile = state.config.read().closed_relay.clone();
+    let pending_timeout = profile
+        .pending_handshake_timeout()
+        .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
     let _runtime = state
         .closed_relay_runtime()
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
@@ -2408,10 +2462,18 @@ pub(crate) async fn open_endpoint(
         session.mark_closed();
         return Err(error);
     }
-    if let Err(error) = session.wait_ready().await {
-        state.remove_closed_relay_endpoint(&session);
-        session.mark_closed();
-        return Err(error);
+    match tokio::time::timeout(pending_timeout, session.wait_ready()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            state.remove_closed_relay_endpoint(&session);
+            session.mark_closed();
+            return Err(error);
+        }
+        Err(_) => {
+            state.remove_closed_relay_endpoint(&session);
+            session.mark_closed();
+            return Err(ClosedRelayRefusal::Expired);
+        }
     }
     Ok(session)
 }
@@ -2685,7 +2747,7 @@ pub(crate) async fn handle_control(
                 send_control_to_owner(state, &response.owner, response.control).await
             {
                 if let Some(generation) = generation.as_ref() {
-                    let _ = state.settle_closed_relay_exact(session_id, generation);
+                    let _ = state.request_terminal_closed_relay_exact(session_id, generation);
                 }
                 return Err(error);
             }
@@ -2915,13 +2977,24 @@ pub(crate) fn on_data(
             &data.target
         },
     )?;
-    state.forward_closed_relay(
+    let result = state.forward_closed_relay(
         data.session_id,
         &generation,
         allocation_epoch,
         direction,
         data.packet,
-    )
+    );
+    #[cfg(test)]
+    if result.is_ok() {
+        record_relay_pipeline_stage(RelayPipelineStage::RelayEnqueued);
+    }
+    #[cfg(feature = "transport-lab")]
+    if result.is_ok() {
+        relay_transport_lab_marker("relay-enqueued");
+    } else {
+        relay_transport_lab_marker("relay-enqueue-refused");
+    }
+    result
 }
 
 /// Async dispatch spelling for engine message loops. The actual admission is
@@ -2962,7 +3035,18 @@ pub(crate) async fn handle_data(
         return Err(ClosedRelayRefusal::OwnerMismatch);
     }
     let route = data.route();
-    state.deliver_closed_relay_endpoint(data.session_id, &route, data.packet)
+    let result = state.deliver_closed_relay_endpoint(data.session_id, &route, data.packet);
+    #[cfg(test)]
+    if result.is_ok() {
+        record_relay_pipeline_stage(RelayPipelineStage::EndpointDelivered);
+    }
+    #[cfg(feature = "transport-lab")]
+    if result.is_ok() {
+        relay_transport_lab_marker("endpoint-delivered");
+    } else {
+        relay_transport_lab_marker("endpoint-delivery-refused");
+    }
+    result
 }
 
 /// Drain one packet from the exact B-side allocation and emit it to the
@@ -2997,6 +3081,8 @@ pub(crate) async fn forward_closed_relay_data(
         generation,
     )) = state.recv_closed_relay(session_id, direction).await
     else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("relay-checkout-refused");
         return Ok(false);
     };
     let Some((context_id, requester, relay, target, allocation_epoch)) =
@@ -3043,17 +3129,26 @@ pub(crate) async fn forward_closed_relay_data(
         allocation_epoch,
         packet,
     };
-    if super::send_to_peer_owner(
+    #[cfg(test)]
+    record_relay_pipeline_stage(RelayPipelineStage::RelayCheckedOut);
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("relay-checked-out");
+    let send_result = super::send_to_peer_owner(
         state,
         &destination_owner,
         &crate::protocol::MeshMessage::ClosedRelayData(data),
     )
-    .await
-    .is_err()
-    {
-        let _ = state.settle_closed_relay_exact(session_id, &generation);
+    .await;
+    if send_result.is_err() {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("relay-forward-refused");
+        let _ = state.request_terminal_closed_relay_exact(session_id, &generation);
         return Err(ClosedRelayRefusal::CarrierUnavailable);
     }
+    #[cfg(test)]
+    record_relay_pipeline_stage(RelayPipelineStage::RelayForwarded);
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("relay-forwarded");
     Ok(true)
 }
 
@@ -3209,5 +3304,51 @@ mod tests {
                 > one.amount(ResourceClass::OpaqueDependencyResidual),
             "each retained packet allocation must be observed"
         );
+    }
+
+    #[test]
+    fn relay_pipeline_witness_is_bounded_and_stage_ordered() {
+        reset_relay_pipeline_witness();
+        record_relay_pipeline_stage(RelayPipelineStage::RelayEnqueued);
+        record_relay_pipeline_stage(RelayPipelineStage::RelayCheckedOut);
+        record_relay_pipeline_stage(RelayPipelineStage::RelayForwarded);
+        record_relay_pipeline_stage(RelayPipelineStage::EndpointDelivered);
+        assert_eq!(relay_pipeline_witness(), 0x1234);
+
+        // A diagnostic stream cannot grow without bound or overwrite its
+        // earlier evidence after the fixed 16-nibble capacity is reached.
+        for _ in 0..20 {
+            record_relay_pipeline_stage(RelayPipelineStage::RelayEnqueued);
+        }
+        assert_eq!(relay_pipeline_witness() >> 60, 0x1);
+    }
+
+    #[tokio::test]
+    async fn checked_out_close_request_wakes_owner_and_cannot_cross_generation() {
+        let control = Arc::new(ClosedRelayCheckoutControl {
+            closing: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            wake: Notify::new(),
+            finished_wake: Notify::new(),
+        });
+        let old_generation = Arc::new(());
+        let successor_generation = Arc::new(());
+        assert!(!Arc::ptr_eq(&old_generation, &successor_generation));
+
+        let closing = control.closing_notified();
+        tokio::pin!(closing);
+        closing.as_mut().enable();
+        control.request_close();
+        closing.await;
+        assert!(control.closing.load(Ordering::Acquire));
+
+        // A duplicate Close is idempotent, while the successor's distinct
+        // generation remains unrelated to this checked-out owner. The real
+        // registry request performs the same pointer fence before waking the
+        // owner; the owner's Drop then returns the exact handle and lease to
+        // the provider-backed settlement path.
+        control.request_close();
+        assert!(control.closing.load(Ordering::Acquire));
+        assert!(!Arc::ptr_eq(&old_generation, &successor_generation));
     }
 }

@@ -19,13 +19,17 @@
     DEFAULT_NETWORK_SIGNALING,
     DEFAULT_NETWORK_STUN,
     DEFAULT_NETWORK_TURN,
+    DEFAULT_SEMANTIC_POLICY,
+    SEMANTIC_POLICY_FIELDS,
     exportNetworkSettings,
+    validateSemanticPolicy,
     type TurnEntry,
   } from "../../network-settings";
   import {
     buildTopology,
     type NetworkConfigInput,
     type NetworkSummary,
+    type SemanticPolicyConfig,
     type TopologyKind,
     type TopologyMode,
   } from "../../types";
@@ -48,6 +52,7 @@
   let stunDraft = $state<string[]>([]);
   let turnDraft = $state<TurnEntry[]>([]);
   let turnEntry = $state<TurnEntry>({ url: "", username: "", credential: "" });
+  let semanticPolicy = $state<SemanticPolicyConfig>({ ...DEFAULT_SEMANTIC_POLICY });
   let autoApprove = $state(false);
 
   let loaded = $state(false);
@@ -108,6 +113,7 @@
       ...(t.username ? { username: t.username } : {}),
       ...(t.credential ? { credential: t.credential } : {}),
     }));
+    semanticPolicy = { ...DEFAULT_SEMANTIC_POLICY, ...cfg.semantic_policy };
     autoApprove = cfg.auto_approve ?? false;
   }
 
@@ -117,6 +123,7 @@
     signalingDraft = [...DEFAULT_NETWORK_SIGNALING];
     stunDraft = [...DEFAULT_NETWORK_STUN];
     turnDraft = DEFAULT_NETWORK_TURN.map((t) => ({ ...t }));
+    semanticPolicy = { ...DEFAULT_SEMANTIC_POLICY };
     autoApprove = false;
   }
 
@@ -201,6 +208,15 @@
     stunDraft = [...DEFAULT_NETWORK_STUN];
   }
 
+  function semanticPolicyLabel(field: keyof SemanticPolicyConfig): string {
+    return field.replaceAll("_", " ");
+  }
+
+  function updateSemanticPolicy(field: keyof SemanticPolicyConfig, event: Event) {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    semanticPolicy = { ...semanticPolicy, [field]: value };
+  }
+
   // ---- save (atomic in-place update) ----------------------------------
 
   async function save() {
@@ -209,6 +225,10 @@
     actionError = null;
     let newCfg: NetworkConfigInput;
     try {
+      const policyError = validateSemanticPolicy(semanticPolicy);
+      if (policyError) {
+        throw new Error(`Semantic policy: ${policyError}`);
+      }
       // Build the new wire payload, carrying THIS network's existing
       // config id so the daemon edits the same record in place rather
       // than creating a duplicate.
@@ -221,6 +241,7 @@
         signalingServers: signalingDraft.filter((s) => s.trim() !== ""),
         stunUrls: stunDraft,
         turnEntries: turnDraft,
+        semanticPolicy,
         autoApprove,
       });
       newCfg.kind = meshClient.networkKindsByNetwork[network.config_id] ?? "open";
@@ -562,6 +583,31 @@
       </div>
     </div>
 
+    <!-- Semantic policy -->
+    <div class="card">
+      <div class="card-title">Semantic fact policy</div>
+      <div class="hint subtle">
+        Owner-selected finite limits for durable facts, quarantine, proofs,
+        and dependency storage. These values are preserved across unrelated
+        edits and included in network-settings exports.
+      </div>
+      <div class="policy-grid">
+        {#each SEMANTIC_POLICY_FIELDS as field (field)}
+          <label class="field policy-field">
+            <span class="field-label">{semanticPolicyLabel(field)}</span>
+            <input
+              class="mono"
+              type="number"
+              min="1"
+              step="1"
+              value={semanticPolicy[field]}
+              oninput={(event) => updateSemanticPolicy(field, event)}
+            />
+          </label>
+        {/each}
+      </div>
+    </div>
+
     <!-- Auto-approve -->
     <div class="card">
       <div class="card-title">Approval policy</div>
@@ -598,10 +644,9 @@
       to write a <code>.network-settings.json</code> file you can
       send to another device — they import it via
       <em>Sidebar → + → Import…</em> to join the same network. For
-      out-of-band pre-authorisation (so a new device's first
-      connection is auto-approved), use the
-      <strong>Approval</strong> action on a rostered peer in the
-      Roster tab.
+      Peer authorization is handled by the daemon's authenticated
+      <strong>Approval</strong> action on a rostered peer in the Roster tab;
+      a settings export carries configuration only.
     </div>
 
     <!-- Danger zone: a clear, sticky path to remove a network from
@@ -821,6 +866,14 @@
   input[type="number"]:focus {
     outline: none;
     border-color: #4a4a85;
+  }
+  .policy-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+    gap: 0.35rem 0.7rem;
+  }
+  .policy-field {
+    margin-bottom: 0;
   }
   .topo-btn {
     padding: 0.3rem 0.7rem;

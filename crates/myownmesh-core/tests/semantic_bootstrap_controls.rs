@@ -69,16 +69,12 @@ fn foreign_context_refuses_before_quarantine_or_projection() {
 }
 
 #[test]
-fn open_bootstrap_has_no_founder_and_only_self_participation() {
-    let bootstrap = VerifiedBootstrap::open("bootstrap-controls").expect("open bootstrap");
-    let signing_key = key(23);
-    let device = author(&signing_key);
-    let participation =
-        FactContent::open_participation(bootstrap.context_id(), device.clone(), true, Vec::new());
-    let mut graph = FactGraph::from_bootstrap(&bootstrap);
-    graph
-        .admit(SignedFact::sign(participation, &signing_key).expect("participation signs"))
-        .expect("self-authored participation admits");
-    assert!(!graph.is_authorized_signer(&device));
-    assert_eq!(graph.context_id(), bootstrap.context_id());
+fn unknown_semantic_kind_wire_is_rejected() {
+    let unsupported = serde_json::json!({
+        "kind": "future_semantic_kind",
+    });
+    assert!(
+        serde_json::from_value::<FactBody>(unsupported).is_err(),
+        "unsupported semantic kind is refused before graph admission"
+    );
 }

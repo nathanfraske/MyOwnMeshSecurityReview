@@ -122,23 +122,97 @@ impl ProofAckMessage {
     }
 }
 
-/// A wire grouping of canonical semantic facts.
+/// One bounded page of canonical semantic facts on the peer wire.
 ///
-/// Bundle membership is transport framing only. Each embedded `SignedFact`
-/// must be verified and reduced independently by the semantic owner.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The context, exclusive continuation cursor, and completion bit are part of
+/// the frame rather than inferred from its carrier. This makes a page safe to
+/// reject before any graph mutation and gives a receiver a deterministic way
+/// to request the next finite portion of a graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct FactBundleMessage {
+pub struct FactPageMessage {
+    pub context_id: MeshContextId,
     pub facts: Vec<SignedFact>,
+    pub next_cursor: Option<FactId>,
+    pub complete: bool,
 }
 
-impl FactBundleMessage {
-    /// Count a bundle page against the exact complete-frame boundary without
-    /// constructing a second serialized buffer.
-    pub(crate) fn encoded_len_for_facts(facts: &[SignedFact]) -> Option<usize> {
-        super::encoded_json_len(&super::MeshMessage::FactBundle(Self {
-            facts: facts.to_vec(),
-        }))
+impl FactPageMessage {
+    pub fn new(
+        context_id: MeshContextId,
+        facts: Vec<SignedFact>,
+        next_cursor: Option<FactId>,
+        complete: bool,
+    ) -> Result<Self, String> {
+        let page = Self {
+            context_id,
+            facts,
+            next_cursor,
+            complete,
+        };
+        page.validate()?;
+        Ok(page)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.facts.is_empty() && (!self.complete || self.next_cursor.is_some()) {
+            return Err("an empty fact page must be complete without a cursor".into());
+        }
+        if self
+            .facts
+            .iter()
+            .any(|fact| fact.content.mesh_context != self.context_id)
+        {
+            return Err("fact page contains a foreign mesh context".into());
+        }
+        if self.facts.windows(2).any(|pair| pair[0].id >= pair[1].id) {
+            return Err("fact page IDs must be strictly increasing".into());
+        }
+        let expected_cursor = self.facts.last().map(|fact| fact.id);
+        if self.complete {
+            if self.next_cursor.is_some() {
+                return Err("a complete fact page cannot have a continuation cursor".into());
+            }
+        } else if self.next_cursor != expected_cursor {
+            return Err("an incomplete fact page must end at its continuation cursor".into());
+        }
+        let encoded_len = self
+            .encoded_len()
+            .ok_or_else(|| "fact page length overflow".to_string())?;
+        if encoded_len > super::RECEIVE_FRAME_BYTES {
+            return Err("fact page exceeds the receive frame boundary".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn encoded_len(&self) -> Option<usize> {
+        super::encoded_json_len(&super::MeshMessage::FactPage(self.clone()))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFactPageMessage {
+    context_id: MeshContextId,
+    facts: Vec<SignedFact>,
+    next_cursor: Option<FactId>,
+    complete: bool,
+}
+
+impl<'de> Deserialize<'de> for FactPageMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawFactPageMessage::deserialize(deserializer)?;
+        let page = Self {
+            context_id: raw.context_id,
+            facts: raw.facts,
+            next_cursor: raw.next_cursor,
+            complete: raw.complete,
+        };
+        page.validate().map_err(D::Error::custom)?;
+        Ok(page)
     }
 }
 
@@ -192,7 +266,7 @@ impl FactInventory {
 /// A non-authoritative request for exact canonical facts.
 ///
 /// Only the identifiers are requested. The response must carry the signed
-/// bodies in [`FactBundleMessage`]; this request itself is never an authority
+/// bodies in [`FactPageMessage`]; this request itself is never an authority
 /// input and cannot install a fact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FactRequest {
@@ -368,16 +442,23 @@ impl<'de> Deserialize<'de> for FactRequest {
 mod tests {
     use ed25519_dalek::SigningKey;
 
+    use crate::semantic::{FactBody, FactDomain};
+
     use super::*;
 
     fn signed_fact(context_id: MeshContextId) -> SignedFact {
         let key = SigningKey::from_bytes(&[11; 32]);
         let device = DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes()).unwrap();
-        SignedFact::sign(
-            FactContent::open_participation(context_id, device, true, Vec::new()),
-            &key,
-        )
-        .unwrap()
+        let content = FactContent::new(
+            FactDomain::Governance,
+            context_id,
+            FactBody::RoleRevoke {
+                target: device.clone(),
+            },
+            device,
+            Vec::new(),
+        );
+        SignedFact::sign(content, &key).unwrap()
     }
 
     #[test]
@@ -407,6 +488,33 @@ mod tests {
         let mut wire = serde_json::to_value(&delivery).unwrap();
         wire["context_id"] = serde_json::to_value(MeshContextId::from_bytes([9; 32])).unwrap();
         assert!(serde_json::from_value::<ProofDeliveryMessage>(wire).is_err());
+    }
+
+    #[test]
+    fn fact_page_requires_exact_context_order_and_continuation() {
+        let context_id = MeshContextId::from_bytes([0x18; 32]);
+        let fact = signed_fact(context_id);
+        let page = FactPageMessage::new(context_id, vec![fact.clone()], None, true).unwrap();
+        let encoded = serde_json::to_vec(&page).unwrap();
+        let decoded: FactPageMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, page);
+
+        let mut foreign = serde_json::to_value(&page).unwrap();
+        foreign["context_id"] =
+            serde_json::to_value(MeshContextId::from_bytes([0x19; 32])).unwrap();
+        assert!(serde_json::from_value::<FactPageMessage>(foreign).is_err());
+
+        let mut incomplete = serde_json::to_value(&page).unwrap();
+        incomplete["complete"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<FactPageMessage>(incomplete).is_err());
+
+        let mut unknown = serde_json::to_value(&page).unwrap();
+        unknown["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<FactPageMessage>(unknown).is_err());
+
+        let mut duplicate = serde_json::to_value(&page).unwrap();
+        duplicate["facts"] = serde_json::json!([fact.clone(), fact]);
+        assert!(serde_json::from_value::<FactPageMessage>(duplicate).is_err());
     }
 
     #[test]

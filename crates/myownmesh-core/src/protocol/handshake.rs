@@ -72,6 +72,7 @@ impl HelloMessage {
 
 /// Response proving possession of the key matching `HelloMessage::device_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthResponseMessage {
     /// Base32-lowercase signature over the endpoint-auth transcript.
     pub signature: String,
@@ -79,6 +80,7 @@ pub struct AuthResponseMessage {
 
 /// Sent once the peer is cleared for application traffic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApproveMessage {}
 
 /// Reason carried when a denial reflects signed semantic eviction state.
@@ -87,6 +89,7 @@ pub const DENY_REASON_EVICTED: &str = "evicted";
 /// Sent when the local side rejects the peer. The reason is a decision hint;
 /// any governance proof is a separately exchanged canonical signed fact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DenyMessage {
     #[serde(default)]
     pub reason: Option<String>,
@@ -110,7 +113,7 @@ mod verification_code_tests {
 
 #[cfg(test)]
 mod protocol_version_tests {
-    use super::HelloMessage;
+    use super::{ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage};
 
     fn hello_json(protocol: Option<u32>) -> String {
         let mut value = serde_json::json!({
@@ -163,5 +166,19 @@ mod protocol_version_tests {
         let mut stale = hello;
         stale.protocol = crate::PROTOCOL_VERSION.saturating_sub(1);
         assert!(stale.validate_protocol().is_err());
+    }
+
+    #[test]
+    fn handshake_control_frames_refuse_unknown_fields() {
+        assert!(serde_json::from_str::<AuthResponseMessage>(
+            r#"{"signature":"proof","capabilities":{}}"#
+        )
+        .is_err());
+        assert!(
+            serde_json::from_str::<ApproveMessage>(r#"{"capabilities":{"rpc":true}}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<DenyMessage>(r#"{"reason":"denied","approval":true}"#).is_err()
+        );
     }
 }

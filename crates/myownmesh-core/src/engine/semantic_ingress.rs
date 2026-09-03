@@ -14,7 +14,7 @@
 //!
 //! | | ephemeral carrier ingress | durable semantic exchange |
 //! |---|---|---|
-//! | what it carries | evidence about one attempt | facts, bundles, inventories, requests |
+//! | what it carries | evidence about one attempt | facts, pages, inventories, requests |
 //! | what makes it actionable | nothing — it grants nothing | the embedded author, signature and domain context |
 //! | who may deliver it | any carrier | any carrier, cache, file or medium |
 //! | may change the roster | never | that is what it is for |
@@ -44,10 +44,10 @@
 //! So [`reduce`] takes the session — when there is one — as a **reply route and
 //! nothing else**. For [`Exchange::SignedFact`] that is a type property rather
 //! than a promise: those arms are never handed the token, so the compiler is
-//! what enforces it (see [`Exchange`]). [`Exchange::FactBundle`] does receive a
+//! what enforces it (see [`Exchange`]). [`Exchange::FactPage`] does receive a
 //! device id derived from the route, and it is diagnostics only — a
 //! session-scoped label on a trace and a log line, never consulted to decide
-//! whether the bundle is true. The bundle authenticates itself the same way a
+//! whether the page is true. The page authenticates itself the same way a
 //! single fact does.
 //!
 //! **What would be a defect, stated precisely.** Adding a durable body to the
@@ -77,7 +77,7 @@ use std::sync::Arc;
 use tracing::trace;
 
 use crate::protocol::{
-    FactBundleMessage, FactInventory, FactRequest, MeshMessage, ProofDeliveryMessage,
+    FactInventory, FactPageMessage, FactRequest, MeshMessage, ProofDeliveryMessage,
 };
 use crate::semantic::{Admission, DeviceId, SignedFact};
 
@@ -108,12 +108,12 @@ pub(crate) struct DurableSemanticExchange {
 /// passed it, so for signed facts "a fact does not depend on its courier" is
 /// checked by the compiler rather than by review.
 ///
-/// [`Self::FactBundle`] is the one arm where that is a review property instead
+/// [`Self::FactPage`] is the one arm where that is a review property instead
 /// of a type property, and the difference is worth stating plainly rather than
 /// rounding off. It is passed a `&str` device id read off the route only as a
 /// diagnostic label in a trace and log line, scoped to the session it arrived
 /// on. It is not an input to verification, not compared against any author,
-/// and not able to make a bundle acceptable or unacceptable — the log walk
+/// and not able to make a page acceptable or unacceptable — the log walk
 /// from genesis decides that alone.
 enum Exchange {
     /// A fact that carries its own author, signature and domain context.
@@ -122,7 +122,7 @@ enum Exchange {
     /// canonical payload that names this network and the state signing domain.
     /// Nothing about the delivery is consulted.
     SignedFact(Box<SignedFact>),
-    /// A bundle of signed semantic facts.
+    /// A bounded page of signed semantic facts.
     ///
     /// Self-authenticating the same way, in bulk: each fact is verified and
     /// reduced through the canonical graph, and a bad signature or invalid
@@ -131,7 +131,7 @@ enum Exchange {
     /// The unsigned `entries` list is carrier material only, not an
     /// authority-bearing membership fact. Signed governance/member logs are
     /// the canonical state source; inventories and requests remain exchanges.
-    FactBundle(FactBundleMessage),
+    FactPage(FactPageMessage),
     /// A typed durable stand-down proof. Its identity is bound to the exact
     /// context, target, and canonical FactIds and may receive a verified ACK
     /// only after admission and projection succeed.
@@ -161,7 +161,7 @@ enum Inventory {
 /// A request for rows the sender is missing.
 enum DependencyRequest {
     /// Exact-context FactIds whose signed bodies the sender requests. The
-    /// response is a FactBundle; this request cannot install a fact.
+    /// response is a FactPage; this request cannot install a fact.
     Facts(FactRequest),
 }
 
@@ -178,7 +178,12 @@ impl DurableSemanticPort {
     pub(crate) fn admit(message: MeshMessage) -> Result<DurableSemanticExchange, Box<MeshMessage>> {
         let exchange = match message {
             MeshMessage::Fact(m) => Exchange::SignedFact(Box::new(m)),
-            MeshMessage::FactBundle(m) => Exchange::FactBundle(m),
+            MeshMessage::FactPage(m) => {
+                if m.validate().is_err() {
+                    return Err(Box::new(MeshMessage::FactPage(m)));
+                }
+                Exchange::FactPage(m)
+            }
             MeshMessage::ProofDelivery(m) => Exchange::ProofDelivery(m),
             MeshMessage::FactInventory(m) => Exchange::Inventory(Inventory::Facts(m)),
             MeshMessage::FactRequest(m) => Exchange::DependencyRequest(DependencyRequest::Facts(m)),
@@ -200,7 +205,7 @@ impl DurableSemanticExchange {
     pub(crate) fn kind_name(&self) -> &'static str {
         match self.exchange {
             Exchange::SignedFact(_) => "signed_fact",
-            Exchange::FactBundle(_) => "fact_bundle",
+            Exchange::FactPage(_) => "fact_page",
             Exchange::ProofDelivery(_) => "proof_delivery",
             Exchange::Inventory(Inventory::Facts(_)) => "fact_inventory",
             Exchange::DependencyRequest(DependencyRequest::Facts(_)) => "fact_request",
@@ -226,9 +231,9 @@ impl DurableSemanticExchange {
 /// for those, transport-independence is checked by the compiler here rather
 /// than asserted in a comment.
 ///
-/// [`Exchange::FactBundle`] is passed a device id derived from the route, and
+/// [`Exchange::FactPage`] is passed a device id derived from the route, and
 /// only as a diagnostic label scoped to the logical session it arrived on. Nothing in
-/// the bundle's acceptance reads it, so the property still holds there — it is
+/// the page's acceptance reads it, so the property still holds there — it is
 /// simply held by the reducer rather than by the type, and that distinction is
 /// stated instead of glossed.
 ///
@@ -253,34 +258,34 @@ pub(super) async fn reduce(
         // name `reply`, so the compiler is what keeps a courier out of the
         // decision.
         Exchange::SignedFact(m) => reduce_signed_fact(state, *m).await,
-        // The bundle does see a device id off the route as a label for the trace
+        // The page does see a device id off the route as a label for the trace
         // and log, scoped to this session, and never as a reason to accept or
         // reject anything; `source` does not appear in that decision.
-        Exchange::FactBundle(m) => {
+        Exchange::FactPage(m) => {
             let facts = m.facts;
             for fact in facts.iter().cloned() {
                 reduce_signed_fact(state, fact).await;
             }
             // The inventory is a durable exchange acknowledgement: it is the
             // receiver's exact post-admission fact set, sent back through the
-            // same logical operation that delivered this bundle. A carrier,
+            // same logical operation that delivered this page. A carrier,
             // heartbeat, or session observation cannot acknowledge a signed
             // proof, and a replacement cannot steal this reply route. Do not
-            // call this an ACK until every fact in the bundle is present in the
-            // authoritative graph. A quarantined, malformed, or empty bundle
+            // call this an ACK until every fact in the page is present in the
+            // authoritative graph. A quarantined, malformed, or empty page
             // must remain eligible for a later inventory/request repair; an
             // inventory emitted for it would be indistinguishable from a
             // verified acceptance to a sender that already has the same IDs.
             // Eviction proofs add one more check: their exact target must be
             // stood down by the resulting canonical projection.
-            if bundle_is_admitted(state, &facts)
-                && governance::fact_bundle_projection_is_verified(state, &facts)
+            if page_is_admitted(state, &facts)
+                && governance::fact_page_projection_is_verified(state, &facts)
             {
                 if let Some(route) = reply {
-                    governance::acknowledge_fact_bundle(state, route).await;
+                    governance::acknowledge_fact_page(state, route).await;
                 }
             } else {
-                trace!(kind, "withholding semantic ACK for incomplete fact bundle");
+                trace!(kind, "withholding semantic ACK for incomplete fact page");
             }
         }
         Exchange::ProofDelivery(delivery) => {
@@ -344,12 +349,12 @@ pub(super) async fn reduce(
     }
 }
 
-/// Return whether a bundle is fully and exactly present in the authoritative
+/// Return whether a page is fully and exactly present in the authoritative
 /// graph after reduction. The graph comparison is intentional rather than a
 /// count check: a duplicate FactId with a different body must never turn into
 /// an apparently successful ACK, and a quarantined fact is not admitted merely
 /// because it has durable provisional custody.
-fn bundle_is_admitted(state: &Arc<NetworkState>, facts: &[SignedFact]) -> bool {
+fn page_is_admitted(state: &Arc<NetworkState>, facts: &[SignedFact]) -> bool {
     if facts.is_empty() {
         return false;
     }
@@ -375,31 +380,38 @@ pub(super) fn proof_delivery_is_verified(
     delivery.validate().is_ok()
         && delivery.context_id == state.mesh_context_id()
         && delivery.target == local
-        && bundle_is_admitted(state, &delivery.facts)
+        && page_is_admitted(state, &delivery.facts)
         && governance::proof_delivery_projection_is_verified(state, delivery)
 }
 
-/// Admit a fact and, when it supplies a missing parent, move every fact that
-/// becomes ready out of quarantine in the same graph write section. The graph
-/// lock is released before any semantic reducer runs; `AlreadyPresent` never
+/// Admit a fact through the state's journaled publication boundary. The graph
+/// write lock is held only inside that boundary and is released before any
+/// semantic reducer runs; `AlreadyPresent` never enters durable storage or
 /// returns a fact to reduce, so replaying a wire frame cannot apply it twice.
-fn admit_with_quarantine_retry(
+async fn admit_journaled_durably(
     state: &Arc<NetworkState>,
     fact: SignedFact,
-) -> Result<(Admission, Vec<SignedFact>), crate::error::Error> {
-    state.admit_fact_durably(fact)
+) -> Result<(Admission, Vec<SignedFact>), AdmissionError> {
+    state
+        .admit_fact_durably_async(fact)
+        .await
+        .map_err(AdmissionError::Durable)
+}
+
+enum AdmissionError {
+    Durable(crate::error::Error),
 }
 
 async fn reduce_signed_fact(state: &Arc<NetworkState>, fact: SignedFact) {
-    match admit_with_quarantine_retry(state, fact) {
+    match admit_journaled_durably(state, fact).await {
         Ok((Admission::Inserted, newly_inserted)) => {
             for fact in newly_inserted {
                 governance::on_fact(state, fact).await;
             }
         }
         Ok((Admission::AlreadyPresent | Admission::Quarantined { .. }, _)) => {}
-        Err(error) => {
-            trace!(error = %error, "durable semantic admission refused");
+        Err(AdmissionError::Durable(error)) => {
+            trace!(error = %error, "journaled semantic admission refused")
         }
     }
 }
@@ -413,7 +425,7 @@ mod tests {
         match DurableSemanticPort::admit(message) {
             Ok(exchange) => match exchange.exchange {
                 Exchange::SignedFact(_) => "signed_fact",
-                Exchange::FactBundle(_) => "fact_bundle",
+                Exchange::FactPage(_) => "fact_page",
                 Exchange::ProofDelivery(_) => "proof_delivery",
                 Exchange::Inventory(_) => "inventory",
                 Exchange::DependencyRequest(_) => "dependency_request",
@@ -442,8 +454,13 @@ mod tests {
     fn the_durable_set_is_classified_by_what_authenticates_each_message() {
         let expected = [
             (
-                "fact_bundle",
-                MeshMessage::FactBundle(FactBundleMessage { facts: Vec::new() }),
+                "fact_page",
+                MeshMessage::FactPage(FactPageMessage {
+                    context_id: crate::semantic::MeshContextId::from_bytes([0; 32]),
+                    facts: Vec::new(),
+                    next_cursor: None,
+                    complete: true,
+                }),
             ),
             (
                 "inventory",
