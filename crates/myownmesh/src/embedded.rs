@@ -42,6 +42,20 @@ pub enum EmbeddedStartError {
 
     #[error("cleanup custodian startup: {0}")]
     CleanupCustody(String),
+
+    /// A transport-lab daemon must state an exact supported ICE policy.
+    #[cfg(feature = "transport-lab")]
+    #[error("MYOWNMESH_TRANSPORT_LAB_ICE_POLICY must be 'all' or 'relay': {0}")]
+    TransportLabIcePolicy(String),
+}
+
+#[cfg(feature = "transport-lab")]
+fn transport_lab_relay_only(value: Option<&str>) -> Result<bool, EmbeddedStartError> {
+    match value {
+        None | Some("all") => Ok(false),
+        Some("relay") => Ok(true),
+        Some(value) => Err(EmbeddedStartError::TransportLabIcePolicy(value.to_owned())),
+    }
 }
 
 /// Ordered terminal failures observed while draining the daemon.
@@ -761,6 +775,29 @@ pub async fn start_connector_capable(
     connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
     realtime: control::RealtimeAdvert,
 ) -> std::result::Result<EmbeddedDaemon, EmbeddedStartError> {
+    #[cfg(feature = "transport-lab")]
+    let mesh = {
+        let requested = std::env::var("MYOWNMESH_TRANSPORT_LAB_ICE_POLICY");
+        let value = match requested {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(EmbeddedStartError::TransportLabIcePolicy(
+                    "value is not UTF-8".to_string(),
+                ));
+            }
+        };
+        if transport_lab_relay_only(value.as_deref())? {
+            myownmesh_core::Mesh::open_connector_capable_relay_only_for_lab(
+                cfg.clone(),
+                connector_policy,
+            )
+            .await?
+        } else {
+            myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?
+        }
+    };
+    #[cfg(not(feature = "transport-lab"))]
     let mesh = myownmesh_core::Mesh::open_connector_capable(cfg.clone(), connector_policy).await?;
     start_with_mesh(cfg, mesh, realtime).await
 }
@@ -1012,6 +1049,18 @@ async fn start_with_mesh_inner(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "transport-lab")]
+    #[test]
+    fn transport_lab_ice_policy_is_explicit_and_fail_closed() {
+        assert!(!transport_lab_relay_only(None).expect("absent selects normal ICE"));
+        assert!(!transport_lab_relay_only(Some("all")).expect("all selects normal ICE"));
+        assert!(transport_lab_relay_only(Some("relay")).expect("relay selects relay-only ICE"));
+        assert!(matches!(
+            transport_lab_relay_only(Some("host")),
+            Err(EmbeddedStartError::TransportLabIcePolicy(value)) if value == "host"
+        ));
+    }
+
     // The connector-capable startup fixture below installs a connector policy,
     // so it spends from the one binary-wide budget `crate::test_resource_provider`
     // grants. It serializes on `crate::exclusive_connector_fixture` with every
@@ -1191,13 +1240,15 @@ mod tests {
         let handoff_returned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let handoff_returned_thread = std::sync::Arc::clone(&handoff_returned);
         let handoff_sender = sender.clone();
+        let second_joined_thread = std::sync::Arc::clone(&second_joined);
+        let second_joining_thread = std::sync::Arc::clone(&second_joining);
         let handoff = std::thread::spawn(move || {
             handoff_cleanup_thread(
                 &handoff_sender,
                 EmbeddedCleanupThreadBatch {
                     thread: second_thread,
-                    joined: std::sync::Arc::clone(&second_joined),
-                    joining: std::sync::Arc::clone(&second_joining),
+                    joined: second_joined_thread,
+                    joining: second_joining_thread,
                 },
             );
             handoff_returned_thread.store(true, std::sync::atomic::Ordering::SeqCst);

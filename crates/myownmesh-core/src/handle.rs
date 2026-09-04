@@ -106,6 +106,22 @@ impl Mesh {
         Self::open_connector_capable_with_identity(config, identity, policy).await
     }
 
+    /// Build a connector-capable lab mesh whose ICE agent accepts relay
+    /// candidates only. The explicit feature-gated constructor prevents a
+    /// benchmark control from silently changing the shipped daemon policy.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn open_connector_capable_relay_only_for_lab(
+        config: MeshConfig,
+        policy: WebRtcConnectorCapablePolicy,
+    ) -> Result<MeshHandle> {
+        let identity = Arc::new(crate::identity::load_or_create()?);
+        let event_capacity = config.event_capacity_usize()?;
+        let transport =
+            Transport::new_relay_only_for_lab()?.with_connector_resource_policy(policy)?;
+        Self::open_with_identity_and_transport(identity, transport, event_capacity)
+    }
+
     /// Build an infrastructure-only `Mesh` with a **caller-supplied identity**,
     /// for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.

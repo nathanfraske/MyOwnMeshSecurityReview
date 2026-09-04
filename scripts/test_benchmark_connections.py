@@ -29,6 +29,27 @@ class BenchmarkConnectionContractTests(unittest.TestCase):
                 expected,
             )
 
+    def test_peer_snapshot_reassembles_public_suffix_for_dial_identity(self) -> None:
+        expected = {
+            "device_id": "vebjwc6ii4wg3vvhiud4wlsrnyh3iqlanmqhkdmrtixcua5fym4a",
+            "device_suffix": "70CD6",
+            "status": "sighted",
+        }
+        with mock.patch.object(
+            BENCHMARK,
+            "run_json",
+            return_value={"peers": [expected]},
+        ):
+            self.assertEqual(
+                BENCHMARK.peer_snapshot(
+                    "myownmesh",
+                    "fresh-network",
+                    "vebjwc6ii4wg3vvhiud4wlsrnyh3iqlanmqhkdmrtixcua5fym4a-70CD6",
+                    1.0,
+                ),
+                expected,
+            )
+
     def test_peer_snapshot_rejects_old_bare_list_assumption(self) -> None:
         with mock.patch.object(BENCHMARK, "run_json", return_value=[]):
             with self.assertRaisesRegex(RuntimeError, "object containing a peers list"):
@@ -67,6 +88,12 @@ class BenchmarkConnectionContractTests(unittest.TestCase):
         for pair, expected in cases:
             with self.subTest(pair=pair):
                 self.assertEqual(BENCHMARK.pair_class(pair), expected)
+
+    def test_required_turn_route_rejects_non_turn_pairs(self) -> None:
+        BENCHMARK.enforce_required_route("turn", "turn")
+        BENCHMARK.enforce_required_route("stun", None)
+        with self.assertRaisesRegex(RuntimeError, "required route 'turn'"):
+            BENCHMARK.enforce_required_route("stun", "turn")
 
     def test_percentile_uses_nearest_rank_without_understating_p95(self) -> None:
         values = [float(value) for value in range(1, 21)]

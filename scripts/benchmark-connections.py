@@ -63,9 +63,28 @@ def peer_snapshot(
         )
     peers = payload["peers"]
     for candidate in peers:
-        if isinstance(candidate, dict) and candidate.get("device_id") == peer:
+        if (
+            isinstance(candidate, dict)
+            and peer_record_canonical_id(candidate).casefold() == peer.casefold()
+        ):
             return candidate
     return None
+
+
+def peer_record_canonical_id(candidate: dict[str, Any]) -> str:
+    """Reassemble the canonical id exposed by the public peer projection.
+
+    ``ctl status`` and dial arguments use ``<device-id>-<suffix>`` while
+    ``ctl peers`` deliberately presents those as separate fields.  Accept an
+    already-combined id too so this stays compatible with older projections.
+    """
+    device_id = str(candidate.get("device_id", ""))
+    suffix = str(candidate.get("device_suffix", ""))
+    if not device_id or not suffix or device_id.casefold().endswith(
+        f"-{suffix}".casefold()
+    ):
+        return device_id
+    return f"{device_id}-{suffix}"
 
 
 def wait_for_peer(
@@ -130,6 +149,13 @@ def pair_class(pair: Any) -> str | None:
     return None
 
 
+def enforce_required_route(route: str, required: str | None) -> None:
+    if required is not None and route != required:
+        raise RuntimeError(
+            f"selected route {route!r} did not satisfy required route {required!r}"
+        )
+
+
 def percentile(sorted_values: list[float], percentile_value: float) -> float:
     if not sorted_values:
         return 0.0
@@ -186,6 +212,7 @@ def measure_one(args: argparse.Namespace, network: str) -> dict[str, Any]:
     route = pair_class(peer.get("selected_pair"))
     if route is None:
         raise RuntimeError("authenticated session has no classifiable selected ICE pair")
+    enforce_required_route(route, args.require_route)
 
     return {
         "schema": "myownmesh-real-connection-benchmark-v1",
@@ -252,6 +279,11 @@ def parse_args() -> argparse.Namespace:
         "--scenario",
         default="baseline",
         help="recorded workload label, for example baseline or semantic-admission-load",
+    )
+    parser.add_argument(
+        "--require-route",
+        choices=("lan", "stun", "turn"),
+        help="fail a sample unless its nominated ICE pair has this route class",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

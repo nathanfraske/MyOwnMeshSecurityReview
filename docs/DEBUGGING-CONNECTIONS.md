@@ -201,6 +201,15 @@ the summary statistically unqualified instead of hiding that limitation. A
 network that already has a live session is not a sample:
 `connect_peer` is intentionally idempotent, so every `--network` must be fresh.
 
+To prove a TURN path rather than merely making TURN available, build the
+daemon with the explicit `transport-lab` feature and start **both** endpoints
+with `MYOWNMESH_TRANSPORT_LAB_ICE_POLICY=relay`. This selects the WebRTC
+standard relay-only ICE policy; it does not alter signaling, credentials, or
+the configured TURN server list. Add `--require-route turn` to the harness so
+any nominated host or reflexive pair is retained as a failed sample. The
+environment value is unavailable in a normal build, accepts only `all` or
+`relay`, and fails startup on any other value.
+
 If you'd rather not keep a `ctl trace` shell open, set
 `MYOWNMESH_CONN_TRACE=1` on the daemon and the transitions land in the
 daemon log itself; with `MYOWNMESH_LOG_FORMAT=json` they're structured.
