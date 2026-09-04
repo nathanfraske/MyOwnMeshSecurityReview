@@ -523,6 +523,56 @@ impl Projection {
         Some(next)
     }
 
+    /// Restore exact values for a bounded set of projection keys.
+    ///
+    /// Admission rollback moves the post-mutation projection out of the graph
+    /// and applies these inverse entries. Keeping only the touched entries
+    /// avoids retaining a shared clone of both complete projection maps on the
+    /// successful path, while the commitment is updated through the same
+    /// Patricia operations used by ordinary sparse publication.
+    pub(crate) fn restore_sparse_entries(
+        &mut self,
+        previous_cells: &BTreeMap<ExclusiveCell, Option<CellProjection>>,
+        previous_stand_down: &BTreeMap<DeviceId, Option<StandDown>>,
+    ) {
+        let cells = Arc::make_mut(&mut self.cells);
+        for (cell, value) in previous_cells {
+            match value {
+                Some(value) => {
+                    cells.insert(cell.clone(), value.clone());
+                }
+                None => {
+                    cells.remove(cell);
+                }
+            }
+        }
+        let stand_down = Arc::make_mut(&mut self.stand_down);
+        for (target, value) in previous_stand_down {
+            match value {
+                Some(value) => {
+                    stand_down.insert(target.clone(), value.clone());
+                }
+                None => {
+                    stand_down.remove(target);
+                }
+            }
+        }
+        let mut commitment = (*self.commitment).clone();
+        for (cell, value) in previous_cells {
+            commitment = commitment.apply(
+                cell_key(cell),
+                value.as_ref().map(|value| cell_value(value)),
+            );
+        }
+        for (target, value) in previous_stand_down {
+            commitment = commitment.apply(
+                stand_down_key(target),
+                value.as_ref().map(|value| stand_down_value(value)),
+            );
+        }
+        self.commitment = Arc::new(commitment);
+    }
+
     pub(crate) fn delta_from(
         &self,
         previous: &Self,
@@ -620,18 +670,13 @@ impl Projection {
         }
         let mut commitment = (*next.commitment).clone();
         for cell in affected_cells {
-            let key = cell_key(cell);
-            commitment = commitment.apply(key, None);
-            if let Some(value) = next.cells.get(cell) {
-                commitment = commitment.apply(cell_key(cell), Some(cell_value(value)));
-            }
+            commitment = commitment.apply(cell_key(cell), next.cells.get(cell).map(cell_value));
         }
         for target in affected_stand_down_targets {
-            commitment = commitment.apply(stand_down_key(target), None);
-            if let Some(value) = next.stand_down.get(target) {
-                commitment =
-                    commitment.apply(stand_down_key(target), Some(stand_down_value(value)));
-            }
+            commitment = commitment.apply(
+                stand_down_key(target),
+                next.stand_down.get(target).map(stand_down_value),
+            );
         }
         next.commitment = Arc::new(commitment);
         next

@@ -32,6 +32,10 @@ fn signed_fact(
     body: FactBody,
     extra_parents: Vec<FactId>,
 ) -> Result<SignedFact> {
+    #[cfg(feature = "transport-lab")]
+    let _author_witness_sign_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::AuthorWitnessSign,
+    );
     let author = canonical_device(state.identity.public_id())?;
     let graph = state.authoritative_fact_graph();
     let graph = graph.read();
@@ -222,6 +226,10 @@ fn apply_canonical_projection_with<F>(state: &Arc<EngineState>, save: F) -> Resu
 where
     F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
 {
+    #[cfg(feature = "transport-lab")]
+    let _projection_roster_publish_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::ProjectionRosterPublish,
+    );
     let projection = canonical_projection_snapshot(state);
     let CanonicalProjection {
         roles,
@@ -237,23 +245,17 @@ where
             .map(|peer| peer.device_id.clone())
             .collect::<BTreeSet<_>>();
         let mut candidate = roster.clone();
-        let mut changed = false;
+        let mut desired = previous_keys
+            .iter()
+            .cloned()
+            .map(|key| (key, None))
+            .collect::<BTreeMap<_, _>>();
         for (pubkey, role) in &roles {
-            if !crate::roster::is_authorized(&candidate, pubkey) {
-                crate::roster::add_peer_in(&mut candidate, pubkey, "");
-                changed = true;
-            }
-            if crate::roster::set_role_in(&mut candidate, pubkey, *role) {
-                changed = true;
+            if !evicted.contains(pubkey) && !stood_down.contains(pubkey) {
+                desired.insert(pubkey.clone(), Some(*role));
             }
         }
-        let before = candidate.authorized_devices.len();
-        candidate.authorized_devices.retain(|entry| {
-            roles.contains_key(&entry.device_id)
-                && !evicted.contains(&entry.device_id)
-                && !stood_down.contains(&entry.device_id)
-        });
-        changed |= before != candidate.authorized_devices.len();
+        let changed = crate::roster::apply_projected_roles_in(&mut candidate, &desired);
         if changed {
             let affected_keys = previous_keys
                 .into_iter()
@@ -264,7 +266,12 @@ where
                         .map(|peer| peer.device_id.clone()),
                 )
                 .collect::<BTreeSet<_>>();
-            save(&candidate, &affected_keys)?;
+            // The role is a derived in-memory field and is intentionally not
+            // part of RosterEntryRecord. Persist only membership or metadata
+            // changes; the canonical graph still updates the live role below.
+            if !crate::roster::persisted_metadata_equal(&roster, &candidate, &affected_keys) {
+                save(&candidate, &affected_keys)?;
+            }
             *roster = candidate;
         }
         Ok(changed)
@@ -302,6 +309,10 @@ fn apply_canonical_projection_delta_with_projection_and_save<F>(
 where
     F: FnOnce(&crate::roster::Roster, &BTreeSet<String>) -> Result<()>,
 {
+    #[cfg(feature = "transport-lab")]
+    let _projection_roster_publish_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::ProjectionRosterPublish,
+    );
     let projection = canonical_projection_for_subjects(state, delta.affected_subjects());
     let CanonicalProjection {
         roles,
@@ -315,35 +326,32 @@ where
         .map(|subject| pk(subject))
         .collect::<BTreeSet<_>>();
     let before = roster.authorized_devices.snapshot_keys(&affected_keys);
-    let mut changed = false;
-    for subject in delta.affected_subjects() {
-        let pubkey = pk(subject);
-        if let Some(role) = roles.get(subject.to_string().as_str()) {
-            if !crate::roster::is_authorized(&roster, &pubkey) {
-                crate::roster::add_peer_in(&mut roster, &pubkey, "");
-                changed = true;
-            }
-            changed |= crate::roster::set_role_in(&mut roster, &pubkey, *role);
-        } else if evicted.contains(&subject.to_string())
-            || stood_down.contains(&subject.to_string())
-        {
-            let before_len = roster.authorized_devices.len();
-            crate::roster::remove_peer_in(&mut roster, &pubkey);
-            changed |= before_len != roster.authorized_devices.len();
-        } else {
-            // A canonical role/membership removal also removes the stale
-            // projection row, but never touches unrelated subjects.
-            let before_len = roster.authorized_devices.len();
-            crate::roster::remove_peer_in(&mut roster, &pubkey);
-            changed |= before_len != roster.authorized_devices.len();
-        }
-    }
+    let desired = delta
+        .affected_subjects()
+        .iter()
+        .map(|subject| {
+            let subject_string = subject.to_string();
+            let role = roles.get(&subject_string).copied().filter(|_| {
+                !evicted.contains(&subject_string) && !stood_down.contains(&subject_string)
+            });
+            (pk(subject), role)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let changed = crate::roster::apply_projected_roles_in(&mut roster, &desired);
     if changed {
-        if let Err(error) = save(&roster, &affected_keys) {
-            roster
-                .authorized_devices
-                .restore_snapshot(&affected_keys, &before);
-            return Err(error);
+        // Semantic roles are an in-memory/UI projection and are deliberately
+        // absent from RosterEntryRecord. Skip filesystem work when only that
+        // non-persisted field changed; membership or metadata changes still
+        // cross the exact save fence.
+        let persisted_changed =
+            !crate::roster::persisted_metadata_matches_snapshot(&before, &roster, &affected_keys);
+        if persisted_changed {
+            if let Err(error) = save(&roster, &affected_keys) {
+                roster
+                    .authorized_devices
+                    .restore_snapshot(&affected_keys, &before);
+                return Err(error);
+            }
         }
     }
     Ok((
@@ -1008,8 +1016,14 @@ async fn commit_proposal(
     let fact = signed_fact(state, body, Vec::new())?;
     let delta = admit_authored_fact(state, &fact).await?;
     let (_, projected) = apply_canonical_projection_delta_with_projection(state, &delta)?;
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
     broadcast_fact_inventory_delta(state, &delta).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
     if let FactBody::RoleGrant { target, role } = &fact.content.body {
         if *role == crate::semantic::Role::Member
             && projected.roles.get(&pk(target)) == Some(&crate::semantic::Role::Member)
@@ -1091,42 +1105,28 @@ pub async fn propose_membership_admit(
     )?;
     let delta = admit_authored_fact(state, &fact).await?;
     apply_canonical_projection_delta_checked(state, &delta)?;
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
     broadcast_fact_inventory_delta(state, &delta).await;
     broadcast(state, MeshMessage::Fact(fact.clone())).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
     Ok(fact.id)
 }
 
-/// Admit one verified canonical fact and project it into the read-only roster
-/// view. The carrier and projection are never used as authority.
-pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
-    if let Err(error) = fact.verify() {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            format!("rejecting invalid semantic fact {error}"),
-        );
-        return;
-    }
-    let admission = state
-        .admit_fact_durably_with_delta_async(fact.clone())
-        .await;
-    let (admission, _, delta) = match admission {
-        Ok(admission) => admission,
-        Err(error) => {
-            diag(
-                state,
-                crate::events::DiagLevel::Warn,
-                format!("rejecting semantic fact admission: {error}"),
-            );
-            return;
-        }
-    };
-    if matches!(admission, crate::semantic::Admission::Quarantined { .. }) {
-        diag(
-            state,
-            crate::events::DiagLevel::Warn,
-            "deferring semantic fact with missing causal parent",
-        );
+/// Publish one already-durable semantic delta without passing its facts back
+/// through admission. A group commit may include both the requested fact and
+/// quarantine promotions; the sparse projection is applied once, and every
+/// changed fact gets the same post-commit lifecycle handling as an ordinary
+/// single admission.
+pub(super) async fn on_committed_facts(
+    state: &Arc<EngineState>,
+    facts: Vec<SignedFact>,
+    delta: crate::semantic::SemanticDelta,
+) {
+    if facts.is_empty() {
         return;
     }
     if let Err(error) = apply_canonical_projection_delta_checked(state, &delta) {
@@ -1142,35 +1142,45 @@ pub(super) async fn on_fact(state: &Arc<EngineState>, fact: SignedFact) {
     // canonical cell may have changed. Recovery never waits for a ticker to
     // discover that signed policy has become negative.
     refresh_self_evicted(state);
-    match &fact.content.body {
-        FactBody::RoleGrant { target, .. }
-        | FactBody::RoleRevoke { target }
-        | FactBody::Evict { target }
-        | FactBody::MembershipAdmit { target }
-        | FactBody::EvictionProof { target, .. }
-        | FactBody::Attestation { target, .. } => {
-            super::reconcile_terminal_recovery_policy(state, target);
-        }
-        FactBody::SelfStandDown { device_id, .. } => {
-            super::reconcile_terminal_recovery_policy(state, device_id);
-        }
-        FactBody::Resolution { cell, .. } => match cell {
-            crate::semantic::ExclusiveCell::Role { subject }
-            | crate::semantic::ExclusiveCell::Membership { subject } => {
+    for fact in &facts {
+        match &fact.content.body {
+            FactBody::RoleGrant { target, .. }
+            | FactBody::RoleRevoke { target }
+            | FactBody::Evict { target }
+            | FactBody::MembershipAdmit { target }
+            | FactBody::EvictionProof { target, .. }
+            | FactBody::Attestation { target, .. } => {
+                super::reconcile_terminal_recovery_policy(state, target);
+            }
+            FactBody::SelfStandDown { device_id, .. } => {
+                super::reconcile_terminal_recovery_policy(state, device_id);
+            }
+            FactBody::Resolution { cell, .. } => match cell {
+                crate::semantic::ExclusiveCell::Role { subject }
+                | crate::semantic::ExclusiveCell::Membership { subject } => {
+                    super::reconcile_terminal_recovery_policy(state, subject);
+                }
+                crate::semantic::ExclusiveCell::Decision { .. } => {}
+            },
+            FactBody::AuthorityLineageResolution { subject, .. } => {
                 super::reconcile_terminal_recovery_policy(state, subject);
             }
-            crate::semantic::ExclusiveCell::Decision { .. } => {}
-        },
-        FactBody::AuthorityLineageResolution { subject, .. } => {
-            super::reconcile_terminal_recovery_policy(state, subject);
         }
     }
+    #[cfg(feature = "transport-lab")]
+    let _post_commit_broadcast_phase = crate::semantic::store::AdmissionPhaseGuard::new(
+        crate::semantic::store::AdmissionPhase::PostCommitBroadcast,
+    );
     broadcast_fact_inventory_delta(state, &delta).await;
-    match &fact.content.body {
-        FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
-            request_pending_approval(state, &fact.content.author).await;
+    #[cfg(feature = "transport-lab")]
+    drop(_post_commit_broadcast_phase);
+    for fact in facts {
+        match &fact.content.body {
+            FactBody::RoleGrant { target, .. } if pk(target) == pk(state.identity.public_id()) => {
+                request_pending_approval(state, &fact.content.author).await;
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -1408,8 +1418,7 @@ mod governance_projection_controls {
     }
 
     #[tokio::test]
-    async fn indexed_delta_role_change_avoids_roster_scan_and_restores_on_save_failure(
-    ) -> Result<()> {
+    async fn role_projection_skips_persistence_and_metadata_failure_is_returned() -> Result<()> {
         let state = crate::engine::build_test_closed_state("indexed-roster-delta", [0x2c; 32]);
         let first_target = crate::identity::Identity::ephemeral()
             .public_id()
@@ -1458,9 +1467,25 @@ mod governance_projection_controls {
                 .map(|peer| peer.role)
         };
         let before_success = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
-        let (changed, _) = apply_canonical_projection_delta_with_projection(&state, &second_delta)
-            .expect("indexed existing-subject projection succeeds");
+        let role_save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let role_save_calls_by_save = Arc::clone(&role_save_calls);
+        let (changed, _) = apply_canonical_projection_delta_with_projection_and_save(
+            &state,
+            &second_delta,
+            move |_, _| {
+                role_save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(Error::Roster(
+                    "role-only projection must not persist".into(),
+                ))
+            },
+        )
+        .expect("indexed existing-subject role projection succeeds without persistence");
         assert!(changed);
+        assert_eq!(
+            role_save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "role-only projection must not enter the persistence path"
+        );
         assert_eq!(
             crate::roster::AuthorizedDevices::test_counters(),
             (0, 0),
@@ -1477,30 +1502,57 @@ mod governance_projection_controls {
             "the role change updates the keyed in-memory row"
         );
 
-        let failure_fact = signed_fact(
+        // A second role-only projection must remain on the same no-persistence
+        // path.  This catches an implementation that skips the first write but
+        // accidentally rewrites the advisory row on a later role transition.
+        let third_fact = signed_fact(
             &state,
             FactBody::RoleGrant {
-                target: canonical_device(&second_target).expect("second target is canonical"),
-                role: crate::semantic::Role::Controller,
+                target: canonical_device(&first_target).expect("first target is canonical"),
+                role: crate::semantic::Role::Owner,
             },
             Vec::new(),
         )?;
-        let (_, _, failure_delta) = state
-            .admit_fact_durably_with_delta_async(failure_fact)
+        let (_, _, third_delta) = state
+            .admit_fact_durably_with_delta_async(third_fact)
             .await
-            .expect("failure-path role change admits");
-        let before_failure = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
-        let before_failure_role = roster_role(&second_target);
-        crate::roster::AuthorizedDevices::reset_test_counters();
-        let error = match apply_canonical_projection_delta_with_projection_and_save(
+            .expect("repeated role-only change admits");
+        let repeated_role_save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repeated_role_save_calls_by_save = Arc::clone(&repeated_role_save_calls);
+        let (changed, _) = apply_canonical_projection_delta_with_projection_and_save(
             &state,
-            &failure_delta,
-            |_, _| {
+            &third_delta,
+            move |_, _| {
+                repeated_role_save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err(Error::Roster(
-                    "injected projection persistence failure".into(),
+                    "repeated role-only projection must not persist".into(),
                 ))
             },
-        ) {
+        )
+        .expect("repeated role-only projection remains persistence-free");
+        assert!(changed);
+        assert_eq!(
+            repeated_role_save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "repeated role-only projection must not enter the persistence path"
+        );
+        assert_eq!(
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Owner),
+            "the repeated role change updates the keyed in-memory row"
+        );
+
+        let stale_target = crate::identity::Identity::ephemeral()
+            .public_id()
+            .to_string();
+        crate::roster::add_peer_in(&mut state.roster.write(), &stale_target, "stale");
+        let before_failure = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        crate::roster::AuthorizedDevices::reset_test_counters();
+        let error = match apply_canonical_projection_with(&state, |_, _| {
+            Err(Error::Roster(
+                "injected projection persistence failure".into(),
+            ))
+        }) {
             Ok(_) => panic!("injected save failure must reach the caller"),
             Err(error) => error,
         };
@@ -1508,19 +1560,60 @@ mod governance_projection_controls {
         assert_eq!(
             serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
             before_failure,
-            "indexed rollback restores exact serialized bytes"
+            "a real persisted-byte refusal preserves exact serialized bytes"
         );
         assert_eq!(
-            roster_role(&second_target),
-            before_failure_role,
-            "indexed rollback restores the affected in-memory role"
-        );
-        assert_eq!(
-            crate::roster::AuthorizedDevices::test_counters(),
-            (0, 0),
-            "existing-subject rollback must not scan or rebuild the roster"
+            roster_role(&first_target),
+            Some(crate::semantic::Role::Owner),
+            "a metadata persistence refusal does not disturb the live role projection"
         );
         Ok(())
+    }
+
+    #[test]
+    fn startup_projection_rebuilds_role_from_graph_without_roster_write() {
+        let state = crate::engine::build_test_closed_state("projection-restart-role", [0x2d; 32]);
+        let root = state.identity.public_id().to_string();
+        assert!(crate::roster::is_authorized(&state.roster.read(), &root));
+        crate::roster::set_role_in(
+            &mut state.roster.write(),
+            &root,
+            crate::semantic::Role::Member,
+        );
+        let before = serde_json::to_vec(&*state.roster.read()).expect("roster serializes");
+        let save_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let save_calls_by_save = Arc::clone(&save_calls);
+        let changed = apply_canonical_projection_with(&state, move |_, _| {
+            save_calls_by_save.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(Error::Roster(
+                "startup role reconstruction must not persist".into(),
+            ))
+        })
+        .expect("startup projection rebuilds the role from canonical state");
+        assert!(changed);
+        assert_eq!(
+            save_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "canonical role restoration must not rewrite advisory metadata"
+        );
+        let root_pubkey = crate::signing::pubkey_part(&root);
+        let role = state
+            .roster
+            .read()
+            .authorized_devices
+            .iter()
+            .find(|peer| peer.device_id == root_pubkey)
+            .map(|peer| peer.role);
+        assert_eq!(
+            role,
+            Some(crate::semantic::Role::Owner),
+            "restart projection must derive the authority tier from the graph"
+        );
+        assert_eq!(
+            serde_json::to_vec(&*state.roster.read()).expect("roster serializes"),
+            before,
+            "rebuilding a derived role leaves persisted roster bytes unchanged"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(feature = "transport-lab")]
+use std::time::Instant;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -63,6 +65,169 @@ const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static ORDERED_RESTORE_ROWS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "transport-lab")]
+const ADMISSION_PHASE_COUNT: usize = 13;
+
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AdmissionPhase {
+    AsyncAdmissionEnvelopeInclusive,
+    AsyncLanePermitWaitExclusive,
+    PublicationGraphReplayColdLookup,
+    CausalJournalApply,
+    StoreWorkerHandoff,
+    StorePlan,
+    CapacityPreflight,
+    BeginImmediate,
+    SqlApply,
+    CommitWalTerminal,
+    AuthorWitnessSign,
+    ProjectionRosterPublish,
+    PostCommitBroadcast,
+}
+
+#[cfg(feature = "transport-lab")]
+impl AdmissionPhase {
+    const fn index(self) -> usize {
+        match self {
+            Self::AsyncAdmissionEnvelopeInclusive => 0,
+            Self::AsyncLanePermitWaitExclusive => 1,
+            Self::PublicationGraphReplayColdLookup => 2,
+            Self::CausalJournalApply => 3,
+            Self::StoreWorkerHandoff => 4,
+            Self::StorePlan => 5,
+            Self::CapacityPreflight => 6,
+            Self::BeginImmediate => 7,
+            Self::SqlApply => 8,
+            Self::CommitWalTerminal => 9,
+            Self::AuthorWitnessSign => 10,
+            Self::ProjectionRosterPublish => 11,
+            Self::PostCommitBroadcast => 12,
+        }
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+pub(crate) struct AdmissionPhaseGuard {
+    phase: AdmissionPhase,
+    started: Instant,
+}
+
+#[cfg(feature = "transport-lab")]
+impl AdmissionPhaseGuard {
+    pub(crate) fn new(phase: AdmissionPhase) -> Self {
+        Self {
+            phase,
+            started: Instant::now(),
+        }
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+impl Drop for AdmissionPhaseGuard {
+    fn drop(&mut self) {
+        let index = self.phase.index();
+        let elapsed = self.started.elapsed().as_nanos();
+        let nanos = u64::try_from(elapsed).unwrap_or(u64::MAX);
+        let _ = ADMISSION_PHASE_COUNTS[index].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(1)),
+        );
+        let _ = ADMISSION_PHASE_NANOS[index].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.saturating_add(nanos)),
+        );
+        let _ = ADMISSION_PHASE_MAX_NANOS[index].fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |value| Some(value.max(nanos)),
+        );
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+static ADMISSION_PHASE_COUNTS: [AtomicU64; ADMISSION_PHASE_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[cfg(feature = "transport-lab")]
+static ADMISSION_PHASE_NANOS: [AtomicU64; ADMISSION_PHASE_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[cfg(feature = "transport-lab")]
+static ADMISSION_PHASE_MAX_NANOS: [AtomicU64; ADMISSION_PHASE_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+#[cfg(feature = "transport-lab")]
+pub(crate) fn reset_admission_phase_profile() {
+    for counter in &ADMISSION_PHASE_COUNTS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in &ADMISSION_PHASE_NANOS {
+        counter.store(0, Ordering::Relaxed);
+    }
+    for counter in &ADMISSION_PHASE_MAX_NANOS {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+pub(crate) fn admission_phase_profile_snapshot() -> (
+    [u64; ADMISSION_PHASE_COUNT],
+    [u64; ADMISSION_PHASE_COUNT],
+    [u64; ADMISSION_PHASE_COUNT],
+) {
+    let mut counts = [0; ADMISSION_PHASE_COUNT];
+    let mut nanos = [0; ADMISSION_PHASE_COUNT];
+    let mut max_nanos = [0; ADMISSION_PHASE_COUNT];
+    for index in 0..ADMISSION_PHASE_COUNT {
+        counts[index] = ADMISSION_PHASE_COUNTS[index].load(Ordering::Relaxed);
+        nanos[index] = ADMISSION_PHASE_NANOS[index].load(Ordering::Relaxed);
+        max_nanos[index] = ADMISSION_PHASE_MAX_NANOS[index].load(Ordering::Relaxed);
+    }
+    (counts, nanos, max_nanos)
+}
 
 /// A local store for one bootstrap record.
 ///
@@ -353,6 +518,8 @@ impl SemanticStorageWorker {
         let operation: WorkerOperation = Box::new(move |store, connection| {
             operation(store, connection).map(|value| Box::new(value) as WorkerValue)
         });
+        #[cfg(feature = "transport-lab")]
+        let handoff = AdmissionPhaseGuard::new(AdmissionPhase::StoreWorkerHandoff);
         self.commands
             .send(WorkerCommand::Run {
                 create,
@@ -368,6 +535,8 @@ impl SemanticStorageWorker {
                     DurableStoreError::OwnerReleased
                 }
             })?;
+        #[cfg(feature = "transport-lab")]
+        drop(handoff);
         let value = result.recv().map_err(|_| {
             if self.poisoned.load(Ordering::Acquire) {
                 DurableStoreError::WorkerPanicked
@@ -382,6 +551,57 @@ impl SemanticStorageWorker {
                 path: PathBuf::from("semantic-worker"),
                 reason: "worker result type mismatch".into(),
             })
+    }
+
+    /// Submit a commit operation while retaining the accepted-command
+    /// boundary. A failed rendezvous send is definitely pre-operation; a
+    /// lost result after the send is ambiguous because SQLite may already
+    /// have crossed COMMIT.
+    fn call_commit<F>(
+        &self,
+        create: bool,
+        reopen: bool,
+        compact_after_reopen: bool,
+        operation: F,
+    ) -> Result<(), DurableStoreError>
+    where
+        F: FnOnce(
+                &DurableSemanticStore,
+                &mut SemanticSqliteConnection,
+            ) -> Result<(), DurableStoreError>
+            + Send
+            + 'static,
+    {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(DurableStoreError::WorkerPanicked);
+        }
+        let (reply, result) = channel();
+        let operation: WorkerOperation = Box::new(move |store, connection| {
+            operation(store, connection).map(|()| Box::new(()) as WorkerValue)
+        });
+        #[cfg(feature = "transport-lab")]
+        let handoff = AdmissionPhaseGuard::new(AdmissionPhase::StoreWorkerHandoff);
+        self.commands
+            .send(WorkerCommand::Run {
+                create,
+                reopen,
+                compact_after_reopen,
+                operation,
+                reply,
+            })
+            .map_err(|_| {
+                if self.poisoned.load(Ordering::Acquire) {
+                    DurableStoreError::WorkerPanicked
+                } else {
+                    DurableStoreError::OwnerReleased
+                }
+            })?;
+        #[cfg(feature = "transport-lab")]
+        drop(handoff);
+        result
+            .recv()
+            .map_err(|_| DurableStoreError::OutcomeUnknown)??;
+        Ok(())
     }
 
     fn shutdown(mut self) -> Result<(), DurableStoreError> {
@@ -5466,6 +5686,29 @@ impl DurableSemanticOwner {
             .call(create, reopen, compact_after_reopen, operation)
     }
 
+    fn worker_call_commit<F>(
+        &self,
+        create: bool,
+        reopen: bool,
+        compact_after_reopen: bool,
+        operation: F,
+    ) -> Result<(), DurableStoreError>
+    where
+        F: FnOnce(
+                &DurableSemanticStore,
+                &mut SemanticSqliteConnection,
+            ) -> Result<(), DurableStoreError>
+            + Send
+            + 'static,
+    {
+        self.worker
+            .lock()
+            .map_err(|_| DurableStoreError::InProcessGatePoisoned)?
+            .as_ref()
+            .ok_or(DurableStoreError::OwnerReleased)?
+            .call_commit(create, reopen, compact_after_reopen, operation)
+    }
+
     fn ensure_live_unlocked(&self) -> Result<(), DurableStoreError> {
         let worker = self
             .worker
@@ -5814,7 +6057,9 @@ impl DurableSemanticOwner {
         self.ensure_live_unlocked()?;
         let delta = delta.clone();
         let custody = custody.to_vec();
-        self.worker_call(false, false, false, move |store, connection| {
+        self.worker_call_commit(false, false, false, move |store, connection| {
+            #[cfg(feature = "transport-lab")]
+            let plan_phase = AdmissionPhaseGuard::new(AdmissionPhase::StorePlan);
             let plan = store.plan_semantic_delta(
                 connection,
                 context_id,
@@ -5824,15 +6069,33 @@ impl DurableSemanticOwner {
                 &custody,
                 None,
             )?;
+            #[cfg(feature = "transport-lab")]
+            drop(plan_phase);
             if !plan.changed {
                 return Ok(());
             }
+            #[cfg(feature = "transport-lab")]
+            let preflight_phase = AdmissionPhaseGuard::new(AdmissionPhase::CapacityPreflight);
             store.preflight_capacity(connection)?;
+            #[cfg(feature = "transport-lab")]
+            drop(preflight_phase);
+            #[cfg(feature = "transport-lab")]
+            let begin_phase = AdmissionPhaseGuard::new(AdmissionPhase::BeginImmediate);
             let transaction = connection
                 .transaction()
                 .map_err(DurableStoreError::Sqlite)?;
+            #[cfg(feature = "transport-lab")]
+            drop(begin_phase);
+            #[cfg(feature = "transport-lab")]
+            let apply_phase = AdmissionPhaseGuard::new(AdmissionPhase::SqlApply);
             store.apply_semantic_delta(&transaction, &plan)?;
-            transaction.commit().map_err(DurableStoreError::Sqlite)
+            #[cfg(feature = "transport-lab")]
+            drop(apply_phase);
+            #[cfg(feature = "transport-lab")]
+            let _commit_phase = AdmissionPhaseGuard::new(AdmissionPhase::CommitWalTerminal);
+            transaction
+                .commit()
+                .map_err(|_| DurableStoreError::OutcomeUnknown)
         })
     }
 
@@ -6722,6 +6985,12 @@ pub enum DurableStoreError {
     OwnerReleased,
     #[error("semantic storage worker panicked")]
     WorkerPanicked,
+    /// The worker or SQLite returned after the atomic commit boundary could
+    /// not be classified. Callers must reconcile exact fact IDs, generation,
+    /// and projection commitment before retrying; this is never a rollback
+    /// indication.
+    #[error("semantic snapshot commit outcome is unknown; reconcile durable state")]
+    OutcomeUnknown,
     #[error("semantic snapshot path has no parent: {0}")]
     InvalidPath(PathBuf),
     #[error("semantic snapshot I/O at {path}: {source}")]

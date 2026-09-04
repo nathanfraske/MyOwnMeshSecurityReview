@@ -263,9 +263,7 @@ pub(super) async fn reduce(
         // reject anything; `source` does not appear in that decision.
         Exchange::FactPage(m) => {
             let facts = m.facts;
-            for fact in facts.iter().cloned() {
-                reduce_signed_fact(state, fact).await;
-            }
+            let batch_admitted = reduce_signed_facts(state, facts.clone()).await;
             // The inventory is a durable exchange acknowledgement: it is the
             // receiver's exact post-admission fact set, sent back through the
             // same logical operation that delivered this page. A carrier,
@@ -278,7 +276,8 @@ pub(super) async fn reduce(
             // verified acceptance to a sender that already has the same IDs.
             // Eviction proofs add one more check: their exact target must be
             // stood down by the resulting canonical projection.
-            if page_is_admitted(state, &facts)
+            if batch_admitted
+                && page_is_admitted(state, &facts)
                 && governance::fact_page_projection_is_verified(state, &facts)
             {
                 if let Some(route) = reply {
@@ -298,10 +297,8 @@ pub(super) async fn reduce(
                 return;
             }
             let facts = delivery.facts.clone();
-            for fact in facts.iter().cloned() {
-                reduce_signed_fact(state, fact).await;
-            }
-            if proof_delivery_is_verified(state, &delivery) {
+            let batch_admitted = reduce_signed_facts(state, facts).await;
+            if batch_admitted && proof_delivery_is_verified(state, &delivery) {
                 if let Some(route) = reply {
                     governance::acknowledge_proof_delivery(state, route, &delivery).await;
                 }
@@ -394,9 +391,9 @@ pub(super) fn proof_delivery_is_verified(
 async fn admit_journaled_durably(
     state: &Arc<NetworkState>,
     fact: SignedFact,
-) -> Result<(Admission, Vec<SignedFact>), AdmissionError> {
+) -> Result<(Admission, Vec<SignedFact>, crate::semantic::SemanticDelta), AdmissionError> {
     state
-        .admit_fact_durably_async(fact)
+        .admit_fact_durably_with_delta_async(fact)
         .await
         .map_err(AdmissionError::Durable)
 }
@@ -407,16 +404,55 @@ enum AdmissionError {
 
 async fn reduce_signed_fact(state: &Arc<NetworkState>, fact: SignedFact) {
     match admit_journaled_durably(state, fact).await {
-        Ok((Admission::Inserted, newly_inserted)) => {
-            for fact in newly_inserted {
-                governance::on_fact(state, fact).await;
-            }
+        Ok((Admission::Inserted, newly_inserted, delta)) => {
+            governance::on_committed_facts(state, newly_inserted, delta).await;
         }
-        Ok((Admission::AlreadyPresent | Admission::Quarantined { .. }, _)) => {}
+        Ok((Admission::AlreadyPresent | Admission::Quarantined { .. }, _, _)) => {}
         Err(AdmissionError::Durable(error)) => {
             trace!(error = %error, "journaled semantic admission refused")
         }
     }
+}
+
+/// Reduce one bounded page through one graph journal and one SQLite
+/// transaction. Per-input outcomes decide the ACK, while the aggregate delta
+/// is published exactly once after the durable commit.
+async fn reduce_signed_facts(state: &Arc<NetworkState>, facts: Vec<SignedFact>) -> bool {
+    if facts.is_empty() {
+        trace!("withholding semantic ACK for empty fact batch");
+        return false;
+    }
+    let expected = facts.len();
+    let batch = match state.admit_facts_durably_with_delta_async(facts).await {
+        Ok(batch) => batch,
+        Err(error) => {
+            trace!(%error, "withholding semantic ACK for failed aggregate admission");
+            return false;
+        }
+    };
+    let crate::engine::state::DurableAdmissionBatch {
+        outcomes,
+        changed_admitted,
+        delta,
+    } = batch;
+    let mut all_admitted = outcomes.len() == expected;
+    for (index, result) in outcomes.into_iter().enumerate() {
+        match result {
+            Ok(Admission::Inserted | Admission::AlreadyPresent) => {}
+            Ok(Admission::Quarantined { .. }) => {
+                all_admitted = false;
+                trace!(index, "withholding semantic ACK for quarantined fact");
+            }
+            Err(error) => {
+                all_admitted = false;
+                trace!(index, %error, "withholding semantic ACK for refused fact");
+            }
+        }
+    }
+    if !changed_admitted.is_empty() {
+        governance::on_committed_facts(state, changed_admitted, delta).await;
+    }
+    all_admitted
 }
 
 #[cfg(test)]

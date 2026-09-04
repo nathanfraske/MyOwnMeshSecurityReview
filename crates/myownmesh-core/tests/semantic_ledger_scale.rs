@@ -16,7 +16,10 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, MutexGuard, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
@@ -29,13 +32,16 @@ use myownmesh_core::resource::{
 };
 use myownmesh_core::semantic::SemanticFactPageRequest;
 use myownmesh_core::semantic::{
-    FactBody, FactContent, FactDomain, FactId, SignedFact, VerifiedBootstrap,
+    DeviceId, FactBody, FactContent, FactDomain, FactId, SemanticFactPage, SignedFact,
+    VerifiedBootstrap,
 };
 use myownmesh_core::{
-    ConnectorCallbackPolicy, Identity, Mesh, MeshConfig, WebRtcConnectorCapablePolicy,
-    WebRtcConnectorProfile,
+    handle::SemanticAdmissionProfile, ConnectorCallbackPolicy, Identity, Mesh, MeshConfig,
+    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use serde::Serialize;
+use tokio::sync::Barrier;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 struct DbFootprint {
@@ -131,6 +137,7 @@ struct ScaleMetrics {
     process_rss_after_restore_bytes: Option<u64>,
     process_scope_write_bytes_delta: Option<u64>,
     process_scope_write_bytes_per_admission: Option<f64>,
+    admission_phases: serde_json::Value,
     provider_baseline: ProviderSnapshot,
     provider_final: ProviderSnapshot,
 }
@@ -139,8 +146,11 @@ struct ScaleMetrics {
 struct ScaleWindowEvidence {
     start_admitted: usize,
     end_admitted: usize,
+    admission_count: usize,
     admission_total_ms: f64,
+    elapsed_ms: f64,
     average_admission_ms: f64,
+    max_admission_ms: f64,
     p50_ms: f64,
     p95_ms: f64,
     p99_ms: f64,
@@ -190,6 +200,47 @@ struct OpenMetrics {
     provider_final: ProviderSnapshot,
 }
 
+#[derive(Debug, Serialize)]
+struct ConcurrentProducerMetrics {
+    selector: &'static str,
+    group_size: usize,
+    max_inflight_callers: usize,
+    producer_count: usize,
+    admitted_count: u64,
+    durable_commit_count: u64,
+    causal_journal_count: u64,
+    mean_facts_per_durable_commit: f64,
+    elapsed_ms: f64,
+    throughput_per_sec: f64,
+    latency_p50_ms: f64,
+    latency_p95_ms: f64,
+    latency_p99_ms: f64,
+    completion_order: Vec<usize>,
+    sequential_provider_baseline: ProviderSnapshot,
+    sequential_provider_final: ProviderSnapshot,
+    concurrent_provider_baseline: ProviderSnapshot,
+    concurrent_provider_final: ProviderSnapshot,
+    sequential_admission_phases: SemanticAdmissionProfile,
+    concurrent_admission_phases: SemanticAdmissionProfile,
+}
+
+#[derive(Debug, Serialize)]
+struct GroupCommitHotpathMetrics {
+    selector: &'static str,
+    group_size: usize,
+    admitted_count: u64,
+    durable_commit_count: u64,
+    causal_journal_count: u64,
+    facts_per_durable_commit: f64,
+    elapsed_ms: f64,
+    throughput_per_sec: f64,
+    db_before: DbFootprint,
+    db_after: DbFootprint,
+    admission_phases: SemanticAdmissionProfile,
+    provider_baseline: ProviderSnapshot,
+    provider_final: ProviderSnapshot,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ScaleCapacity {
     admitted_bytes: u64,
@@ -231,6 +282,18 @@ fn representative_fact_bytes(network_id: &str, parents: Vec<FactId>) -> u64 {
 }
 
 fn scale_capacity(scale: usize, network_id: &str) -> ScaleCapacity {
+    scale_capacity_with_ready_batch(scale, network_id, 1)
+}
+
+fn scale_capacity_with_ready_batch(
+    scale: usize,
+    network_id: &str,
+    max_ready_batch: usize,
+) -> ScaleCapacity {
+    assert!(
+        max_ready_batch > 0,
+        "the selected ready-batch bound is finite and nonzero"
+    );
     let scale_u64 = u64::try_from(scale).expect("scale fits u64");
     let first_fact_bytes = representative_fact_bytes(network_id, Vec::new());
     let chained_fact_bytes =
@@ -277,12 +340,17 @@ fn scale_capacity(scale: usize, network_id: &str) -> ScaleCapacity {
                 .expect("scaled dependency edges fit u64"),
         )
         .expect("dependency edge workload fits u64");
-    policy.max_ready_batch = 1;
-    policy.max_pending_proofs = 1;
-    policy.max_pending_proof_bytes = max_fact_encoded_bytes;
-    policy.max_proof_records = 1;
-    policy.max_proof_bytes = max_fact_encoded_bytes;
-    policy.max_proof_links = 1;
+    policy.max_ready_batch =
+        u64::try_from(max_ready_batch).expect("the selected ready-batch bound fits u64");
+    let batch_bound = u64::try_from(max_ready_batch)
+        .expect("the selected ready-batch bound fits the semantic policy");
+    policy.max_pending_proofs = batch_bound;
+    policy.max_pending_proof_bytes = max_fact_encoded_bytes
+        .checked_mul(batch_bound)
+        .expect("the selected proof-delivery envelope fits u64");
+    policy.max_proof_records = batch_bound;
+    policy.max_proof_bytes = policy.max_pending_proof_bytes;
+    policy.max_proof_links = batch_bound;
     policy.max_author_usage_rows = 1;
     policy.max_provisional_rows = 1;
     policy.max_freelist_pages = 1;
@@ -324,9 +392,7 @@ fn scale_capacity(scale: usize, network_id: &str) -> ScaleCapacity {
     }
 }
 
-fn connector_policy(
-    capacity: ScaleCapacity,
-) -> (WebRtcConnectorCapablePolicy, FiniteResourceProvider) {
+fn finite_provider(capacity: ScaleCapacity) -> FiniteResourceProvider {
     let per_class = capacity.provider_per_class;
     let grant = ResourceClaim::try_from_entries(ResourceClass::ALL.into_iter().map(|class| {
         let amount = if class == ResourceClass::StorageBytes {
@@ -337,16 +403,24 @@ fn connector_policy(
         (class, amount)
     }))
     .expect("finite scaling resource grant");
-    let provider = FiniteResourceProvider::new(grant);
+    FiniteResourceProvider::new(grant)
+}
+
+fn connector_policy_for_resources(resources: ResourceProviderPort) -> WebRtcConnectorCapablePolicy {
+    WebRtcConnectorCapablePolicy::new(
+        resources,
+        WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
+    )
+}
+
+fn connector_policy(
+    capacity: ScaleCapacity,
+) -> (WebRtcConnectorCapablePolicy, FiniteResourceProvider) {
+    let provider = finite_provider(capacity);
     let resources =
         ResourceProviderPort::new(provider.clone()).expect("finite scaling resource provider");
-    (
-        WebRtcConnectorCapablePolicy::new(
-            resources,
-            WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only()),
-        ),
-        provider,
-    )
+    let connector = connector_policy_for_resources(resources);
+    (connector, provider)
 }
 
 fn assert_footprint_within(policy: &SemanticPolicyConfig, footprint: DbFootprint, label: &str) {
@@ -692,6 +766,416 @@ mod metric_controls {
     }
 }
 
+/// Read the concurrent-producer selector as an explicit operator choice.
+/// There is intentionally no production/default group size: the finite
+/// resource grant and this selector together define the diagnostic run.
+fn selected_concurrent_group() -> myownmesh_core::Result<Option<usize>> {
+    let Some(raw) = std::env::var_os("MYOWNMESH_SCALE_CONCURRENT_GROUP") else {
+        return Ok(None);
+    };
+    let raw = raw.to_str().ok_or_else(|| {
+        myownmesh_core::Error::Other("MYOWNMESH_SCALE_CONCURRENT_GROUP must be UTF-8".to_string())
+    })?;
+    let value = raw.parse::<u64>().map_err(|error| {
+        myownmesh_core::Error::Other(format!(
+            "MYOWNMESH_SCALE_CONCURRENT_GROUP must be an integer: {error}"
+        ))
+    })?;
+    let value = usize::try_from(value).map_err(|_| {
+        myownmesh_core::Error::Other(
+            "MYOWNMESH_SCALE_CONCURRENT_GROUP does not fit usize".to_string(),
+        )
+    })?;
+    if !(2..=64).contains(&value) {
+        return Err(myownmesh_core::Error::Other(
+            "MYOWNMESH_SCALE_CONCURRENT_GROUP must be between 2 and 64".to_string(),
+        ));
+    }
+    Ok(Some(value))
+}
+
+async fn run_public_producer_case(
+    home: &Path,
+    network_id: &str,
+    targets: &[String],
+    concurrent: bool,
+    provider: &FiniteResourceProvider,
+    connector: &WebRtcConnectorCapablePolicy,
+) -> myownmesh_core::Result<(
+    myownmesh_core::semantic::SemanticStateIdentity,
+    Vec<Duration>,
+    Vec<usize>,
+    usize,
+    ProviderSnapshot,
+    ProviderSnapshot,
+    SemanticAdmissionProfile,
+    Duration,
+)> {
+    let _home_env = ScopedMeshHome::new(home);
+    let capacity = scale_capacity_with_ready_batch(targets.len(), network_id, targets.len());
+    let identity = Arc::new(Identity::from_signing_key(
+        SigningKey::from_bytes(&[0x43; 32]),
+        "semantic-scale-concurrent",
+    ));
+    let mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        identity,
+        connector.clone(),
+    )
+    .await?;
+    let provider_baseline_claim = provider.in_use();
+    let provider_baseline = provider_snapshot(&mesh);
+    let network = mesh
+        .create_network(
+            closed_config(network_id, targets.len(), capacity),
+            [0x71; 32],
+        )
+        .await?;
+    assert_eq!(provider_snapshot(&mesh), provider_baseline);
+    let network = Arc::new(network);
+    network.reset_semantic_admission_profile_for_lab();
+    let producer_started = Instant::now();
+    let (latencies, replay_order, peak_producers) = if concurrent {
+        let barrier = Arc::new(Barrier::new(targets.len()));
+        let active_producers = Arc::new(AtomicUsize::new(0));
+        let peak_producers = Arc::new(AtomicUsize::new(0));
+        let mut producers = JoinSet::new();
+        for (index, target) in targets.iter().cloned().enumerate() {
+            let barrier = Arc::clone(&barrier);
+            let active_producers = Arc::clone(&active_producers);
+            let peak_producers = Arc::clone(&peak_producers);
+            let network = Arc::clone(&network);
+            producers.spawn(async move {
+                barrier.wait().await;
+                let active = active_producers.fetch_add(1, Ordering::AcqRel) + 1;
+                peak_producers.fetch_max(active, Ordering::AcqRel);
+                let started = Instant::now();
+                let outcome = network
+                    .propose_role_grant(&target, myownmesh_core::semantic::Role::Member, None)
+                    .await
+                    .map(|_| (index, started.elapsed()));
+                active_producers.fetch_sub(1, Ordering::AcqRel);
+                outcome
+            });
+        }
+        let mut completed = Vec::with_capacity(targets.len());
+        while let Some(result) = producers.join_next().await {
+            let result = result.map_err(|error| {
+                myownmesh_core::Error::Other(format!(
+                    "concurrent semantic producer task failed: {error}"
+                ))
+            })??;
+            completed.push(result);
+        }
+        let latencies = completed.iter().map(|(_, elapsed)| *elapsed).collect();
+        let replay_order = completed.iter().map(|(index, _)| *index).collect();
+        (
+            latencies,
+            replay_order,
+            peak_producers.load(Ordering::Acquire),
+        )
+    } else {
+        let mut latencies = Vec::with_capacity(targets.len());
+        let mut replay_order = Vec::with_capacity(targets.len());
+        for (index, target) in targets.iter().enumerate() {
+            let started = Instant::now();
+            network
+                .propose_role_grant(target, myownmesh_core::semantic::Role::Member, None)
+                .await?;
+            latencies.push(started.elapsed());
+            replay_order.push(index);
+        }
+        (latencies, replay_order, 1)
+    };
+    let producer_elapsed = producer_started.elapsed();
+    let admission_phases = network.semantic_admission_profile_for_lab();
+    // SemanticStateIdentity carries a provider lease while it is live.  The
+    // benchmark needs only its scalar observation fields across teardown, so
+    // exercise the public diagnostic representation and release that lease
+    // before asserting the provider baseline.
+    let identity: myownmesh_core::semantic::SemanticStateIdentity = serde_json::from_value(
+        serde_json::to_value(network.semantic_state_identity()?)
+            .expect("semantic producer identity serializes"),
+    )
+    .expect("semantic producer identity diagnostic representation round-trips");
+    assert_eq!(
+        identity.admitted_fact_count(),
+        u64::try_from(targets.len()).expect("concurrent producer count fits u64")
+    );
+    let network = Arc::try_unwrap(network).map_err(|_| {
+        myownmesh_core::Error::Other("producer tasks retained the network owner".to_string())
+    })?;
+    network.shutdown().await?;
+    drop(network);
+    let provider_final = provider_snapshot(&mesh);
+    assert_eq!(
+        provider_final, provider_baseline,
+        "producer case releases all funded resources"
+    );
+    assert_eq!(
+        provider.in_use(),
+        provider_baseline_claim,
+        "producer case restores the exact finite provider grant"
+    );
+    Ok((
+        identity,
+        latencies,
+        replay_order,
+        peak_producers,
+        provider_baseline,
+        provider_final,
+        admission_phases,
+        producer_elapsed,
+    ))
+}
+
+async fn run_concurrent_producers(group_size: usize) -> myownmesh_core::Result<()> {
+    let network_id = format!("semantic-ledger-scale-concurrent-{group_size}");
+    let targets: Vec<_> = (0..group_size).map(target_id).collect();
+    let provider = finite_provider(scale_capacity_with_ready_batch(
+        targets.len(),
+        &network_id,
+        targets.len(),
+    ));
+    let resources =
+        ResourceProviderPort::new(provider.clone()).expect("concurrent scaling resource provider");
+    let connector = connector_policy_for_resources(resources);
+    let sequential_home = tempfile::tempdir().expect("sequential producer instance root");
+    let (
+        sequential_identity,
+        _,
+        sequential_order,
+        _,
+        sequential_provider_baseline,
+        sequential_provider_final,
+        sequential_admission_phases,
+        _,
+    ) = run_public_producer_case(
+        sequential_home.path(),
+        &network_id,
+        &targets,
+        false,
+        &provider,
+        &connector,
+    )
+    .await?;
+    assert_eq!(
+        sequential_order,
+        (0..group_size).collect::<Vec<_>>(),
+        "the comparison run is the explicit deterministic target order"
+    );
+
+    let concurrent_home = tempfile::tempdir().expect("concurrent producer instance root");
+    let (
+        concurrent_identity,
+        mut latencies,
+        observed_order,
+        concurrent_peak_producers,
+        concurrent_provider_baseline,
+        concurrent_provider_final,
+        concurrent_admission_phases,
+        concurrent_elapsed,
+    ) = run_public_producer_case(
+        concurrent_home.path(),
+        &network_id,
+        &targets,
+        true,
+        &provider,
+        &connector,
+    )
+    .await?;
+    let elapsed_ms = concurrent_elapsed.as_secs_f64() * 1_000.0;
+    // Independently authored facts sign the current causal parents, so a
+    // concurrent authoring order is not expected to have the same FactIds or
+    // commitments as a different sequential authoring order.  Exact restart
+    // and cross-node replay identity are covered by the group-commit controls;
+    // this workload compares the order-independent public outcomes.
+    assert_eq!(
+        concurrent_identity.context_id(),
+        sequential_identity.context_id()
+    );
+    assert_eq!(
+        concurrent_identity.admitted_fact_count(),
+        sequential_identity.admitted_fact_count(),
+        "concurrent and sequential public producers admit the same bounded fact count"
+    );
+    assert_eq!(
+        concurrent_identity.unresolved_fact_count(),
+        0,
+        "concurrent public producers leave no unresolved custody"
+    );
+    let durable_commit_count = concurrent_admission_phases.commit_wal_terminal.count;
+    let causal_journal_count = concurrent_admission_phases.causal_journal_apply.count;
+    assert!(
+        durable_commit_count > 0 && durable_commit_count <= group_size as u64,
+        "the profiled producer run must perform a bounded nonzero number of durable commits"
+    );
+    assert_eq!(
+        causal_journal_count, durable_commit_count,
+        "each committed producer group is represented by one aggregate causal journal"
+    );
+    let mean_facts_per_durable_commit = group_size as f64 / durable_commit_count as f64;
+    latencies.sort_unstable();
+    let throughput_per_sec = (elapsed_ms > 0.0)
+        .then(|| group_size as f64 * 1_000.0 / elapsed_ms)
+        .unwrap_or(0.0);
+    let metrics = ConcurrentProducerMetrics {
+        selector: "semantic_ledger_scale_concurrent_producers",
+        group_size,
+        max_inflight_callers: concurrent_peak_producers,
+        producer_count: group_size,
+        admitted_count: concurrent_identity.admitted_fact_count(),
+        durable_commit_count,
+        causal_journal_count,
+        mean_facts_per_durable_commit,
+        elapsed_ms,
+        throughput_per_sec,
+        latency_p50_ms: percentile_ms_sorted(&latencies, 50),
+        latency_p95_ms: percentile_ms_sorted(&latencies, 95),
+        latency_p99_ms: percentile_ms_sorted(&latencies, 99),
+        completion_order: observed_order,
+        sequential_provider_baseline,
+        sequential_provider_final,
+        concurrent_provider_baseline,
+        concurrent_provider_final,
+        sequential_admission_phases,
+        concurrent_admission_phases,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&metrics).expect("concurrent producer metrics serialize")
+    );
+    Ok(())
+}
+
+fn semantic_fact_page(
+    context_id: myownmesh_core::semantic::MeshContextId,
+    mut facts: Vec<SignedFact>,
+) -> SemanticFactPage {
+    facts.sort_by_key(|fact| fact.id);
+    serde_json::from_value(serde_json::json!({
+        "context_id": context_id,
+        "facts": facts,
+        "next_cursor": null,
+        "complete": true,
+    }))
+    .expect("group-commit benchmark page is canonical")
+}
+
+/// Measure the production multi-fact boundary separately from local command
+/// authoring. Each fact is already signed before the clock starts; the timed
+/// path still performs the complete replay/context/signature/causal/resource
+/// validation, one aggregate graph journal, one FULL/WAL transaction, sparse
+/// projection publication, and semantic ingress reduction.
+async fn run_group_commit_hotpath(group_size: usize) -> myownmesh_core::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
+    let home = tempfile::tempdir().expect("group-commit hotpath instance root");
+    let _home_env = ScopedMeshHome::new(home.path());
+    let network_id = format!("semantic-ledger-group-hotpath-{group_size}");
+    let capacity = scale_capacity_with_ready_batch(group_size, &network_id, group_size);
+    let (connector, provider) = connector_policy(capacity);
+    let signer = Arc::new(Identity::from_signing_key(
+        SigningKey::from_bytes(&[0x43; 32]),
+        "semantic-scale-group-hotpath",
+    ));
+    let author =
+        DeviceId::from_canonical_str(signer.public_id()).expect("group-commit author is canonical");
+    let mesh = Mesh::open_connector_capable_with_identity(
+        MeshConfig::default(),
+        Arc::clone(&signer),
+        connector,
+    )
+    .await?;
+    let provider_baseline_claim = provider.in_use();
+    let provider_baseline = provider_snapshot(&mesh);
+    let network = mesh
+        .create_network(closed_config(&network_id, group_size, capacity), [0x71; 32])
+        .await?;
+    let before_identity = network.semantic_state_identity()?;
+    let context_id = before_identity.context_id();
+    let before_count = before_identity.admitted_fact_count();
+    drop(before_identity);
+    let facts = (0..group_size)
+        .map(|index| {
+            let target = DeviceId::from_canonical_str(&target_id(index))
+                .expect("group-commit target is canonical");
+            SignedFact::sign(
+                FactContent::new(
+                    FactDomain::Governance,
+                    context_id,
+                    FactBody::RoleGrant {
+                        target,
+                        role: myownmesh_core::semantic::Role::Member,
+                    },
+                    author.clone(),
+                    Vec::new(),
+                ),
+                signer.signing_key(),
+            )
+            .expect("group-commit fact signs")
+        })
+        .collect::<Vec<_>>();
+    let page = semantic_fact_page(context_id, facts);
+    let db_before = db_footprint(home.path());
+    network.reset_semantic_admission_profile_for_lab();
+    let started = Instant::now();
+    let observed = network.import_semantic_fact_page(page).await?;
+    let elapsed = started.elapsed();
+    let admission_phases = network.semantic_admission_profile_for_lab();
+    let admitted_count = observed
+        .admitted_fact_count()
+        .checked_sub(before_count)
+        .expect("admitted group count is ordered");
+    drop(observed);
+    assert_eq!(
+        admitted_count,
+        u64::try_from(group_size).expect("group size fits u64"),
+        "the timed page admits every signed fact"
+    );
+    let durable_commit_count = admission_phases.commit_wal_terminal.count;
+    let causal_journal_count = admission_phases.causal_journal_apply.count;
+    assert_eq!(
+        durable_commit_count, 1,
+        "one bounded page crosses one FULL/WAL commit"
+    );
+    assert_eq!(
+        causal_journal_count, 1,
+        "one bounded page uses one aggregate graph journal"
+    );
+    let db_after = db_footprint(home.path());
+    network.shutdown().await?;
+    drop(network);
+    let provider_final = provider_snapshot(&mesh);
+    assert_eq!(provider_final, provider_baseline);
+    assert_eq!(provider.in_use(), provider_baseline_claim);
+    let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+    let metrics = GroupCommitHotpathMetrics {
+        selector: "semantic_ledger_scale_group_commit_hotpath",
+        group_size,
+        admitted_count,
+        durable_commit_count,
+        causal_journal_count,
+        facts_per_durable_commit: group_size as f64 / durable_commit_count as f64,
+        elapsed_ms,
+        throughput_per_sec: (elapsed_ms > 0.0)
+            .then(|| group_size as f64 * 1_000.0 / elapsed_ms)
+            .unwrap_or(0.0),
+        db_before,
+        db_after,
+        admission_phases,
+        provider_baseline,
+        provider_final,
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&metrics).expect("group-commit hotpath metrics serialize")
+    );
+    Ok(())
+}
+
 async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
@@ -756,6 +1240,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
     assert_footprint_within(&selected_policy, seeded_db, "seeded");
     let initial_io_bytes = process_io_bytes();
     let initial_cpu_time_ms = process_cpu_time_ms();
+    network.reset_semantic_admission_profile_for_lab();
     let sample_every = (timed_admissions / 100).max(1);
     let mut peak_db = initial_db;
     peak_db.observe_peak(seeded_db);
@@ -774,7 +1259,9 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         .expect("window sample arithmetic fits usize")
         / WINDOW_SAMPLE_LIMIT;
     let mut window_start_admitted = seeded_admissions;
+    let mut window_started = Instant::now();
     let mut window_admission_total_ms = 0.0;
+    let mut window_max_admission_ms: f64 = 0.0;
     let mut admission_total_ms = 0.0;
     let mut window_evidence: Vec<ScaleWindowEvidence> =
         Vec::with_capacity(SCALE_WINDOW_TARGETS.min(timed_admissions.max(1)));
@@ -838,6 +1325,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         let admission_ms = elapsed.as_secs_f64() * 1_000.0;
         admission_total_ms += admission_ms;
         window_admission_total_ms += admission_ms;
+        window_max_admission_ms = window_max_admission_ms.max(admission_ms);
         let window_position = index
             .checked_sub(window_start_admitted)
             .expect("window position is ordered");
@@ -875,42 +1363,6 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
                 elapsed_ms: elapsed.as_secs_f64() * 1_000.0,
                 admitted_before: before_identity.admitted_fact_count(),
                 admitted_after: after_identity.admitted_fact_count(),
-                db_before: before_db,
-                db_after: after_db,
-                provider_before: before_provider,
-                provider_after: after_provider,
-            });
-        }
-        if measured_index == 0 {
-            let before_identity = network
-                .semantic_state_identity()
-                .expect("no-op identity before duplicate");
-            let before_db = db_footprint(home.path());
-            let before_provider = provider_snapshot(&mesh);
-            let duplicate = network
-                .propose_role_grant(&target, role, None)
-                .await
-                .expect_err("repeating an effective grant is a semantic no-op");
-            match duplicate {
-                myownmesh_core::Error::Other(message) => assert!(
-                    message.to_ascii_lowercase().contains("no-op"),
-                    "duplicate grant identifies a semantic no-op: {message}"
-                ),
-                other => panic!("duplicate grant must be a semantic no-op: {other:?}"),
-            }
-            let after_identity = network.semantic_state_identity()?;
-            let after_db = db_footprint(home.path());
-            let after_provider = provider_snapshot(&mesh);
-            assert_eq!(after_identity, before_identity);
-            assert_eq!(
-                after_db, before_db,
-                "duplicate grant causes no durable churn"
-            );
-            assert_eq!(
-                after_provider, before_provider,
-                "duplicate grant causes no provider churn"
-            );
-            no_op_evidence = Some(NoOpEvidence {
                 db_before: before_db,
                 db_after: after_db,
                 provider_before: before_provider,
@@ -959,8 +1411,11 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
                 window_evidence.push(ScaleWindowEvidence {
                     start_admitted: window_start_admitted + 1,
                     end_admitted,
+                    admission_count: admitted_in_window,
                     admission_total_ms,
+                    elapsed_ms: window_started.elapsed().as_secs_f64() * 1_000.0,
                     average_admission_ms,
+                    max_admission_ms: window_max_admission_ms,
                     p50_ms,
                     p95_ms,
                     p99_ms,
@@ -972,7 +1427,9 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
                 });
                 window_samples = Vec::with_capacity(WINDOW_SAMPLE_LIMIT.min(window_size));
                 window_admission_total_ms = 0.0;
+                window_max_admission_ms = 0.0;
                 window_start_admitted = end_admitted;
+                window_started = Instant::now();
             }
         }
     }
@@ -1001,6 +1458,60 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         tail_evidence.is_some(),
         "the bounded workload records its final admitted fact"
     );
+    // Snapshot the production phase profile before the deliberate duplicate
+    // probe.  The probe is intentionally outside both the wall-clock timing
+    // interval and this reset/profile interval, so its rejection cannot
+    // masquerade as admission work.
+    let admission_phases = serde_json::to_value(network.semantic_admission_profile_for_lab())
+        .expect("admission phase profile serializes");
+    // Keep the deliberate duplicate probe outside the timed/profiled
+    // admission interval.  It remains a real no-write control, but its
+    // rejection and observation work cannot contaminate admission latency.
+    {
+        let target = fixed_target.clone();
+        let final_index = scale
+            .checked_sub(1)
+            .expect("the scale workload always admits at least one fact");
+        let role = if final_index % 2 == 0 {
+            myownmesh_core::semantic::Role::Member
+        } else {
+            myownmesh_core::semantic::Role::Owner
+        };
+        let before_identity = network
+            .semantic_state_identity()
+            .expect("no-op identity before duplicate");
+        let before_db = db_footprint(home.path());
+        let before_provider = provider_snapshot(&mesh);
+        let duplicate = network
+            .propose_role_grant(&target, role, None)
+            .await
+            .expect_err("repeating an effective grant is a semantic no-op");
+        match duplicate {
+            myownmesh_core::Error::Other(message) => assert!(
+                message.to_ascii_lowercase().contains("no-op"),
+                "duplicate grant identifies a semantic no-op: {message}"
+            ),
+            other => panic!("duplicate grant must be a semantic no-op: {other:?}"),
+        }
+        let after_identity = network.semantic_state_identity()?;
+        let after_db = db_footprint(home.path());
+        let after_provider = provider_snapshot(&mesh);
+        assert_eq!(after_identity, before_identity);
+        assert_eq!(
+            after_db, before_db,
+            "duplicate grant causes no durable churn"
+        );
+        assert_eq!(
+            after_provider, before_provider,
+            "duplicate grant causes no provider churn"
+        );
+        no_op_evidence = Some(NoOpEvidence {
+            db_before: before_db,
+            db_after: after_db,
+            provider_before: before_provider,
+            provider_after: after_provider,
+        });
+    }
     assert!(
         no_op_evidence.is_some(),
         "the bounded workload records a real duplicate no-op"
@@ -1193,6 +1704,7 @@ async fn run_scale(scale: usize, selector: &'static str) -> myownmesh_core::Resu
         process_rss_after_restore_bytes,
         process_scope_write_bytes_delta: process_write_delta,
         process_scope_write_bytes_per_admission: process_write_per_admission,
+        admission_phases,
         provider_baseline,
         provider_final,
     };
@@ -1343,6 +1855,30 @@ async fn semantic_ledger_scale_n_500k() -> myownmesh_core::Result<()> {
 #[ignore = "operator-selected scaling evidence"]
 async fn semantic_ledger_scale_n_1m() -> myownmesh_core::Result<()> {
     run_scale(1_000_000, "semantic_ledger_scale_n_1m").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "operator-selected concurrent producer evidence; set MYOWNMESH_SCALE_CONCURRENT_GROUP"]
+async fn semantic_ledger_scale_concurrent_producers() -> myownmesh_core::Result<()> {
+    let Some(group_size) = selected_concurrent_group()? else {
+        eprintln!(
+            "semantic_ledger_scale_concurrent_producers: selector is unset; no production batch default"
+        );
+        return Ok(());
+    };
+    run_concurrent_producers(group_size).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "operator-selected group-commit evidence; set MYOWNMESH_SCALE_CONCURRENT_GROUP"]
+async fn semantic_ledger_scale_group_commit_hotpath() -> myownmesh_core::Result<()> {
+    let Some(group_size) = selected_concurrent_group()? else {
+        eprintln!(
+            "semantic_ledger_scale_group_commit_hotpath: selector is unset; no production batch default"
+        );
+        return Ok(());
+    };
+    run_group_commit_hotpath(group_size).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

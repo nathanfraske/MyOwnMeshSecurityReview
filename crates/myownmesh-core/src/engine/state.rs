@@ -98,6 +98,8 @@ pub(crate) use super::carrier_state::{
 pub(crate) use super::command::NetworkCmd;
 use super::peer_registry::{PeerOwnerToken, PeerRegistry};
 use super::signaling_ingress::EphemeralIngress;
+#[cfg(feature = "transport-lab")]
+use crate::semantic::store::{AdmissionPhase, AdmissionPhaseGuard};
 use crate::semantic::store::{DurableSemanticOwner, DurableSemanticStore, ProvisionalCustody};
 use crate::semantic::{DurableProofOutbox, ProofDeliveryId, ProofRecord};
 
@@ -667,6 +669,28 @@ unsafe impl ResourceMailboxItem for SignalingOutbound {
     }
 }
 
+type DurableAdmissionResponse = Result<crate::semantic::Admission>;
+
+pub(crate) struct DurableAdmissionBatch {
+    pub(crate) outcomes: Vec<DurableAdmissionResponse>,
+    pub(crate) changed_admitted: Vec<crate::semantic::SignedFact>,
+    pub(crate) delta: crate::semantic::SemanticDelta,
+}
+
+#[cfg(test)]
+struct DurableAdmissionActivityGuard<'a> {
+    state: &'a NetworkState,
+}
+
+#[cfg(test)]
+impl Drop for DurableAdmissionActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .durable_admission_active
+            .fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// The shared state for a single joined network. Every long-lived
 /// subsystem (driver loop, channels, rpc, handle) holds an
 /// `Arc<NetworkState>`. Independent ownership domains use their own narrow
@@ -766,10 +790,9 @@ pub struct NetworkState {
     /// semantic work.  The guard is never held across an async transport
     /// await; callers receive a funded, exact send witness instead.
     durable_publication_gate: Mutex<()>,
-    /// Bounds the number of blocking durable admissions per network.  The
-    /// permit is acquired before the blocking closure is spawned and is held
-    /// until that closure has completed, so admission order remains the
-    /// journal/publication order rather than an unbounded executor queue.
+    /// Bounds blocking durable requests before they enter the executor. Each
+    /// request is already a policy-bounded batch and becomes one graph journal
+    /// plus one SQLite transaction on the existing storage worker.
     durable_admission_lane: Arc<Semaphore>,
     #[cfg(test)]
     durable_admission_active: AtomicU64,
@@ -2925,6 +2948,9 @@ impl NetworkState {
                 "Open networks do not admit durable semantic facts".into(),
             ));
         }
+        #[cfg(feature = "transport-lab")]
+        let publication_phase =
+            AdmissionPhaseGuard::new(AdmissionPhase::PublicationGraphReplayColdLookup);
         let _publication = self.durable_publication_gate.lock();
         let mut live = self.fact_graph.write();
         self.ensure_durable_owner_mutation_allowed()?;
@@ -2955,12 +2981,18 @@ impl NetworkState {
             self.admitted_semantic_causal_history(dependency_roots)?
         };
         let expected_base_projection = live.projection_commitment_root();
+        #[cfg(feature = "transport-lab")]
+        drop(publication_phase);
+        #[cfg(feature = "transport-lab")]
+        let causal_phase = AdmissionPhaseGuard::new(AdmissionPhase::CausalJournalApply);
         let journal = if causal_history.is_empty() {
             live.admit_journaled(fact)
         } else {
             live.admit_journaled_with_history(fact, causal_history)
         }
         .map_err(|error| Error::Other(format!("semantic fact rejected: {error}")))?;
+        #[cfg(feature = "transport-lab")]
+        drop(causal_phase);
         let admission = journal.admission().clone();
         if matches!(admission, crate::semantic::Admission::AlreadyPresent) {
             journal.commit();
@@ -2987,7 +3019,24 @@ impl NetworkState {
             projection_commitment,
             &provisional_additions,
         ) {
-            journal.rollback();
+            if matches!(
+                &error,
+                crate::semantic::store::DurableStoreError::OutcomeUnknown
+            ) {
+                let delta = journal.delta().clone();
+                // Do not claim rollback across an ambiguous COMMIT. Release
+                // the journal borrow, then replace the tentative graph with
+                // the exact durable reopen result when it is available.
+                journal.commit();
+                if self
+                    .reconcile_unknown_admission(&mut live, &delta, projection_commitment)
+                    .is_none()
+                {
+                    self.shutdown_requested.store(true, Ordering::Release);
+                }
+            } else {
+                journal.rollback();
+            }
             return Err(Error::Network(format!("semantic delta commit: {error}")));
         }
 
@@ -3020,12 +3069,10 @@ impl NetworkState {
         Ok((admission, changed_admitted, semantic_delta))
     }
 
-    /// Run one durable admission on the blocking executor behind this
-    /// network's single bounded lane.  The synchronous method above remains
-    /// available to the bootstrap/ingress paths that already execute on a
-    /// dedicated synchronous boundary; every async proposal path acquires
-    /// this permit before spawning and holds it through journal commit or
-    /// rollback.
+    /// Admit one policy-bounded request through the existing single-writer
+    /// lane. The caller supplies the batch boundary (one fact, fact page, or
+    /// proof delivery); the request becomes one causal journal and one SQLite
+    /// transaction. There is no second scheduler or cross-request coalescing.
     pub(crate) async fn admit_fact_durably_with_delta_async(
         self: &Arc<Self>,
         fact: crate::semantic::SignedFact,
@@ -3034,33 +3081,300 @@ impl NetworkState {
         Vec<crate::semantic::SignedFact>,
         crate::semantic::SemanticDelta,
     )> {
+        let batch = self
+            .admit_facts_durably_with_delta_async(vec![fact])
+            .await?;
+        if batch.outcomes.len() != 1 {
+            return Err(Error::Network(
+                "single durable admission returned an invalid result count".into(),
+            ));
+        }
+        let admission = batch
+            .outcomes
+            .into_iter()
+            .next()
+            .expect("single durable admission result count was checked")?;
+        Ok((admission, batch.changed_admitted, batch.delta))
+    }
+
+    pub(crate) async fn admit_facts_durably_with_delta_async(
+        self: &Arc<Self>,
+        facts: Vec<crate::semantic::SignedFact>,
+    ) -> Result<DurableAdmissionBatch> {
+        #[cfg(feature = "transport-lab")]
+        let _envelope_phase =
+            AdmissionPhaseGuard::new(AdmissionPhase::AsyncAdmissionEnvelopeInclusive);
+        if matches!(
+            self.verified_bootstrap.policy(),
+            crate::semantic::VerifiedProjectPolicy::Open
+        ) {
+            return Err(Error::Other(
+                "Open networks do not admit durable semantic facts".into(),
+            ));
+        }
+        if facts.is_empty() {
+            return Err(Error::Other(
+                "durable admission request cannot be empty".into(),
+            ));
+        }
+        #[cfg(feature = "transport-lab")]
+        let lane_wait_phase =
+            AdmissionPhaseGuard::new(AdmissionPhase::AsyncLanePermitWaitExclusive);
         let permit = self
             .durable_admission_lane
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::Network("durable admission lane closed".into()))?;
+        #[cfg(feature = "transport-lab")]
+        drop(lane_wait_phase);
+
         let state = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             #[cfg(test)]
-            let active = state
-                .durable_admission_active
-                .fetch_add(1, Ordering::SeqCst)
-                + 1;
-            #[cfg(test)]
-            state
-                .durable_admission_max
-                .fetch_max(active, Ordering::SeqCst);
-            let result = state.admit_fact_durably_with_delta(fact);
-            #[cfg(test)]
-            state
-                .durable_admission_active
-                .fetch_sub(1, Ordering::SeqCst);
-            result
+            let _activity = {
+                let active = state
+                    .durable_admission_active
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
+                state
+                    .durable_admission_max
+                    .fetch_max(active, Ordering::SeqCst);
+                DurableAdmissionActivityGuard { state: &state }
+            };
+            state.process_durable_admission_batch(facts)
         })
         .await
         .map_err(|error| Error::Network(format!("durable admission worker failed: {error}")))?
+    }
+
+    fn process_durable_admission_batch(
+        &self,
+        facts: Vec<crate::semantic::SignedFact>,
+    ) -> Result<DurableAdmissionBatch> {
+        let batch_limit = usize::try_from(self.config.read().semantic_policy.max_ready_batch)
+            .map_err(|_| Error::Network("durable admission batch limit exceeds usize".into()))?;
+        if facts.len() > batch_limit {
+            return Err(Error::Other(
+                "durable admission request exceeds semantic batch envelope".into(),
+            ));
+        }
+
+        #[cfg(feature = "transport-lab")]
+        let publication_phase =
+            AdmissionPhaseGuard::new(AdmissionPhase::PublicationGraphReplayColdLookup);
+        let _publication = self.durable_publication_gate.lock();
+        self.ensure_durable_owner_mutation_allowed()?;
+        let mut live = self.fact_graph.write();
+
+        // A retired hot row is still an exact durable duplicate. Classify it
+        // before causal admission so replay remains a zero-write operation.
+        let mut outcomes = facts.iter().map(|_| None).collect::<Vec<_>>();
+        let mut candidates = Vec::with_capacity(facts.len());
+        let mut candidate_positions = Vec::with_capacity(facts.len());
+        for (position, fact) in facts.into_iter().enumerate() {
+            if live.get(&fact.id).is_some() {
+                candidate_positions.push(position);
+                candidates.push(fact);
+                continue;
+            }
+            match self
+                .durable_semantic_owner
+                .admitted_fact(fact.id)
+                .map_err(|error| Error::Network(format!("durable fact lookup: {error}")))?
+            {
+                Some(existing) if existing == fact => {
+                    outcomes[position] = Some(Ok(crate::semantic::Admission::AlreadyPresent));
+                }
+                Some(_) => {
+                    outcomes[position] = Some(Err(Error::Other(format!(
+                        "semantic fact rejected: duplicate fact id {}",
+                        fact.id
+                    ))));
+                }
+                None => {
+                    candidate_positions.push(position);
+                    candidates.push(fact);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(DurableAdmissionBatch {
+                outcomes: outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.expect("every duplicate was classified"))
+                    .collect(),
+                changed_admitted: Vec::new(),
+                delta: crate::semantic::SemanticDelta::default(),
+            });
+        }
+
+        let candidate_ids = candidates
+            .iter()
+            .map(|fact| fact.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let dependency_roots = candidates
+            .iter()
+            .flat_map(crate::semantic::causal::dependencies)
+            .filter(|id| live.get(id).is_none() && !candidate_ids.contains(id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let causal_history = if dependency_roots.is_empty() {
+            Vec::new()
+        } else {
+            self.admitted_semantic_causal_history(dependency_roots)?
+        };
+        let expected_base_projection = live.projection_commitment_root();
+        #[cfg(feature = "transport-lab")]
+        drop(publication_phase);
+        #[cfg(feature = "transport-lab")]
+        let causal_phase = AdmissionPhaseGuard::new(AdmissionPhase::CausalJournalApply);
+        let journal = live
+            .admit_journaled_batch_with_history(candidates, causal_history)
+            .map_err(|error| {
+                Error::Other(format!("aggregate semantic admission rejected: {error}"))
+            })?;
+        #[cfg(feature = "transport-lab")]
+        drop(causal_phase);
+
+        for (position, result) in candidate_positions.into_iter().zip(journal.results()) {
+            outcomes[position] = Some(match result.outcome() {
+                crate::semantic::causal::AggregateAdmissionOutcome::Inserted { .. } => {
+                    Ok(crate::semantic::Admission::Inserted)
+                }
+                crate::semantic::causal::AggregateAdmissionOutcome::AlreadyPresent { .. } => {
+                    Ok(crate::semantic::Admission::AlreadyPresent)
+                }
+                crate::semantic::causal::AggregateAdmissionOutcome::Quarantined {
+                    missing, ..
+                } => Ok(crate::semantic::Admission::Quarantined {
+                    missing: missing.clone(),
+                }),
+                crate::semantic::causal::AggregateAdmissionOutcome::Refused { error, .. } => {
+                    Err(Error::Other(format!("semantic fact rejected: {error}")))
+                }
+            });
+        }
+
+        let aggregate_delta = journal.delta().clone();
+        let changed = !aggregate_delta.rows().is_empty()
+            || !aggregate_delta.removed().is_empty()
+            || !aggregate_delta.provisional_added().is_empty()
+            || !aggregate_delta.provisional_removed().is_empty();
+        if !changed {
+            journal.commit();
+            return Ok(DurableAdmissionBatch {
+                outcomes: outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.expect("every aggregate input was classified"))
+                    .collect(),
+                changed_admitted: Vec::new(),
+                delta: crate::semantic::SemanticDelta::default(),
+            });
+        }
+
+        let projection_commitment = aggregate_delta
+            .projection_delta()
+            .map(|delta| delta.commitment())
+            .unwrap_or(expected_base_projection);
+        let provisional_additions: Vec<ProvisionalCustody> = aggregate_delta
+            .provisional_added()
+            .iter()
+            .copied()
+            .map(|fact_id| ProvisionalCustody::new(fact_id, "semantic-ingress"))
+            .collect();
+
+        if let Err(error) = self.durable_semantic_owner.commit_semantic_delta(
+            self.mesh_context_id,
+            &aggregate_delta,
+            expected_base_projection,
+            projection_commitment,
+            &provisional_additions,
+        ) {
+            if matches!(
+                &error,
+                crate::semantic::store::DurableStoreError::OutcomeUnknown
+            ) {
+                journal.commit();
+                if self
+                    .reconcile_unknown_admission(&mut live, &aggregate_delta, projection_commitment)
+                    .is_none()
+                {
+                    self.shutdown_requested.store(true, Ordering::Release);
+                }
+            } else {
+                journal.rollback();
+            }
+            return Err(Error::Network(format!(
+                "durable aggregate semantic commit: {error}"
+            )));
+        }
+
+        let changed_admitted = aggregate_delta
+            .rows()
+            .iter()
+            .filter(|row| row.status() == crate::semantic::SemanticFactStatus::Admitted)
+            .map(|row| row.fact().clone())
+            .collect();
+        let provisional_removed = aggregate_delta.provisional_removed().to_vec();
+        journal.commit();
+        live.retire_cold_history();
+
+        {
+            let mut provisional = self.durable_provisional.lock();
+            for fact_id in provisional_removed {
+                provisional.retain(|claim| claim.fact_id != fact_id);
+            }
+            for claim in &provisional_additions {
+                if !provisional
+                    .iter()
+                    .any(|current| current.fact_id == claim.fact_id)
+                {
+                    provisional.push(claim.clone());
+                }
+            }
+        }
+
+        Ok(DurableAdmissionBatch {
+            outcomes: outcomes
+                .into_iter()
+                .map(|outcome| outcome.expect("every aggregate input was classified"))
+                .collect(),
+            changed_admitted,
+            delta: aggregate_delta,
+        })
+    }
+    fn reconcile_unknown_admission(
+        &self,
+        live: &mut crate::semantic::FactGraph,
+        delta: &crate::semantic::SemanticDelta,
+        expected_projection: [u8; 32],
+    ) -> Option<bool> {
+        let Ok(restored) = self
+            .durable_semantic_owner
+            .restore(&self.verified_bootstrap)
+        else {
+            return None;
+        };
+        let graph = restored.graph();
+        let verified = delta.rows().iter().all(|row| match row.status() {
+            crate::semantic::SemanticFactStatus::Admitted => graph
+                .get(&row.fact().id)
+                .is_some_and(|fact| fact == row.fact()),
+            crate::semantic::SemanticFactStatus::Quarantined => graph
+                .quarantined()
+                .any(|(id, fact)| *id == row.fact().id && fact == row.fact()),
+        }) && delta.removed().iter().all(|id| {
+            graph.get(id).is_none() && !graph.quarantined().any(|(current, _)| current == id)
+        });
+        let applied = graph.projection_commitment_root() == expected_projection && verified;
+        let (restored_graph, restored_provisional) = restored.into_parts();
+        *live = restored_graph;
+        *self.durable_provisional.lock() = restored_provisional;
+        Some(applied)
     }
 
     pub(crate) async fn admit_fact_durably_async(

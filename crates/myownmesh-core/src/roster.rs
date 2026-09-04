@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
@@ -265,6 +265,60 @@ impl AuthorizedDevices {
         self.rebuild_index();
     }
 
+    /// Apply one committed semantic projection batch and rebuild the ordered
+    /// position index at most once. Existing role-only updates stay in place;
+    /// structural additions and removals are staged against the old index and
+    /// published together.
+    fn apply_projected_roles(
+        &mut self,
+        desired: &BTreeMap<String, Option<crate::semantic::Role>>,
+    ) -> bool {
+        let approved_at = now_unix();
+        let mut removals = BTreeSet::new();
+        let mut structural = false;
+        let mut changed = false;
+
+        for (device_id, role) in desired {
+            match (self.position(device_id), role) {
+                (Some(index), Some(role)) => {
+                    let peer = self
+                        .entries
+                        .get_mut(index)
+                        .expect("the keyed roster index points at an entry");
+                    if peer.role != *role {
+                        peer.role = *role;
+                        changed = true;
+                    }
+                }
+                (None, Some(role)) => {
+                    self.entries.push(AuthorizedPeer {
+                        device_id: device_id.clone(),
+                        label: String::new(),
+                        approved_at,
+                        role: *role,
+                    });
+                    structural = true;
+                    changed = true;
+                }
+                (Some(_), None) => {
+                    removals.insert(device_id.clone());
+                    structural = true;
+                    changed = true;
+                }
+                (None, None) => {}
+            }
+        }
+
+        if !removals.is_empty() {
+            self.entries
+                .retain(|peer| !removals.contains(&peer.device_id));
+        }
+        if structural {
+            self.rebuild_index();
+        }
+        changed
+    }
+
     pub fn push(&mut self, peer: AuthorizedPeer) {
         self.push_keyed(peer);
     }
@@ -314,6 +368,55 @@ impl AuthorizedDevices {
         self.rebuild_index();
         removed
     }
+}
+
+/// Apply an already-validated, committed semantic role projection as one
+/// keyed roster batch. The roster remains a disposable UI cache; authority is
+/// still evaluated exclusively from the semantic graph.
+pub(crate) fn apply_projected_roles_in(
+    roster: &mut Roster,
+    desired: &BTreeMap<String, Option<crate::semantic::Role>>,
+) -> bool {
+    roster.authorized_devices.apply_projected_roles(desired)
+}
+
+/// Compare only the fields represented by [`RosterEntryRecord`].  A semantic
+/// role change is deliberately absent from that record, so callers can update
+/// the in-memory role projection without rewriting the advisory metadata.
+/// The comparison remains keyed and bounded by the supplied affected set.
+pub(crate) fn persisted_metadata_equal(
+    before: &Roster,
+    after: &Roster,
+    affected_keys: &std::collections::BTreeSet<String>,
+) -> bool {
+    if before.version != after.version || before.network_id != after.network_id {
+        return false;
+    }
+    persisted_metadata_matches_snapshot(
+        &before.authorized_devices.snapshot_keys(affected_keys),
+        after,
+        affected_keys,
+    )
+}
+
+/// Compare the persisted fields against an already captured keyed snapshot.
+/// This is the delta-path variant: it avoids cloning or read-locking the whole
+/// roster while its write lock is held.
+pub(crate) fn persisted_metadata_matches_snapshot(
+    before: &BTreeMap<String, (usize, AuthorizedPeer)>,
+    after: &Roster,
+    affected_keys: &std::collections::BTreeSet<String>,
+) -> bool {
+    affected_keys.iter().all(|key| {
+        let before = before
+            .get(key)
+            .map(|(_, peer)| (&peer.device_id, &peer.label, peer.approved_at));
+        let after = after
+            .authorized_devices
+            .get_by_key(key)
+            .map(|peer| (&peer.device_id, &peer.label, peer.approved_at));
+        before == after
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1187,6 +1290,53 @@ mod tests {
     }
 
     #[test]
+    fn projected_role_batch_rebuilds_the_key_index_once() {
+        let mut roster = empty_for("net-batch");
+        AuthorizedDevices::reset_test_counters();
+        let desired = (0..64)
+            .map(|index| {
+                (
+                    format!("peer-{index:03}"),
+                    Some(crate::semantic::Role::Member),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert!(apply_projected_roles_in(&mut roster, &desired));
+        assert_eq!(roster.authorized_devices.len(), desired.len());
+        assert_eq!(AuthorizedDevices::test_counters(), (0, 1));
+
+        AuthorizedDevices::reset_test_counters();
+        let role_updates = desired
+            .keys()
+            .cloned()
+            .map(|key| (key, Some(crate::semantic::Role::Controller)))
+            .collect::<BTreeMap<_, _>>();
+        assert!(apply_projected_roles_in(&mut roster, &role_updates));
+        assert_eq!(AuthorizedDevices::test_counters(), (0, 0));
+        assert!(roster
+            .authorized_devices
+            .iter()
+            .all(|peer| peer.role == crate::semantic::Role::Controller));
+
+        AuthorizedDevices::reset_test_counters();
+        let structural = BTreeMap::from([
+            ("peer-000".to_string(), None),
+            ("peer-new".to_string(), Some(crate::semantic::Role::Owner)),
+        ]);
+        assert!(apply_projected_roles_in(&mut roster, &structural));
+        assert_eq!(AuthorizedDevices::test_counters(), (0, 1));
+        assert!(!is_authorized(&roster, "peer-000"));
+        assert!(is_authorized(&roster, "peer-new"));
+        assert_eq!(
+            roster
+                .authorized_devices
+                .get_by_key("peer-new")
+                .map(|peer| peer.role),
+            Some(crate::semantic::Role::Owner)
+        );
+    }
+
+    #[test]
     fn old_hard_alpha_roster_without_role_is_refused() {
         let old_json = r#"{
             "version": 1,
@@ -1224,6 +1374,29 @@ mod tests {
         let mut r = empty_for("net-a");
         assert!(!set_role_in(&mut r, "ghost", crate::semantic::Role::Owner));
         assert!(r.authorized_devices.is_empty());
+    }
+
+    #[test]
+    fn persisted_metadata_comparison_ignores_role_but_detects_row_changes() {
+        let mut before = empty_for("net-a");
+        add_peer_in(&mut before, "peer1", "Laptop");
+        let keys = ["peer1".to_string()].into_iter().collect();
+
+        let mut role_only = before.clone();
+        assert!(set_role_in(
+            &mut role_only,
+            "peer1",
+            crate::semantic::Role::Controller
+        ));
+        assert!(persisted_metadata_equal(&before, &role_only, &keys));
+
+        let mut metadata = role_only.clone();
+        add_peer_in(&mut metadata, "peer1", "Laptop-renamed");
+        assert!(!persisted_metadata_equal(&before, &metadata, &keys));
+
+        let mut membership = role_only;
+        remove_peer_in(&mut membership, "peer1");
+        assert!(!persisted_metadata_equal(&before, &membership, &keys));
     }
 
     #[test]

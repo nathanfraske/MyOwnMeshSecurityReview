@@ -398,6 +398,42 @@ pub struct JoinedNetwork {
     lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
+/// Aggregate timing for one bounded phase of durable semantic admission.
+///
+/// Counts and nanoseconds are process-local instrumentation for the
+/// `transport-lab` scale controls. They intentionally contain no per-fact
+/// samples or retained operation data.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SemanticAdmissionPhaseTiming {
+    pub count: u64,
+    pub total_nanos: u64,
+    pub max_nanos: u64,
+}
+
+/// Aggregate phase timings emitted by the semantic-ledger scale control.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SemanticAdmissionProfile {
+    /// Time waiting for the bounded durable-admission permit; this excludes
+    /// blocking graph/store work measured by `async_envelope_inclusive`.
+    pub async_lane_wait_exclusive: SemanticAdmissionPhaseTiming,
+    /// Inclusive async request envelope: permit wait, blocking graph/store
+    /// work, and completion.
+    pub async_envelope_inclusive: SemanticAdmissionPhaseTiming,
+    pub publication_graph_replay_cold_lookup: SemanticAdmissionPhaseTiming,
+    pub causal_journal_apply: SemanticAdmissionPhaseTiming,
+    pub store_worker_handoff: SemanticAdmissionPhaseTiming,
+    pub store_plan: SemanticAdmissionPhaseTiming,
+    pub capacity_preflight: SemanticAdmissionPhaseTiming,
+    pub begin_immediate: SemanticAdmissionPhaseTiming,
+    pub sql_apply: SemanticAdmissionPhaseTiming,
+    pub commit_wal_terminal: SemanticAdmissionPhaseTiming,
+    pub author_witness_sign: SemanticAdmissionPhaseTiming,
+    pub projection_roster_publish: SemanticAdmissionPhaseTiming,
+    pub post_commit_broadcast: SemanticAdmissionPhaseTiming,
+}
+
 /// A move-only opaque endpoint channel for a Closed-member relay route.
 ///
 /// The relay and session identifiers are descriptive metadata only. Endpoint
@@ -463,6 +499,43 @@ impl ClosedRelayChannel {
 }
 
 impl JoinedNetwork {
+    /// Reset process-local aggregate admission phase counters for a scale
+    /// measurement. This is deliberately hidden from the stable application
+    /// API and exists only with the transport-lab feature enabled.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn reset_semantic_admission_profile_for_lab(&self) {
+        crate::semantic::store::reset_admission_phase_profile();
+    }
+
+    /// Snapshot process-local aggregate admission phase counters for a scale
+    /// measurement. The returned value is a fixed-size, serializable report.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn semantic_admission_profile_for_lab(&self) -> SemanticAdmissionProfile {
+        let (counts, nanos, max_nanos) = crate::semantic::store::admission_phase_profile_snapshot();
+        let phase = |index: usize| SemanticAdmissionPhaseTiming {
+            count: counts[index],
+            total_nanos: nanos[index],
+            max_nanos: max_nanos[index],
+        };
+        SemanticAdmissionProfile {
+            async_lane_wait_exclusive: phase(1),
+            async_envelope_inclusive: phase(0),
+            publication_graph_replay_cold_lookup: phase(2),
+            causal_journal_apply: phase(3),
+            store_worker_handoff: phase(4),
+            store_plan: phase(5),
+            capacity_preflight: phase(6),
+            begin_immediate: phase(7),
+            sql_apply: phase(8),
+            commit_wal_terminal: phase(9),
+            author_witness_sign: phase(10),
+            projection_roster_publish: phase(11),
+            post_commit_broadcast: phase(12),
+        }
+    }
+
     /// Prepare a validated large-history fixture for transport-lab scale
     /// measurements, then leave subsequent admissions on the public path.
     #[cfg(feature = "transport-lab")]
