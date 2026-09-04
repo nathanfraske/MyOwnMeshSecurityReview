@@ -414,6 +414,10 @@ pub struct JoinedNetwork {
     lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
+fn peer_registry_key(device_id: &str) -> &str {
+    crate::signing::pubkey_part(device_id)
+}
+
 /// Aggregate timing for one bounded phase of durable semantic admission.
 ///
 /// Counts and nanoseconds are process-local instrumentation for the
@@ -1092,6 +1096,7 @@ impl JoinedNetwork {
     /// presence. `Ok(())` means the command was queued, not that the peer
     /// connected — observe [`crate::PeerEvent`]s for the outcome.
     pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
+        let device_id = peer_registry_key(device_id);
         self.state
             .cmd_tx
             .send(NetworkCmd::ConnectPeer {
@@ -1118,6 +1123,7 @@ impl JoinedNetwork {
         sticky: bool,
         timeout: std::time::Duration,
     ) -> Result<()> {
+        let device_id = peer_registry_key(device_id);
         match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await {
             Ok(result) => result,
             Err(_) => Err(Error::Network(format!(
@@ -1516,6 +1522,18 @@ mod tests {
                     .expect("fixture grant funds its process record")
             })
             .clone()
+    }
+
+    #[test]
+    fn public_display_device_id_dials_the_bare_signaling_registry_key() {
+        assert_eq!(
+            peer_registry_key("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst-24842"),
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
+        );
+        assert_eq!(
+            peer_registry_key("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"),
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
+        );
     }
 
     /// The injection seam adopts the caller's identity rather than the
