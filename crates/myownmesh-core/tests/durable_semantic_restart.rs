@@ -23,7 +23,8 @@ use myownmesh_core::engine::transport_lab::{
 use myownmesh_core::identity::Identity;
 use myownmesh_core::semantic::content::AuthorityUse;
 use myownmesh_core::semantic::{
-    DeviceId, FactBody, FactContent, FactDomain, Role, SemanticFactPageRequest, SignedFact,
+    DeviceId, FactBody, FactContent, FactDomain, Role, SemanticFactPageRequest,
+    SemanticRecentFactsRequest, SignedFact,
 };
 use myownmesh_core::{
     ConnectorCallbackPolicy, FiniteResourceProvider, ResourceClaim, ResourceClass,
@@ -325,6 +326,22 @@ async fn closed_network_restart_restores_the_committed_semantic_graph() {
         .find(|fact| fact.id == fact_id)
         .cloned()
         .expect("the admitted fact is exported");
+    {
+        let recent = network
+            .recent_semantic_facts(SemanticRecentFactsRequest {
+                max_facts: 2,
+                max_encoded_bytes:
+                    myownmesh_core::protocol::topology::MAX_ROUTED_APPLICATION_PAYLOAD_BYTES as u32,
+            })
+            .expect("render bounded recent facts");
+        assert_eq!(
+            recent.total_admitted_fact_count(),
+            admitted_identity.admitted_fact_count()
+        );
+        assert!(recent.facts().iter().any(|fact| fact.id == fact_id));
+        let human_readable = serde_json::to_value(&recent).expect("recent facts render as JSON");
+        assert!(human_readable.get("facts").is_some());
+    }
     let checkpoint_started = Instant::now();
     network
         .compact_semantic_state()

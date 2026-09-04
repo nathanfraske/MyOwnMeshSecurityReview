@@ -102,6 +102,7 @@ pub(super) enum PreparedReply {
     Bootstrap(FundedDiagnostic<myownmesh_core::semantic::BootstrapRecord>),
     SemanticFactPage(FundedDiagnostic<myownmesh_core::semantic::SemanticFactPage>),
     SemanticStateIdentity(FundedDiagnostic<myownmesh_core::semantic::SemanticStateIdentity>),
+    SemanticRecentFacts(FundedDiagnostic<myownmesh_core::semantic::SemanticRecentFacts>),
     ClosedRelay(FundedDiagnostic<ClosedRelayReply>),
     Variable(FundedVariableReply),
 }
@@ -406,6 +407,18 @@ impl serde::Serialize for PreparedReply {
                     &Field {
                         key: "semantic_state_identity",
                         value: &identity.value,
+                    },
+                )?;
+                response.end()
+            }
+            Self::SemanticRecentFacts(facts) => {
+                let mut response = serializer.serialize_struct("Response", 2)?;
+                response.serialize_field("ok", &true)?;
+                response.serialize_field(
+                    "data",
+                    &Field {
+                        key: "semantic_recent_facts",
+                        value: &facts.value,
                     },
                 )?;
                 response.end()

@@ -179,6 +179,28 @@ pub(in crate::control) fn semantic_state_identity(
     .context("semantic state identity response line was not admitted")
 }
 
+/// Render one bounded, non-canonical diagnostic view from the live cache.
+pub(in crate::control) fn semantic_recent_facts(
+    state: &Arc<ControlState>,
+    admission: &FrameAdmission,
+    network: String,
+    request: myownmesh_core::semantic::SemanticRecentFactsRequest,
+) -> Result<Answer> {
+    let Some(joined) = state.registry.get(&network) else {
+        return unknown_network(&network, admission);
+    };
+    let owner = ResponseOwner::acquire(admission)
+        .context("semantic recent-facts response was not admitted")?;
+    let facts = joined
+        .recent_semantic_facts(request)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    funded(
+        PreparedReply::SemanticRecentFacts(FundedDiagnostic::new(facts, owner)),
+        admission,
+    )
+    .context("semantic recent-facts response line was not admitted")
+}
+
 /// Set the local topology directly.
 pub(in crate::control) async fn topology_set(
     state: &Arc<ControlState>,

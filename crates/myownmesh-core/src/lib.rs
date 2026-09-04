@@ -8,7 +8,10 @@
 //! # Quick tour
 //!
 //! ```no_run
-//! # async fn _ex(connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn _ex(
+//! #     connector_policy: myownmesh_core::WebRtcConnectorCapablePolicy,
+//! #     semantic_policy: myownmesh_core::config::SemanticPolicyConfig,
+//! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! use myownmesh_core::{
 //!     ClosedRelayPolicyConfig, Mesh, MeshConfig, NetworkConfig, RoutingPolicyConfig, TopologyMode,
 //! };
@@ -27,7 +30,9 @@
 //!     label: "Home".into(),
 //!     kind: Default::default(),                            // Open (default)
 //!     scheduler: Default::default(),
-//!     semantic_policy: Default::default(),
+//!     // Resource retention is an owner decision; the library supplies no
+//!     // hidden production ceiling.
+//!     semantic_policy,
 //!     routing_policy: RoutingPolicyConfig::default(),
 //!     event_capacity: 256,
 //!     connection_trace_capacity: 512,

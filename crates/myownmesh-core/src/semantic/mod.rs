@@ -13,6 +13,7 @@ pub mod content;
 pub mod fact;
 pub mod projection;
 pub mod proof_outbox;
+mod storage_codec;
 pub(crate) mod store;
 pub mod verify;
 
@@ -44,6 +45,62 @@ pub struct SemanticFactPageRequest {
     pub cursor: Option<FactId>,
     pub max_facts: u32,
     pub max_encoded_bytes: u32,
+}
+
+/// Bounds one non-canonical, human-readable view of the facts already kept in
+/// the live hot-history cache. The view is for diagnostics only: it is never
+/// read by semantic admission and is never persisted as a second ledger.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRecentFactsRequest {
+    pub max_facts: u32,
+    pub max_encoded_bytes: u32,
+}
+
+/// A bounded diagnostic projection of the live hot-history cache.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticRecentFacts {
+    context_id: MeshContextId,
+    total_admitted_fact_count: u64,
+    cached_fact_count: u64,
+    facts: Vec<SignedFact>,
+    #[serde(skip)]
+    _funding: Option<crate::resource::ResourceLease>,
+}
+
+impl SemanticRecentFacts {
+    pub fn context_id(&self) -> MeshContextId {
+        self.context_id
+    }
+
+    pub fn total_admitted_fact_count(&self) -> u64 {
+        self.total_admitted_fact_count
+    }
+
+    pub fn cached_fact_count(&self) -> u64 {
+        self.cached_fact_count
+    }
+
+    pub fn facts(&self) -> &[SignedFact] {
+        &self.facts
+    }
+
+    pub(crate) fn new(
+        context_id: MeshContextId,
+        total_admitted_fact_count: u64,
+        cached_fact_count: u64,
+        facts: Vec<SignedFact>,
+        funding: crate::resource::ResourceLease,
+    ) -> Self {
+        Self {
+            context_id,
+            total_admitted_fact_count,
+            cached_fact_count,
+            facts,
+            _funding: Some(funding),
+        }
+    }
 }
 
 /// One bounded canonical fact page. The private funding lease remains held

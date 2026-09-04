@@ -1008,6 +1008,10 @@ pub struct SemanticPolicyConfig {
     pub max_quarantined_bytes_per_author: u64,
     pub max_retained_facts_per_author: u64,
     pub max_retained_bytes_per_author: u64,
+    /// Maximum recently admitted bodies kept beside SQLite before one
+    /// deterministic cold-history retirement pass. This is an explicit
+    /// memory/CPU tradeoff selected by the owner, not a library constant.
+    pub max_hot_history_facts: u64,
     pub max_dependency_edges: u64,
     pub max_ready_batch: u64,
     pub max_pending_proofs: u64,
@@ -1022,6 +1026,10 @@ pub struct SemanticPolicyConfig {
     pub max_freelist_pages: u64,
     pub max_fragmented_pages: u64,
     pub max_main_journal_bytes: u64,
+    /// Maximum encoded clean-start checkpoint stored beside canonical rows.
+    /// Owners choose this separately because it trades startup latency for
+    /// durable storage; it is never inferred from a typical mesh size.
+    pub max_live_checkpoint_bytes: u64,
     pub max_database_bytes: u64,
     pub max_wal_bytes: u64,
     pub wal_checkpoint_threshold_bytes: u64,
@@ -1032,8 +1040,6 @@ pub struct SemanticPolicyConfig {
 /// a store connection exists.  A store may pass its actual page size to the
 /// checked envelope helpers below.
 pub const SQLITE_DEFAULT_PAGE_SIZE_BYTES: u64 = 4096;
-pub(crate) const SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES: u64 = 8 * 1024 * 1024;
-
 const SQLITE_WAL_HEADER_BYTES: u64 = 32;
 const SQLITE_WAL_FRAME_OVERHEAD_BYTES: u64 = 24;
 const SQLITE_SHM_CHUNK_BYTES: u64 = 32_768;
@@ -1153,6 +1159,7 @@ pub struct SemanticStorageWorkload {
     pub max_freelist_pages: u64,
     pub max_fragmented_pages: u64,
     pub max_main_journal_bytes: u64,
+    pub max_live_checkpoint_bytes: u64,
 }
 
 /// Checked logical named-file/process-local reservation for one semantic
@@ -1182,6 +1189,10 @@ pub struct SemanticStorageEnvelope {
     pub total_bytes: u64,
 }
 
+// Test/lab fixtures need a finite envelope to exercise refusal boundaries.
+// Production has deliberately no semantic resource default: the network
+// owner must state the complete persisted policy.
+#[cfg(any(test, feature = "transport-lab"))]
 impl Default for SemanticPolicyConfig {
     fn default() -> Self {
         Self {
@@ -1197,6 +1208,7 @@ impl Default for SemanticPolicyConfig {
             max_quarantined_bytes_per_author: 4 * 1024 * 1024,
             max_retained_facts_per_author: 10_000,
             max_retained_bytes_per_author: 16 * 1024 * 1024,
+            max_hot_history_facts: 64,
             max_dependency_edges: 1_000_000,
             max_ready_batch: 256,
             max_pending_proofs: 10_000,
@@ -1211,6 +1223,7 @@ impl Default for SemanticPolicyConfig {
             max_freelist_pages: 1024,
             max_fragmented_pages: 1024,
             max_main_journal_bytes: 8 * 1024 * 1024,
+            max_live_checkpoint_bytes: 8 * 1024 * 1024,
             // The default semantic maxima include 128 MiB of facts, 1M
             // canonical edges, and 64 MiB of proofs.  The checked page
             // arithmetic below deliberately charges both packed leaves and
@@ -1262,6 +1275,7 @@ impl SemanticPolicyConfig {
             max_freelist_pages: self.max_freelist_pages,
             max_fragmented_pages: self.max_fragmented_pages,
             max_main_journal_bytes: self.max_main_journal_bytes,
+            max_live_checkpoint_bytes: self.max_live_checkpoint_bytes,
         }
     }
 
@@ -1334,7 +1348,7 @@ impl SemanticPolicyConfig {
                     checked_sum(&[META_KEY_MAX_BYTES, SQL_INTEGER_BYTES])?,
                     checked_sum(&[10, FACT_ID_BYTES])?,
                     checked_sum(&[13, 12])?,
-                    SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
+                    workload.max_live_checkpoint_bytes,
                 ])?,
             ),
             (fact_rows, fact_payload),
@@ -1385,27 +1399,19 @@ impl SemanticPolicyConfig {
         for (rows, record_bytes) in table_pages {
             pages = pages.checked_add(object_pages(rows, record_bytes)?)?;
         }
-        // Charge each of the eight non-integer PRIMARY KEY autoindex b-trees
-        // and the two named secondary indexes as its own object. SQLite
-        // aliases an INTEGER PRIMARY KEY to the table rowid, so the singleton
-        // semantic_usage/proof_usage tables do not own separate index trees.
-        // Separate roots,
+        // Only rowid tables with non-integer primary keys own a second
+        // autoindex b-tree. The small composite/key-only tables are declared
+        // WITHOUT ROWID and their primary keys are already the table b-tree;
+        // charging those again would reserve storage that SQLite cannot use.
+        // The two named secondary indexes remain separate objects. Separate roots,
         // interior rounding, and overflow streams are all retained in the
         // envelope rather than being hidden by a combined row count.
         let primary_index_trees = [
             (4, META_KEY_MAX_BYTES),
             (fact_rows, FACT_ID_BYTES),
-            (workload.max_author_usage_rows, DEVICE_KEY_BYTES),
-            (workload.max_dependency_edges, 2 * FACT_ID_BYTES),
-            (
-                workload.max_provisional_rows,
-                checked_sum(&[FACT_ID_BYTES, SEMANTIC_INGRESS_OWNER_MAX_BYTES])?,
-            ),
             (workload.max_proof_records, FACT_ID_BYTES),
-            (workload.max_proof_links, 2 * FACT_ID_BYTES),
-            (1, COMMITMENT_NAME_MAX_BYTES),
         ];
-        debug_assert_eq!(primary_index_trees.len(), 8);
+        debug_assert_eq!(primary_index_trees.len(), 3);
         for (rows, key_bytes) in primary_index_trees {
             let payload = checked_rows(rows, key_bytes)?;
             pages = pages.checked_add(object_pages(rows, payload)?)?;
@@ -1454,6 +1460,7 @@ impl SemanticPolicyConfig {
             workload.max_freelist_pages,
             workload.max_fragmented_pages,
             workload.max_main_journal_bytes,
+            workload.max_live_checkpoint_bytes,
         ];
         if values.iter().any(|value| *value == 0)
             || workload.max_fact_encoded_bytes > self.max_fact_encoded_bytes
@@ -1472,6 +1479,7 @@ impl SemanticPolicyConfig {
             || workload.max_freelist_pages > self.max_freelist_pages
             || workload.max_fragmented_pages > self.max_fragmented_pages
             || workload.max_main_journal_bytes > self.max_main_journal_bytes
+            || workload.max_live_checkpoint_bytes > self.max_live_checkpoint_bytes
         {
             return Err(Error::Config(
                 "semantic storage workload exceeds policy".into(),
@@ -1575,6 +1583,7 @@ impl SemanticPolicyConfig {
             self.max_quarantined_bytes_per_author,
             self.max_retained_facts_per_author,
             self.max_retained_bytes_per_author,
+            self.max_hot_history_facts,
             self.max_dependency_edges,
             self.max_ready_batch,
             self.max_pending_proofs,
@@ -1589,6 +1598,7 @@ impl SemanticPolicyConfig {
             self.max_freelist_pages,
             self.max_fragmented_pages,
             self.max_main_journal_bytes,
+            self.max_live_checkpoint_bytes,
             self.max_database_bytes,
             self.max_wal_bytes,
             self.wal_checkpoint_threshold_bytes,
@@ -1609,6 +1619,7 @@ impl SemanticPolicyConfig {
             self.max_quarantined_bytes_per_author,
             self.max_retained_facts_per_author,
             self.max_retained_bytes_per_author,
+            self.max_hot_history_facts,
             self.max_dependency_edges,
             self.max_ready_batch,
             self.max_pending_proofs,
@@ -1623,6 +1634,7 @@ impl SemanticPolicyConfig {
             self.max_freelist_pages,
             self.max_fragmented_pages,
             self.max_main_journal_bytes,
+            self.max_live_checkpoint_bytes,
             self.max_database_bytes,
             self.max_wal_bytes,
             self.wal_checkpoint_threshold_bytes,
@@ -1660,6 +1672,7 @@ impl SemanticPolicyConfig {
         let storage_relationships = self.wal_checkpoint_threshold_bytes <= self.max_wal_bytes
             && self.max_transaction_dirty_main_pages <= self.max_database_bytes
             && self.max_main_journal_bytes <= self.max_database_bytes
+            && self.max_live_checkpoint_bytes <= self.max_database_bytes
             && self.max_freelist_pages <= self.max_database_bytes / SQLITE_DEFAULT_PAGE_SIZE_BYTES
             && self.max_fragmented_pages
                 <= self.max_database_bytes / SQLITE_DEFAULT_PAGE_SIZE_BYTES;
@@ -1840,7 +1853,11 @@ impl NetworkConfig {
     /// approval). The local `id` defaults to the network id. This backs
     /// `myownmesh ctl networks join <network_id>`, which only takes an
     /// id; richer setups go through config.json or the GUI.
-    pub fn from_network_id(id: impl Into<String>, network_id: impl Into<String>) -> Self {
+    pub fn from_network_id_with_semantic_policy(
+        id: impl Into<String>,
+        network_id: impl Into<String>,
+        semantic_policy: SemanticPolicyConfig,
+    ) -> Self {
         Self {
             id: id.into(),
             network_id: network_id.into(),
@@ -1849,7 +1866,7 @@ impl NetworkConfig {
             label: String::new(),
             kind: Default::default(),
             scheduler: SchedulerPolicyConfig::default(),
-            semantic_policy: SemanticPolicyConfig::default(),
+            semantic_policy,
             topology: Default::default(),
             routing_policy: RoutingPolicyConfig::default(),
             signaling: Default::default(),
@@ -1859,6 +1876,14 @@ impl NetworkConfig {
             pinned_peers: Vec::new(),
             auto_approve: false,
         }
+    }
+
+    /// Test/lab convenience profile. Shipped applications must use
+    /// [`Self::from_network_id_with_semantic_policy`] so resource custody is
+    /// never selected by a library constant.
+    #[cfg(any(test, feature = "transport-lab"))]
+    pub fn from_network_id(id: impl Into<String>, network_id: impl Into<String>) -> Self {
+        Self::from_network_id_with_semantic_policy(id, network_id, SemanticPolicyConfig::default())
     }
 
     /// Return the checked policy before engine construction performs side
@@ -2856,6 +2881,7 @@ mod tests {
         assert_eq!(policy.max_quarantined_bytes_per_author, 4 * 1024 * 1024);
         assert_eq!(policy.max_retained_facts_per_author, 10_000);
         assert_eq!(policy.max_retained_bytes_per_author, 16 * 1024 * 1024);
+        assert_eq!(policy.max_hot_history_facts, 64);
         assert_eq!(policy.max_dependency_edges, 1_000_000);
         assert_eq!(policy.max_ready_batch, 256);
         assert_eq!(policy.max_pending_proofs, 10_000);
@@ -2863,6 +2889,7 @@ mod tests {
         assert_eq!(policy.max_proof_records, 100_000);
         assert_eq!(policy.max_proof_bytes, 64 * 1024 * 1024);
         assert_eq!(policy.max_main_journal_bytes, 8 * 1024 * 1024);
+        assert_eq!(policy.max_live_checkpoint_bytes, 8 * 1024 * 1024);
         assert_eq!(policy.max_database_bytes, 2 * 1024 * 1024 * 1024);
         assert_eq!(policy.max_wal_bytes, 8_413_072);
         assert_eq!(
@@ -3079,6 +3106,7 @@ mod tests {
         reject_n_plus_one!(max_freelist_pages);
         reject_n_plus_one!(max_fragmented_pages);
         reject_n_plus_one!(max_main_journal_bytes);
+        reject_n_plus_one!(max_live_checkpoint_bytes);
     }
 
     #[test]
@@ -3110,6 +3138,7 @@ mod tests {
         reject_zero!(max_quarantined_bytes_per_author);
         reject_zero!(max_retained_facts_per_author);
         reject_zero!(max_retained_bytes_per_author);
+        reject_zero!(max_hot_history_facts);
         reject_zero!(max_dependency_edges);
         reject_zero!(max_ready_batch);
         reject_zero!(max_pending_proofs);
@@ -3124,6 +3153,7 @@ mod tests {
         reject_zero!(max_freelist_pages);
         reject_zero!(max_fragmented_pages);
         reject_zero!(max_main_journal_bytes);
+        reject_zero!(max_live_checkpoint_bytes);
         reject_zero!(max_database_bytes);
         reject_zero!(max_wal_bytes);
         reject_zero!(wal_checkpoint_threshold_bytes);

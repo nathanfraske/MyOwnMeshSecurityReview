@@ -393,6 +393,27 @@ struct SelectedPageWire<'a> {
     complete: bool,
 }
 
+struct RecentFactsWire<'a> {
+    context_id: crate::semantic::MeshContextId,
+    total_admitted_fact_count: u64,
+    cached_fact_count: u64,
+    facts: &'a [&'a SignedFact],
+}
+
+impl Serialize for RecentFactsWire<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("SemanticRecentFacts", 4)?;
+        state.serialize_field("context_id", &self.context_id)?;
+        state.serialize_field("total_admitted_fact_count", &self.total_admitted_fact_count)?;
+        state.serialize_field("cached_fact_count", &self.cached_fact_count)?;
+        state.serialize_field("facts", &self.facts)?;
+        state.end()
+    }
+}
+
 impl Serialize for SelectedPageWire<'_> {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
@@ -576,6 +597,91 @@ pub(crate) fn export_semantic_fact_page(
         facts,
         next_cursor,
         complete,
+        funding,
+    ))
+}
+
+/// Materialize a bounded, human-readable view of the newest facts already in
+/// the machine-governed hot-history cache. This never reads the cold ledger,
+/// creates a mirror database, or feeds the result back into admission.
+pub(crate) fn recent_semantic_facts(
+    state: &Arc<NetworkState>,
+    request: crate::semantic::SemanticRecentFactsRequest,
+) -> Result<crate::semantic::SemanticRecentFacts> {
+    let max_facts = checked_page_limit(request.max_facts, "max_facts")?;
+    let max_encoded_bytes = checked_page_limit(request.max_encoded_bytes, "max_encoded_bytes")?;
+    let graph = state.authoritative_fact_graph();
+    let graph = graph.read();
+    let total_admitted_fact_count = graph.admitted_fact_count();
+    let cached_fact_count = u64::try_from(graph.hot_fact_count())
+        .map_err(|_| Error::Other("semantic hot-history count is not representable".into()))?;
+    let context_id = state.mesh_context_id();
+    let empty: [&SignedFact; 0] = [];
+    let metadata_bytes = serialized_len(&RecentFactsWire {
+        context_id,
+        total_admitted_fact_count,
+        cached_fact_count,
+        facts: &empty,
+    })?;
+    if metadata_bytes > max_encoded_bytes {
+        return Err(Error::Other(
+            "semantic recent-facts metadata does not fit the requested bound".into(),
+        ));
+    }
+
+    // Grow only as facts actually fit the requested encoded-byte ceiling. A
+    // very large count bound must not itself reserve a large pointer array.
+    let mut facts = Vec::new();
+    let mut fact_bytes = 0usize;
+    for fact in graph.hot_facts_in_admission_order().rev().take(max_facts) {
+        let one_fact_bytes = serialized_len(fact)?;
+        let candidate_fact_bytes = fact_bytes
+            .checked_add(one_fact_bytes)
+            .and_then(|bytes| bytes.checked_add(usize::from(!facts.is_empty())))
+            .ok_or_else(|| Error::Other("semantic recent-facts length overflow".into()))?;
+        if metadata_bytes
+            .checked_add(candidate_fact_bytes)
+            .is_none_or(|bytes| bytes > max_encoded_bytes)
+        {
+            break;
+        }
+        facts.push(fact);
+        fact_bytes = candidate_fact_bytes;
+    }
+    if facts.is_empty() && cached_fact_count != 0 {
+        return Err(Error::Other(
+            "newest semantic fact does not fit the requested bound".into(),
+        ));
+    }
+    facts.reverse();
+
+    let wire = RecentFactsWire {
+        context_id,
+        total_admitted_fact_count,
+        cached_fact_count,
+        facts: &facts,
+    };
+    let measurement = crate::resource::measure_serialized_mailbox_item::<
+        crate::semantic::SemanticRecentFacts,
+    >(&wire)
+    .map_err(|error| {
+        Error::Other(format!(
+            "semantic recent-facts measurement refused: {error}"
+        ))
+    })?;
+    let claim = measurement.into_claim();
+    let scope = state
+        .local_application_resource_scope()
+        .map_err(|error| Error::Other(format!("semantic recent-facts scope refused: {error}")))?;
+    let funding = scope.acquire(claim).map_err(|error| {
+        Error::Other(format!("semantic recent-facts admission refused: {error}"))
+    })?;
+    let facts = facts.into_iter().cloned().collect();
+    Ok(crate::semantic::SemanticRecentFacts::new(
+        context_id,
+        total_admitted_fact_count,
+        cached_fact_count,
+        facts,
         funding,
     ))
 }

@@ -1441,6 +1441,7 @@ version = "0.3.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
+ "bincode",
  "bytes",
  "dashmap",
  "data-encoding",

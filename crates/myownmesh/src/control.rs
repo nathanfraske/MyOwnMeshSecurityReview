@@ -2103,6 +2103,20 @@ async fn handle_client(stream: LocalSocketStream, state: Arc<ControlState>) -> R
                     Wrote::Ended => break,
                 }
             }
+            Request::SemanticRecentFacts { network, request } => {
+                let (reply, output) = dispatch::governance::semantic_recent_facts(
+                    &state,
+                    &json_lines,
+                    network,
+                    request,
+                )?;
+                let line = AdmittedLineOut::encode_prepared(ControlOut::Prepared(&reply), output)
+                    .context("semantic recent-facts response changed after measurement")?;
+                match write_admitted_line(&mut writer, &cancel, line).await? {
+                    Wrote::Sent => continue,
+                    Wrote::Ended => break,
+                }
+            }
             Request::ClosedRelayOpen {
                 network,
                 relay,

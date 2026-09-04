@@ -45,16 +45,16 @@ use super::{
 };
 use crate::config::{
     SemanticPolicyConfig, SEMANTIC_INGRESS_OWNER, SEMANTIC_INGRESS_OWNER_MAX_BYTES,
-    SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
 };
 use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
 
 const BOOTSTRAP_DIRECTORY: &str = "bootstrap";
 const SEMANTIC_DIRECTORY: &str = "semantic";
 const SEMANTIC_DATABASE_FILE: &str = "store.sqlite3";
-// Version 3 adds exact proof-link usage to the singleton proof counters, so
-// steady-state proof mutations never scan the retained link table.
-const SEMANTIC_DATABASE_VERSION: u64 = 3;
+// Version 4 makes the compact binary fact codec the only durable encoding.
+// Earlier databases are rejected as a unit instead of mixing JSON and binary
+// rows or carrying a permanent compatibility decoder in the engine.
+const SEMANTIC_DATABASE_VERSION: u64 = 4;
 const LIVE_CHECKPOINT_KEY: &str = "live_checkpoint_v1";
 #[cfg(test)]
 const SQLITE_WAL_HEADER_BYTES: u64 = 32;
@@ -263,8 +263,6 @@ impl SemanticSqliteTransaction<'_> {
     }
 }
 
-const SEMANTIC_WORKER_QUEUE_CAPACITY: usize = 4;
-
 type WorkerValue = Box<dyn Any + Send>;
 type WorkerResult = Result<WorkerValue, DurableStoreError>;
 type WorkerOperation =
@@ -297,7 +295,11 @@ impl SemanticStorageWorker {
         writer_lease: WriterLease,
         storage_lease: Option<ResourceLease>,
     ) -> Result<Self, DurableStoreError> {
-        let (commands, receiver) = sync_channel(SEMANTIC_WORKER_QUEUE_CAPACITY);
+        // Calls are already serialized by the owner's process gate. A
+        // rendezvous channel therefore transfers exactly one owned command
+        // without inventing a second, hard-coded backlog or retaining burst
+        // traffic outside the resource provider.
+        let (commands, receiver) = sync_channel(0);
         let path = store.path.clone();
         let storage_funded = storage_lease.is_some();
         let poisoned = Arc::new(AtomicBool::new(false));
@@ -938,6 +940,7 @@ impl BootstrapStore {
 }
 
 impl DurableSemanticStore {
+    #[cfg(any(test, feature = "transport-lab"))]
     pub fn new(instance_root: impl Into<PathBuf>, local_slot: impl AsRef<str>) -> Self {
         Self::with_policy(instance_root, local_slot, SemanticPolicyConfig::default())
     }
@@ -959,6 +962,56 @@ impl DurableSemanticStore {
             process_gate: Arc::new(Mutex::new(())),
             policy: policy,
         }
+    }
+
+    fn encode_stored_fact(&self, fact: &SignedFact) -> Result<Vec<u8>, DurableStoreError> {
+        super::storage_codec::encode(fact).map_err(|reason| DurableStoreError::Rebuild {
+            path: self.path.clone(),
+            reason: format!("fact storage encoding failed: {reason}"),
+        })
+    }
+
+    fn decode_stored_fact(
+        &self,
+        encoded: &[u8],
+        context: MeshContextId,
+        author: &[u8],
+        fact_id: &[u8],
+    ) -> Result<SignedFact, DurableStoreError> {
+        let author: [u8; 32] = author.try_into().map_err(|_| DurableStoreError::Corrupt {
+            path: self.path.clone(),
+            reason: "invalid fact author index".into(),
+        })?;
+        let fact_id: [u8; 32] = fact_id.try_into().map_err(|_| DurableStoreError::Corrupt {
+            path: self.path.clone(),
+            reason: "invalid fact id index".into(),
+        })?;
+        super::storage_codec::decode(encoded, context, author, fact_id).map_err(|reason| {
+            DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: format!("invalid stored fact: {reason}"),
+            }
+        })
+    }
+
+    fn context_id_from_connection(
+        &self,
+        connection: &Connection,
+    ) -> Result<MeshContextId, DurableStoreError> {
+        let context: Vec<u8> = connection
+            .query_row("SELECT value FROM meta WHERE key='context_id'", [], |row| {
+                row.get(0)
+            })
+            .map_err(DurableStoreError::Sqlite)?;
+        let context: [u8; 32] = context.try_into().map_err(|_| DurableStoreError::Corrupt {
+            path: self.path.clone(),
+            reason: "invalid context id".into(),
+        })?;
+        Ok(MeshContextId::from_bytes(context))
+    }
+
+    fn canonical_fact_bytes(fact: &SignedFact) -> Result<u64, DurableStoreError> {
+        u64::try_from(serde_json::to_vec(fact)?.len()).map_err(|_| DurableStoreError::InvalidPolicy)
     }
 
     /// Remove this instance's canonical semantic snapshot while holding both
@@ -1335,7 +1388,7 @@ impl DurableSemanticStore {
                  UNION
                  SELECT d.dep_id FROM dependencies d JOIN closure c ON d.fact_id=c.fact_id
              )
-             SELECT f.fact_id,f.encoded
+             SELECT f.fact_id,f.encoded,f.author
              FROM facts f JOIN closure c ON c.fact_id=f.fact_id
              WHERE f.status='admitted'
              ORDER BY f.seq"
@@ -1345,7 +1398,7 @@ impl DurableSemanticStore {
             .map(|id| id.as_bytes().to_vec())
             .collect::<Vec<_>>();
         let params = rusqlite::params_from_iter(values.iter());
-        let rows: Vec<(Vec<u8>, Vec<u8>)> = bounded_query_collect(
+        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = bounded_query_collect(
             connection,
             &sql,
             params,
@@ -1355,33 +1408,18 @@ impl DurableSemanticStore {
             |row| {
                 let id: Vec<u8> = row.get(0)?;
                 let encoded: Vec<u8> = row.get(1)?;
+                let author: Vec<u8> = row.get(2)?;
                 let bytes = u64::try_from(id.len())
                     .ok()
                     .and_then(|value| value.checked_add(u64::try_from(encoded.len()).ok()?))
+                    .and_then(|value| value.checked_add(u64::try_from(author.len()).ok()?))
                     .ok_or(rusqlite::Error::InvalidQuery)?;
-                Ok(((id, encoded), bytes))
+                Ok(((id, encoded, author), bytes))
             },
         )?;
+        let context = self.context_id_from_connection(connection)?;
         rows.into_iter()
-            .map(|(id, encoded)| {
-                let id: [u8; 32] = id.try_into().map_err(|_| DurableStoreError::Corrupt {
-                    path: self.path.clone(),
-                    reason: "invalid causal history fact id".into(),
-                })?;
-                let fact: SignedFact = serde_json::from_slice(&encoded).map_err(|error| {
-                    DurableStoreError::Corrupt {
-                        path: self.path.clone(),
-                        reason: error.to_string(),
-                    }
-                })?;
-                if fact.id.as_bytes() != &id {
-                    return Err(DurableStoreError::Corrupt {
-                        path: self.path.clone(),
-                        reason: "causal history id does not match signed bytes".into(),
-                    });
-                }
-                Ok(fact)
-            })
+            .map(|(id, encoded, author)| self.decode_stored_fact(&encoded, context, &author, &id))
             .collect()
     }
 
@@ -1657,18 +1695,18 @@ impl DurableSemanticStore {
                     retained_bytes BLOB NOT NULL,
                     quarantined_count BLOB NOT NULL,
                     quarantined_bytes BLOB NOT NULL
-                );
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS dependencies (
                     fact_id BLOB NOT NULL REFERENCES facts(fact_id) ON DELETE CASCADE,
                     dep_id BLOB NOT NULL,
                     PRIMARY KEY(fact_id, dep_id)
-                );
+                ) WITHOUT ROWID;
                 CREATE INDEX IF NOT EXISTS dependencies_dep_idx ON dependencies(dep_id);
                 CREATE TABLE IF NOT EXISTS provisional (
                     fact_id BLOB NOT NULL REFERENCES facts(fact_id) ON DELETE CASCADE,
                     owner TEXT NOT NULL,
                     PRIMARY KEY(fact_id, owner)
-                );
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS proofs (
                     delivery_id BLOB PRIMARY KEY NOT NULL,
                     encoded BLOB NOT NULL,
@@ -1680,11 +1718,11 @@ impl DurableSemanticStore {
                     delivery_id BLOB NOT NULL REFERENCES proofs(delivery_id) ON DELETE CASCADE,
                     fact_id BLOB NOT NULL REFERENCES facts(fact_id),
                     PRIMARY KEY(delivery_id, fact_id)
-                );
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS commitments (
                     name TEXT PRIMARY KEY NOT NULL,
                     value BLOB NOT NULL
-                );
+                ) WITHOUT ROWID;
                 CREATE TABLE IF NOT EXISTS proof_usage (
                     usage_id INTEGER PRIMARY KEY CHECK(usage_id = 1),
                     total_count BLOB NOT NULL,
@@ -2689,9 +2727,7 @@ impl DurableSemanticStore {
             if !seen.insert(fact.id) || fact.content.mesh_context != context_id {
                 return Err(DurableStoreError::DeltaConflict);
             }
-            let encoded = serde_json::to_vec(fact)?;
-            let encoded_bytes = u64::try_from(encoded.len())
-                .map_err(|_| DurableStoreError::LimitExceeded("fact delta bytes"))?;
+            let encoded_bytes = Self::canonical_fact_bytes(fact)?;
             let dependency_count = u64::try_from(canonical_dependencies(fact).len())
                 .map_err(|_| DurableStoreError::LimitExceeded("fact delta dependencies"))?;
             if encoded_bytes > self.policy.max_fact_encoded_bytes
@@ -2721,7 +2757,13 @@ impl DurableSemanticStore {
                 .map_err(DurableStoreError::Sqlite)?;
             let (existing, promote) = match existing {
                 Some((stored_encoded, stored_status, stored_author, stored_domain)) => {
-                    if stored_encoded != encoded
+                    let stored_fact = self.decode_stored_fact(
+                        &stored_encoded,
+                        context_id,
+                        &stored_author,
+                        fact.id.as_bytes(),
+                    )?;
+                    if stored_fact != *fact
                         || stored_author != expected_author
                         || stored_domain != expected_domain
                     {
@@ -2788,11 +2830,8 @@ impl DurableSemanticStore {
                 path: self.path.clone(),
                 reason: "invalid removed fact author".into(),
             })?;
-            let removed_fact: SignedFact =
-                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
-                    path: self.path.clone(),
-                    reason: format!("invalid removed fact: {error}"),
-                })?;
+            let removed_fact =
+                self.decode_stored_fact(&encoded, context_id, &author, id.as_bytes())?;
             if removed_fact.id != *id {
                 return Err(DurableStoreError::Corrupt {
                     path: self.path.clone(),
@@ -2806,12 +2845,7 @@ impl DurableSemanticStore {
             removed.push(PlannedDeltaRemoval {
                 id: *id,
                 author,
-                encoded_bytes: u64::try_from(encoded.len()).map_err(|_| {
-                    DurableStoreError::Corrupt {
-                        path: self.path.clone(),
-                        reason: "removed fact byte count overflow".into(),
-                    }
-                })?,
+                encoded_bytes: Self::canonical_fact_bytes(&removed_fact)?,
                 dependency_count: u64::try_from(dependency_count).map_err(|_| {
                     DurableStoreError::Corrupt {
                         path: self.path.clone(),
@@ -3318,7 +3352,7 @@ impl DurableSemanticStore {
                     return Err(DurableStoreError::DeltaConflict);
                 }
             } else if !row.existing {
-                let encoded = serde_json::to_vec(&row.fact)?;
+                let encoded = self.encode_stored_fact(&row.fact)?;
                 let author = row.fact.content.author.as_bytes().to_vec();
                 let domain = serde_json::to_string(&row.fact.content.domain)?;
                 transaction
@@ -3525,9 +3559,8 @@ impl DurableSemanticStore {
             .chain(graph.quarantined.values().map(|fact| ("quarantined", fact)))
             .enumerate()
         {
-            let encoded = serde_json::to_vec(fact)?;
-            let encoded_bytes =
-                u64::try_from(encoded.len()).map_err(|_| DurableStoreError::InvalidPolicy)?;
+            let encoded_bytes = Self::canonical_fact_bytes(fact)?;
+            let encoded = self.encode_stored_fact(fact)?;
             if encoded_bytes > self.policy.max_fact_encoded_bytes {
                 return Err(DurableStoreError::LimitExceeded("fact bytes"));
             }
@@ -3879,7 +3912,7 @@ impl DurableSemanticStore {
         max_length_at_most("SELECT MAX(LENGTH(key)) FROM meta", 18, "meta key bytes")?;
         max_length_at_most(
             "SELECT MAX(LENGTH(value)) FROM meta",
-            SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES,
+            self.policy.max_live_checkpoint_bytes,
             "meta value bytes",
         )?;
         sum_length_at_most(
@@ -3890,7 +3923,8 @@ impl DurableSemanticStore {
         )?;
         sum_length_at_most(
             "SELECT COALESCE(SUM(LENGTH(value)),0) FROM meta",
-            SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES
+            self.policy
+                .max_live_checkpoint_bytes
                 .checked_add(3 * 32)
                 .ok_or(DurableStoreError::InvalidPolicy)?,
             "meta value bytes",
@@ -4284,16 +4318,21 @@ impl DurableSemanticStore {
             reason: "invalid context id".into(),
         })?;
         let context_id = MeshContextId::from_bytes(context);
-        let admission_ordered = connection
+        let fact_sequence = connection
             .query_row(
                 "SELECT value FROM meta WHERE key='fact_sequence'",
                 [],
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(DurableStoreError::Sqlite)?
-            .as_deref()
-            == Some("admission_v1");
+            .map_err(DurableStoreError::Sqlite)?;
+        if fact_sequence.as_deref() != Some("admission_v1") {
+            return Err(DurableStoreError::Corrupt {
+                path: path.to_path_buf(),
+                reason: "unsupported fact sequence".into(),
+            });
+        }
+        let admission_ordered = true;
         let admitted_capacity: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM facts WHERE status='admitted'",
@@ -4348,17 +4387,8 @@ impl DurableSemanticStore {
                 });
             }
             previous_seq = Some(seq);
-            let fact: SignedFact =
-                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
-                    path: path.to_path_buf(),
-                    reason: error.to_string(),
-                })?;
-            let fact_id: [u8; 32] = fact_id.try_into().map_err(|_| DurableStoreError::Corrupt {
-                path: path.to_path_buf(),
-                reason: "invalid fact id index".into(),
-            })?;
-            if fact.id.as_bytes() != &fact_id
-                || fact.content.author.as_bytes().as_slice() != author.as_slice()
+            let fact = self.decode_stored_fact(&encoded, context_id, &author, &fact_id)?;
+            if fact.content.author.as_bytes().as_slice() != author.as_slice()
                 || serde_json::to_string(&fact.content.domain)? != domain
             {
                 return Err(DurableStoreError::Corrupt {
@@ -4888,7 +4918,7 @@ impl DurableSemanticStore {
         let Some(encoded) = encoded else {
             return Ok(None);
         };
-        if encoded.len() as u64 > SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES {
+        if encoded.len() as u64 > self.policy.max_live_checkpoint_bytes {
             return Err(DurableStoreError::LimitExceeded("live checkpoint bytes"));
         }
         let checkpoint: DurableLiveCheckpoint =
@@ -5026,7 +5056,7 @@ impl DurableSemanticStore {
             checksum,
         };
         let encoded = serde_json::to_vec(&checkpoint)?;
-        if encoded.len() as u64 > SEMANTIC_LIVE_CHECKPOINT_MAX_BYTES {
+        if encoded.len() as u64 > self.policy.max_live_checkpoint_bytes {
             return Err(DurableStoreError::LimitExceeded("live checkpoint bytes"));
         }
         transaction
@@ -5110,18 +5140,8 @@ impl DurableSemanticStore {
                 });
             }
             previous_seq = Some(seq);
-            let fact: SignedFact =
-                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
-                    path: self.path.clone(),
-                    reason: error.to_string(),
-                })?;
-            let indexed_id: [u8; 32] =
-                fact_id.try_into().map_err(|_| DurableStoreError::Corrupt {
-                    path: self.path.clone(),
-                    reason: "invalid fact id index".into(),
-                })?;
-            if fact.id.as_bytes() != &indexed_id
-                || fact.content.author.as_bytes().as_slice() != author.as_slice()
+            let fact = self.decode_stored_fact(&encoded, context_id, &author, &fact_id)?;
+            if fact.content.author.as_bytes().as_slice() != author.as_slice()
                 || serde_json::to_string(&fact.content.domain)? != domain
             {
                 return Err(DurableStoreError::Corrupt {
@@ -5153,8 +5173,7 @@ impl DurableSemanticStore {
                 });
             }
 
-            let bytes =
-                u64::try_from(encoded.len()).map_err(|_| DurableStoreError::InvalidPolicy)?;
+            let bytes = Self::canonical_fact_bytes(&fact)?;
             expected_usage.dependency_edges = expected_usage
                 .dependency_edges
                 .checked_add(
@@ -5400,72 +5419,25 @@ impl DurableSemanticStore {
                 tracing::warn!(%error, "ignoring unusable semantic live checkpoint");
             }
         }
-        let admission_ordered = connection
+        let fact_sequence = connection
             .query_row(
                 "SELECT value FROM meta WHERE key='fact_sequence'",
                 [],
                 |row| row.get::<_, String>(0),
             )
             .optional()
+            .map_err(DurableStoreError::Sqlite)?;
+        if fact_sequence.as_deref() != Some("admission_v1") {
+            return Err(DurableStoreError::Corrupt {
+                path: self.path.clone(),
+                reason: "unsupported fact sequence".into(),
+            });
+        }
+        connection
+            .with_read_snapshot(|connection| {
+                Ok(self.restore_ordered_in_snapshot(connection, bootstrap))
+            })
             .map_err(DurableStoreError::Sqlite)?
-            .as_deref()
-            == Some("admission_v1");
-        if admission_ordered {
-            return connection
-                .with_read_snapshot(|connection| {
-                    Ok(self.restore_ordered_in_snapshot(connection, bootstrap))
-                })
-                .map_err(DurableStoreError::Sqlite)?;
-        }
-        let snapshot = self.load_snapshot_connection(connection, &self.path)?;
-        if snapshot.context_id != bootstrap.context_id() {
-            return Err(DurableStoreError::ContextMismatch {
-                expected: bootstrap.context_id(),
-                actual: snapshot.context_id,
-            });
-        }
-
-        let V4StoreAggregate {
-            context_id: _,
-            facts,
-            quarantined,
-            admission_ordered,
-            projection_commitment,
-            provisional,
-            proofs,
-        } = snapshot;
-        let expected_facts = facts.len();
-        let expected_quarantined: std::collections::BTreeSet<_> =
-            quarantined.iter().map(|fact| fact.id).collect();
-        let mut graph = FactGraph::from_bootstrap_with_policy(bootstrap, self.policy);
-        let restore = if admission_ordered {
-            graph.restore_admitted_in_order(facts, quarantined)
-        } else {
-            // Compatibility for version-3 snapshots written before `seq`
-            // became the canonical admission order.
-            graph.bulk_restore_admitted(facts, quarantined)
-        };
-        restore.map_err(|error| DurableStoreError::Rebuild {
-            path: self.path.clone(),
-            reason: error.to_string(),
-        })?;
-        let actual_quarantined: std::collections::BTreeSet<_> =
-            graph.quarantined().map(|(id, _)| *id).collect();
-        if graph.len() != expected_facts || actual_quarantined != expected_quarantined {
-            return Err(DurableStoreError::Rebuild {
-                path: self.path.clone(),
-                reason: "snapshot contains unresolved or missing fact dependencies".into(),
-            });
-        }
-        validate_proofs_for_state(&proofs, &graph)?;
-        validate_provisional_for_state(&provisional, &graph)?;
-        if !graph.verify_projection_commitment(projection_commitment) {
-            return Err(DurableStoreError::ProjectionMismatch {
-                path: self.path.clone(),
-            });
-        }
-        graph.retire_cold_history();
-        Ok(RestoredSemanticState { graph, provisional })
     }
 }
 
@@ -5522,31 +5494,22 @@ impl DurableSemanticOwner {
         let _gate = self.store.lock_process()?;
         self.ensure_live_unlocked()?;
         self.worker_call(false, false, false, move |store, connection| {
-            let row: Option<(Vec<u8>, String)> = connection
+            let context = store.context_id_from_connection(&connection.inner)?;
+            let row: Option<(Vec<u8>, String, Vec<u8>)> = connection
                 .query_row(
-                    "SELECT encoded,status FROM facts WHERE fact_id=?",
+                    "SELECT encoded,status,author FROM facts WHERE fact_id=?",
                     params![fact_id.as_bytes().to_vec()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()
                 .map_err(DurableStoreError::Sqlite)?;
-            let Some((encoded, status)) = row else {
+            let Some((encoded, status, author)) = row else {
                 return Ok(None);
             };
             if status != "admitted" {
                 return Ok(None);
             }
-            let fact: SignedFact =
-                serde_json::from_slice(&encoded).map_err(|error| DurableStoreError::Corrupt {
-                    path: store.path.clone(),
-                    reason: error.to_string(),
-                })?;
-            if fact.id != fact_id {
-                return Err(DurableStoreError::Corrupt {
-                    path: store.path.clone(),
-                    reason: "fact row id does not match signed bytes".into(),
-                });
-            }
+            let fact = store.decode_stored_fact(&encoded, context, &author, fact_id.as_bytes())?;
             Ok(Some(fact))
         })
     }
@@ -5558,40 +5521,28 @@ impl DurableSemanticOwner {
         let _gate = self.store.lock_process()?;
         self.ensure_live_unlocked()?;
         self.worker_call(false, false, false, move |store, connection| {
-            connection
-                .prepare(
-                    "SELECT encoded,status FROM facts WHERE fact_id=?",
-                    |statement| {
-                        let mut facts = Vec::with_capacity(fact_ids.len());
-                        for fact_id in fact_ids {
-                            let row: Option<(Vec<u8>, String)> = statement
-                                .query_row(params![fact_id.as_bytes().to_vec()], |row| {
-                                    Ok((row.get(0)?, row.get(1)?))
-                                })
-                                .optional()?;
-                            let fact = match row {
-                                Some((encoded, status)) if status == "admitted" => {
-                                    let fact: SignedFact = serde_json::from_slice(&encoded)
-                                        .map_err(|_| rusqlite::Error::InvalidQuery)?;
-                                    if fact.id != fact_id {
-                                        return Err(rusqlite::Error::InvalidQuery);
-                                    }
-                                    Some(fact)
-                                }
-                                Some(_) | None => None,
-                            };
-                            facts.push(fact);
-                        }
-                        Ok(facts)
-                    },
-                )
-                .map_err(|error| match error {
-                    rusqlite::Error::InvalidQuery => DurableStoreError::Corrupt {
-                        path: store.path.clone(),
-                        reason: "invalid admitted fact row".into(),
-                    },
-                    other => DurableStoreError::Sqlite(other),
-                })
+            let context = store.context_id_from_connection(&connection.inner)?;
+            let mut statement = connection
+                .inner
+                .prepare("SELECT encoded,status,author FROM facts WHERE fact_id=?")
+                .map_err(DurableStoreError::Sqlite)?;
+            let mut facts = Vec::with_capacity(fact_ids.len());
+            for fact_id in fact_ids {
+                let row: Option<(Vec<u8>, String, Vec<u8>)> = statement
+                    .query_row(params![fact_id.as_bytes().to_vec()], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()
+                    .map_err(DurableStoreError::Sqlite)?;
+                let fact = match row {
+                    Some((encoded, status, author)) if status == "admitted" => Some(
+                        store.decode_stored_fact(&encoded, context, &author, fact_id.as_bytes())?,
+                    ),
+                    Some(_) | None => None,
+                };
+                facts.push(fact);
+            }
+            Ok(facts)
         })
     }
 
@@ -5678,8 +5629,8 @@ impl DurableSemanticOwner {
                                 hasher.update(count_label.to_le_bytes());
                                 hasher.update(b"\0unresolved\0");
                             }
-                            let sql =
-                                "SELECT fact_id,encoded FROM facts WHERE status=? ORDER BY fact_id";
+                            let sql = "SELECT fact_id,encoded,author FROM facts \
+                                       WHERE status=? ORDER BY fact_id";
                             let mut statement =
                                 connection.prepare(sql).map_err(DurableStoreError::Sqlite)?;
                             let mut rows = statement
@@ -5691,14 +5642,18 @@ impl DurableSemanticOwner {
                                     row.get(0).map_err(DurableStoreError::Sqlite)?;
                                 let encoded: Vec<u8> =
                                     row.get(1).map_err(DurableStoreError::Sqlite)?;
+                                let author: Vec<u8> =
+                                    row.get(2).map_err(DurableStoreError::Sqlite)?;
                                 if fact_id.len() != 32 {
                                     return Err(DurableStoreError::Corrupt {
                                         path: store.path.clone(),
                                         reason: "semantic identity row has an invalid id".into(),
                                     });
                                 }
+                                let fact = store
+                                    .decode_stored_fact(&encoded, context_id, &author, &fact_id)?;
                                 hasher.update(&fact_id);
-                                hasher.update(&encoded);
+                                hasher.update(serde_json::to_vec(&fact)?);
                                 hasher.update([0]);
                                 observed = observed
                                     .checked_add(1)
@@ -5748,7 +5703,7 @@ impl DurableSemanticOwner {
                      UNION
                      SELECT d.dep_id FROM dependencies d JOIN closure c ON d.fact_id=c.fact_id
                  )
-                 SELECT f.fact_id,f.encoded
+                 SELECT f.fact_id,f.encoded,f.author
                  FROM facts f JOIN closure c ON c.fact_id=f.fact_id
                  WHERE f.status='admitted'
                  ORDER BY f.seq"
@@ -5758,7 +5713,7 @@ impl DurableSemanticOwner {
                             .map(|id| id.as_bytes().to_vec())
                             .collect::<Vec<_>>();
                         let params = rusqlite::params_from_iter(values.iter());
-                        let rows: Vec<(Vec<u8>, Vec<u8>)> = bounded_query_collect(
+                        let rows: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = bounded_query_collect(
                             connection,
                             &sql,
                             params,
@@ -5768,37 +5723,23 @@ impl DurableSemanticOwner {
                             |row| {
                                 let id: Vec<u8> = row.get(0)?;
                                 let encoded: Vec<u8> = row.get(1)?;
+                                let author: Vec<u8> = row.get(2)?;
                                 let bytes = u64::try_from(id.len())
                                     .ok()
                                     .and_then(|value| {
                                         value.checked_add(u64::try_from(encoded.len()).ok()?)
                                     })
+                                    .and_then(|value| {
+                                        value.checked_add(u64::try_from(author.len()).ok()?)
+                                    })
                                     .ok_or(rusqlite::Error::InvalidQuery)?;
-                                Ok(((id, encoded), bytes))
+                                Ok(((id, encoded, author), bytes))
                             },
                         )?;
+                        let context = store.context_id_from_connection(connection)?;
                         rows.into_iter()
-                            .map(|(id, encoded)| {
-                                let id: [u8; 32] =
-                                    id.try_into().map_err(|_| DurableStoreError::Corrupt {
-                                        path: store.path.clone(),
-                                        reason: "invalid causal history fact id".into(),
-                                    })?;
-                                let fact: SignedFact =
-                                    serde_json::from_slice(&encoded).map_err(|error| {
-                                        DurableStoreError::Corrupt {
-                                            path: store.path.clone(),
-                                            reason: error.to_string(),
-                                        }
-                                    })?;
-                                if fact.id.as_bytes() != &id {
-                                    return Err(DurableStoreError::Corrupt {
-                                        path: store.path.clone(),
-                                        reason: "causal history id does not match signed bytes"
-                                            .into(),
-                                    });
-                                }
-                                Ok(fact)
+                            .map(|(id, encoded, author)| {
+                                store.decode_stored_fact(&encoded, context, &author, &id)
                             })
                             .collect()
                     })())
@@ -8444,7 +8385,6 @@ mod tests {
             })
             .expect("worker call");
         assert_eq!(worker_name, "myownmesh-semantic-storage");
-        assert_eq!(SEMANTIC_WORKER_QUEUE_CAPACITY, 4);
         assert!(matches!(
             owner.worker_call::<(), _>(false, false, false, |_, _| {
                 panic!("deliberate semantic worker panic")

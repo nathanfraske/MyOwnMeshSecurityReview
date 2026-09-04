@@ -507,6 +507,16 @@ impl JoinedNetwork {
         crate::engine::lifecycle::semantic_state_identity(&self.state)
     }
 
+    /// Render a bounded diagnostic view of the newest signed facts already
+    /// retained in the live hot-history cache. The returned JSON shape is not
+    /// a storage format and is never consumed by the engine.
+    pub fn recent_semantic_facts(
+        &self,
+        request: crate::semantic::SemanticRecentFactsRequest,
+    ) -> Result<crate::semantic::SemanticRecentFacts> {
+        crate::engine::lifecycle::recent_semantic_facts(&self.state, request)
+    }
+
     /// Transport-lab observation of the live in-memory semantic history.
     /// Retired states report zero after their durable owner has terminated.
     #[cfg(feature = "transport-lab")]

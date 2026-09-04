@@ -141,6 +141,12 @@ pub enum Request {
     SemanticStateIdentity {
         network: String,
     },
+    /// Render a bounded, non-canonical view of the newest facts retained in
+    /// the live hot-history cache.
+    SemanticRecentFacts {
+        network: String,
+        request: myownmesh_core::semantic::SemanticRecentFactsRequest,
+    },
     /// Remove a network: take it out of the registry, `leave()` the
     /// engine driver, drop the signaling handle, and persist the
     /// updated config.json. Idempotent — removing an unknown id is

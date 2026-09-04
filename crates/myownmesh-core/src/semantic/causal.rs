@@ -16,11 +16,6 @@ thread_local! {
     static INDEX_REBUILD_COUNT: Cell<usize> = Cell::new(0);
 }
 
-// Sweep cold bodies in small batches. This keeps peak history residency
-// bounded (at most 64 newly admitted fact bodies) without walking every live
-// participant head on every admission.
-const COLD_HISTORY_RETIREMENT_INTERVAL: usize = 64;
-
 use super::content::{DeviceId, ExclusiveCell, FactBody, Role};
 #[cfg(feature = "transport-lab")]
 use super::projection::ProjectionDelta;
@@ -48,6 +43,7 @@ pub struct SemanticAdmissionPolicy {
     pub max_quarantined_bytes_per_author: u64,
     pub max_retained_facts_per_author: u64,
     pub max_retained_bytes_per_author: u64,
+    pub max_hot_history_facts: u64,
     pub max_dependency_edges: u64,
     pub max_ready_batch: u64,
     pub max_pending_proofs: u64,
@@ -57,6 +53,7 @@ pub struct SemanticAdmissionPolicy {
     pub emergency_reserve_bytes: u64,
 }
 
+#[cfg(any(test, feature = "transport-lab"))]
 impl Default for SemanticAdmissionPolicy {
     fn default() -> Self {
         Self {
@@ -72,6 +69,7 @@ impl Default for SemanticAdmissionPolicy {
             max_quarantined_bytes_per_author: 4 * 1024 * 1024,
             max_retained_facts_per_author: 10_000,
             max_retained_bytes_per_author: 16 * 1024 * 1024,
+            max_hot_history_facts: 64,
             max_dependency_edges: 1_000_000,
             max_ready_batch: 256,
             max_pending_proofs: 10_000,
@@ -97,6 +95,7 @@ impl SemanticAdmissionPolicy {
         max_quarantined_bytes_per_author: u64,
         max_retained_facts_per_author: u64,
         max_retained_bytes_per_author: u64,
+        max_hot_history_facts: u64,
         max_dependency_edges: u64,
         max_ready_batch: u64,
         max_pending_proofs: u64,
@@ -118,6 +117,7 @@ impl SemanticAdmissionPolicy {
             max_quarantined_bytes_per_author,
             max_retained_facts_per_author,
             max_retained_bytes_per_author,
+            max_hot_history_facts,
             max_dependency_edges,
             max_ready_batch,
             max_pending_proofs,
@@ -144,6 +144,7 @@ impl From<crate::config::SemanticPolicyConfig> for SemanticAdmissionPolicy {
             config.max_quarantined_bytes_per_author,
             config.max_retained_facts_per_author,
             config.max_retained_bytes_per_author,
+            config.max_hot_history_facts,
             config.max_dependency_edges,
             config.max_ready_batch,
             config.max_pending_proofs,
@@ -902,6 +903,7 @@ impl FactGraph {
     /// Construct the graph from the verified, exact bootstrap context. The
     /// graph owns the policy snapshot, so callers cannot supply an unrelated
     /// root set or leave the graph context unbound.
+    #[cfg(any(test, feature = "transport-lab"))]
     pub fn from_bootstrap(bootstrap: &VerifiedBootstrap) -> Self {
         Self::from_bootstrap_with_policy(bootstrap, crate::config::SemanticPolicyConfig::default())
     }
@@ -1267,7 +1269,8 @@ impl FactGraph {
     /// a second database.
     pub(crate) fn retire_cold_history(&mut self) {
         if self.staged_cold_pending == 0
-            && self.cold_history_since_retirement < COLD_HISTORY_RETIREMENT_INTERVAL
+            && (self.cold_history_since_retirement as u64)
+                < self.policy_limits.max_hot_history_facts
         {
             return;
         }
@@ -1333,7 +1336,8 @@ impl FactGraph {
     /// Unlike the amortized admission sweep, shutdown must not leave a
     /// partially filled retirement batch in the checkpoint.
     pub(crate) fn seal_live_checkpoint(&mut self) {
-        self.cold_history_since_retirement = COLD_HISTORY_RETIREMENT_INTERVAL;
+        self.cold_history_since_retirement =
+            usize::try_from(self.policy_limits.max_hot_history_facts).unwrap_or(usize::MAX);
         self.retire_cold_history();
     }
 
@@ -1418,12 +1422,31 @@ impl FactGraph {
         usize::try_from(self.admitted_fact_count).unwrap_or(usize::MAX)
     }
 
+    pub(crate) fn admitted_fact_count(&self) -> u64 {
+        self.admitted_fact_count
+    }
+
     pub fn is_empty(&self) -> bool {
         self.admitted_fact_count == 0
     }
 
     pub fn get(&self, id: &FactId) -> Option<&SignedFact> {
         self.facts.get(id)
+    }
+
+    /// Visit the currently cached signed bodies in admission order. Cold
+    /// history is deliberately absent: SQLite owns it, while this bounded hot
+    /// set exists only to continue admission and support diagnostics.
+    pub(crate) fn hot_facts_in_admission_order(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &SignedFact> {
+        self.admission_order
+            .iter()
+            .filter_map(|id| self.facts.get(id))
+    }
+
+    pub(crate) fn hot_fact_count(&self) -> usize {
+        self.facts.len()
     }
 
     fn indexes_current(&self) -> bool {
@@ -7687,7 +7710,10 @@ mod tests {
             assert_eq!(live.len(), index + 1, "logical history remains exact");
             assert_eq!(live.projection(), complete.projection());
             assert!(
-                live.facts.len() <= COLD_HISTORY_RETIREMENT_INTERVAL + 4,
+                live.facts.len()
+                    <= usize::try_from(live.policy_limits.max_hot_history_facts)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(4),
                 "live continuation stays independent of total history"
             );
             assert_eq!(
