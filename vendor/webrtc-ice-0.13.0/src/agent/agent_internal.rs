@@ -4,6 +4,9 @@ use arc_swap::ArcSwapOption;
 use tokio::task::JoinHandle;
 use util::sync::Mutex as SyncMutex;
 
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use super::agent_transport::*;
 use super::*;
 use crate::candidate::candidate_base::CandidateBaseConfig;
@@ -47,6 +50,9 @@ pub struct AgentInternal {
     pub(crate) notification_tasks: SyncMutex<Vec<JoinHandle<()>>>,
     notification_failure: SyncMutex<Option<String>>,
     pub(crate) closing: AtomicBool,
+
+    #[cfg(test)]
+    pub(crate) recv_exit_gate: SyncMutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 
     pub(crate) tie_breaker: AtomicU64,
     pub(crate) is_controlling: AtomicBool,
@@ -122,6 +128,9 @@ impl AgentInternal {
             notification_tasks: SyncMutex::new(Vec::new()),
             notification_failure: SyncMutex::new(None),
             closing: AtomicBool::new(false),
+
+            #[cfg(test)]
+            recv_exit_gate: SyncMutex::new(None),
 
             tie_breaker: AtomicU64::new(rand::random::<u64>()),
             is_controlling: AtomicBool::new(config.is_controlling),
@@ -274,6 +283,7 @@ impl AgentInternal {
             if self.closing.load(Ordering::SeqCst) {
                 return;
             }
+            self.observe_finished_notification_tasks(&mut tasks);
             tasks.push(tokio::spawn(async move {
                 loop {
                     let mut interval = DEFAULT_CHECK_INTERVAL;
@@ -634,6 +644,30 @@ impl AgentInternal {
                 .iter()
                 .any(|task| task.id() == id)
         })
+    }
+
+    fn observe_finished_notification_tasks(&self, tasks: &mut Vec<JoinHandle<()>>) {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        let mut index = 0;
+        while index < tasks.len() {
+            if !tasks[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            match Pin::new(&mut tasks[index]).poll(&mut cx) {
+                std::task::Poll::Ready(Err(error)) => {
+                    *self.notification_failure.lock() =
+                        Some(format!("ICE notification task failed: {error}"));
+                }
+                std::task::Poll::Ready(Ok(())) => {}
+                std::task::Poll::Pending => {
+                    index += 1;
+                    continue;
+                }
+            }
+            drop(tasks.swap_remove(index));
+        }
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
@@ -1098,11 +1132,25 @@ impl AgentInternal {
             let conn = Arc::clone(conn);
             let addr = candidate.addr();
             let ai = Arc::clone(self);
-            tokio::spawn(async move {
+            let mut tasks = self.notification_tasks.lock();
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
+            self.observe_finished_notification_tasks(&mut tasks);
+            let task = tokio::spawn(async move {
                 let _ = ai
                     .recv_loop(cand, closed_ch_rx, initialized_ch, conn, addr)
                     .await;
+                #[cfg(test)]
+                let exit_gate = { ai.recv_exit_gate.lock().clone() };
+                #[cfg(test)]
+                if let Some((entered, release)) = exit_gate {
+                    entered.notify_one();
+                    release.notified().await;
+                    entered.notify_one();
+                }
             });
+            tasks.push(task);
         } else {
             log::error!("[{}]: Can't start due to conn is_none", self.get_name(),);
         }
@@ -1118,6 +1166,7 @@ impl AgentInternal {
         if self.closing.load(Ordering::SeqCst) {
             return;
         }
+        self.observe_finished_notification_tasks(&mut tasks);
         let ai = Arc::clone(self);
         tasks.push(tokio::spawn(async move {
             // CandidatePair and ConnectionState are usually changed at once.
@@ -1133,6 +1182,7 @@ impl AgentInternal {
             }
         }));
 
+        self.observe_finished_notification_tasks(&mut tasks);
         let ai = Arc::clone(self);
         tasks.push(tokio::spawn(async move {
             loop {
