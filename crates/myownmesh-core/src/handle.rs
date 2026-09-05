@@ -8,19 +8,21 @@
 
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tracing::info;
 
 use crate::channels::Channel;
 use crate::config::{MeshConfig, NetworkConfig, TopologyMode};
 use crate::engine::connection::PeerStatus;
 use crate::engine::ladder::ConnectionTier;
-use crate::engine::spawn_network_in_mesh_scope;
 use crate::engine::state::{NetworkCmd, NetworkState};
-use crate::error::{Error, Result};
-use crate::events::{DropReason, MeshEvent, MeshPhase};
+use crate::engine::{
+    create_network_in_mesh_scope, import_network_in_mesh_scope, spawn_network_in_mesh_scope,
+};
+use crate::error::{ClosedRelayError, Error, Result};
+use crate::events::{MeshEvent, MeshPhase};
 use crate::identity::Identity;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
@@ -33,13 +35,6 @@ use crate::runtime::attempt::{
     ConnectorResourceOwnerReport, MeshConnectorResourceReport, WebRtcConnectorCapablePolicy,
 };
 use crate::transport::{IceCandidateStats, SelectedCandidatePair, Transport};
-
-/// How long [`JoinedNetwork::announce_leave`] waits after queuing the
-/// departure broadcast before returning, so the publish reaches the
-/// already-connected relay sockets before the caller drops the signaling
-/// driver. Long enough for one WebSocket frame on a live socket, short
-/// enough to be imperceptible on a user-initiated reconnect.
-const LEAVE_FLUSH: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// One mesh instance bound to a single device identity. Constructs
 /// the local identity on first call and shares the WebRTC API
@@ -56,12 +51,32 @@ struct MeshInner {
     events_tx: broadcast::Sender<MeshEvent>,
 }
 
+/// The complete configuration classification used by network replacement.
+/// Fields are named so callers cannot mistake a capacity or policy change for
+/// an ordinary hot update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct ReconcileStatus {
+    pub needs_restart: bool,
+    pub network_id_changed: bool,
+    pub signaling_changed: bool,
+    pub closed_relay_changed: bool,
+    pub semantic_policy_changed: bool,
+    pub scheduler_changed: bool,
+    pub event_capacity_changed: bool,
+    pub connection_trace_capacity_changed: bool,
+}
+
 struct JoinedNetworkLifecycle {
     /// The async mutex is intentionally held across the join: concurrent
     /// shutdown callers then wait for the same exact driver completion instead
     /// of the second caller observing an empty slot and returning early.
     driver: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    fanout: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Terminal result of the one driver join. Concurrent shutdown callers
+    /// wait for the same driver lock and then observe this exact outcome
+    /// rather than treating an already-consumed handle as success.
+    shutdown_result: tokio::sync::Mutex<Option<std::result::Result<(), String>>>,
+    fanout: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Mesh {
@@ -91,6 +106,22 @@ impl Mesh {
         Self::open_connector_capable_with_identity(config, identity, policy).await
     }
 
+    /// Build a connector-capable lab mesh whose ICE agent accepts relay
+    /// candidates only. The explicit feature-gated constructor prevents a
+    /// benchmark control from silently changing the shipped daemon policy.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn open_connector_capable_relay_only_for_lab(
+        config: MeshConfig,
+        policy: WebRtcConnectorCapablePolicy,
+    ) -> Result<MeshHandle> {
+        let identity = Arc::new(crate::identity::load_or_create()?);
+        let event_capacity = config.event_capacity_usize()?;
+        let transport =
+            Transport::new_relay_only_for_lab()?.with_connector_resource_policy(policy)?;
+        Self::open_with_identity_and_transport(identity, transport, event_capacity)
+    }
+
     /// Build an infrastructure-only `Mesh` with a **caller-supplied identity**,
     /// for embedders
     /// that manage their own key storage rather than the on-disk anchor — e.g.
@@ -101,33 +132,36 @@ impl Mesh {
     /// use [`Self::open_connector_capable_with_identity`] for
     /// network participation.
     pub async fn open_infrastructure_only_with_identity(
-        _config: MeshConfig,
+        config: MeshConfig,
         identity: Arc<Identity>,
         resources: ResourceProviderPort,
     ) -> Result<MeshHandle> {
+        let event_capacity = config.event_capacity_usize()?;
         ProcessResourceRoot::global().install_local_application_provider(resources)?;
         let transport = Transport::new()?;
-        Self::open_with_identity_and_transport(identity, transport)
+        Self::open_with_identity_and_transport(identity, transport, event_capacity)
     }
 
     /// Identity-injected form of [`Self::open_connector_capable`].
     pub async fn open_connector_capable_with_identity(
-        _config: MeshConfig,
+        config: MeshConfig,
         identity: Arc<Identity>,
         policy: WebRtcConnectorCapablePolicy,
     ) -> Result<MeshHandle> {
+        let event_capacity = config.event_capacity_usize()?;
         let transport = Transport::new()?.with_connector_resource_policy(policy)?;
-        Self::open_with_identity_and_transport(identity, transport)
+        Self::open_with_identity_and_transport(identity, transport, event_capacity)
     }
 
     fn open_with_identity_and_transport(
         identity: Arc<Identity>,
         transport: Transport,
+        event_capacity: usize,
     ) -> Result<MeshHandle> {
         let resource_scope = ProcessResourceRoot::global().mesh_runtime_scope();
         let local_application_resources =
             ProcessResourceRoot::global().issue_local_application_scope()?;
-        let (events_tx, _) = broadcast::channel(256);
+        let (events_tx, _) = broadcast::channel(event_capacity);
         let inner = Arc::new(MeshInner {
             identity,
             transport,
@@ -210,15 +244,7 @@ impl MeshHandle {
     /// until [`JoinedNetwork::leave`] is called (or the
     /// `JoinedNetwork` is dropped).
     pub async fn join(&self, mut config: NetworkConfig) -> Result<JoinedNetwork> {
-        if self
-            .mesh
-            .inner
-            .transport
-            .connector_resource_report()
-            .is_none()
-        {
-            return Err(Error::ConnectorPolicyRequired);
-        }
+        self.require_connector_capable()?;
         // Normalize the network id so signaling derivation is
         // case-insensitive on the user input.
         config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
@@ -231,7 +257,88 @@ impl MeshHandle {
             &self.mesh.inner.local_application_resources,
         )
         .await?;
-        let rpc = Rpc::attach(&state)?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    /// Create and join a new Closed network through the Mesh-owned authority.
+    ///
+    /// The creation record is signed and persisted before the engine becomes
+    /// observable. `creation_id` is caller-owned semantic input; it does not
+    /// select a resource provider or bypass the Mesh's existing scopes.
+    pub async fn create_network(
+        &self,
+        mut config: NetworkConfig,
+        creation_id: [u8; 32],
+    ) -> Result<JoinedNetwork> {
+        self.require_connector_capable()?;
+        config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
+        let (state, driver) = create_network_in_mesh_scope(
+            config.clone(),
+            self.mesh.inner.identity.clone(),
+            self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
+            &self.mesh.inner.local_application_resources,
+            creation_id,
+        )
+        .await?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    /// Import and join an existing Closed network through the Mesh-owned
+    /// authority. The expected context fences the import; the supplied record
+    /// remains the only authority-bearing bootstrap input.
+    pub async fn import_network(
+        &self,
+        mut config: NetworkConfig,
+        expected_context_id: crate::semantic::MeshContextId,
+        record: crate::semantic::BootstrapRecord,
+    ) -> Result<JoinedNetwork> {
+        self.require_connector_capable()?;
+        config.network_id = crate::identity::normalize_network_id(&config.network_id)?;
+        let (state, driver) = import_network_in_mesh_scope(
+            config.clone(),
+            self.mesh.inner.identity.clone(),
+            self.mesh.inner.transport.clone(),
+            &self.mesh.inner.resource_scope,
+            &self.mesh.inner.local_application_resources,
+            expected_context_id,
+            record,
+        )
+        .await?;
+        self.finish_joined_network(config, state, driver).await
+    }
+
+    fn require_connector_capable(&self) -> Result<()> {
+        if self
+            .mesh
+            .inner
+            .transport
+            .connector_resource_report()
+            .is_none()
+        {
+            return Err(Error::ConnectorPolicyRequired);
+        }
+        Ok(())
+    }
+
+    async fn finish_joined_network(
+        &self,
+        config: NetworkConfig,
+        state: Arc<NetworkState>,
+        driver: tokio::task::JoinHandle<()>,
+    ) -> Result<JoinedNetwork> {
+        let rpc = match Rpc::attach(&state) {
+            Ok(rpc) => rpc,
+            Err(error) => {
+                state.request_shutdown();
+                return match driver.await {
+                    Ok(()) => Err(error.into()),
+                    Err(join_error) => Err(Error::Other(format!(
+                        "{error}; network driver cleanup failed: {join_error}"
+                    ))),
+                };
+            }
+        };
 
         // Fan-out per-network events into the mesh-wide broadcaster.
         let mesh_events_tx = self.mesh.inner.events_tx.clone();
@@ -255,7 +362,8 @@ impl MeshHandle {
             label: config.label,
             lifecycle: Arc::new(JoinedNetworkLifecycle {
                 driver: tokio::sync::Mutex::new(Some(driver)),
-                fanout: Mutex::new(Some(fanout)),
+                shutdown_result: tokio::sync::Mutex::new(None),
+                fanout: AsyncMutex::new(Some(fanout)),
             }),
         })
     }
@@ -306,7 +414,229 @@ pub struct JoinedNetwork {
     lifecycle: Arc<JoinedNetworkLifecycle>,
 }
 
+fn peer_registry_key(device_id: &str) -> &str {
+    crate::signing::pubkey_part(device_id)
+}
+
+/// Aggregate timing for one bounded phase of durable semantic admission.
+///
+/// Counts and nanoseconds are process-local instrumentation for the
+/// `transport-lab` scale controls. They intentionally contain no per-fact
+/// samples or retained operation data.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SemanticAdmissionPhaseTiming {
+    pub count: u64,
+    pub total_nanos: u64,
+    pub max_nanos: u64,
+}
+
+/// Aggregate phase timings emitted by the semantic-ledger scale control.
+#[cfg(feature = "transport-lab")]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SemanticAdmissionProfile {
+    /// Time waiting for the bounded durable-admission permit; this excludes
+    /// blocking graph/store work measured by `async_envelope_inclusive`.
+    pub async_lane_wait_exclusive: SemanticAdmissionPhaseTiming,
+    /// Inclusive async request envelope: permit wait, blocking graph/store
+    /// work, and completion.
+    pub async_envelope_inclusive: SemanticAdmissionPhaseTiming,
+    pub publication_graph_replay_cold_lookup: SemanticAdmissionPhaseTiming,
+    pub causal_journal_apply: SemanticAdmissionPhaseTiming,
+    pub store_worker_handoff: SemanticAdmissionPhaseTiming,
+    pub store_plan: SemanticAdmissionPhaseTiming,
+    pub capacity_preflight: SemanticAdmissionPhaseTiming,
+    pub begin_immediate: SemanticAdmissionPhaseTiming,
+    pub sql_apply: SemanticAdmissionPhaseTiming,
+    pub commit_wal_terminal: SemanticAdmissionPhaseTiming,
+    pub author_witness_sign: SemanticAdmissionPhaseTiming,
+    pub projection_roster_publish: SemanticAdmissionPhaseTiming,
+    pub post_commit_broadcast: SemanticAdmissionPhaseTiming,
+}
+
+/// A move-only opaque endpoint channel for a Closed-member relay route.
+///
+/// The relay and session identifiers are descriptive metadata only. Endpoint
+/// key material, authenticated peer ownership, and the bounded relay route
+/// remain inside the engine; callers can only exchange plaintext through this
+/// handle and close the exact endpoint session that opened it.
+pub struct ClosedRelayChannel {
+    session: crate::engine::closed_relay::EndpointSession,
+    peer: String,
+    relay: String,
+    session_id: [u8; 16],
+}
+
+impl ClosedRelayChannel {
+    /// The remote endpoint's canonical device id.
+    pub fn peer_device_id(&self) -> &str {
+        &self.peer
+    }
+
+    /// The canonical device id of the member forwarding this route.
+    pub fn relay_device_id(&self) -> &str {
+        &self.relay
+    }
+
+    /// The opaque session coordinate assigned to this exact endpoint pair.
+    pub fn session_id(&self) -> [u8; 16] {
+        self.session_id
+    }
+
+    /// The exact allocation epoch captured by this endpoint session.
+    ///
+    /// This is an observation coordinate for replacement-generation controls,
+    /// not authority or key material.  A stale endpoint may still retain its
+    /// original number, which lets a caller prove that a later allocation did
+    /// not accept work from the earlier generation.
+    pub fn allocation_epoch(&self) -> u64 {
+        self.session.metadata().allocation_epoch
+    }
+
+    /// Encrypt and send one plaintext through the exact endpoint session.
+    pub async fn send(&self, plaintext: &[u8]) -> Result<()> {
+        self.session
+            .send(plaintext)
+            .await
+            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
+    }
+
+    /// Receive and decrypt one plaintext from the exact endpoint session.
+    pub async fn recv(&self) -> Result<Vec<u8>> {
+        self.session
+            .recv()
+            .await
+            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
+    }
+
+    /// Close this exact endpoint session and release its bounded custody.
+    pub async fn close(self) -> Result<()> {
+        self.session
+            .close()
+            .await
+            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))
+    }
+}
+
 impl JoinedNetwork {
+    /// Reset process-local aggregate admission phase counters for a scale
+    /// measurement. This is deliberately hidden from the stable application
+    /// API and exists only with the transport-lab feature enabled.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn reset_semantic_admission_profile_for_lab(&self) {
+        crate::semantic::store::reset_admission_phase_profile();
+    }
+
+    /// Snapshot process-local aggregate admission phase counters for a scale
+    /// measurement. The returned value is a fixed-size, serializable report.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn semantic_admission_profile_for_lab(&self) -> SemanticAdmissionProfile {
+        let (counts, nanos, max_nanos) = crate::semantic::store::admission_phase_profile_snapshot();
+        let phase = |index: usize| SemanticAdmissionPhaseTiming {
+            count: counts[index],
+            total_nanos: nanos[index],
+            max_nanos: max_nanos[index],
+        };
+        SemanticAdmissionProfile {
+            async_lane_wait_exclusive: phase(1),
+            async_envelope_inclusive: phase(0),
+            publication_graph_replay_cold_lookup: phase(2),
+            causal_journal_apply: phase(3),
+            store_worker_handoff: phase(4),
+            store_plan: phase(5),
+            capacity_preflight: phase(6),
+            begin_immediate: phase(7),
+            sql_apply: phase(8),
+            commit_wal_terminal: phase(9),
+            author_witness_sign: phase(10),
+            projection_roster_publish: phase(11),
+            post_commit_broadcast: phase(12),
+        }
+    }
+
+    /// Prepare a validated large-history fixture for transport-lab scale
+    /// measurements, then leave subsequent admissions on the public path.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn seed_semantic_scale_history_for_lab(
+        &self,
+        target: crate::semantic::DeviceId,
+        count: usize,
+    ) -> Result<()> {
+        self.state
+            .seed_semantic_scale_history_for_lab(target, count)
+            .await
+    }
+
+    /// Import one bounded semantic fact page through the durable reducer and
+    /// return the resulting deterministic graph identity.
+    ///
+    /// The page is checked for its exact protocol byte/count bounds, canonical
+    /// signatures, and verified bootstrap context before it enters the
+    /// reducer. Semantic authorization, dependency quarantine, custody, and
+    /// projection remain owned by the canonical `FactGraph`.
+    pub async fn import_semantic_fact_page(
+        &self,
+        page: crate::semantic::SemanticFactPage,
+    ) -> Result<crate::semantic::SemanticStateIdentity> {
+        crate::engine::lifecycle::import_semantic_fact_page(&self.state, page).await
+    }
+
+    /// Export one provider-funded page of canonical signed facts in stable
+    /// FactId order. The exclusive cursor and protocol-derived bounds make
+    /// every retained response finite and resumable.
+    pub fn export_semantic_fact_page(
+        &self,
+        request: crate::semantic::SemanticFactPageRequest,
+    ) -> Result<crate::semantic::SemanticFactPage> {
+        crate::engine::lifecycle::export_semantic_fact_page(&self.state, request)
+    }
+
+    /// Inspect the deterministic identity of this network's canonical graph,
+    /// including unresolved custody and the projected authority commitment.
+    pub fn semantic_state_identity(&self) -> Result<crate::semantic::SemanticStateIdentity> {
+        crate::engine::lifecycle::semantic_state_identity(&self.state)
+    }
+
+    /// Render a bounded diagnostic view of the newest signed facts already
+    /// retained in the live hot-history cache. The returned JSON shape is not
+    /// a storage format and is never consumed by the engine.
+    pub fn recent_semantic_facts(
+        &self,
+        request: crate::semantic::SemanticRecentFactsRequest,
+    ) -> Result<crate::semantic::SemanticRecentFacts> {
+        crate::engine::lifecycle::recent_semantic_facts(&self.state, request)
+    }
+
+    /// Transport-lab observation of the live in-memory semantic history.
+    /// Retired states report zero after their durable owner has terminated.
+    #[cfg(feature = "transport-lab")]
+    pub fn semantic_fact_count_for_lab(&self) -> usize {
+        self.state.semantic_fact_count()
+    }
+
+    /// Checkpoint the exact durable semantic database owned by this network.
+    /// This never reloads or replaces the already-authoritative live graph.
+    pub fn compact_semantic_state(&self) -> Result<()> {
+        self.state.compact_semantic_state()
+    }
+
+    /// Export the verified Closed bootstrap record that owns this network.
+    /// Open and Silent networks deliberately refuse because they have no
+    /// authority-bearing bootstrap record to export.
+    pub fn export_bootstrap_record(&self) -> Result<crate::semantic::BootstrapRecord> {
+        match self.state.verified_bootstrap().policy() {
+            crate::semantic::VerifiedProjectPolicy::Closed(_) => {
+                Ok(self.state.verified_bootstrap_record().clone())
+            }
+            crate::semantic::VerifiedProjectPolicy::Open => Err(Error::Other(
+                "open network has no Closed bootstrap record".into(),
+            )),
+        }
+    }
+
     pub fn network_id(&self) -> &str {
         &self.state.network_id
     }
@@ -337,6 +667,70 @@ impl JoinedNetwork {
 
     pub fn current_topology(&self) -> TopologyMode {
         self.state.topology.read().clone()
+    }
+
+    /// Subscribe to the connection diagnostics for this exact joined
+    /// runtime. The engine state remains behind the handle boundary.
+    pub fn subscribe_conn_trace(
+        &self,
+    ) -> broadcast::Receiver<crate::engine::conn_trace::ConnTrace> {
+        self.state.subscribe_conn_trace()
+    }
+
+    /// Attach an in-process signaling broker to this joined runtime.
+    ///
+    /// This is an explicit supported carrier for applications that can place
+    /// both endpoints in one process. It traverses the same bounded ingress,
+    /// authentication, and promotion path as the configured carriers; the
+    /// broker is only the transport between those production boundaries.
+    #[cfg(feature = "transport-lab")]
+    pub fn attach_local(&self, broker: &myownmesh_signaling::local::LocalBroker) {
+        crate::engine::attach_local(&self.state, broker);
+    }
+
+    /// Attach the signaling drivers selected by this network's configuration.
+    ///
+    /// Driver ownership stays inside the joined-network handle: callers do
+    /// not need to borrow or retain the engine state in order to start the
+    /// configured signaling path. `Ok(None)` means another in-process owner
+    /// already took the outbound receiver; it is not an attach failure.
+    pub fn attach_signaling(&self) -> Result<Option<crate::engine::SignalingDrivers>> {
+        crate::engine::attach_signaling(&self.state)
+    }
+
+    /// Return the restart decision and every construction-time config
+    /// dimension used by the daemon's lifecycle log without exposing the
+    /// engine state.
+    #[doc(hidden)]
+    pub fn reconcile_status(&self, next: &NetworkConfig) -> ReconcileStatus {
+        let current = self.state.config.read();
+        ReconcileStatus {
+            needs_restart: crate::engine::reconcile::requires_restart(&current, next),
+            network_id_changed: current.network_id != next.network_id,
+            signaling_changed: current.signaling != next.signaling,
+            closed_relay_changed: current.closed_relay != next.closed_relay,
+            semantic_policy_changed: current.semantic_policy != next.semantic_policy,
+            scheduler_changed: current.scheduler != next.scheduler,
+            event_capacity_changed: current.event_capacity != next.event_capacity,
+            connection_trace_capacity_changed: current.connection_trace_capacity
+                != next.connection_trace_capacity,
+        }
+    }
+
+    /// Snapshot the exact live configuration owned by this handle.
+    ///
+    /// The daemon uses this only to restore the predecessor when a
+    /// transport-config replacement is refused after teardown has begun.
+    #[doc(hidden)]
+    pub fn config_snapshot(&self) -> NetworkConfig {
+        self.state.config.read().clone()
+    }
+
+    /// Apply the config fields that are safe to change while this exact
+    /// joined runtime remains current.
+    #[doc(hidden)]
+    pub fn apply_hot(&self, next: NetworkConfig) -> Result<()> {
+        crate::engine::reconcile::apply_hot(&self.state, next)
     }
 
     /// Lend the allocation-free fields of one daemon network summary as one
@@ -412,6 +806,143 @@ impl JoinedNetwork {
         self.state.peer_info(device_id)
     }
 
+    /// Capture the exact current transport owner for one peer for a bounded
+    /// transport-lab observation. The device id is used only for this initial
+    /// lookup; the returned witness carries the installation and worker that
+    /// the registry proved current.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn capture_transport_channel_for_lab(
+        &self,
+        device_id: &str,
+    ) -> Option<crate::engine::transport_lab::TransportChannelWitness> {
+        let device_id = peer_registry_key(device_id);
+        let owner = crate::engine::transport_lab::proof_owner_for_device(&self.state, device_id)?;
+        crate::engine::transport_lab::capture_transport_channel(&self.state, &owner)
+    }
+
+    /// Snapshot one previously captured exact transport owner. Replacement or
+    /// retirement returns `None`; no device-id lookup occurs after capture.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn transport_channel_snapshot_for_lab(
+        &self,
+        witness: &crate::engine::transport_lab::TransportChannelWitness,
+    ) -> Option<crate::engine::transport_lab::ChannelSnapshot> {
+        crate::engine::transport_lab::transport_channel_snapshot(&self.state, witness).await
+    }
+
+    /// Open an opaque endpoint channel from this member to `target` through
+    /// the exact authenticated member `relay`. The session coordinate is
+    /// generated here and never accepted from a caller, while the engine
+    /// retains endpoint keys and current-owner checks behind this facade.
+    pub async fn open_closed_relay(&self, relay: &str, target: &str) -> Result<ClosedRelayChannel> {
+        let relay = crate::semantic::DeviceId::from_canonical_str(relay)
+            .map_err(|_| Error::ClosedRelay(ClosedRelayError::InvalidPacket))?;
+        let target = crate::semantic::DeviceId::from_canonical_str(target)
+            .map_err(|_| Error::ClosedRelay(ClosedRelayError::InvalidPacket))?;
+        let mut session_id = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut session_id);
+        if session_id.iter().all(|byte| *byte == 0) {
+            return Err(Error::ClosedRelay(ClosedRelayError::InvalidPacket));
+        }
+        let session = crate::engine::closed_relay::open_endpoint(
+            &self.state,
+            relay.clone(),
+            target.clone(),
+            session_id,
+        )
+        .await
+        .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))?;
+        Ok(ClosedRelayChannel {
+            session,
+            peer: target.base32(),
+            relay: relay.base32(),
+            session_id,
+        })
+    }
+
+    /// Accept the next authenticated endpoint Offer delivered to this
+    /// network. The engine selects the exact bounded FIFO entry and supplies
+    /// its observed requester, relay, and session metadata; callers cannot
+    /// inject or reconstruct a route identifier.
+    pub async fn accept_closed_relay(&self) -> Result<ClosedRelayChannel> {
+        let session = self
+            .state
+            .await_next_closed_relay_target_accept()
+            .await
+            .map_err(|error| Error::ClosedRelay(ClosedRelayError::from_refusal(&error)))?;
+        let metadata = session.metadata();
+        Ok(ClosedRelayChannel {
+            session,
+            peer: metadata.requester.base32(),
+            relay: metadata.relay.base32(),
+            session_id: metadata.session_id,
+        })
+    }
+
+    /// Propose a canonical member/controller/owner grant.
+    pub async fn propose_role_grant(
+        &self,
+        target: &str,
+        role: crate::semantic::Role,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ProposeRoleGrant {
+                target: target.to_string(),
+                role,
+                mfa_code,
+                reply,
+            })
+            .map_err(|error| error.into_admission_error())?;
+        receiver
+            .await
+            .map_err(|_| Error::Network("engine dropped governance proposal reply".into()))?
+    }
+
+    /// Propose demoting a device to the canonical member role.
+    pub async fn propose_role_revoke(
+        &self,
+        target: &str,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ProposeRoleRevoke {
+                target: target.to_string(),
+                mfa_code,
+                reply,
+            })
+            .map_err(|error| error.into_admission_error())?;
+        receiver
+            .await
+            .map_err(|_| Error::Network("engine dropped governance proposal reply".into()))?
+    }
+
+    /// Propose canonical eviction of a device.
+    pub async fn propose_evict(
+        &self,
+        target: &str,
+        mfa_code: Option<String>,
+    ) -> Result<crate::semantic::FactId> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.state
+            .cmd_tx
+            .send(NetworkCmd::ProposeEvict {
+                target: target.to_string(),
+                mfa_code,
+                reply,
+            })
+            .map_err(|error| error.into_admission_error())?;
+        receiver
+            .await
+            .map_err(|_| Error::Network("engine dropped governance proposal reply".into()))?
+    }
+
     /// How many RPC operations are filed against `device_id`'s current
     /// session, or `None` if that peer has no live session at all.
     ///
@@ -444,7 +975,7 @@ impl JoinedNetwork {
         self.state.peers.with_live_session_state(
             &owner,
             self.state.session_broker.as_ref(),
-            &self.state.network_id,
+            &self.state.mesh_context_id().to_string(),
             |_session, app| app.rpc_mut().pending_len(),
         )
     }
@@ -500,48 +1031,7 @@ impl JoinedNetwork {
 
     /// List approved peers from the on-disk roster.
     pub async fn roster_list(&self) -> Result<Vec<AuthorizedPeer>> {
-        Ok(self.state.roster.read().authorized_devices.clone())
-    }
-
-    /// Approve a peer into the roster (and send the on-the-wire
-    /// `approve` if a session is currently open).
-    pub async fn roster_approve(&self, device_id: &str, label: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::ApproveRoster {
-                device_id: device_id.to_string(),
-                label: label.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped approve reply".into()))??;
-        // Emit local approve frame after roster persistence.
-        crate::engine::handshake::send_local_approve(&self.state, device_id).await;
-        Ok(())
-    }
-
-    /// Remove a peer from the roster. Drops the active session
-    /// if any.
-    pub async fn roster_remove(&self, device_id: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::RemoveRoster {
-                device_id: device_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped reply".into()))??;
-        if let Err(error) = self.state.cmd_tx.send(NetworkCmd::DropPeer {
-            device_id: device_id.to_string(),
-            reason: DropReason::Denied,
-        }) {
-            tracing::warn!(error = %error.into_admission_error(), peer = %device_id, "post-roster peer drop was refused");
-        }
-        Ok(())
+        Ok(self.state.canonical_roster_view())
     }
 
     /// Set the capability advertisement this node publishes. It crosses only as
@@ -557,140 +1047,49 @@ impl JoinedNetwork {
         self.rpc.advertise(caps)
     }
 
-    // ---- governance (closed networks) ---------------------------------
-    //
-    // These wrap the engine's `NetworkCmd::*` variants for the
-    // proposal lifecycle. Every method except `governance_state()`
-    // round-trips through the driver loop so mutations stay serialised
-    // with the rest of the engine's per-network operations.
-
-    /// Snapshot the current signed governance state — kind + role
-    /// assignments + the append-only transition log + pending
-    /// proposals + spawned splits. Read-only.
-    pub async fn governance_state(&self) -> Result<crate::network_state::NetworkState> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::GovernanceSnapshot { reply })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped snapshot reply".into()))
-    }
-
-    /// Float a new signed transition. Returns the new proposal id
-    /// so the caller can correlate with subsequent acks. The engine
-    /// signs the canonical payload with the local identity,
-    /// persists to pending, and broadcasts to active peers in one
-    /// step; if the local signer set already satisfies the variant's
-    /// quorum (e.g. founder self-election), the proposal ratifies
-    /// before this call returns.
-    pub async fn propose_transition(
-        &self,
-        variant: crate::network_state::TransitionVariant,
-        mfa_code: Option<String>,
-    ) -> Result<String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::ProposeTransition {
-                variant,
-                mfa_code,
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped propose reply".into()))?
-    }
-
-    /// Sign a pending proposal floated by another peer (or by this
-    /// device). The engine broadcasts the signed ack and attempts
-    /// ratification atomically.
-    pub async fn sign_proposal(&self, proposal_id: &str, mfa_code: Option<String>) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::SignProposal {
-                proposal_id: proposal_id.to_string(),
-                mfa_code,
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped sign reply".into()))?
-    }
-
-    /// Deny a pending proposal. A single deny invalidates the
-    /// proposal across the whole network; the engine signs the deny
-    /// + broadcasts so other peers see the kill switch fire.
-    pub async fn deny_proposal(&self, proposal_id: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::DenyProposal {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped deny reply".into()))?
-    }
-
-    /// Withdraw a proposal the local device floated. Engine drops
-    /// from pending without broadcasting a deny; peers see the
-    /// proposal disappear via the next state snapshot.
-    pub async fn withdraw_proposal(&self, proposal_id: &str) -> Result<()> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::WithdrawProposal {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped withdraw reply".into()))?
-    }
-
-    /// Fire the proposer-initiated split fallback for a stuck close.
-    /// Returns the deterministically-derived network id of the new
-    /// closed network; the caller typically `join`s it straight
-    /// away. Only callable by the proposer of the original
-    /// open→closed proposal.
-    pub async fn spawn_split(&self, proposal_id: &str) -> Result<String> {
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        self.state
-            .cmd_tx
-            .send(NetworkCmd::SpawnSplit {
-                proposal_id: proposal_id.to_string(),
-                reply,
-            })
-            .map_err(|error| error.into_admission_error())?;
-        rx.await
-            .map_err(|_| Error::Network("engine dropped split reply".into()))?
-    }
-
-    /// Announce a graceful departure to the room, then briefly wait for it
-    /// to reach the relays. Peers tear our session down immediately on the
-    /// `leave` (instead of waiting out the ~90 s heartbeat timeout), so a
-    /// deliberate reconnect — leave-then-rejoin — doesn't strand them on a
-    /// dead session whose ICE still falsely reports `Connected`.
+    /// Leave deliberately: depart every authenticated session, then drop the
+    /// carrier hint on the way out.
+    ///
+    /// **The departure travels on the authenticated sessions, and only the
+    /// carrier hint rides signaling.** Each live session is told over itself,
+    /// awaited, and then retired locally; the room-wide `leave` that follows is
+    /// reachability evidence with no teardown authority, because no carrier
+    /// supplies a Device-authenticated goodbye and a receiver will not retire a
+    /// healthy session on one.
     ///
     /// Call this on the *live* handle **before** the signaling driver is
-    /// dropped (the registry drops it inside `remove`): once the driver is
-    /// gone there's no socket left to publish on. Best-effort — the short
-    /// flush window lets the publish hit the already-connected relay sockets
-    /// without blocking teardown on a delivery confirmation the signaling
-    /// layer never provides anyway.
+    /// dropped (the registry drops it inside `remove`): once the driver is gone
+    /// there is no socket left to publish the hint on, and no data channel left
+    /// to depart over.
+    ///
+    /// Nothing is acknowledged, retried, or timed. What replaced the old fixed
+    /// flush window is not a shorter wait but a real one: this returns when the
+    /// sessions have actually been told, rather than after a duration chosen to
+    /// be probably-long-enough for a publish it never watched.
     pub async fn announce_leave(&self) {
+        crate::engine::depart_authenticated_sessions(&self.state).await;
         self.request_departure();
-        tokio::time::sleep(LEAVE_FLUSH).await;
     }
 
-    /// Queue the departure broadcast without waiting for it to flush. Bulk
-    /// teardown (daemon shutdown) emits one per network and then does a
-    /// single combined flush before draining, rather than paying the
-    /// per-network wait [`Self::announce_leave`] does.
-    pub fn request_departure(&self) {
+    /// Emit the carrier departure hint alone, without departing any session.
+    ///
+    /// **Hint only.** This publishes a room-wide `leave` on signaling, which a
+    /// receiver may use as reachability evidence — to update availability, to
+    /// stop speculative work that never became a session, or to go look at a
+    /// connector — and may not use to retire a session holding a promoted
+    /// `SessionCapability`.
+    /// On a network carrier the receiver reads it as sender-claimed, which
+    /// retires nothing in any session state.
+    ///
+    /// **Private, because there is nothing here for a caller to want.** It was
+    /// `pub` while the hint *was* the departure; now that
+    /// [`Self::announce_leave`] departs each session over itself first, a caller
+    /// reaching for this alone would be asking to publish an announcement with
+    /// no authority behind it and no session left in a different state for it to
+    /// describe. `announce_leave` is the deliberate exit and its only caller.
+    /// `TRANSITION-PLAYBOOK.md` §7.3 admits no dead public surface, and a repo
+    /// scan finds no other caller in or outside this crate.
+    fn request_departure(&self) {
         self.state.announce_departure();
     }
 
@@ -708,7 +1107,7 @@ impl JoinedNetwork {
 
     /// Deliberately dial exactly one signaling-discovered peer by device id,
     /// opening the WebRTC session on demand. This is the manual-connect
-    /// primitive a [`Silent`](crate::NetworkKind::Silent) network needs: on a
+    /// primitive a [`Silent`](crate::config::NetworkKind::Silent) network needs: on a
     /// Silent mesh the engine never dials just because a peer announced (a
     /// co-present peer surfaces as [`crate::PeerEvent::Sighted`] / in
     /// [`Self::peers`] with no session), so a connection is initiated only
@@ -723,13 +1122,9 @@ impl JoinedNetwork {
     /// presence. `Ok(())` means the command was queued, not that the peer
     /// connected — observe [`crate::PeerEvent`]s for the outcome.
     pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
+        let device_id = peer_registry_key(device_id);
         self.state
-            .cmd_tx
-            .send(NetworkCmd::ConnectPeer {
-                device_id: device_id.to_string(),
-                sticky: false,
-                reply: None,
-            })
+            .request_connect_peer(device_id.to_string(), false, None)
             .map_err(|error| error.into_admission_error())?;
         Ok(())
     }
@@ -749,6 +1144,7 @@ impl JoinedNetwork {
         sticky: bool,
         timeout: std::time::Duration,
     ) -> Result<()> {
+        let device_id = peer_registry_key(device_id);
         match tokio::time::timeout(timeout, self.state.connect_peer_wait(device_id, sticky)).await {
             Ok(result) => result,
             Err(_) => Err(Error::Network(format!(
@@ -813,24 +1209,59 @@ impl JoinedNetwork {
     /// retirement before it returns.
     pub async fn shutdown(&self) -> Result<()> {
         self.state.request_shutdown();
+        // Cancel and join the mesh-wide event fan-out before waiting for the
+        // driver. A departure or terminal peer event can otherwise keep this
+        // lifecycle task retaining the network state while the driver waits
+        // for its final peer cleanup, which is a shutdown-only deadlock for a
+        // silently connected peer.
         let mut driver = self.lifecycle.driver.lock().await;
-        if let Some(driver) = driver.take() {
-            let _ = driver.await;
-        }
-        if let Some(fanout) = self.lifecycle.fanout.lock().take() {
+        let fanout_failure = if let Some(fanout) = self.lifecycle.fanout.lock().await.take() {
             fanout.abort();
-        }
-        Ok(())
+            match fanout.await {
+                Ok(()) => None,
+                Err(error) if error.is_cancelled() => None,
+                Err(error) => Some(format!(
+                    "network event fan-out task failed during shutdown: {error}"
+                )),
+            }
+        } else {
+            None
+        };
+        let driver_failure = if let Some(driver) = driver.take() {
+            match driver.await {
+                Ok(()) => None,
+                Err(error) => Some(format!(
+                    "network driver task failed during shutdown: {error}"
+                )),
+            }
+        } else {
+            self.lifecycle
+                .shutdown_result
+                .lock()
+                .await
+                .clone()
+                .and_then(|result| result.err())
+        };
+        let outcome = match (driver_failure, fanout_failure) {
+            (None, None) => Ok(()),
+            (Some(error), None) | (None, Some(error)) => Err(Error::Other(error)),
+            (Some(driver), Some(fanout)) => Err(Error::Other(format!("{driver}; {fanout}"))),
+        };
+        *self.lifecycle.shutdown_result.lock().await =
+            Some(outcome.as_ref().map(|_| ()).map_err(ToString::to_string));
+        outcome
     }
 
-    /// Direct access to the shared network state. Hidden from
-    /// the API surface for embedders — the engine reaches across
-    /// crate boundaries to manipulate it.
+    /// Remove this joined network's canonical semantic snapshot after its
+    /// engine shutdown has completed. The state-owned owner and exact slot
+    /// remain behind this narrow daemon-control seam; callers cannot select a
+    /// persistence root or local slot of their own.
     #[doc(hidden)]
-    pub fn state(&self) -> Arc<NetworkState> {
-        self.state.clone()
+    pub fn purge_durable_semantic_state(&self) -> Result<()> {
+        self.state.purge_durable_semantic_state()
     }
 
+    /// the API surface for embedders — the engine reaches across
     /// Open one WebRTC realtime flow to `peer` on this network.
     ///
     /// **Named for its provider on purpose.** It carries WebRTC's own
@@ -1004,9 +1435,8 @@ pub struct PeerInfo {
     /// How far this peer's wall clock reads from ours (ms; positive = the
     /// peer is ahead), estimated passively from the heartbeat pings it
     /// already sends (RTT-corrected median over a short window). `None`
-    /// until its first inbound ping. `#[serde(default)]` so a snapshot
-    /// from an older daemon still decodes.
-    #[serde(default)]
+    /// until its first inbound ping. The current status schema requires this
+    /// field, including when its value is `None`.
     pub clock_skew_ms: Option<i64>,
     pub label: String,
     pub capabilities: Option<CapabilityAdvert>,
@@ -1070,6 +1500,29 @@ pub struct PeerInfo {
     pub selected_pair: Option<SelectedCandidatePair>,
 }
 
+/// Redacted, immutable description of the one authenticated wire profile.
+///
+/// The profile is derived from the local authenticated observation rather than
+/// copied from peer input. Its presence is the authentication bit; it carries
+/// no peer-supplied identifiers, capabilities, or mutable engine state.
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuthenticatedProfile {
+    pub protocol_version: u32,
+    pub endpoint_auth_v1: bool,
+}
+
+impl PeerInfo {
+    /// Return the fixed authenticated profile only after this peer is locally
+    /// authenticated. The current protocol has exactly one endpoint-auth
+    /// profile, so no peer-controlled profile selector is exposed.
+    pub fn authenticated_profile(&self) -> Option<AuthenticatedProfile> {
+        self.authenticated.then_some(AuthenticatedProfile {
+            protocol_version: crate::PROTOCOL_VERSION,
+            endpoint_auth_v1: true,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,6 +1543,18 @@ mod tests {
                     .expect("fixture grant funds its process record")
             })
             .clone()
+    }
+
+    #[test]
+    fn public_display_device_id_dials_the_bare_signaling_registry_key() {
+        assert_eq!(
+            peer_registry_key("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst-24842"),
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
+        );
+        assert_eq!(
+            peer_registry_key("abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"),
+            "abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
+        );
     }
 
     /// The injection seam adopts the caller's identity rather than the
@@ -1133,5 +1598,36 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, Error::ConnectorPolicyRequired));
+    }
+
+    #[test]
+    fn peer_info_requires_the_current_clock_skew_field() {
+        let snapshot = PeerInfo {
+            device_id: "peer".into(),
+            status: PeerStatus::Offline,
+            tier: ConnectionTier::Steady,
+            rtt_ms: None,
+            clock_skew_ms: None,
+            label: String::new(),
+            capabilities: None,
+            local_shelved: false,
+            remote_shelved: false,
+            authenticated: false,
+            device_suffix: String::new(),
+            verification_code_received: None,
+            verification_code_sent: None,
+            local_approve_sent: false,
+            remote_approve_seen: false,
+            needs_turn: false,
+            local_candidates: IceCandidateStats::default(),
+            remote_candidates: IceCandidateStats::default(),
+            selected_pair: None,
+        };
+        let mut value = serde_json::to_value(snapshot).expect("peer snapshot serializes");
+        value
+            .as_object_mut()
+            .expect("peer snapshot is an object")
+            .remove("clock_skew_ms");
+        assert!(serde_json::from_value::<PeerInfo>(value).is_err());
     }
 }

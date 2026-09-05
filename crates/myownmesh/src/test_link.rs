@@ -28,8 +28,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use myownmesh_core::config::{NetworkConfig, SignalingConfig, TopologyMode};
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::config::{
+    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode,
+};
+use myownmesh_core::engine::transport_lab::{attach_local, spawn_network};
 use myownmesh_core::events::{MeshEvent, PeerEvent};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::Transport;
@@ -41,8 +43,8 @@ use tokio::time::Instant;
 
 /// The two engines' driver tasks, and the shutdown that really ends them.
 pub(crate) struct TwoPeerDrivers {
-    alice: Arc<myownmesh_core::engine::NetworkState>,
-    bob: Arc<myownmesh_core::engine::NetworkState>,
+    alice: Arc<myownmesh_core::engine::transport_lab::NetworkState>,
+    bob: Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     drivers: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -74,13 +76,18 @@ pub(crate) fn fresh_network(id: &str, wire_id: &str) -> NetworkConfig {
     NetworkConfig {
         id: id.to_string(),
         network_id: wire_id.to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: id.to_string(),
         kind: Default::default(),
+        scheduler: SchedulerPolicyConfig::default(),
+        routing_policy: RoutingPolicyConfig::default(),
+        semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
         signaling: SignalingConfig::default(),
+        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: Vec::new(),
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve: true,
     }
@@ -123,8 +130,8 @@ pub(crate) async fn wait_for_approval(
 pub(crate) async fn two_peer_rpc(
     wire_id: &str,
 ) -> (
-    Arc<myownmesh_core::engine::NetworkState>,
-    Arc<myownmesh_core::engine::NetworkState>,
+    Arc<myownmesh_core::engine::transport_lab::NetworkState>,
+    Arc<myownmesh_core::engine::transport_lab::NetworkState>,
     Arc<myownmesh_core::rpc::Rpc>,
     Arc<myownmesh_core::rpc::Rpc>,
     Arc<Identity>,
@@ -151,11 +158,11 @@ pub(crate) async fn two_peer_rpc(
         .await
         .expect("bob engine");
     let alice_rpc = Arc::new(
-        myownmesh_core::rpc::Rpc::attach(&alice_state)
+        myownmesh_core::engine::transport_lab::rpc(&alice_state)
             .expect("Alice's live gateway admits its RPC owner"),
     );
     let bob_rpc = Arc::new(
-        myownmesh_core::rpc::Rpc::attach(&bob_state)
+        myownmesh_core::engine::transport_lab::rpc(&bob_state)
             .expect("Bob's live gateway admits its RPC owner"),
     );
 

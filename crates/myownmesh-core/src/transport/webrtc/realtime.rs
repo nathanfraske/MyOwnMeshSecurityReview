@@ -469,7 +469,7 @@ impl RealtimeFlowRegistry {
     /// on its side would keep passing after the queue's calibration changed,
     /// which is the failure a resource control exists to catch. So the type
     /// stays in and the number comes out.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "transport-lab"))]
     pub(super) fn queued_event_node_claim(
     ) -> std::result::Result<ResourceClaim, ResourceUnavailable> {
         Self::queue_node_claim::<QueuedRealtimeEvent>()

@@ -20,7 +20,11 @@
 //! use myownmesh_services::{StunServer, TurnServer};
 //! use myownmesh_core::config::{StunServiceConfig, TurnServiceConfig};
 //!
-//! let stun = StunServer::start(&StunServiceConfig { enabled: true, ..Default::default() }).await?;
+//! # let scope: myownmesh_core::LocalApplicationResourceScope = todo!();
+//! let stun = StunServer::start_with_resource_scope(
+//!     &StunServiceConfig { enabled: true, ..Default::default() },
+//!     scope,
+//! ).await?;
 //! println!("STUN listening on {}", stun.local_addr());
 //! # let _ = stun;
 //! # Ok(()) }
@@ -49,9 +53,15 @@ pub enum Error {
     /// credentials).
     #[error("turn config: {0}")]
     TurnConfig(String),
+    /// The owner-selected resource provider refused service custody.
+    #[error("resource custody: {0}")]
+    Resource(String),
     /// The underlying `turn` crate returned an error.
     #[error("turn: {0}")]
     Turn(String),
+    /// A service listener task terminated unexpectedly while being joined.
+    #[error("service task: {0}")]
+    TaskJoin(String),
 }
 
 /// Crate result alias.

@@ -14,7 +14,7 @@
 //! with per-node dedup; directed frames route the same path (see
 //! `engine::routing`).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use sha2::{Digest, Sha256};
 
@@ -31,32 +31,150 @@ pub struct HubsSelector {
 }
 
 impl HubsSelector {
+    fn redundancy_limit(&self) -> usize {
+        usize::try_from(self.spoke_redundancy).unwrap_or(usize::MAX)
+    }
+
     fn is_hub(&self, id: &str) -> bool {
         let id = signing::pubkey_part(id);
         self.hubs.iter().any(|h| signing::pubkey_part(h) == id)
+    }
+
+    fn unique_hub_count(&self) -> usize {
+        self.hubs
+            .iter()
+            .enumerate()
+            .filter(|(index, hub)| {
+                let key = signing::pubkey_part(hub);
+                !self.hubs[..*index]
+                    .iter()
+                    .any(|previous| signing::pubkey_part(previous) == key)
+            })
+            .count()
+    }
+
+    /// Return a configured hub's zero-based rendezvous rank without
+    /// materializing the complete ranking. Duplicate configured spellings
+    /// are ignored at their first canonical pubkey occurrence.
+    fn rendezvous_rank(&self, spoke: &str, hub: &str) -> Option<usize> {
+        let hub = signing::pubkey_part(hub);
+        let target_score = rendezvous_score(spoke, hub);
+        let mut rank = 0usize;
+        let mut found = false;
+        for (index, configured) in self.hubs.iter().enumerate() {
+            let candidate = signing::pubkey_part(configured);
+            if self.hubs[..index]
+                .iter()
+                .any(|previous| signing::pubkey_part(previous) == candidate)
+            {
+                continue;
+            }
+            if candidate == hub {
+                found = true;
+                continue;
+            }
+            let candidate_score = rendezvous_score(spoke, candidate);
+            if candidate_score > target_score
+                || (candidate_score == target_score && candidate < hub)
+            {
+                rank = rank.saturating_add(1);
+            }
+        }
+        found.then_some(rank)
     }
 
     /// The hubs `spoke` should attach to: the top-`spoke_redundancy`
     /// of the rendezvous ranking. Pure and total — defined even for
     /// ids nobody has seen yet, which is what keeps every node's
     /// answer identical during membership churn.
-    fn hubs_for(&self, spoke: &str) -> Vec<String> {
+    fn ranked_hubs_for(&self, spoke: &str) -> Vec<String> {
         let spoke = signing::pubkey_part(spoke);
-        let mut ranked: Vec<(u64, &str)> = self
+        let unique_hubs: BTreeSet<String> = self
             .hubs
             .iter()
-            .map(|h| {
-                let hub = signing::pubkey_part(h);
-                (rendezvous_score(spoke, hub), hub)
-            })
+            .map(|hub| signing::pubkey_part(hub).to_string())
+            .collect();
+        let mut ranked: Vec<(u64, String)> = unique_hubs
+            .into_iter()
+            .map(|hub| (rendezvous_score(spoke, &hub), hub))
             .collect();
         // Highest score first; the hub id breaks exact ties so the
         // order is total.
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
-        ranked
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        ranked.into_iter().map(|(_, hub)| hub).collect()
+    }
+
+    fn hubs_for(&self, spoke: &str) -> Vec<String> {
+        self.ranked_hubs_for(spoke)
             .into_iter()
-            .take((self.spoke_redundancy.max(1)) as usize)
-            .map(|(_, h)| h.to_string())
+            .take(self.spoke_redundancy.max(1) as usize)
+            .collect()
+    }
+
+    fn next_hops_with_limit(
+        &self,
+        self_id: &str,
+        dest: &str,
+        connected: &[String],
+        limit: usize,
+    ) -> Vec<String> {
+        let dest_key = signing::pubkey_part(dest);
+        let source_key = signing::pubkey_part(self_id);
+        let target = limit.min(self.redundancy_limit());
+        if target == 0 {
+            return Vec::new();
+        }
+
+        // Retain only the best target candidates. An observed peer that
+        // cannot enter this bounded set needs no retained state; duplicate
+        // observations of a retained canonical pubkey only update its
+        // deterministic spelling.
+        let preferred_prefix = if self.is_hub(dest_key) {
+            1
+        } else {
+            self.redundancy_limit().min(self.unique_hub_count())
+        };
+        let destination_is_hub = self.is_hub(dest_key);
+        let mut candidates = Vec::<RankedCandidate>::new();
+        for peer in connected {
+            let key = signing::pubkey_part(peer);
+            if key == source_key {
+                continue;
+            }
+            let Some(rank) = self.rendezvous_rank(dest_key, key) else {
+                continue;
+            };
+            let priority = if destination_is_hub {
+                if key == dest_key {
+                    0
+                } else {
+                    1usize.saturating_add(rank)
+                }
+            } else if rank < self.redundancy_limit() {
+                rank
+            } else {
+                preferred_prefix.saturating_add(rank)
+            };
+            let candidate = RankedCandidate {
+                priority,
+                key: key.to_string(),
+                peer: peer.clone(),
+            };
+            if let Some(existing) = candidates.iter_mut().find(|item| item.key == candidate.key) {
+                if candidate.peer < existing.peer {
+                    existing.peer = candidate.peer;
+                }
+                continue;
+            }
+            candidates.push(candidate);
+            candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.key.cmp(&b.key)));
+            if candidates.len() > target {
+                candidates.pop();
+            }
+        }
+        candidates
+            .into_iter()
+            .map(|candidate| candidate.peer)
             .collect()
     }
 }
@@ -108,31 +226,14 @@ impl Topology for HubsSelector {
         self.is_hub(self_id)
     }
 
-    fn next_hops(&self, self_id: &str, dest: &str, connected: &[String]) -> Vec<String> {
-        let dest_key = signing::pubkey_part(dest);
-        // Prefer the hubs the destination actually attaches to; fall
-        // back to any connected hub (it can take the next step).
-        let dest_hubs = if self.is_hub(dest_key) {
-            vec![dest_key.to_string()]
-        } else {
-            self.hubs_for(dest_key)
-        };
-        let connected_key = |c: &String| signing::pubkey_part(c).to_string();
-        let mut hops: Vec<String> = connected
-            .iter()
-            .filter(|c| dest_hubs.iter().any(|h| h == &connected_key(c)))
-            .cloned()
-            .collect();
-        if hops.is_empty() {
-            hops = connected
-                .iter()
-                .filter(|c| {
-                    self.is_hub(c) && signing::pubkey_part(c) != signing::pubkey_part(self_id)
-                })
-                .cloned()
-                .collect();
-        }
-        hops
+    fn next_hops(
+        &self,
+        self_id: &str,
+        dest: &str,
+        connected: &[String],
+        limit: usize,
+    ) -> Vec<String> {
+        self.next_hops_with_limit(self_id, dest, connected, limit)
     }
 
     fn flood_ttl(&self) -> u8 {
@@ -150,6 +251,10 @@ mod tests {
             hubs: hubs.iter().map(|h| h.to_string()).collect(),
             spoke_redundancy: redundancy,
         }
+    }
+
+    fn s(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
     }
 
     #[test]
@@ -222,12 +327,12 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let hops = t.next_hops("hub-x-not-real", "s2", &connected);
+        let hops = t.next_hops("hub-x-not-real", "s2", &connected, 1);
         assert_eq!(hops, vec![s2_hub]);
         // With none of the destination's hubs connected, any hub will do.
         let connected: Vec<String> = vec!["hub-a".into()];
         let t2 = sel(&["hub-a", "hub-b"], 1);
-        let hops = t2.next_hops("s1", "s2", &connected);
+        let hops = t2.next_hops("s1", "s2", &connected, 1);
         assert!(hops == vec!["hub-a".to_string()] || hops.is_empty());
     }
 
@@ -253,4 +358,48 @@ mod tests {
             .collect();
         assert_eq!(picks, expected);
     }
+
+    #[test]
+    fn next_hops_are_bounded_stable_and_self_free_with_duplicate_input() {
+        let t = sel(&["hub-a", "hub-b", "hub-c"], 2);
+        let first = vec![
+            "hub-a".to_string(),
+            "hub-a".to_string(),
+            "hub-b".to_string(),
+            "spoke".to_string(),
+        ];
+        let mut reordered = first.clone();
+        reordered.reverse();
+        let a = t.next_hops("spoke", "destination", &first, 2);
+        let b = t.next_hops("spoke", "destination", &reordered, 2);
+        assert_eq!(a, b, "connected input order must not affect failover");
+        assert!(a.len() <= 2);
+        assert!(a.iter().all(|hop| signing::pubkey_part(hop) != "spoke"));
+        assert_eq!(
+            a.iter()
+                .map(|hop| signing::pubkey_part(hop))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            a.len()
+        );
+    }
+
+    #[test]
+    fn next_hops_respects_explicit_limit_without_growing_with_connected_input() {
+        let t = sel(&["hub-a", "hub-b", "hub-c", "hub-d"], 3);
+        let connected = s(&["hub-a", "hub-b", "hub-c", "hub-d", "hub-a-display", "spoke"]);
+        let one = t.next_hops_with_limit("spoke", "destination", &connected, 1);
+        assert_eq!(one.len(), 1);
+        assert!(one.iter().all(|hop| signing::pubkey_part(hop) != "spoke"));
+        let zero = t.next_hops_with_limit("spoke", "destination", &connected, 0);
+        assert!(zero.is_empty());
+        let over = t.next_hops_with_limit("spoke", "destination", &connected, 99);
+        assert!(over.len() <= 3);
+    }
+}
+
+struct RankedCandidate {
+    priority: usize,
+    key: String,
+    peer: String,
 }

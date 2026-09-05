@@ -37,10 +37,10 @@ use crate::engine::state::NetworkState;
 use crate::identity::DeviceId;
 use crate::protocol::CapabilityAdvert;
 use crate::resource::{
-    checked_measure_add, mailbox_measure_serialized, mailbox_retained_claim, strings_measure,
-    FundedArc, LeasedMap, LocalApplicationResourceScope, ResourceClaim,
-    ResourceClaimArithmeticError, ResourceClass, ResourceLease, ResourceMailboxItem,
-    ResourceMailboxItemError, ResourceMailboxReceiver,
+    checked_measure_add, mailbox_measure_serialized, strings_measure, FundedArc, LeasedMap,
+    LocalApplicationResourceScope, MailboxMeasurement, ResourceClaim, ResourceClaimArithmeticError,
+    ResourceClass, ResourceLease, ResourceMailboxItem, ResourceMailboxItemError,
+    ResourceMailboxReceiver, ResourceUnavailable,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -210,14 +210,14 @@ pub enum RpcStreamItem {
     End(Result<(), String>),
 }
 
-impl ResourceMailboxItem for RpcStreamItem {
-    fn retained_claim(&self) -> Result<ResourceClaim, ResourceMailboxItemError> {
+unsafe impl ResourceMailboxItem for RpcStreamItem {
+    fn measured_claim(&self) -> Result<MailboxMeasurement<Self>, ResourceMailboxItemError> {
         let (retained, queued, allocations) = match self {
             Self::Chunk(payload) => mailbox_measure_serialized(payload)?,
             Self::End(Ok(())) => (0, 0, 0),
             Self::End(Err(error)) => strings_measure([error.as_str()])?,
         };
-        mailbox_retained_claim::<Self>(retained, queued, allocations)
+        MailboxMeasurement::from_parts(retained, queued, allocations)
     }
 }
 
@@ -603,6 +603,34 @@ fn rpc_inner_claim() -> Result<ResourceClaim, ResourceClaimArithmeticError> {
         (ResourceClass::AccountedMemoryBytes, bytes),
         (ResourceClass::OpaqueDependencyResidual, 1),
     ])
+}
+
+/// Exact provider planning charge for one locally-attached RPC dispatcher.
+///
+/// This uses the same internal allocation claim that [`Rpc::attach`] acquires,
+/// then applies the provider's own reservation bookkeeping charge. It exists so
+/// an external finite fixture can fund the dispatcher without duplicating the
+/// representation formula used by production admission.
+pub fn rpc_dispatcher_planning_claim() -> Result<ResourceClaim, ResourceUnavailable> {
+    let claim = rpc_inner_claim().map_err(|_| ResourceUnavailable::ProviderInvariant {
+        dimension: ResourceClass::AccountedMemoryBytes,
+    })?;
+    crate::resource::FiniteResourceProvider::reservation_planning_charge(claim)
+}
+
+/// Exact provider planning charge for one [`Rpc::attach`] application child.
+///
+/// Attachment first creates a child application scope and then retains the
+/// dispatcher in that scope. Keep both terms in this planner so a fixture pays
+/// for the same provider bookkeeping that the production constructor performs.
+pub fn rpc_dispatcher_attachment_planning_claim() -> Result<ResourceClaim, ResourceUnavailable> {
+    rpc_dispatcher_planning_claim()?
+        .checked_add(
+            crate::application_gateway::ApplicationGateway::rpc_resource_scope_planning_charge(),
+        )
+        .map_err(|_| ResourceUnavailable::ProviderInvariant {
+            dimension: ResourceClass::OpaqueDependencyResidual,
+        })
 }
 
 /// The layout of what an `Arc<FundedRpcHandler<C>>` holds, with `C` inferred
@@ -2661,8 +2689,9 @@ impl Drop for OwnedMethodRegistration {
 
 impl Rpc {
     /// Attach (or look up) the RPC dispatcher for a network. Use
-    /// this when you've spun up the engine directly via
-    /// [`crate::engine::spawn_network`] and want to register
+    /// this when you've spun up the engine directly via the explicit
+    /// transport-lab facade `engine::transport_lab::spawn_network`
+    /// and want to register
     /// handlers or make calls. The [`crate::JoinedNetwork`] facade
     /// attaches automatically — this is the lower-level
     /// equivalent.
@@ -2670,7 +2699,13 @@ impl Rpc {
     /// Idempotent: subsequent calls return a fresh `Rpc` handle
     /// over the same underlying state, so previously-registered
     /// handlers remain in effect.
-    pub fn attach(
+    pub(crate) fn attach(
+        network: &Arc<NetworkState>,
+    ) -> Result<Self, crate::application_gateway::GatewayRefusal> {
+        Self::attach_inner(network)
+    }
+
+    fn attach_inner(
         network: &Arc<NetworkState>,
     ) -> Result<Self, crate::application_gateway::GatewayRefusal> {
         if let Some(inner) = network.application_gateway.rpc() {
@@ -3156,17 +3191,7 @@ impl Rpc {
         // and every session established afterwards is sent the stored value
         // regardless, so the refusal costs reachable peers a push, not the
         // advertisement.
-        if let Err(error) = net
-            .cmd_tx
-            .send(crate::engine::state::NetworkCmd::FanoutCapabilities { caps })
-        {
-            // Converted before it is logged. The send error still owns the
-            // command it refused, and it has no `Display` of its own precisely
-            // because rendering it would mean rendering that payload;
-            // `into_admission_error` drops it and answers with the typed reason
-            // alone, which is all this line has to say. The advert itself is
-            // already committed locally and is not lost by being dropped here.
-            let error = error.into_admission_error();
+        if let Err(error) = net.application_gateway.fanout_capabilities(&net, caps) {
             tracing::warn!(
                 %error,
                 "capability fan-out was not admitted after local commit"
@@ -4511,5 +4536,43 @@ mod session_ownership_tests {
         drop(state);
         assert!(weak.upgrade().is_none());
         assert!(first.inner.network.upgrade().is_none());
+    }
+
+    #[test]
+    fn stale_registration_drop_cannot_remove_a_live_successor() {
+        let state = crate::engine::build_test_state("rpc-registration-successor");
+        let rpc = Rpc::attach(&state).expect("the fixture funds one dispatcher");
+
+        let first = rpc
+            .prepare_serve("successor", |_call| async {
+                Ok(RpcResponse::from_value(serde_json::json!("first")))
+            })
+            .expect("the predecessor registration is funded");
+        let first = first
+            .commit()
+            .into_result()
+            .expect("the predecessor registration commits");
+
+        let second = rpc
+            .prepare_serve("successor", |_call| async {
+                Ok(RpcResponse::from_value(serde_json::json!("second")))
+            })
+            .expect("the successor registration is funded");
+        let second = second
+            .commit()
+            .into_result()
+            .expect("the successor registration commits");
+
+        drop(first);
+        assert_eq!(
+            rpc.registered_methods(),
+            vec!["successor".to_string()],
+            "dropping a stale registration cannot remove its live successor"
+        );
+        drop(second);
+        assert!(
+            rpc.registered_methods().is_empty(),
+            "dropping the current registration removes exactly its own entry"
+        );
     }
 }

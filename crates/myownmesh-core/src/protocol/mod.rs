@@ -29,6 +29,8 @@
 //!   - `ping` / `pong` for keepalive
 //!   - `rpc_request` / `rpc_response` / `rpc_stream_chunk` /
 //!     `rpc_stream_end` for embedder-defined request/response calls
+//!   - `routed_application` for signed, context-bound application payloads
+//!     carried across the bounded topology-selected hop chain
 //!   - Application data over typed user-defined channels (see
 //!     [`crate::events`])
 //!
@@ -36,33 +38,48 @@
 //! does not implement refuses it — the frame fails to deserialize and
 //! reaches no handler — so there is no revision-tolerance to rely on.
 //! There is no optional feature negotiation or mixed-version mode in this
-//! alpha. `hello.features` carries only the closed endpoint-authentication
+//! protocol. `hello.features` carries only the closed endpoint-authentication
 //! profile required before any post-active frame is admitted.
 
+pub mod departure;
+pub mod facts;
 pub mod features;
-pub mod governance;
 pub mod handshake;
 pub mod keepalive;
+pub mod relay;
 pub mod rpc;
 pub mod topology;
 
-pub use features::{Feature, ADVERTISED_FEATURES};
-pub use governance::{
-    AckDecision, NetworkStateAckMessage, NetworkStateBroadcast, NetworkStateProposeMessage,
-    NetworkStateSplitMessage, RosterEntriesMessage, RosterEntry, RosterRequestMessage,
-    RosterSummaryMessage,
+pub use departure::{
+    DepartureCorrelation, DepartureCorrelationError, DEPARTURE_CORRELATION_BYTES,
+    DEPARTURE_CORRELATION_WIRE_CHARS,
 };
+pub use facts::{
+    CanonicalFact, FactContent, FactId, FactInventory, FactPageMessage, FactRequest,
+    ProofAckMessage, ProofDeliveryMessage, SignedFact,
+};
+pub use features::{Feature, ADVERTISED_FEATURES};
 pub use handshake::{
     ApproveMessage, AuthResponseMessage, DenyMessage, HelloMessage, DENY_REASON_EVICTED,
 };
 pub use keepalive::{PingMessage, PongMessage};
+pub use relay::{
+    ClosedRelayControl, ClosedRelayData, ClosedRelayDataDirection, OpaqueRelayPacket, RelayKeyShare,
+};
 pub use rpc::{
     CapabilitiesUpdateMessage, CapabilityAdvert, RpcRequestMessage, RpcResponseMessage,
     RpcStreamChunkMessage, RpcStreamEndMessage,
 };
-pub use topology::{ShelveMessage, UnshelveMessage};
+pub use topology::{
+    ClosedRoutedPayload, RoutedApplicationEnvelope, RoutedApplicationError,
+    RoutedApplicationLimits, RoutedHop, ShelveMessage, UnshelveMessage,
+};
 
 use serde::{Deserialize, Serialize};
+
+/// The exact largest frame the WebRTC receive callback can deliver. Semantic
+/// anti-entropy uses this existing protocol boundary, not an item count.
+pub(crate) const RECEIVE_FRAME_BYTES: usize = relay::CLOSED_RELAY_WEBRTC_CALLBACK_BYTES as usize;
 
 /// Exactly how many bytes `value`'s compact JSON encoding occupies, counted
 /// without building it.
@@ -140,10 +157,38 @@ where
     (buffer.len() == len).then(|| buffer.into_boxed_slice())
 }
 
+/// Count the exact compact JSON bytes of one authenticated departure receipt.
+///
+/// The count walks the same protocol-owned value that is later encoded, so a
+/// provider claim can fund the receipt buffer without a guessed multiplier.
+pub(crate) fn departure_receipt_json_len(correlation: &DepartureCorrelation) -> Option<usize> {
+    let message = MeshMessage::SessionControl(SessionControl::DepartObserved {
+        correlation: correlation.clone(),
+    });
+    encoded_json_len(&message)
+}
+
+/// Encode one departure receipt into exactly the counted allocation.
+pub(crate) fn encode_departure_receipt_exact(
+    correlation: &DepartureCorrelation,
+) -> Option<Box<[u8]>> {
+    let message = MeshMessage::SessionControl(SessionControl::DepartObserved {
+        correlation: correlation.clone(),
+    });
+    let len = encoded_json_len(&message)?;
+    encode_json_exact(&message, len)
+}
+
 /// First-stage classification obtained from the small leading JSON tag only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FrameAdmission {
     Protocol,
+    /// A canonical signed fact or bounded fact page. These frames are durable
+    /// semantic traffic, not application payload: a later admission seam may
+    /// carry them to an authenticated PendingApproval peer without widening
+    /// that peer's access to inventory, requests, or realtime application
+    /// traffic.
+    DurableFact,
     Application,
 }
 
@@ -211,6 +256,21 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
             admission: FrameAdmission::Protocol,
             on_failure: FailurePolicy::EndSession,
         },
+        // Facts and exact proof delivery/receipt are the only non-handshake
+        // frames with a durable semantic identity. Keep this exact set distinct from every
+        // inventory/request/application kind; those remain Application
+        // and retain their existing failure policies below.
+        "fact" | "fact_page" | "proof_delivery" | "proof_ack" => ClassifiedFrame {
+            admission: FrameAdmission::DurableFact,
+            on_failure: FailurePolicy::EndSession,
+        },
+        // Inventories and requests carry only exact context plus identifiers.
+        // They are non-authoritative coordination traffic and must not receive
+        // the durable-fact admission reserved for signed bodies.
+        "fact_inventory" | "fact_request" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        },
         // The one best-effort application delivery. A plain `Channel` frame
         // carries no sequence, is acknowledged by nobody, and resolves no local
         // wait: `MeshMessage::Channel` is delivered to whatever subscribers
@@ -227,11 +287,77 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
             admission: FrameAdmission::Application,
             on_failure: FailurePolicy::DropFrame,
         },
+        // Routed application envelopes carry their own authenticated origin
+        // and bounded hop chain. They are still application traffic: the
+        // current authenticated carrier must be admitted before decoding or
+        // forwarding one.
+        "routed_application" => ClassifiedFrame {
+            admission: FrameAdmission::Application,
+            on_failure: FailurePolicy::EndSession,
+        },
         _ => ClassifiedFrame {
             admission: FrameAdmission::Application,
             on_failure: FailurePolicy::EndSession,
         },
     })
+}
+
+/// Authenticated control for the exact Peer Session carrying it.
+///
+/// **Not application payload, not a durable fact, and not signaling.** It is the
+/// narrow control an endpoint may exercise over the session it is already
+/// speaking on.
+///
+/// # Why it carries no target
+///
+/// There is no Device ID field, and its absence is the security property rather
+/// than an economy. The session defines its own two endpoints, so every variant
+/// can affect only the connector that carried it. A target field would
+/// immediately be a way for one authenticated peer to name a *third* device's
+/// session — the same third-party naming that makes an unauthenticated carrier
+/// hint untrustworthy, reintroduced on the one path that is trusted.
+///
+/// # What a receiver may do with it
+///
+/// `Depart` may retire the exact session that carried it. Renegotiation controls
+/// may mutate only that same connector, after application admission and the
+/// connector's fixed offerer/answerer role are re-proved. A frame that arrives
+/// on a channel which has since been retired affects nothing; it cannot be
+/// redirected through a Device ID lookup to a successor.
+///
+/// A deliberate departure has exactly one correlated receipt:
+/// [`SessionControl::DepartObserved`]. There is no retry, timer, or grace
+/// period. If either control is lost, ordinary connector closure and lifecycle
+/// cancellation resolve the departure; no alternate acknowledgement framework
+/// is introduced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionControl {
+    /// This endpoint is leaving deliberately: a graceful network leave, a
+    /// network removal, or a daemon shutdown. **Not** sent by a reconnect,
+    /// which keeps its session and application state while the transport
+    /// underneath it recovers or is replaced.
+    Depart {
+        /// Opaque bounded receipt correlation. It is scoped to this exact
+        /// authenticated session and carries no target identity.
+        correlation: DepartureCorrelation,
+    },
+    /// Receipt for a matching `Depart` on this exact authenticated session.
+    DepartObserved { correlation: DepartureCorrelation },
+    /// The answerer has a locally authorized track-set change. It cannot create
+    /// an offer without glare, so it asks this channel's fixed offerer to make
+    /// the one in-band offer. The exact authenticated connector carrying the
+    /// frame is the correlation and target.
+    RenegotiateRequest,
+    /// SDP created by this channel's fixed offerer for connector-local media
+    /// changes. This is authenticated application control, not carrier
+    /// signaling, and may be applied only to the exact answerer connector that
+    /// carried it.
+    RenegotiateOffer { sdp: String },
+    /// The exact answerer connector's reply to [`Self::RenegotiateOffer`].
+    /// Only the matching fixed offerer connector may apply it, and only while
+    /// that connector is awaiting an answer.
+    RenegotiateAnswer { sdp: String },
 }
 
 /// Tagged union of every wire frame the mesh transport carries.
@@ -244,7 +370,7 @@ pub(crate) fn classify_frame(bytes: &[u8]) -> Option<ClassifiedFrame> {
 /// no longer offers. Frames are discrete, so refusing one costs
 /// nothing but that frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MeshMessage {
     Hello(HelloMessage),
     AuthResponse(AuthResponseMessage),
@@ -255,36 +381,36 @@ pub enum MeshMessage {
     CapabilitiesUpdate(CapabilitiesUpdateMessage),
     Shelve(ShelveMessage),
     Unshelve(UnshelveMessage),
+    /// Authenticated exact-session control. See [`SessionControl`] for why it
+    /// has no target field and what a receiver may do with it.
+    SessionControl(SessionControl),
+    /// Exact Closed relay route control. Every variant carries its complete
+    /// context, three-party identity, and session binding.
+    ClosedRelayControl(ClosedRelayControl),
+    /// Opaque ciphertext for one exact Closed relay route.
+    ClosedRelayData(ClosedRelayData),
+    /// Signed, context-bound application traffic carried across a bounded
+    /// topology-selected hop chain.
+    RoutedApplication(RoutedApplicationEnvelope),
     RpcRequest(RpcRequestMessage),
     RpcResponse(RpcResponseMessage),
     RpcStreamChunk(RpcStreamChunkMessage),
     RpcStreamEnd(RpcStreamEndMessage),
 
-    // -- closed-network governance --
-    /// Sender's snapshot of the network's governance state.
-    /// Broadcast on ACTIVE; receivers compare against their own to
-    /// detect drift.
-    NetworkState(NetworkStateBroadcast),
-    /// In-flight transition awaiting signatures. The proposer signs
-    /// at issue time; co-signers respond with `NetworkStateAck`.
-    NetworkStatePropose(NetworkStateProposeMessage),
-    /// Sign-or-deny response to a `NetworkStatePropose`.
-    NetworkStateAck(NetworkStateAckMessage),
-    /// Proposer-initiated split fallback after the consent timeout
-    /// expires on a stuck close. Spawns a derived closed network
-    /// containing the signers the proposer had so far.
-    NetworkStateSplit(NetworkStateSplitMessage),
-
-    // -- roster gossip --
-    /// Merkle-root summary of the sender's roster. Triggers a
-    /// `RosterRequest` from receivers whose root disagrees.
-    RosterSummary(RosterSummaryMessage),
-    /// "Send me the entries I'm missing." Carried alone on a
-    /// targeted reply to a `RosterSummary`.
-    RosterRequest(RosterRequestMessage),
-    /// Roster entries the responder is sharing. Receivers verify
-    /// each entry's authority chain before merging.
-    RosterEntries(RosterEntriesMessage),
+    // -- closed-network semantic facts --
+    /// One independently verifiable canonical V4 authority fact.
+    Fact(SignedFact),
+    /// A bounded exact-context page of canonical V4 authority facts.
+    FactPage(FactPageMessage),
+    /// Non-authoritative exact-context inventory of known FactIds.
+    FactInventory(FactInventory),
+    /// Non-authoritative exact-context request for signed facts by FactId.
+    FactRequest(FactRequest),
+    /// Exact, durable stand-down proof. Receipt is acknowledged only after the
+    /// signed facts are durably admitted and canonically project the target.
+    ProofDelivery(ProofDeliveryMessage),
+    /// Verified receipt for one exact proof delivery identity.
+    ProofAck(ProofAckMessage),
 
     /// Application payload on a user-defined typed channel. The
     /// `channel` name is the embedder's identifier; `payload` is the
@@ -462,7 +588,115 @@ mod tests {
                 on_failure: FailurePolicy::DropFrame,
             })
         );
+        assert_eq!(
+            classify_frame(br#"{"kind":"routed_application","payload":[}}"#),
+            Some(ClassifiedFrame {
+                admission: FrameAdmission::Application,
+                on_failure: FailurePolicy::EndSession,
+            })
+        );
+        for fact_kind in ["fact", "fact_page", "proof_delivery", "proof_ack"] {
+            assert_eq!(
+                classify_frame(format!(r#"{{"kind":"{fact_kind}","payload":[}}"#).as_bytes()),
+                Some(ClassifiedFrame {
+                    admission: FrameAdmission::DurableFact,
+                    on_failure: FailurePolicy::EndSession,
+                }),
+                "only canonical fact kinds receive the durable-fact class"
+            );
+        }
+        for coordination_kind in ["fact_inventory", "fact_request"] {
+            assert_eq!(
+                classify_frame(
+                    format!(r#"{{"kind":"{coordination_kind}","payload":[}}"#).as_bytes()
+                ),
+                Some(ClassifiedFrame {
+                    admission: FrameAdmission::Application,
+                    on_failure: FailurePolicy::EndSession,
+                }),
+                "fact coordination is not durable-fact admission"
+            );
+        }
         assert_eq!(classify_frame(br#"{"payload":[],"kind":"hello"}"#), None);
+    }
+
+    #[test]
+    fn durable_fact_class_does_not_widen_to_inventory_or_application_frames() {
+        let classify = |kind: &str| {
+            classify_frame(format!(r#"{{"kind":"{kind}","payload":[}}"#).as_bytes())
+                .expect("canonical leading tag classifies")
+        };
+
+        for kind in [
+            "fact_inventory",
+            "fact_request",
+            "rpc_request",
+            "rpc_response",
+            "rpc_stream_chunk",
+            "rpc_stream_end",
+            "channel_seq",
+            "channel_ack",
+            "routed_application",
+        ] {
+            assert_eq!(
+                classify(kind).admission,
+                FrameAdmission::Application,
+                "{kind} remains application admission"
+            );
+            assert_eq!(
+                classify(kind).on_failure,
+                FailurePolicy::EndSession,
+                "{kind} retains its completion-bearing failure policy"
+            );
+        }
+        assert_eq!(classify("channel").admission, FrameAdmission::Application);
+        assert_eq!(classify("channel").on_failure, FailurePolicy::DropFrame);
+        for kind in ["hello", "auth_response", "approve", "deny"] {
+            assert_eq!(classify(kind).admission, FrameAdmission::Protocol);
+        }
+    }
+
+    #[test]
+    fn routed_application_round_trips_as_application_and_rejects_unknown_fields() {
+        let origin_key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
+        let destination_key = ed25519_dalek::SigningKey::from_bytes(&[22; 32]);
+        let origin = crate::semantic::DeviceId::from_public_key_bytes(
+            *origin_key.verifying_key().as_bytes(),
+        )
+        .expect("origin device id");
+        let destination = crate::semantic::DeviceId::from_public_key_bytes(
+            *destination_key.verifying_key().as_bytes(),
+        )
+        .expect("destination device id");
+        let envelope = RoutedApplicationEnvelope::new(
+            crate::semantic::MeshContextId::from_bytes([23; 32]),
+            origin,
+            destination,
+            [24; 16],
+            1,
+            ClosedRoutedPayload::ChannelFrame {
+                channel: "protocol-test".into(),
+                payload: serde_json::json!({"probe": true}),
+            },
+            &origin_key,
+        )
+        .expect("routed envelope");
+        envelope.verify().expect("origin envelope verifies");
+
+        let message = MeshMessage::RoutedApplication(envelope.clone());
+        let encoded = serde_json::to_vec(&message).expect("routed message serializes");
+        assert!(String::from_utf8_lossy(&encoded).contains(r#""kind":"routed_application""#));
+        let decoded: MeshMessage =
+            serde_json::from_slice(&encoded).expect("routed message decodes");
+        let MeshMessage::RoutedApplication(decoded) = decoded else {
+            panic!("decoded message changed routed variant");
+        };
+        assert_eq!(decoded, envelope);
+        decoded.verify().expect("decoded envelope verifies");
+
+        let mut unknown = serde_json::to_value(MeshMessage::RoutedApplication(envelope)).unwrap();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(unknown).is_err());
     }
 
     /// Only the best-effort delivery is droppable, and the acknowledged one is
@@ -514,6 +748,12 @@ mod tests {
     }
 
     #[test]
+    fn mesh_message_rejects_unknown_fields_at_the_outer_wire_layer() {
+        let raw = r#"{"kind":"channel","channel":"control","payload":null,"legacy":true}"#;
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
+    }
+
+    #[test]
     fn hello_round_trips() {
         let msg = MeshMessage::Hello(HelloMessage {
             protocol: crate::PROTOCOL_VERSION,
@@ -535,98 +775,203 @@ mod tests {
     }
 
     #[test]
-    fn network_state_broadcast_round_trips() {
-        use crate::network_state::NetworkKind;
-        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-            kind: NetworkKind::Closed,
-            transitions_count: 4,
-            member_log_count: 2,
-            roster_root: "abcdefghij".into(),
-        });
+    fn canonical_fact_page_round_trips() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[13; 32]);
+        let device =
+            crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+                .unwrap();
+        let context = crate::semantic::MeshContextId::from_bytes([14; 32]);
+        let fact = crate::semantic::SignedFact::sign(
+            crate::semantic::FactContent::new(
+                crate::semantic::FactDomain::Governance,
+                context,
+                crate::semantic::FactBody::RoleRevoke {
+                    target: device.clone(),
+                },
+                device,
+                Vec::new(),
+            ),
+            &key,
+        )
+        .unwrap();
+        let page = FactPageMessage::new(context, vec![fact], None, true).unwrap();
+        let msg = MeshMessage::FactPage(page);
         let s = serde_json::to_string(&msg).unwrap();
+        assert!(s.contains(r#""kind":"fact_page""#));
         let back: MeshMessage = serde_json::from_str(&s).unwrap();
         match back {
-            MeshMessage::NetworkState(b) => {
-                assert_eq!(b.kind, NetworkKind::Closed);
-                assert_eq!(b.transitions_count, 4);
-                assert_eq!(b.member_log_count, 2);
-                assert_eq!(b.roster_root, "abcdefghij");
+            MeshMessage::FactPage(page) => {
+                assert_eq!(page.context_id, context);
+                assert_eq!(page.facts.len(), 1);
+                assert!(page.complete);
             }
-            _ => panic!("did not round-trip as NetworkState"),
+            _ => panic!("did not round-trip as FactPage"),
         }
     }
 
     #[test]
-    fn network_state_kind_discriminator_is_snake_case() {
-        // Wire-level kind tag must be snake_case so the JS GUI's
-        // existing dispatch tables don't need a special case for
-        // these. Pinning here so a future #[serde(rename_all)]
-        // tweak doesn't silently break interop.
-        let msg = MeshMessage::NetworkState(NetworkStateBroadcast {
-            kind: crate::network_state::NetworkKind::Open,
-            transitions_count: 0,
-            member_log_count: 0,
-            roster_root: "x".into(),
+    fn durable_fact_round_trips_and_rejects_unknown_wire_fields() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[11; 32]);
+        let device =
+            crate::semantic::DeviceId::from_public_key_bytes(*key.verifying_key().as_bytes())
+                .unwrap();
+        let context = crate::semantic::MeshContextId::from_bytes([12; 32]);
+        let content = crate::semantic::FactContent::new(
+            crate::semantic::FactDomain::Governance,
+            context,
+            crate::semantic::FactBody::RoleRevoke {
+                target: device.clone(),
+            },
+            device.clone(),
+            Vec::new(),
+        );
+        let fact = crate::semantic::SignedFact::sign(content, &key).unwrap();
+        let message = MeshMessage::Fact(fact.clone());
+
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let decoded: MeshMessage = serde_json::from_slice(&encoded).unwrap();
+        assert!(matches!(decoded, MeshMessage::Fact(actual) if actual == fact));
+
+        let mut outer_wire = serde_json::to_value(&message).unwrap();
+        outer_wire["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(outer_wire).is_err());
+
+        let mut nested_wire = serde_json::to_value(&message).unwrap();
+        nested_wire["content"]["legacy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<MeshMessage>(nested_wire).is_err());
+
+        let unsupported_body = serde_json::json!({
+            "kind": "future_semantic_kind",
         });
-        let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""kind":"network_state""#));
+        assert!(
+            serde_json::from_value::<crate::semantic::FactBody>(unsupported_body).is_err(),
+            "unsupported semantic kind must be refused by semantic decoding"
+        );
     }
 
     #[test]
-    fn ack_decision_round_trips() {
-        let msg = MeshMessage::NetworkStateAck(NetworkStateAckMessage {
-            proposal_id: "prop_x".into(),
-            signer: "alice".into(),
-            decision: AckDecision::Deny,
-            at: 42,
-            signature: "sig".into(),
-        });
-        let s = serde_json::to_string(&msg).unwrap();
-        assert!(s.contains(r#""decision":"deny""#));
-        let back: MeshMessage = serde_json::from_str(&s).unwrap();
-        match back {
-            MeshMessage::NetworkStateAck(a) => {
-                assert_eq!(a.decision, AckDecision::Deny);
-                assert_eq!(a.signer, "alice");
+    fn fact_inventory_and_request_canonicalize_ids_and_preserve_context() {
+        let context = crate::semantic::MeshContextId::from_bytes([7; 32]);
+        let first = crate::semantic::FactId::from_bytes([1; 32]);
+        let second = crate::semantic::FactId::from_bytes([2; 32]);
+        let inventory = FactInventory::new(context, [second, first, second]);
+        assert_eq!(inventory.context_id(), context);
+        assert_eq!(inventory.fact_ids(), &[first, second]);
+        let request = FactRequest::new(context, [second, first, second]);
+        assert_eq!(request.context_id(), context);
+        assert_eq!(request.fact_ids(), &[first, second]);
+
+        for message in [
+            MeshMessage::FactInventory(inventory),
+            MeshMessage::FactRequest(request),
+        ] {
+            let encoded = serde_json::to_string(&message).expect("fact coordination serializes");
+            let decoded: MeshMessage =
+                serde_json::from_str(&encoded).expect("fact coordination round-trips");
+            match (message, decoded) {
+                (MeshMessage::FactInventory(expected), MeshMessage::FactInventory(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                (MeshMessage::FactRequest(expected), MeshMessage::FactRequest(actual)) => {
+                    assert_eq!(actual, expected);
+                }
+                _ => panic!("fact coordination changed wire variant"),
             }
-            _ => panic!("did not round-trip as NetworkStateAck"),
         }
     }
 
     #[test]
-    fn roster_summary_round_trips() {
-        let msg = MeshMessage::RosterSummary(RosterSummaryMessage {
-            root: "merkle_root".into(),
-            count: 3,
-            last_edit_ts: 1700000000,
-        });
-        let s = serde_json::to_string(&msg).unwrap();
-        let back: MeshMessage = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back, MeshMessage::RosterSummary(_)));
-    }
-
-    #[test]
-    fn roster_request_defaults_clean() {
-        // include_all + subtree_hashes are #[serde(default)] so an
-        // empty request frame parses without per-field nulls. v1
-        // peers send `{ "kind": "roster_request" }` literally.
-        let raw = r#"{"kind":"roster_request"}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        match msg {
-            MeshMessage::RosterRequest(r) => {
-                assert!(!r.include_all);
-                assert!(r.subtree_hashes.is_empty());
-            }
-            _ => panic!("did not parse as RosterRequest"),
+    fn fact_coordination_rejects_noncanonical_id_order_or_duplicates() {
+        let context = crate::semantic::MeshContextId::from_bytes([8; 32]);
+        let first = crate::semantic::FactId::from_bytes([1; 32]);
+        let second = crate::semantic::FactId::from_bytes([2; 32]);
+        let context = serde_json::to_string(&context).unwrap();
+        let first = serde_json::to_string(&first).unwrap();
+        let second = serde_json::to_string(&second).unwrap();
+        for kind in ["fact_inventory", "fact_request"] {
+            let raw = format!(
+                r#"{{"kind":"{kind}","context_id":{context},"fact_ids":[{second},{first}]}}"#
+            );
+            assert!(serde_json::from_str::<MeshMessage>(&raw).is_err());
+            let raw = format!(
+                r#"{{"kind":"{kind}","context_id":{context},"fact_ids":[{first},{first}]}}"#
+            );
+            assert!(serde_json::from_str::<MeshMessage>(&raw).is_err());
         }
     }
 
     #[test]
-    fn a_governance_kind_this_build_implements_decodes_and_a_future_one_is_refused() {
-        // A supported peer decodes this exact frame.
-        let raw = r#"{"kind":"network_state_propose","proposal_id":"x","variant":{"kind":"role_grant","target":"a","role":"member"},"proposer":"b","created_at":0,"signature":"s"}"#;
-        let msg: MeshMessage = serde_json::from_str(raw).unwrap();
-        assert!(matches!(msg, MeshMessage::NetworkStatePropose(_)));
+    fn authenticated_departure_control_round_trips_with_bounded_correlation() {
+        let correlation = DepartureCorrelation::from_bytes([0x11; DEPARTURE_CORRELATION_BYTES]);
+        let message = MeshMessage::SessionControl(SessionControl::Depart {
+            correlation: correlation.clone(),
+        });
+        let encoded = serde_json::to_string(&message).expect("departure serializes");
+        assert!(encoded.contains(r#""op":"depart""#));
+        assert!(!encoded.contains("device_id"));
+        let decoded: MeshMessage = serde_json::from_str(&encoded).expect("departure decodes");
+        assert!(matches!(
+            decoded,
+            MeshMessage::SessionControl(SessionControl::Depart { correlation: value })
+                if value == correlation
+        ));
+        let observed = MeshMessage::SessionControl(SessionControl::DepartObserved {
+            correlation: correlation.clone(),
+        });
+        let observed_encoded = serde_json::to_string(&observed).expect("receipt serializes");
+        assert!(observed_encoded.contains(r#""op":"depart_observed""#));
+        let observed_decoded: MeshMessage =
+            serde_json::from_str(&observed_encoded).expect("receipt decodes");
+        assert!(matches!(
+            observed_decoded,
+            MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
+                if value == correlation
+        ));
+        let exact_len = departure_receipt_json_len(&correlation).expect("receipt is countable");
+        let exact = encode_departure_receipt_exact(&correlation).expect("receipt is encodable");
+        assert_eq!(
+            exact.len(),
+            exact_len,
+            "the receipt uses the exact allocation that was counted"
+        );
+        let exact_decoded: MeshMessage =
+            serde_json::from_slice(&exact).expect("exactly encoded receipt decodes");
+        assert!(matches!(
+            exact_decoded,
+            MeshMessage::SessionControl(SessionControl::DepartObserved { correlation: value })
+                if value == correlation
+        ));
+        let too_long = "a".repeat(DEPARTURE_CORRELATION_WIRE_CHARS + 1);
+        assert!(serde_json::from_str::<MeshMessage>(&format!(
+            r#"{{"kind":"session_control","op":"depart","correlation":"{too_long}"}}"#
+        ))
+        .is_err());
+        let with_unknown =
+            encoded.replacen(r#""correlation""#, r#""legacy":true,"correlation""#, 1);
+        assert!(serde_json::from_str::<MeshMessage>(&with_unknown).is_err());
+    }
+
+    #[test]
+    fn authenticated_renegotiation_control_round_trips_on_the_session_wire() {
+        let message = MeshMessage::SessionControl(SessionControl::RenegotiateOffer {
+            sdp: "v=0\r\na=ice-ufrag:exact-channel\r\n".to_string(),
+        });
+        let encoded = serde_json::to_string(&message).expect("session control serializes");
+        assert!(encoded.contains(r#""kind":"session_control""#));
+        assert!(encoded.contains(r#""op":"renegotiate_offer""#));
+        let decoded: MeshMessage = serde_json::from_str(&encoded).expect("session control decodes");
+        assert!(matches!(
+            decoded,
+            MeshMessage::SessionControl(SessionControl::RenegotiateOffer { sdp })
+                if sdp.contains("exact-channel")
+        ));
+    }
+
+    #[test]
+    fn a_fact_kind_this_build_implements_and_a_future_one_is_refused() {
+        // The removed unbounded bundle is refused before any durable handler.
+        let raw = r#"{"kind":"fact_bundle","facts":[]}"#;
+        assert!(serde_json::from_str::<MeshMessage>(raw).is_err());
         // The inverse fails closed: there is no mixed-version live fallback.
         let raw_future = r#"{"kind":"network_state_some_future_thing","whatever":1}"#;
         assert!(serde_json::from_str::<MeshMessage>(raw_future).is_err());

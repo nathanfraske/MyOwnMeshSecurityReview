@@ -29,6 +29,7 @@ fn client_id_roundtrips_through_string() {
     assert_eq!(parsed, id);
     assert!("not-an-id".parse::<ClientId>().is_err());
     assert!("c-99".parse::<ClientId>().is_err());
+    assert!("c042".parse::<ClientId>().is_err());
 }
 
 #[test]
@@ -1505,7 +1506,7 @@ fn only_the_first_caller_owns_the_drain() {
 /// what a finishing task does.
 #[tokio::test]
 async fn the_task_join_resolves_only_once_the_last_task_is_gone() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     let task = reg
         .lease_task()
         .expect("the daemon test grant funds one task");
@@ -1541,7 +1542,7 @@ async fn the_task_join_resolves_only_once_the_last_task_is_gone() {
 /// come and `serve` would never return.
 #[tokio::test]
 async fn a_task_ending_during_the_wait_still_wakes_it() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     let task = reg
         .lease_task()
         .expect("the daemon test grant funds one task");
@@ -1565,7 +1566,7 @@ async fn a_task_ending_during_the_wait_still_wakes_it() {
 /// `Closed` learns that instead of publishing it.
 #[test]
 fn closed_is_never_published_early() {
-    let reg = ClientRegistry::default();
+    let reg = one_task_registry();
     assert_eq!(
         reg.finish_closed(),
         Lifecycle::Running,
@@ -1590,6 +1591,20 @@ fn closed_is_never_published_early() {
     assert!(matches!(reg.lease_task(), Err(IpcAdmissionError::Closing)));
 }
 
+/// An isolated registry whose grant contains exactly its process scope and one
+/// task reservation. The three lifecycle controls below each hold one task;
+/// they must not borrow the process-wide daemon fixture or a connector proxy.
+fn one_task_registry() -> ClientRegistry {
+    let grant = registry_fixture_claim(0, 0, 0)
+        .expect("the isolated task registry scope claim is representable")
+        .checked_add(
+            super::task_reservation_planning_charge_for_test()
+                .expect("the isolated task reservation is representable"),
+        )
+        .expect("the isolated one-task registry grant is representable");
+    ClientRegistry::over_grant(grant)
+}
+
 /// The closing signal is already-signalled for a task that arrives late.
 ///
 /// A connection accepted microseconds before the drain, or a pump whose select
@@ -1605,6 +1620,83 @@ async fn the_closing_signal_resolves_for_a_task_that_arrives_after_it() {
     tokio::time::timeout(std::time::Duration::from_millis(500), reg.closing())
         .await
         .expect("a late arrival sees the state, not the missed wake");
+}
+
+/// One isolated fixture can fund an exact IPC task cohort beside a connector
+/// structural floor without changing the process-wide daemon grant.
+///
+/// The connector floor is held first, then the exact owner list's IPC task
+/// cohort is held beside it. The next task refuses for the worker dimension,
+/// proving the cohort is finite and that it did not silently consume a
+/// connector slot.
+/// Dropping both owners must return the private provider to the exact baseline;
+/// this control never reads or mutates the process-wide fixture provider.
+#[test]
+fn isolated_task_cohort_is_admitted_without_borrowing_connector_floor() {
+    let structural = myownmesh_core::connector_resource_structural_claims();
+    let connector = structural.connector_opening();
+    let connector_charge =
+        myownmesh_core::FiniteResourceProvider::reservation_planning_charge(connector)
+            .expect("the connector opening reservation is representable");
+    let task = super::task_claim_for_test().expect("the IPC task claim is representable");
+    // Keep the cohort isolated to this control. Its owner list is explicit and
+    // the grant is priced from that list, so N is the number of leases this
+    // fixture really retains rather than a process-wide guessed constant.
+    let task_owners: Vec<usize> = (0..crate::TEST_PROCESS_CONNECTOR_CAPACITY).collect();
+    let task_charge = super::task_cohort_reservation_planning_charge_for_test(task_owners.len())
+        .expect("the IPC task cohort reservation is representable");
+    let grant = myownmesh_core::FiniteResourceProvider::scope_planning_charge()
+        .checked_add(connector_charge)
+        .and_then(|grant| grant.checked_add(task_charge))
+        .expect("the connector and IPC task grant is representable");
+    let provider = myownmesh_core::FiniteResourceProvider::new(grant);
+    let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
+        .expect("the private grant funds its process scope");
+    let scope = port.process_scope();
+    let baseline = provider.in_use();
+
+    let connector_lease = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            connector,
+        )
+        .expect("the connector floor is admitted before IPC tasks");
+    let mut tasks = Vec::new();
+    for index in &task_owners {
+        tasks.push(
+            port.acquire(
+                &scope,
+                myownmesh_core::ResourceAuthorityClass::Admitted,
+                task,
+            )
+            .unwrap_or_else(|error| panic!("IPC task {index} must be admitted: {error:?}")),
+        );
+    }
+    assert_eq!(tasks.len(), task_owners.len());
+    let refusal = port
+        .acquire(
+            &scope,
+            myownmesh_core::ResourceAuthorityClass::Admitted,
+            task,
+        )
+        .expect_err("the N+1 IPC task exceeds its named finite cohort");
+    assert!(
+        matches!(
+            refusal,
+            myownmesh_core::ResourceUnavailable::Pressure(pressure)
+                if pressure.dimension == myownmesh_core::ResourceClass::WorkerOrTask
+        ),
+        "the refusal is IPC task pressure, not connector-floor pressure: {refusal:?}"
+    );
+
+    drop(tasks);
+    drop(connector_lease);
+    assert_eq!(
+        provider.in_use(),
+        baseline,
+        "dropping the connector and IPC task owners returns the exact baseline"
+    );
 }
 
 // ---- off-node retention -------------------------------------------------

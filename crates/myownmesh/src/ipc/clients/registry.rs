@@ -152,8 +152,8 @@ impl ClientRegistry {
     ///
     /// No queue sizing to select: the inbound RPC stream queue is a resource
     /// mailbox, so its capacity is the grant rather than an item count.
-    pub fn new(resources: LocalApplicationResourceScope) -> Self {
-        Self::over(RegistryResources::Application(resources))
+    pub fn new(resources: LocalApplicationResourceScope) -> Result<Self, IpcAdmissionError> {
+        Self::try_over(RegistryResources::Application(resources))
     }
 
     /// A registry funded by a provider this control owns outright.
@@ -165,6 +165,13 @@ impl ClientRegistry {
     /// control can exhaust it.
     #[cfg(test)]
     pub fn over_grant(grant: ResourceClaim) -> Self {
+        let custody = myownmesh_core::FiniteResourceProvider::reservation_planning_charge(
+            final_watchdog_claim().expect("the final watchdog claim is representable"),
+        )
+        .expect("the final watchdog charge is representable");
+        let grant = grant
+            .checked_add(custody)
+            .expect("the test grant includes final watchdog custody");
         let provider = myownmesh_core::FiniteResourceProvider::new(grant);
         let port = myownmesh_core::ResourceProviderPort::new(provider.clone())
             .expect("the control grant funds its own process scope");
@@ -176,8 +183,14 @@ impl ClientRegistry {
         })
     }
 
+    #[cfg(test)]
     fn over(resources: RegistryResources) -> Self {
-        Self {
+        Self::try_over(resources).expect("the test registry's final watchdog custody starts")
+    }
+
+    fn try_over(resources: RegistryResources) -> Result<Self, IpcAdmissionError> {
+        let final_watchdog_custody = Some(FinalWatchdogCustody::reserve(&resources)?);
+        Ok(Self {
             inner: Arc::new(RegistryInner {
                 resources,
                 next_id: AtomicU64::new(0),
@@ -194,6 +207,8 @@ impl ClientRegistry {
                 tables: Mutex::new(RegistryTables {
                     lifecycle: Lifecycle::Running,
                     live_tasks: 0,
+                    watchdogs: crate::ipc::LeasedList::new(),
+                    final_watchdog_custody,
                     clients: LeasedMap::new(),
                     handler_claims: LeasedMap::new(),
                     channel_subs: LeasedMap::new(),
@@ -201,7 +216,7 @@ impl ClientRegistry {
                     installed_handlers: LeasedMap::new(),
                 }),
             }),
-        }
+        })
     }
 
     /// Park the next channel pump at the line after it has selected a
@@ -352,6 +367,7 @@ impl ClientRegistry {
         let mut residue = RegistryResidue {
             lifecycle: tables.lifecycle,
             live_tasks: tables.live_tasks,
+            watchdogs: tables.watchdogs.len() as u64,
             clients: 0,
             realtime_flows: 0,
             handler_claims: 0,
@@ -446,6 +462,77 @@ impl ClientRegistry {
         }
     }
 
+    /// Retain an inbound-stream watchdog under the same lifecycle fence as
+    /// every other registry admission. The handle is returned on refusal so
+    /// its owner can abort and observe it exactly once rather than detaching
+    /// it on an error path.
+    #[cfg(test)]
+    pub(crate) fn retain_watchdog(
+        &self,
+        handle: tokio::task::JoinHandle<()>,
+    ) -> Result<(), (tokio::task::JoinHandle<()>, IpcAdmissionError)> {
+        let claim = match crate::ipc::LeasedList::<tokio::task::JoinHandle<()>>::node_claim() {
+            Ok(claim) => claim,
+            Err(reason) => return Err((handle, IpcAdmissionError::Claim(reason))),
+        };
+        let mut tables = self.inner.tables.lock();
+        if let Err(reason) = admitting(&tables) {
+            return Err((handle, reason));
+        }
+        let node = match self.inner.resources.acquire(claim) {
+            Ok(node) => node,
+            Err(reason) => return Err((handle, IpcAdmissionError::Resources(reason))),
+        };
+        if tables.final_watchdog_custody.is_none() {
+            let custody = match FinalWatchdogCustody::reserve(&self.inner.resources) {
+                Ok(custody) => custody,
+                Err(reason) => return Err((handle, reason)),
+            };
+            tables.final_watchdog_custody = Some(custody);
+        }
+        tables.watchdogs.push(handle, node);
+        Ok(())
+    }
+
+    /// Remove and await every retained watchdog, observing each terminal
+    /// result exactly once. The table lock is released before awaiting, and
+    /// the node lease is released when the entry is popped.
+    pub(crate) async fn drain_watchdogs(&self) -> usize {
+        let mut abnormal = 0;
+        while let Some(handle) = {
+            let mut tables = self.inner.tables.lock();
+            tables.watchdogs.pop()
+        } {
+            let custody = {
+                let tables = self.inner.tables.lock();
+                tables
+                    .final_watchdog_custody
+                    .clone()
+                    .expect("every registry has a watchdog terminal owner")
+            };
+            let mut guard = WatchdogJoinGuard {
+                handle: Some(handle),
+                custody,
+            };
+            #[cfg(test)]
+            {
+                WATCHDOG_GUARD_CREATED.fetch_add(1, Ordering::AcqRel);
+                watchdog_guard_notify().notify_waiters();
+            }
+            if guard
+                .handle
+                .as_mut()
+                .expect("the watchdog guard owns the popped handle")
+                .await
+                .is_err()
+            {
+                abnormal += 1;
+            }
+            guard.handle.take();
+        }
+        abnormal
+    }
+
     /// Resolve when the runtime enters `Closing`, or immediately if it already
     /// has.
     ///
@@ -522,7 +609,7 @@ impl ClientRegistry {
             .map_err(IpcAdmissionError::Resources)?;
         tables.live_tasks += 1;
         drop(tables);
-        Ok(TaskAdmission::new(lease, Arc::clone(&self.inner)))
+        Ok(TaskAdmission::new(lease, &self.inner))
     }
 
     /// Allocate a fresh `ClientId` and register the client's outbound writer.
@@ -621,7 +708,7 @@ impl ClientRegistry {
         owner: &FundedArc<ClientHandle>,
         network: String,
         flow: myownmesh_core::realtime::RealtimeFlowHandle,
-    ) -> Result<RealtimeFlowCapability, RealtimeFlowRejected> {
+    ) -> Result<RealtimeFlowCapability, Box<RealtimeFlowRejected>> {
         // The capability is a fixed-width mint, so its length is known before
         // it exists; the network name is the client-influenced half and is the
         // reason this is computed per call rather than being a constant.
@@ -646,10 +733,10 @@ impl ClientRegistry {
         }) {
             Ok(cleanup) => cleanup,
             Err(reason) => {
-                return Err(RealtimeFlowRejected {
+                return Err(Box::new(RealtimeFlowRejected {
                     flow,
                     reason: RegistrationError::Admission(reason),
-                });
+                }));
             }
         };
         self.install_if_live(
@@ -661,7 +748,7 @@ impl ClientRegistry {
                 owner.register_realtime_flow(network, flow, entry, retained, cleanup)
             },
         )
-        .map_err(|(flow, reason)| RealtimeFlowRejected { flow, reason })
+        .map_err(|(flow, reason)| Box::new(RealtimeFlowRejected { flow, reason }))
     }
 
     /// Run `install` only while `owner` is still a registered, connected client
@@ -1440,12 +1527,13 @@ impl ClientRegistry {
     pub(crate) fn route_cancellation(
         &self,
     ) -> Result<FundedArc<RouteCancellation>, IpcAdmissionError> {
+        let retirement = RouteRetirementCustodian::reserve(&self.inner.resources)?;
         let retained = self
             .inner
             .resources
             .acquire(route_cancellation_retained().map_err(IpcAdmissionError::Claim)?)
             .map_err(IpcAdmissionError::Resources)?;
-        Ok(FundedArc::new(RouteCancellation::new(), retained)
+        Ok(FundedArc::new(RouteCancellation::new(retirement), retained)
             .unwrap_or_else(|_| unreachable!("an admitted cancellation lease may be shared")))
     }
 
@@ -1507,7 +1595,12 @@ impl ClientRegistry {
                         .channel_subs
                         .get_mut(key)
                         .expect("presence was established under this same acquisition");
-                    route.state = RouteState::Live(PumpOwner { cancel, join });
+                    let retirement = cancel.retirement();
+                    route.state = RouteState::Live(PumpOwner {
+                        cancel,
+                        join: Some(join),
+                        retirement,
+                    });
                     Outcome::Live
                 }
                 (true, None) => {
@@ -2263,5 +2356,6 @@ impl ClientRegistry {
 impl Default for ClientRegistry {
     fn default() -> Self {
         Self::new(crate::test_application_scope())
+            .expect("the daemon test grant starts the IPC final watchdog custodian")
     }
 }

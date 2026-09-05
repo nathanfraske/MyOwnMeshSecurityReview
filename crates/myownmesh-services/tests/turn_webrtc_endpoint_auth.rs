@@ -4,39 +4,58 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myownmesh_core::config::{
-    NetworkConfig, SignalingConfig, TopologyMode, TurnCredential, TurnServer as IceTurnServer,
-    TurnServiceConfig,
+    NetworkConfig, RoutingPolicyConfig, SchedulerPolicyConfig, SignalingConfig, TopologyMode,
+    TurnCredential, TurnServer as IceTurnServer, TurnServiceConfig,
 };
 use myownmesh_core::engine::connection::PeerStatus;
-use myownmesh_core::engine::{attach_local, spawn_network};
+use myownmesh_core::engine::transport_lab::{attach_local, channel, spawn_network};
 use myownmesh_core::identity::Identity;
 use myownmesh_core::transport::{IceCandidateKind, Transport};
 use myownmesh_core::{
     transport_lab_connector_fixture_grant, transport_lab_remote_candidate_fixture_grant,
-    transport_lab_remote_description_fixture_grant, Channel, ConnectorCallbackPolicy,
-    FiniteResourceProvider, MeshEvent, PeerEvent, ResourceProviderPort,
-    TransportLabCallbackWorkload, WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
+    transport_lab_remote_description_fixture_grant, ConnectorCallbackPolicy,
+    FiniteResourceProvider, LocalApplicationResourceScope, MeshEvent, PeerEvent, ResourceClaim,
+    ResourceClass, ResourceProviderPort, TransportLabCallbackWorkload,
+    WebRtcConnectorCapablePolicy, WebRtcConnectorProfile,
 };
 use myownmesh_services::TurnServer;
 use myownmesh_signaling::local::LocalBroker;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn service_scope() -> LocalApplicationResourceScope {
+    let grant = ResourceClaim::try_from_entries(
+        ResourceClass::ALL
+            .into_iter()
+            .map(|class| (class, 1_000_000)),
+    )
+    .expect("TURN service fixture grant is representable");
+    let port = ResourceProviderPort::new(FiniteResourceProvider::new(grant))
+        .expect("TURN service fixture provider is valid");
+    LocalApplicationResourceScope::transport_lab_child_of(&port)
+        .expect("TURN service fixture scope is valid")
+}
+
 fn network_config(label: &str, turn_url: String, auto_approve: bool) -> NetworkConfig {
     NetworkConfig {
         id: label.to_string(),
         network_id: "turn-endpoint-auth".to_string(),
+        event_capacity: NetworkConfig::from_network_id("", "").event_capacity,
+        connection_trace_capacity: NetworkConfig::from_network_id("", "").connection_trace_capacity,
         label: label.to_string(),
         kind: Default::default(),
+        scheduler: SchedulerPolicyConfig::default(),
+        semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
         topology: TopologyMode::FullMesh,
+        routing_policy: RoutingPolicyConfig::default(),
         signaling: SignalingConfig::default(),
+        closed_relay: Default::default(),
         stun_servers: Vec::new(),
         turn_servers: vec![IceTurnServer {
             urls: vec![turn_url],
             username: Some("arc03-user".to_string()),
             credential: Some("arc03-password".to_string()),
         }],
-        roster_path: None,
         pinned_peers: Vec::new(),
         auto_approve,
     }
@@ -240,7 +259,9 @@ async fn wait_for_authenticated(
     .expect("endpoint authentication timed out");
 }
 
-async fn wait_for_reported_relay_pair(peers: [(&myownmesh_core::engine::NetworkState, &str); 2]) {
+async fn wait_for_reported_relay_pair(
+    peers: [(&myownmesh_core::engine::transport_lab::NetworkState, &str); 2],
+) {
     tokio::time::timeout(TEST_TIMEOUT, async {
         loop {
             if peers.iter().any(|(state, peer_id)| {
@@ -267,20 +288,23 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     let home = tempfile::tempdir().expect("isolated MyOwnMesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());
 
-    let turn = TurnServer::start(&TurnServiceConfig {
-        enabled: true,
-        bind: "127.0.0.1".to_string(),
-        port: 0,
-        public_ip: "127.0.0.1".to_string(),
-        realm: "arc03-test".to_string(),
-        credentials: vec![TurnCredential {
-            username: "arc03-user".to_string(),
-            password: "arc03-password".to_string(),
-        }],
-        max_bps_per_connection: 0,
-        relay_port_min: 0,
-        relay_port_max: 0,
-    })
+    let turn = TurnServer::start_with_resource_scope(
+        &TurnServiceConfig {
+            enabled: true,
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+            public_ip: "127.0.0.1".to_string(),
+            realm: "arc03-test".to_string(),
+            credentials: vec![TurnCredential {
+                username: "arc03-user".to_string(),
+                password: "arc03-password".to_string(),
+            }],
+            max_bps_per_connection: 0,
+            relay_port_min: 0,
+            relay_port_max: 0,
+        },
+        service_scope(),
+    )
     .await
     .expect("real TURN server starts");
     let turn_url = format!("turn:{}?transport=udp", turn.local_addr());
@@ -339,8 +363,8 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
     }
     assert!(reported_relay_pair, "ICE reports the selected relay pair");
 
-    let alice_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&alice));
-    let bob_channel = Channel::<String>::new("arc03-proof".to_string(), Arc::clone(&bob));
+    let alice_channel = channel::<String>("arc03-proof".to_string(), Arc::clone(&alice));
+    let bob_channel = channel::<String>("arc03-proof".to_string(), Arc::clone(&bob));
     let mut alice_receive = alice_channel
         .subscribe()
         .expect("alice subscription admitted");
@@ -429,7 +453,7 @@ async fn turn_selected_session_authenticates_endpoints_before_bidirectional_data
         assert!(!peer.remote_approve_seen);
     }
 
-    let carol_channel = Channel::<String>::new("arc03-negative".to_string(), Arc::clone(&carol));
+    let carol_channel = channel::<String>("arc03-negative".to_string(), Arc::clone(&carol));
     carol_channel
         .send_to(dave_id.public_id(), &"must-not-send".to_string())
         .await

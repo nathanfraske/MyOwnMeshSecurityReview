@@ -70,15 +70,6 @@ pub enum Request {
     RosterList {
         network: String,
     },
-    RosterApprove {
-        network: String,
-        device_id: String,
-        label: Option<String>,
-    },
-    RosterRemove {
-        network: String,
-        device_id: String,
-    },
     TopologySet {
         network: String,
         topology: String,
@@ -115,6 +106,46 @@ pub enum Request {
     /// already exists in the running daemon.
     NetworkAdd {
         config: NetworkConfig,
+    },
+    /// Create a new Closed network. The daemon mints the creation nonce and
+    /// persists the signed bootstrap before registering the runtime.
+    NetworkCreateClosed {
+        config: NetworkConfig,
+    },
+    /// Import one exact signed Closed bootstrap under the caller-selected
+    /// local config id and an explicit context fence.
+    NetworkImportClosed {
+        config: NetworkConfig,
+        expected_context_id: myownmesh_core::semantic::MeshContextId,
+        bootstrap: myownmesh_core::semantic::BootstrapRecord,
+    },
+    /// Export the verified bootstrap record for a joined Closed network.
+    NetworkBootstrapExport {
+        network: String,
+    },
+    /// Export one provider-funded, receive-safe page of canonical semantic
+    /// facts.  The cursor is exclusive and the two limits are validated by
+    /// the core facade against its receive-frame ceiling.
+    SemanticFactPageExport {
+        network: String,
+        request: myownmesh_core::semantic::SemanticFactPageRequest,
+    },
+    /// Import one bounded semantic fact page.  Wire deserialization carries
+    /// no lease; the joined-network facade reacquires exact provider funding
+    /// before reducing the page.
+    SemanticFactPageImport {
+        network: String,
+        page: myownmesh_core::semantic::SemanticFactPage,
+    },
+    /// Inspect the deterministic semantic identity of one joined network.
+    SemanticStateIdentity {
+        network: String,
+    },
+    /// Render a bounded, non-canonical view of the newest facts retained in
+    /// the live hot-history cache.
+    SemanticRecentFacts {
+        network: String,
+        request: myownmesh_core::semantic::SemanticRecentFactsRequest,
     },
     /// Remove a network: take it out of the registry, `leave()` the
     /// engine driver, drop the signaling handle, and persist the
@@ -235,39 +266,17 @@ pub enum Request {
     },
 
     // ---- closed-network governance --------------------------------
-    /// Snapshot the per-network signed governance state — kind,
-    /// roles, transition log, pending proposals, splits. The GUI
-    /// polls this to render its Governance tab + per-network kind
-    /// badge.
-    GovernanceState {
-        network: String,
-    },
-    /// Float a kind-change proposal (`open → closed` or
-    /// `closed → open`). Engine signs with the local identity,
-    /// broadcasts to peers, attempts immediate ratification if the
-    /// quorum is already met. Returns the new proposal id.
-    GovernanceProposeKindChange {
-        network: String,
-        /// Target kind. Must differ from the current one.
-        to: myownmesh_core::NetworkKind,
-        /// Per-device custody second factor, if this device enrolled one for
-        /// the network (see the `GovernanceMfa*` ops). Omitted otherwise.
-        #[serde(default)]
-        mfa_code: Option<String>,
-    },
     /// Float a role-grant proposal.
     GovernanceProposeRoleGrant {
         network: String,
         target: String,
-        role: myownmesh_core::Role,
-        #[serde(default)]
+        role: myownmesh_core::semantic::Role,
         mfa_code: Option<String>,
     },
     /// Float a role-revoke proposal.
     GovernanceProposeRoleRevoke {
         network: String,
         target: String,
-        #[serde(default)]
         mfa_code: Option<String>,
     },
     /// Float an evict proposal — remove a peer from the closed network's
@@ -275,56 +284,32 @@ pub enum Request {
     GovernanceProposeEvict {
         network: String,
         target: String,
-        #[serde(default)]
         mfa_code: Option<String>,
     },
-    /// Float a topology-change proposal: the owner-signed, network-wide
-    /// shape (mode, hub set, spoke redundancy) in one transition. Once
-    /// ratified it outranks every device's local config topology and
-    /// converges through the signed log exactly like roles do — this is
-    /// how a node is made an infra hub for the whole network. Closed
-    /// networks only; open/silent ones keep the per-device `TopologySet`.
-    GovernanceProposeTopology {
+    /// Prepare a new enrollment and return its exact transaction identity.
+    /// The enrollment remains prepared until an explicit commit or abort.
+    GovernanceMfaPrepare {
         network: String,
-        /// Same encoding `TopologySet` takes: `ring`, `star`, `hubs`,
-        /// or `full_mesh`.
-        topology: String,
-        /// Hub spec for `star` (`<device_id>`) / `hubs`
-        /// (`id1,id2[,…][:spoke_redundancy]`).
-        #[serde(default)]
-        hub: Option<String>,
-        #[serde(default)]
-        mfa_code: Option<String>,
     },
-    /// Sign a pending proposal.
-    GovernanceSign {
+    /// Query one exact enrollment transaction without selecting a successor.
+    GovernanceMfaQuery {
         network: String,
-        proposal_id: String,
-        #[serde(default)]
-        mfa_code: Option<String>,
+        transaction_id: String,
     },
-    /// Deny a pending proposal. Single-shot kill switch.
-    GovernanceDeny {
+    /// Re-deliver the exact material for one prepared transaction.
+    GovernanceMfaRedeliver {
         network: String,
-        proposal_id: String,
+        transaction_id: String,
     },
-    /// Withdraw a proposal the local device floated.
-    GovernanceWithdraw {
+    /// Commit one exact enrollment transaction, idempotently.
+    GovernanceMfaCommit {
         network: String,
-        proposal_id: String,
+        transaction_id: String,
     },
-    /// Spawn a proposer-initiated split. Returns the derived
-    /// network id of the new closed network.
-    GovernanceSpawnSplit {
+    /// Abort one exact enrollment transaction, idempotently.
+    GovernanceMfaAbort {
         network: String,
-        proposal_id: String,
-    },
-    /// Enroll a per-device TOTP custody lock for `network` on this daemon.
-    /// Returns the secret (base32 + `otpauth://` URI for a QR) and the
-    /// one-time recovery codes — shown to the user exactly once. Fails if an
-    /// enrollment already exists (disable it first).
-    GovernanceMfaEnroll {
-        network: String,
+        transaction_id: String,
     },
     /// Whether this device holds a custody enrollment for `network`.
     GovernanceMfaStatus {
@@ -335,6 +320,40 @@ pub enum Request {
     GovernanceMfaDisable {
         network: String,
         code: String,
+    },
+
+    // ---- bounded Closed relay capability --------------------------
+    /// Open an opaque endpoint session through one authenticated member.
+    ClosedRelayOpen {
+        network: String,
+        relay: String,
+        target: String,
+    },
+    /// Accept one queued authenticated endpoint offer, waiting only for the
+    /// caller-provided duration.
+    ClosedRelayAccept {
+        network: String,
+        wait_ms: u64,
+    },
+    /// Send one bounded opaque plaintext through a daemon-held capability.
+    ClosedRelaySend {
+        handle: String,
+        payload: Vec<u8>,
+    },
+    /// Receive one opaque plaintext from a daemon-held capability, waiting
+    /// only for the caller-provided duration.
+    ClosedRelayRecv {
+        handle: String,
+        wait_ms: u64,
+    },
+    /// Consume one exact relay capability and close its endpoint session.
+    ClosedRelayClose {
+        handle: String,
+    },
+    /// Return deterministic generation and configured/active allocation
+    /// evidence for one daemon-held capability.
+    ClosedRelayState {
+        handle: String,
     },
 
     // ---- typed-channel + RPC IPC (post-EventsSubscribe) ----------

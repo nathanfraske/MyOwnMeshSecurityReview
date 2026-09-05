@@ -49,7 +49,7 @@ enum Command {
     /// Install/start/stop/uninstall MyOwnMesh as a background OS service
     /// (systemd on Linux, launchd on macOS). Manages the daemon process
     /// lifecycle — distinct from `ctl services`, which toggles the mesh's
-    /// own hosted relay/STUN/TURN/signaling roles.
+    /// own hosted signaling relay/STUN/TURN roles.
     Service {
         /// Manage the system-wide service (root, starts at boot) instead
         /// of the default per-user service (no root, starts at login).

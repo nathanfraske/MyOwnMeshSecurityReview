@@ -10,17 +10,23 @@
 //! applies the initial config and tears everything down on shutdown —
 //! and the control socket, which handles live `services set` requests.
 //!
-//! Service start failures are non-fatal: a port already in use shouldn't
-//! take the daemon down, so a failed start is logged and surfaced in the
-//! status report as `enabled but not running`, leaving the rest of the
-//! mesh untouched.
+//! Service start failures are isolated: a port already in use shouldn't take
+//! the daemon down, but it must be surfaced as a reconciliation error. The
+//! desired config remains the restart intent; status separately shows which
+//! listeners are actually running.
 
 use std::sync::Arc;
 
 use myownmesh_core::services::{ServiceAdvert, ServiceRole};
-use myownmesh_core::{CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ServicesConfig};
+use myownmesh_core::{
+    CapabilityAdvert, MeshConfig, MeshHandle, NetworkConfig, ResourceClaim, ResourceClass,
+    ResourceLease, ServicesConfig,
+};
 use myownmesh_services::{StunServer, StunServerHandle, TurnServer, TurnServerHandle};
 use myownmesh_signaling::server::{RelayStatsSnapshot, SignalingServer, SignalingServerHandle};
+use myownmesh_signaling::{
+    DedicatedTaskCustodian, TaskCustodian, TaskCustodyError, TaskReservation,
+};
 use serde::Serialize;
 use tokio::sync::{Mutex, MutexGuard};
 use tracing::{info, warn};
@@ -37,15 +43,33 @@ pub struct ServiceManager {
 
 /// Why a service configuration was refused.
 ///
-/// A second variant used to sit here, refusing any configuration that enabled
-/// ordinary-member application payload relay. There is no longer a
-/// configuration that can ask for it: the key is gone from `ServicesConfig`, so
-/// the refusal has nothing left to refuse and the exclusion is now structural.
-/// See `no_service_configuration_can_advertise_a_member_payload_relay`.
+/// A former policy check referred to ordinary-member application-payload
+/// relay. That capability is not part of the hosted-services
+/// configuration/status/advertisement namespace: `ServicesConfig` exposes the
+/// signaling relay, STUN, and TURN services only, so there is no such request
+/// for this error to refuse.
 #[derive(Debug, thiserror::Error)]
 pub enum ServicePolicyError {
     #[error("connector resource policy is required before enabling node participation")]
     ConnectorPolicyRequired,
+    #[error("service reconciliation failed: {0}")]
+    Reconciliation(String),
+}
+
+/// Terminal failures observed while stopping hosted services.
+///
+/// Every stop is still attempted in the prescribed order; the aggregate is
+/// returned only after all owned handles have reached their terminal boundary.
+#[derive(Debug, thiserror::Error)]
+#[error("hosted service shutdown failed: {failures:?}")]
+pub struct ServiceShutdownError {
+    pub failures: Vec<ServiceShutdownFailure>,
+}
+
+#[derive(Debug)]
+pub struct ServiceShutdownFailure {
+    pub service: &'static str,
+    pub error: String,
 }
 
 struct ManagerState {
@@ -53,6 +77,53 @@ struct ManagerState {
     stun: Option<StunServerHandle>,
     turn: Option<TurnServerHandle>,
     signaling: Option<SignalingServerHandle>,
+}
+
+/// Keeps the signaling task owner and its process-resource charge together.
+/// The signaling crate owns task observation; the daemon owns the exact
+/// provider lease and releases it only after the server closes that owner.
+struct ScopedSignalingCustodian {
+    inner: Arc<DedicatedTaskCustodian>,
+    _lease: ResourceLease,
+}
+
+impl TaskCustodian for ScopedSignalingCustodian {
+    fn reserve(
+        &self,
+        slots: usize,
+    ) -> std::result::Result<Box<dyn TaskReservation>, TaskCustodyError> {
+        self.inner.reserve(slots)
+    }
+
+    fn progress(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.progress()
+    }
+
+    fn close(&self) {
+        self.inner.close();
+    }
+}
+
+fn make_signaling_custodian(
+    scope: &myownmesh_core::LocalApplicationResourceScope,
+    limits: &myownmesh_signaling::server::Limits,
+) -> std::result::Result<Arc<dyn TaskCustodian>, String> {
+    let slots = SignalingServer::required_task_custody_slots(limits)
+        .map_err(|error| format!("signaling custody sizing: {error}"))?;
+    let slots = u64::try_from(slots)
+        .map_err(|_| "signaling custody sizing exceeds provider range".to_string())?;
+    let lease = scope
+        .acquire(ResourceClaim::single(ResourceClass::WorkerOrTask, slots))
+        .map_err(|error| format!("signaling custody resource scope: {error}"))?;
+    let inner = DedicatedTaskCustodian::new(
+        usize::try_from(slots)
+            .map_err(|_| "signaling custody sizing exceeds platform range".to_string())?,
+    )
+    .map_err(|error| format!("signaling task custodian: {error:?}"))?;
+    Ok(Arc::new(ScopedSignalingCustodian {
+        inner,
+        _lease: lease,
+    }))
 }
 
 /// Status snapshot for the control protocol / CLI / GUI.
@@ -109,6 +180,22 @@ struct CapturedEndpoint {
     activity: Option<RelayStatsSnapshot>,
 }
 
+/// Release the conflicting TURN listener before a standalone STUN bind.
+/// Taking the handle first preserves the manager's retry intent even when the
+/// close reports an error, while the awaited stop keeps actual-port ownership
+/// ordering deterministic.
+async fn stop_turn_before_standalone_stun(
+    turn: &mut Option<TurnServerHandle>,
+    failures: &mut Vec<String>,
+) {
+    if let Some(handle) = turn.take() {
+        if let Err(error) = handle.stop().await {
+            warn!("TURN service failed to stop before standalone STUN: {error}");
+            failures.push(format!("turn stop: {error}"));
+        }
+    }
+}
+
 pub(crate) struct FundedServicesStatus {
     report: ServicesReport,
     config: ServicesConfig,
@@ -157,13 +244,10 @@ impl Serialize for SocketDisplay {
     }
 }
 
-// There is no member-payload-relay report.
-//
-// It carried `enabled`, a relayed-network count, and a fanout ceiling for a
-// service an ordinary member could host to forward other members' application
-// payload. Nothing publishes it now: the configuration key, the runtime, the
-// service role, and the advert field are all gone, so a status field would be a
-// permanent `false` describing a service the daemon has no way to run.
+// The hosted-services report contains node participation plus signaling relay,
+// STUN, and TURN endpoint state. It has no separate application-payload relay
+// field because that capability is outside this namespace and has no daemon
+// runtime or configuration entry.
 
 impl ServiceManager {
     /// Validate a service configuration against this daemon incarnation.
@@ -195,26 +279,60 @@ impl ServiceManager {
         })
     }
 
-    /// Reconcile running services against `desired`. Starts newly-enabled
-    /// or reconfigured services, stops disabled ones, and refreshes capability
-    /// adverts. Returns the resulting status. Per-service start failures
-    /// are logged, not propagated.
+    /// Reconcile running services against `desired`. Starts newly-enabled or
+    /// reconfigured services, stops disabled ones, and refreshes capability
+    /// adverts. Returns the resulting status only when every attempted
+    /// transition was observed successfully. The desired config is retained
+    /// as restart intent when a transition fails, so a later apply can retry
+    /// the missing runtime object.
     pub async fn apply(
         &self,
         desired: ServicesConfig,
     ) -> Result<ServicesReport, ServicePolicyError> {
         self.validate_config_for_runtime(&desired)?;
         let mut g = self.state.lock().await;
+        let mut failures = Vec::new();
 
         // ---- Node participation ----
-        // Toggling node membership joins or leaves every configured network.
-        if g.config.node.enabled && !desired.node.enabled {
+        // Use the registry as the live truth. The desired config is retained
+        // below as restart intent, so keying this branch off g.config would
+        // suppress retries after a partial join.
+        if !desired.node.enabled && self.registry.joined_count() != 0 {
             info!("node participation disabled — leaving all networks (pure-infra mode)");
-            leave_all(&self.registry).await;
-        } else if !g.config.node.enabled && desired.node.enabled {
+            if let Err(error) = leave_all(&self.registry).await {
+                failures.push(format!("network leave: {error}"));
+            }
+        } else if desired.node.enabled {
             info!("node participation enabled — joining configured networks");
-            join_configured(&self.mesh, &self.registry).await;
+            if let Err(error) = join_configured(&self.mesh, &self.registry).await {
+                failures.push(format!("network join: {error}"));
+            }
         }
+
+        // STUN/TURN service custody is funded by the owner-selected local
+        // application scope, not by a service-global provider. Acquire the
+        // scope before either listener starts (including a retry or
+        // reconfigure); each constructor consumes its clone and retains its
+        // own startup lease until its terminal shutdown path.
+        let run_standalone_stun = desired.stun.enabled && !desired.turn.enabled;
+        let needs_service_scope = (desired.signaling.enabled
+            && (g.signaling.is_none() || g.config.signaling != desired.signaling))
+            || (run_standalone_stun
+                && (g.stun.is_none()
+                    || g.config.stun != desired.stun
+                    || g.config.turn != desired.turn))
+            || (desired.turn.enabled && (g.turn.is_none() || g.config.turn != desired.turn));
+        let service_scope = if needs_service_scope {
+            match self.mesh.local_application_resource_scope() {
+                Ok(scope) => Some(scope),
+                Err(error) => {
+                    failures.push(format!("service resource scope: {error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // ---- STUN ----
         // A TURN server already answers STUN Binding requests on its own
@@ -224,18 +342,26 @@ impl ServiceManager {
         // into TURN: skip the standalone listener entirely (no warning),
         // and report STUN as served-by-TURN rather than a failed start.
         // Turn STUN back on by itself the moment TURN is disabled.
-        let run_standalone_stun = desired.stun.enabled && !desired.turn.enabled;
         if g.stun.is_some() != run_standalone_stun
             || g.config.stun != desired.stun
             || g.config.turn != desired.turn
         {
             if let Some(h) = g.stun.take() {
-                h.stop();
+                if let Err(error) = h.stop_and_wait().await {
+                    warn!("STUN service failed to stop during reconfiguration: {error}");
+                    failures.push(format!("stun stop: {error}"));
+                }
             }
             if run_standalone_stun {
-                match StunServer::start(&desired.stun).await {
-                    Ok(h) => g.stun = Some(h),
-                    Err(e) => warn!("STUN service failed to start: {e}"),
+                stop_turn_before_standalone_stun(&mut g.turn, &mut failures).await;
+                if let Some(scope) = service_scope.clone() {
+                    match StunServer::start_with_resource_scope(&desired.stun, scope).await {
+                        Ok(h) => g.stun = Some(h),
+                        Err(e) => {
+                            warn!("STUN service failed to start: {e}");
+                            failures.push(format!("stun start: {e}"));
+                        }
+                    }
                 }
             } else if desired.stun.enabled && desired.turn.enabled {
                 info!(
@@ -248,12 +374,20 @@ impl ServiceManager {
         // ---- TURN ----
         if g.turn.is_some() != desired.turn.enabled || g.config.turn != desired.turn {
             if let Some(h) = g.turn.take() {
-                let _ = h.stop().await;
+                if let Err(error) = h.stop().await {
+                    warn!("TURN service failed to stop during reconfiguration: {error}");
+                    failures.push(format!("turn stop: {error}"));
+                }
             }
             if desired.turn.enabled {
-                match TurnServer::start(&desired.turn).await {
-                    Ok(h) => g.turn = Some(h),
-                    Err(e) => warn!("TURN service failed to start: {e}"),
+                if let Some(scope) = service_scope.clone() {
+                    match TurnServer::start_with_resource_scope(&desired.turn, scope).await {
+                        Ok(h) => g.turn = Some(h),
+                        Err(e) => {
+                            warn!("TURN service failed to start: {e}");
+                            failures.push(format!("turn start: {e}"));
+                        }
+                    }
                 }
             }
         }
@@ -263,24 +397,43 @@ impl ServiceManager {
             || g.config.signaling != desired.signaling
         {
             if let Some(h) = g.signaling.take() {
-                h.stop();
+                if let Err(error) = h.stop_and_wait().await {
+                    warn!("signaling service failed to stop during reconfiguration: {error}");
+                    failures.push(format!("signaling stop: {error}"));
+                }
             }
             if desired.signaling.enabled {
-                match SignalingServer::start(
-                    &desired.signaling.bind,
-                    desired.signaling.port,
-                    desired.signaling.limits.clone(),
-                )
-                .await
-                {
-                    Ok(h) => g.signaling = Some(h),
-                    Err(e) => warn!("signaling service failed to start: {e}"),
+                if let Some(scope) = service_scope.clone() {
+                    match make_signaling_custodian(&scope, &desired.signaling.limits) {
+                        Ok(custodian) => {
+                            match SignalingServer::start_with_custodian(
+                                &desired.signaling.bind,
+                                desired.signaling.port,
+                                desired.signaling.limits.clone(),
+                                custodian,
+                            )
+                            .await
+                            {
+                                Ok(h) => g.signaling = Some(h),
+                                Err(error) => {
+                                    warn!("signaling service failed to start: {error}");
+                                    failures.push(format!("signaling start: {error}"));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!("signaling service custody failed: {error}");
+                            failures.push(format!("signaling start: {error}"));
+                        }
+                    }
+                } else {
+                    failures.push("signaling start: service resource scope unavailable".into());
                 }
             }
         }
 
         g.config = desired;
-        self.refresh_adverts_locked(&g);
+        failures.extend(self.refresh_adverts_locked(&g));
         let joined = self.registry.joined_count();
         info!(
             node = g.config.node.enabled,
@@ -290,22 +443,32 @@ impl ServiceManager {
             signaling = g.signaling.is_some(),
             "services reconciled"
         );
-        Ok(g.report(joined))
+        let report = g.report(joined);
+        if failures.is_empty() {
+            Ok(report)
+        } else {
+            Err(ServicePolicyError::Reconciliation(failures.join("; ")))
+        }
     }
 
     /// Snapshot the current service status without changing anything.
+    #[cfg(test)]
     pub async fn status(&self) -> ServicesReport {
         self.status_source().await.build_report()
     }
 
     /// The currently-applied config (for persistence round-trips).
+    #[cfg(test)]
     pub async fn current_config(&self) -> ServicesConfig {
         self.state.lock().await.config.clone()
     }
 
     pub(crate) async fn status_source(&self) -> ServicesStatusSource<'_> {
-        let joined = self.registry.joined_count();
         let state = self.state.lock().await;
+        // Keep the same state -> registry order as apply.  Sampling the
+        // registry first could pair a new joined count with the previous
+        // service configuration while an apply is in flight.
+        let joined = self.registry.joined_count();
         let captured = state.capture(joined);
         ServicesStatusSource { state, captured }
     }
@@ -313,14 +476,20 @@ impl ServiceManager {
     /// Hook for when a network joins after services were applied: push the
     /// current advert onto it.
     ///
-    /// Nothing per-network is started here any more. The two owners this hook
-    /// used to bind — a routing facade and a plain-envelope member relay — were
-    /// the only per-network service runtimes, and both are gone; the surviving
-    /// services (signaling, STUN, TURN) are device-wide listeners.
-    pub async fn on_network_added(&self, config_id: &str) {
-        let _ = config_id;
+    /// Nothing per-network is started here. The hosted signaling relay, STUN,
+    /// and TURN services are device-wide listeners; this hook only refreshes
+    /// their advertised roles on the newly joined network.
+    pub async fn on_network_added(&self, config_id: &str) -> Result<(), String> {
         let g = self.state.lock().await;
-        self.refresh_adverts_locked(&g);
+        let failures = self.refresh_adverts_locked(&g);
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "service advert refresh for {config_id} failed: {}",
+                failures.join("; ")
+            ))
+        }
     }
 
     /// Hook for when a network leaves. No per-network service runtime exists to
@@ -330,23 +499,72 @@ impl ServiceManager {
     }
 
     /// Stop every running service. Called on daemon shutdown.
-    pub async fn shutdown(&self) {
+    ///
+    /// All owned handles are consumed and awaited before returning. A failure
+    /// is retained as a typed terminal result instead of being discarded as
+    /// if the service had stopped cleanly.
+    pub async fn shutdown(&self) -> Result<(), ServiceShutdownError> {
         let mut g = self.state.lock().await;
+        let mut failures = Vec::new();
         if let Some(h) = g.stun.take() {
-            h.stop();
+            if let Err(error) = h.stop_and_wait().await {
+                warn!("STUN service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "stun",
+                    error: error.to_string(),
+                });
+            }
         }
         if let Some(h) = g.signaling.take() {
-            h.stop();
+            if let Err(error) = h.stop_and_wait().await {
+                warn!("signaling service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "signaling",
+                    error: error.to_string(),
+                });
+            }
         }
         if let Some(h) = g.turn.take() {
-            let _ = h.stop().await;
+            if let Err(error) = h.stop().await {
+                warn!("TURN service failed to stop: {error}");
+                failures.push(ServiceShutdownFailure {
+                    service: "turn",
+                    error: error.to_string(),
+                });
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ServiceShutdownError { failures })
         }
     }
 
     /// Push the service-role capability advert to every joined network so
     /// peers see what this device hosts.
-    fn refresh_adverts_locked(&self, g: &ManagerState) {
-        let advert = build_capability_advert(&g.config);
+    fn refresh_adverts_locked(&self, g: &ManagerState) -> Vec<String> {
+        let advert = build_capability_advert(
+            &g.config,
+            RunningServicePorts {
+                signaling: g
+                    .signaling
+                    .as_ref()
+                    .map(|handle| handle.local_addr().port()),
+                stun: g
+                    .stun
+                    .as_ref()
+                    .map(|handle| handle.local_addr().port())
+                    .or_else(|| {
+                        if g.turn.is_some() && g.config.stun.enabled && g.config.turn.enabled {
+                            g.turn.as_ref().map(|handle| handle.local_addr().port())
+                        } else {
+                            None
+                        }
+                    }),
+                turn: g.turn.as_ref().map(|handle| handle.local_addr().port()),
+            },
+        );
+        let mut failures = Vec::new();
         for summary in self.registry.summaries() {
             if let Some(joined) = self.registry.get(&summary.config_id) {
                 // Reported per network and never aborts the sweep: the refusals
@@ -362,6 +580,7 @@ impl ServiceManager {
                         "service-role advert was refused; this network still \
                          publishes its previous roles: {error}"
                     );
+                    failures.push(format!("network {} advert: {error}", summary.config_id));
                 }
             }
         }
@@ -369,6 +588,7 @@ impl ServiceManager {
         // where no networks are joined yet; keeps the handle around for
         // future per-device advert needs.
         let _ = &self.mesh;
+        failures
     }
 }
 
@@ -451,15 +671,14 @@ impl ServicesStatusSource<'_> {
     pub(crate) fn typed_claim(
         &self,
     ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<(ServicesReport, ServicesConfig)>(
-            &self.view(),
-        )
+        serialized_typed_claim::<(ServicesReport, ServicesConfig)>(&self.view())
     }
 
     pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
         services_status_line_ceiling(&self.view())
     }
 
+    #[cfg(test)]
     fn build_report(&self) -> ServicesReport {
         self.captured.build()
     }
@@ -487,6 +706,44 @@ impl ServicesStatusSource<'_> {
             _retention: retention,
         })
     }
+}
+
+fn serialized_typed_claim<T>(
+    value: &impl serde::Serialize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let (retained, queued, allocations) = myownmesh_core::mailbox_measure_serialized(value)?;
+    let fixed = std::mem::size_of::<T>().checked_add(retained).ok_or(
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let fixed = u64::try_from(fixed).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let queued = u64::try_from(queued).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::QueuedBytes,
+        }
+    })?;
+    let allocations = u64::try_from(allocations)
+        .map_err(|_| myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?
+        .checked_add(1)
+        .ok_or(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?;
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (myownmesh_core::ResourceClass::AccountedMemoryBytes, fixed),
+        (myownmesh_core::ResourceClass::QueuedBytes, queued),
+        (myownmesh_core::ResourceClass::ParsingOrCpuWork, queued),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            allocations,
+        ),
+    ])?)
 }
 
 fn services_status_line_ceiling(
@@ -523,24 +780,32 @@ impl CapturedServicesReport {
     }
 }
 
-/// Build the capability advert describing the services this device
-/// hosts. Role tags are always set for enabled services so peers can
-/// discover the host; concrete endpoint URLs are added only when a
-/// public address is known (we use the TURN `public_ip` as the host
-/// hint, since an operator who set it has declared the device's routable
-/// address).
-fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
-    // Every role a device can advertise is here. There is no member-relay tag
-    // because there is no such role to offer — see
-    // `no_service_configuration_can_advertise_a_member_payload_relay`.
+/// Build the capability advert describing the services this device actually
+/// hosts. Role tags and endpoint URLs are derived from observed running
+/// handles, not desired enablement; the TURN `public_ip` remains only the
+/// configured host hint for those live endpoints.
+#[derive(Clone, Copy)]
+struct RunningServicePorts {
+    signaling: Option<u16>,
+    stun: Option<u16>,
+    turn: Option<u16>,
+}
+
+fn build_capability_advert(
+    config: &ServicesConfig,
+    running: RunningServicePorts,
+) -> CapabilityAdvert {
+    // Every hosted service role is emitted here. The signaling relay is the
+    // only relay role in this advert namespace; application-payload relay is
+    // not a hosted service role.
     let mut tags = Vec::new();
-    if config.signaling.enabled {
+    if running.signaling.is_some() {
         tags.push(ServiceRole::Signaling.tag().to_string());
     }
-    if config.stun.enabled {
+    if running.stun.is_some() {
         tags.push(ServiceRole::Stun.tag().to_string());
     }
-    if config.turn.enabled {
+    if running.turn.is_some() {
         tags.push(ServiceRole::Turn.tag().to_string());
     }
 
@@ -554,14 +819,14 @@ fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
     };
     let mut advert = ServiceAdvert::default();
     if let Some(host) = host {
-        if config.signaling.enabled {
-            advert.signaling_url = Some(format!("ws://{host}:{}", config.signaling.port));
+        if let Some(port) = running.signaling {
+            advert.signaling_url = Some(format!("ws://{host}:{port}"));
         }
-        if config.stun.enabled {
-            advert.stun_url = Some(format!("stun:{host}:{}", config.stun.port));
+        if let Some(port) = running.stun {
+            advert.stun_url = Some(format!("stun:{host}:{port}"));
         }
-        if config.turn.enabled {
-            advert.turn_url = Some(format!("turn:{host}:{}", config.turn.port));
+        if let Some(port) = running.turn {
+            advert.turn_url = Some(format!("turn:{host}:{port}"));
         }
     }
 
@@ -575,18 +840,25 @@ fn build_capability_advert(config: &ServicesConfig) -> CapabilityAdvert {
     }
 }
 
-/// Join one configured network: bring it up on the mesh, attach the
-/// Nostr signaling driver, and register it. Skips networks already in the
-/// registry. Shared by daemon startup and the node-enable transition so
-/// there's a single join path. Best-effort — a failed join is logged, not
-/// fatal.
-pub(crate) async fn join_network(
+/// Checked join path used by live service reconciliation. Every failure is
+/// returned after any partially-created network and driver have been shut
+/// down, so callers can distinguish a completed node transition from a
+/// desired-but-not-yet-joined restart intent.
+async fn join_network_checked(
     mesh: &MeshHandle,
     registry: &NetworkRegistry,
     cfg: NetworkConfig,
-) {
-    if registry.contains(&cfg.id) || registry.contains(&cfg.network_id) {
-        return;
+) -> Result<(), String> {
+    match registry.classify_join(&cfg.id, &cfg.network_id) {
+        crate::registry::JoinAdmission::Existing(_) => return Ok(()),
+        crate::registry::JoinAdmission::Collision(state) => {
+            return Err(format!(
+                "network identity collision: requested pair ({}, {}), \
+                 existing owner is in {state:?} state",
+                cfg.id, cfg.network_id,
+            ));
+        }
+        crate::registry::JoinAdmission::Empty => {}
     }
     match mesh.join(cfg.clone()).await {
         Ok(joined) => {
@@ -595,13 +867,9 @@ pub(crate) async fn join_network(
             // not attach is unreachable, so it is taken back down rather than
             // registered — the same disposal the id-refusal path below performs
             // — instead of being left running as a network nothing can signal
-            // through. This stays best-effort per this function's contract:
-            // neither caller (daemon startup, the node-enable transition) has
-            // anywhere to return a per-network failure to.
-            let attached = {
-                let net_state = joined.state();
-                myownmesh_core::engine::attach_signaling(&net_state)
-            };
+            // through. The startup wrapper below remains best-effort, but
+            // live apply uses this checked path and receives the refusal.
+            let attached = joined.attach_signaling();
             let drivers = match attached {
                 Ok(drivers) => drivers,
                 Err(error) => {
@@ -612,7 +880,7 @@ pub(crate) async fn join_network(
                             "network with no signaling failed to shut down: {e:#}"
                         );
                     }
-                    return;
+                    return Err(format!("signaling attach: {error}"));
                 }
             };
             if drivers.is_none() {
@@ -621,6 +889,16 @@ pub(crate) async fn join_network(
                     "signaling outbound receiver was already taken — \
                      this network keeps no driver handle"
                 );
+                if let Err(error) = joined.shutdown().await {
+                    warn!(
+                        network = %cfg.network_id,
+                        "network with no signaling failed to shut down: {error:#}"
+                    );
+                    return Err(format!(
+                        "signaling receiver unavailable; shutdown failed: {error:#}"
+                    ));
+                }
+                return Err("signaling outbound receiver unavailable".to_string());
             }
             // The `contains` check above is advisory — it is a separate lock
             // acquisition from the insert, so a join racing a removal or
@@ -634,46 +912,77 @@ pub(crate) async fn join_network(
                     state = ?refused.state,
                     "join refused: that id is held by a runtime that has not stopped"
                 );
-                drop(refused.drivers);
+                if let Some(drivers) = refused.drivers {
+                    drivers.shutdown().await;
+                }
                 if let Err(e) = refused.joined.shutdown().await {
                     warn!(network = %cfg.network_id, "refused join failed to shut down: {e:#}");
                 }
-                return;
+                return Err(format!("registry refused join: {:?}", refused.state));
             }
             info!(network = %cfg.network_id, "joined network");
+            Ok(())
         }
-        Err(e) => warn!(network = %cfg.network_id, "join failed: {e:#}"),
+        Err(e) => {
+            warn!(network = %cfg.network_id, "join failed: {e:#}");
+            Err(format!("mesh join: {e:#}"))
+        }
+    }
+}
+
+/// Join the exact network list selected by a startup owner or a live
+/// reconciliation. Every attempted entry is checked and all refusals are
+/// returned together, so startup cannot silently continue with a partial
+/// authenticated mesh.
+pub(crate) async fn join_networks_checked(
+    mesh: &MeshHandle,
+    registry: &NetworkRegistry,
+    networks: &[NetworkConfig],
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for network_config in networks {
+        let network = network_config.network_id.clone();
+        if let Err(error) = join_network_checked(mesh, registry, network_config.clone()).await {
+            failures.push(format!("{network}: {error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
 /// Join every network in the on-disk config — the node-enable transition.
-async fn join_configured(mesh: &MeshHandle, registry: &NetworkRegistry) {
+async fn join_configured(mesh: &MeshHandle, registry: &NetworkRegistry) -> Result<(), String> {
     let cfg = match MeshConfig::load() {
         Ok(c) => c,
         Err(e) => {
             warn!("load config for node join: {e}");
-            return;
+            return Err(format!("load config: {e}"));
         }
     };
-    for net in cfg.networks {
-        join_network(mesh, registry, net).await;
-    }
+    join_networks_checked(mesh, registry, &cfg.networks).await
 }
 
 /// Leave every joined network — the node-disable transition.
-async fn leave_all(registry: &NetworkRegistry) {
-    // Announce a graceful departure first so peers drop our sessions now
-    // instead of waiting out their heartbeat timeout (~90 s) — without it,
-    // disabling the node leaves us showing online-but-unconnectable on every
-    // peer for over a minute.
-    registry.announce_all_departures().await;
-    // Every distinct network, none skipped. This is the node-disable
-    // transition, so a network the previous drain could not take sole
-    // ownership of stayed running while the node reported itself disabled.
-    for outcome in registry.shutdown_all().await {
+async fn leave_all(registry: &NetworkRegistry) -> Result<(), String> {
+    // Start authenticated departures and teardown together. A silent peer's
+    // departure waiter is resolved by shutdown; awaiting announcements first
+    // would prevent that cancellation from ever being requested. The carrier
+    // hint remains part of each departure future.
+    // Every distinct network is included; teardown reports each failure.
+    let mut failures = Vec::new();
+    for outcome in registry.shutdown_all_with_departures().await {
         if let Err(e) = outcome {
             warn!("network shutdown failed: {e}");
+            failures.push(e);
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -682,12 +991,23 @@ mod tests {
     use super::*;
     use myownmesh_core::services::ServiceAdvert;
 
+    fn advert_for_config(config: &ServicesConfig) -> CapabilityAdvert {
+        build_capability_advert(
+            config,
+            RunningServicePorts {
+                signaling: config.signaling.enabled.then_some(config.signaling.port),
+                stun: config.stun.enabled.then_some(config.stun.port),
+                turn: config.turn.enabled.then_some(config.turn.port),
+            },
+        )
+    }
+
     #[test]
     fn advert_tags_track_enabled_services() {
         let mut cfg = ServicesConfig::default();
         cfg.signaling.enabled = true;
         cfg.turn.enabled = true;
-        let advert = build_capability_advert(&cfg);
+        let advert = advert_for_config(&cfg);
         assert!(advert.tags.contains(&"service:signaling".to_string()));
         assert!(advert.tags.contains(&"service:turn".to_string()));
         assert!(!advert.tags.contains(&"service:stun".to_string()));
@@ -699,7 +1019,7 @@ mod tests {
         cfg.signaling.enabled = true;
         cfg.turn.enabled = true;
         cfg.turn.public_ip = "203.0.113.9".into();
-        let advert = build_capability_advert(&cfg);
+        let advert = advert_for_config(&cfg);
         let svc = ServiceAdvert::from_extra(&advert.extra).unwrap();
         assert_eq!(
             svc.signaling_url.as_deref(),
@@ -712,27 +1032,21 @@ mod tests {
     fn advert_without_public_ip_has_tags_but_no_urls() {
         let mut cfg = ServicesConfig::default();
         cfg.signaling.enabled = true;
-        let advert = build_capability_advert(&cfg);
+        let advert = advert_for_config(&cfg);
         // Role tag present...
         assert!(advert.tags.contains(&"service:signaling".to_string()));
         // ...but no URL since we don't know a reachable host.
         assert_eq!(ServiceAdvert::from_extra(&advert.extra), None);
     }
 
-    /// No service configuration reaches a member payload relay.
+    /// Hosted-service adverts contain only the configured infrastructure roles.
+    /// The signaling relay is advertised as `service:signaling`; no separate
+    /// application-payload relay role exists in this namespace.
     ///
-    /// This used to be a refusal: a config could ask for `relay.enabled` and
-    /// the daemon answered with an error. The key is now gone from
-    /// `ServicesConfig`, so the stronger claim is available and is what this
-    /// asserts — with *every* service a device can host turned on, nothing the
-    /// daemon offers peers names a payload relay. A peer reading this advert
-    /// has no way to select this device as a hop for another member's data.
-    ///
-    /// Non-vacuous by construction: the same advert must carry the three roles
-    /// that do exist, so a build that stopped advertising anything at all fails
-    /// here rather than passing as "no relay".
+    /// Non-vacuous by construction: the advert must carry all three roles that
+    /// do exist, so a build that stopped advertising services fails here.
     #[test]
-    fn no_service_configuration_can_advertise_a_member_payload_relay() {
+    fn hosted_service_advertises_only_infrastructure_roles() {
         let mut cfg = ServicesConfig::default();
         cfg.node.enabled = true;
         cfg.signaling.enabled = true;
@@ -740,7 +1054,7 @@ mod tests {
         cfg.turn.enabled = true;
         cfg.turn.public_ip = "203.0.113.9".into();
 
-        let advert = build_capability_advert(&cfg);
+        let advert = advert_for_config(&cfg);
         assert_eq!(
             advert.tags,
             vec![
@@ -750,11 +1064,63 @@ mod tests {
             ],
             "the roles a device can host are exactly these three"
         );
-        let published = serde_json::to_string(&advert).expect("advert serializes");
-        assert!(
-            !published.contains("relay"),
-            "nothing published to peers may name a relay: {published}"
+    }
+
+    #[test]
+    fn failed_hosted_service_is_not_advertised_from_desired_config() {
+        let mut cfg = ServicesConfig::default();
+        cfg.signaling.enabled = true;
+        cfg.stun.enabled = true;
+        cfg.turn.enabled = true;
+        cfg.turn.public_ip = "203.0.113.9".into();
+
+        let advert = build_capability_advert(
+            &cfg,
+            RunningServicePorts {
+                signaling: Some(cfg.signaling.port),
+                stun: None,
+                turn: None,
+            },
         );
+        assert_eq!(advert.tags, vec!["service:signaling".to_string()]);
+        let hosted = ServiceAdvert::from_extra(&advert.extra)
+            .expect("the running signaling service keeps its endpoint advert");
+        let expected_signaling = format!("ws://203.0.113.9:{}", cfg.signaling.port);
+        assert_eq!(hosted.stun_url, None);
+        assert_eq!(hosted.turn_url, None);
+        assert_eq!(
+            hosted.signaling_url.as_deref(),
+            Some(expected_signaling.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn status_waits_for_paused_apply_state_before_snapshot() {
+        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+            crate::test_resource_provider(),
+        )
+        .await
+        .expect("open infrastructure-only mesh");
+        let manager = ServiceManager::new(mesh, NetworkRegistry::new());
+
+        // `apply` and status_source share this state gate. Holding it models
+        // an apply paused before its registry snapshot: status must not
+        // publish a report until the same gate is released.
+        let apply_state = manager.state.lock().await;
+        let mut pending_status = Box::pin(manager.status_source());
+        tokio::select! {
+            biased;
+            _ = &mut pending_status => {
+                panic!("status crossed the paused apply state gate");
+            }
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(apply_state);
+        let source = pending_status.await;
+        assert_eq!(source.captured.joined, manager.registry.joined_count());
     }
 
     #[tokio::test]
@@ -785,19 +1151,288 @@ mod tests {
         assert!(!manager.current_config().await.node.enabled);
     }
 
-    /// A running daemon reports no member payload relay authority.
-    ///
-    /// The refusal this replaces asked the manager to enable `relay` and
-    /// checked the error. That request is now unrepresentable, so what is left
-    /// to prove is the other half: a live manager's published status describes
-    /// no relay it could be asked about. A client cannot read a relay state off
-    /// this daemon, because it has none to report.
+    #[tokio::test]
+    async fn hosted_start_refusal_is_reported_and_retried_without_losing_successful_owner() {
+        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+            crate::test_resource_provider(),
+        )
+        .await
+        .expect("open infrastructure-only mesh");
+        let manager = ServiceManager::new(mesh, NetworkRegistry::new());
+
+        let mut desired = ServicesConfig::default();
+        desired.node.enabled = false;
+        desired.signaling.enabled = true;
+        desired.signaling.port = 0;
+        desired.turn.enabled = true;
+        desired.turn.bind = "not-an-ip".to_string();
+        let error = manager
+            .apply(desired.clone())
+            .await
+            .expect_err("a refused TURN start must not report success");
+        assert!(
+            error.to_string().contains("turn start"),
+            "the reconciliation identifies the refused service: {error}"
+        );
+        let status = manager.status().await;
+        assert!(status.signaling.enabled && status.signaling.running);
+        assert!(status.turn.enabled && !status.turn.running);
+
+        // The desired config remains the restart intent. Fixing only the
+        // refused field must retry TURN while retaining the already-running
+        // signaling owner rather than silently skipping either transition.
+        desired.turn.bind = "127.0.0.1".to_string();
+        let status = manager
+            .apply(desired)
+            .await
+            .expect("the same desired config retries the missing owner");
+        assert!(status.signaling.running && status.turn.running);
+        manager
+            .shutdown()
+            .await
+            .expect("successful owners are all consumed by shutdown");
+    }
+
+    /// The manager owns the TURN/STUN hand-off as one transaction: the exact
+    /// TURN control port is released and observed terminal before standalone
+    /// STUN can bind it.  The second half deliberately leaves only one worker
+    /// slot available after TURN stops, so the first STUN admission is a real
+    /// provider refusal; dropping that lease makes the retained desired config
+    /// a successful retry. The control runs its provider-owning body in an
+    /// exact-name child test process, because the daemon test provider is
+    /// process-global and cannot be replaced after another mesh opens.
+    #[tokio::test]
+    async fn manager_turn_to_stun_releases_port_and_retries_after_underfunding() {
+        use std::net::SocketAddr;
+
+        if std::env::var_os("MYOWNMESH_ISOLATED_MANAGER_CONTROL").is_none() {
+            let executable = std::env::current_exe().expect("the test executable is available");
+            let status = std::process::Command::new(executable)
+                .args([
+                    "--exact",
+                    "services::tests::manager_turn_to_stun_releases_port_and_retries_after_underfunding",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("MYOWNMESH_ISOLATED_MANAGER_CONTROL", "1")
+                .status()
+                .expect("the isolated manager control can start its child test");
+            assert!(
+                status.success(),
+                "the isolated manager control child failed: {status}"
+            );
+            return;
+        }
+
+        let provider_grant = myownmesh_core::ResourceClaim::try_from_entries(
+            myownmesh_core::ResourceClass::ALL
+                .into_iter()
+                .map(|class| (class, 1_000_000)),
+        )
+        .expect("the isolated manager fixture grant is representable");
+        let provider = myownmesh_core::FiniteResourceProvider::new(provider_grant);
+        let resources = myownmesh_core::ResourceProviderPort::new(provider.clone())
+            .expect("the isolated manager fixture funds its process scope");
+        let identity = Arc::new(myownmesh_core::Identity::ephemeral());
+        let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
+            MeshConfig::default(),
+            identity,
+            resources,
+        )
+        .await
+        .expect("open infrastructure-only mesh");
+        let baseline = provider.in_use();
+        let manager = ServiceManager::new(mesh.clone(), NetworkRegistry::new());
+
+        let mut turn = ServicesConfig::default();
+        turn.node.enabled = false;
+        turn.turn.enabled = true;
+        turn.turn.bind = "127.0.0.1".into();
+        turn.turn.port = 0;
+        turn.turn.public_ip = "127.0.0.1".into();
+        manager
+            .apply(turn.clone())
+            .await
+            .expect("TURN binds its ephemeral control port");
+        let turn_status = manager.status().await;
+        let turn_port = turn_status
+            .turn
+            .listen
+            .as_deref()
+            .and_then(|listen| listen.parse::<SocketAddr>().ok())
+            .expect("TURN reports its actual control port")
+            .port();
+        assert!(turn_status.turn.running);
+        let turn_live = provider.in_use();
+        let turn_delta = turn_live
+            .checked_sub(baseline)
+            .expect("TURN live accounting is above the baseline");
+        assert!(
+            turn_delta != myownmesh_core::ResourceClaim::ZERO,
+            "TURN owns a nonzero live provider delta"
+        );
+
+        let mut stun = turn.clone();
+        stun.turn.enabled = false;
+        stun.stun.enabled = true;
+        stun.stun.bind = "127.0.0.1".into();
+        stun.stun.port = turn_port;
+        manager
+            .apply(stun.clone())
+            .await
+            .expect("the exact port hand-off binds STUN after TURN terminal");
+        let handoff = manager.status().await;
+        assert!(
+            !handoff.turn.running,
+            "TURN is terminal before the STUN bind"
+        );
+        assert!(handoff.stun.running);
+        assert_eq!(
+            handoff
+                .stun
+                .listen
+                .as_deref()
+                .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                .expect("STUN reports its live listener")
+                .port(),
+            turn_port,
+            "the STUN listener owns the exact former TURN port"
+        );
+        let stun_live = provider.in_use();
+        let stun_delta = stun_live
+            .checked_sub(baseline)
+            .expect("STUN live accounting is above the baseline");
+        assert!(
+            stun_delta != myownmesh_core::ResourceClaim::ZERO,
+            "STUN owns a nonzero live provider delta"
+        );
+        assert_eq!(
+            turn_delta.amount(myownmesh_core::ResourceClass::SocketOrHandle),
+            stun_delta.amount(myownmesh_core::ResourceClass::SocketOrHandle),
+            "both services own one control socket"
+        );
+        assert_eq!(
+            turn_delta.amount(myownmesh_core::ResourceClass::WorkerOrTask),
+            stun_delta.amount(myownmesh_core::ResourceClass::WorkerOrTask) + 2,
+            "the TURN-only worker ownership is released before STUN admission"
+        );
+
+        let live_stun_port = handoff
+            .stun
+            .listen
+            .as_deref()
+            .and_then(|listen| listen.parse::<SocketAddr>().ok())
+            .expect("the running STUN endpoint is parseable")
+            .port();
+        let advert = build_capability_advert(
+            &stun,
+            RunningServicePorts {
+                signaling: None,
+                stun: Some(live_stun_port),
+                turn: None,
+            },
+        );
+        assert!(advert.tags.contains(&"service:stun".to_string()));
+        let hosted = ServiceAdvert::from_extra(&advert.extra)
+            .expect("the live STUN endpoint produces an advert");
+        assert_eq!(
+            hosted.stun_url.as_deref(),
+            Some(format!("stun:127.0.0.1:{live_stun_port}").as_str())
+        );
+
+        manager
+            .shutdown()
+            .await
+            .expect("first hand-off shuts down cleanly");
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the first transition returns the provider to its baseline"
+        );
+
+        manager
+            .apply(turn.clone())
+            .await
+            .expect("TURN restarts for the underfunded retry arm");
+        let retry_turn_port = manager
+            .status()
+            .await
+            .turn
+            .listen
+            .as_deref()
+            .and_then(|listen| listen.parse::<SocketAddr>().ok())
+            .expect("the retry TURN listener reports its port")
+            .port();
+        let held_scope = manager
+            .mesh
+            .local_application_resource_scope()
+            .expect("the underfunding lease gets an owner scope");
+        let available_workers = provider_grant
+            .checked_sub(provider.in_use())
+            .expect("the provider remains within its grant")
+            .amount(myownmesh_core::ResourceClass::WorkerOrTask);
+        let held_workers = available_workers
+            .checked_sub(1)
+            .expect("TURN leaves more than one worker slot available");
+        let held_lease = held_scope
+            .acquire(myownmesh_core::ResourceClaim::single(
+                myownmesh_core::ResourceClass::WorkerOrTask,
+                held_workers,
+            ))
+            .expect("the fixture can hold all but one worker slot");
+
+        let mut underfunded_stun = turn;
+        underfunded_stun.turn.enabled = false;
+        underfunded_stun.stun.enabled = true;
+        underfunded_stun.stun.bind = "127.0.0.1".into();
+        underfunded_stun.stun.port = retry_turn_port;
+        let refusal = manager
+            .apply(underfunded_stun.clone())
+            .await
+            .expect_err("underfunded STUN admission refuses after TURN stop");
+        assert!(refusal.to_string().contains("stun start"));
+        let refused = manager.status().await;
+        assert!(!refused.turn.running && !refused.stun.running);
+
+        drop(held_lease);
+        drop(held_scope);
+        let recovered = manager
+            .apply(underfunded_stun)
+            .await
+            .expect("the retained desired STUN config retries after funding");
+        assert!(!recovered.turn.running && recovered.stun.running);
+        assert_eq!(
+            recovered
+                .stun
+                .listen
+                .as_deref()
+                .and_then(|listen| listen.parse::<SocketAddr>().ok())
+                .expect("the recovered STUN listener reports its port")
+                .port(),
+            retry_turn_port
+        );
+        manager
+            .shutdown()
+            .await
+            .expect("retry owner shuts down cleanly");
+        assert_eq!(
+            provider.in_use(),
+            baseline,
+            "the underfunded refusal and retry leave no provider residue"
+        );
+    }
+
+    /// A running daemon's hosted-services status contains the infrastructure
+    /// endpoints and no application-payload relay field.
     ///
     /// Asserted on a real running manager rather than on the report type,
     /// because the claim is about what a daemon serving the control socket
     /// actually says, not about which fields a struct happens to declare.
     #[tokio::test]
-    async fn a_running_daemon_reports_no_member_payload_relay_authority() {
+    async fn a_running_daemon_reports_hosted_services_only() {
         let identity = Arc::new(myownmesh_core::Identity::ephemeral());
         let mesh = myownmesh_core::Mesh::open_infrastructure_only_with_identity(
             MeshConfig::default(),
@@ -821,8 +1456,9 @@ mod tests {
             "the status must still describe the services that do exist: {status}"
         );
         assert!(
-            !status.contains("relay"),
-            "a running daemon publishes no relay state: {status}"
+            !status.contains("application_payload_relay")
+                && !status.contains("member_payload_relay"),
+            "hosted-services status has no application-payload relay field: {status}"
         );
     }
 

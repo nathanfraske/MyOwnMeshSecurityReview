@@ -23,7 +23,7 @@ pub enum FrameClass {
     /// Handshake + topology negotiation (`hello`, `auth_response`,
     /// `approve`, `deny`, `shelve`, `unshelve`, capabilities).
     Control,
-    /// Roster + governance anti-entropy.
+    /// Governance anti-entropy.
     Gossip,
     /// Application frames: typed channels (plain and acked) + RPC.
     App,
@@ -41,17 +41,20 @@ pub fn class_of(msg: &MeshMessage) -> FrameClass {
         | MeshMessage::Deny(_)
         | MeshMessage::Shelve(_)
         | MeshMessage::Unshelve(_)
-        | MeshMessage::CapabilitiesUpdate(_) => FrameClass::Control,
-        MeshMessage::NetworkState(_)
-        | MeshMessage::NetworkStatePropose(_)
-        | MeshMessage::NetworkStateAck(_)
-        | MeshMessage::NetworkStateSplit(_)
-        | MeshMessage::RosterSummary(_)
-        | MeshMessage::RosterRequest(_)
-        | MeshMessage::RosterEntries(_) => FrameClass::Gossip,
+        | MeshMessage::SessionControl(_)
+        | MeshMessage::CapabilitiesUpdate(_)
+        | MeshMessage::ClosedRelayControl(_) => FrameClass::Control,
+        MeshMessage::Fact(_)
+        | MeshMessage::FactPage(_)
+        | MeshMessage::FactInventory(_)
+        | MeshMessage::FactRequest(_)
+        | MeshMessage::ProofDelivery(_)
+        | MeshMessage::ProofAck(_) => FrameClass::Gossip,
         MeshMessage::Channel { .. }
         | MeshMessage::ChannelSeq { .. }
         | MeshMessage::ChannelAck { .. }
+        | MeshMessage::ClosedRelayData(_)
+        | MeshMessage::RoutedApplication(_)
         | MeshMessage::RpcRequest(_)
         | MeshMessage::RpcResponse(_)
         | MeshMessage::RpcStreamChunk(_)
@@ -198,6 +201,7 @@ pub struct TrafficSnapshot {
 mod tests {
     use super::*;
     use crate::protocol::keepalive::PingMessage;
+    use ed25519_dalek::SigningKey;
 
     #[test]
     fn classes_cover_the_wire() {
@@ -210,6 +214,33 @@ mod tests {
                 channel: "c".into(),
                 payload: serde_json::json!(1)
             }),
+            FrameClass::App
+        );
+        let origin_key = SigningKey::from_bytes(&[31; 32]);
+        let destination_key = SigningKey::from_bytes(&[32; 32]);
+        let origin = crate::semantic::DeviceId::from_public_key_bytes(
+            *origin_key.verifying_key().as_bytes(),
+        )
+        .expect("origin device id");
+        let destination = crate::semantic::DeviceId::from_public_key_bytes(
+            *destination_key.verifying_key().as_bytes(),
+        )
+        .expect("destination device id");
+        let routed = crate::protocol::RoutedApplicationEnvelope::new(
+            crate::semantic::MeshContextId::from_bytes([33; 32]),
+            origin,
+            destination,
+            [34; 16],
+            1,
+            crate::protocol::ClosedRoutedPayload::ChannelFrame {
+                channel: "traffic-test".into(),
+                payload: serde_json::json!({"probe": true}),
+            },
+            &origin_key,
+        )
+        .expect("routed application envelope");
+        assert_eq!(
+            class_of(&MeshMessage::RoutedApplication(routed)),
             FrameClass::App
         );
     }

@@ -60,19 +60,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use myownmesh_core::engine::SignalingDrivers;
+use myownmesh_core::handle::ClosedRelayChannel;
 use myownmesh_core::JoinedNetwork;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
-
-/// How long [`NetworkRegistry::announce_all_departures`] waits after queuing
-/// the per-network `leave` broadcasts before returning, so they reach the
-/// already-connected relay sockets before the registry is drained on
-/// shutdown. Mirrors core's per-network `JoinedNetwork::announce_leave`
-/// flush window.
-const DEPARTURE_FLUSH: Duration = Duration::from_millis(250);
 
 /// Where one joined runtime is in its life. The single owner of that answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +79,19 @@ pub enum RuntimeState {
     /// Teardown finished: signaling drivers dropped, engine driver retired. A
     /// replacement may install under the same ids.
     Stopped,
+}
+
+/// Atomic answer for a prospective join's two identity aliases.
+///
+/// `Existing` is deliberately returned for an unbound local config id that
+/// names the same currently-running wire network.  A caller can therefore
+/// replay a config with a different local id without creating a second
+/// runtime.  `Collision` covers both a different wire owner and a runtime
+/// that is still closing; neither may be bypassed by a later insert.
+pub(crate) enum JoinAdmission {
+    Empty,
+    Existing(Arc<JoinedNetwork>),
+    Collision(RuntimeState),
 }
 
 /// Snapshot view of one joined network for ctl / GUI consumers.
@@ -221,6 +227,314 @@ pub struct NetworkRegistry {
     state: Mutex<RegistryState>,
     #[cfg(test)]
     claim_pause: Mutex<Option<Arc<ClaimPause>>>,
+}
+
+/// The daemon-owned capability table for Closed relay endpoint sessions.
+///
+/// A control handle is deliberately not an engine handle: only this table can
+/// reach the move-only channel, and every entry is removed before its
+/// consuming close is awaited. Reservations are counted before the engine
+/// allocates an endpoint, so the daemon never starts a relay it cannot retain.
+pub(crate) struct ClosedRelayRegistry {
+    state: Mutex<ClosedRelayState>,
+}
+
+struct ClosedRelayState {
+    entries: HashMap<String, Arc<ClosedRelayEntry>>,
+    reservations: HashMap<String, usize>,
+    next_generation: u64,
+    closing: bool,
+}
+
+struct ClosedRelayEntry {
+    snapshot: ClosedRelaySnapshot,
+    channel: tokio::sync::Mutex<Option<ClosedRelayChannel>>,
+    _lease: myownmesh_core::ResourceLease,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClosedRelaySnapshot {
+    pub(crate) network: String,
+    pub(crate) peer: String,
+    pub(crate) relay: String,
+    pub(crate) session_id: [u8; 16],
+    pub(crate) allocation_epoch: u64,
+    pub(crate) generation: u64,
+    pub(crate) max_allocations: u64,
+    pub(crate) max_frame_bytes: u64,
+}
+
+pub(crate) struct ClosedRelayCapability {
+    pub(crate) handle: String,
+    pub(crate) snapshot: ClosedRelaySnapshot,
+}
+
+pub(crate) struct ClosedRelayReservation {
+    registry: Arc<ClosedRelayRegistry>,
+    network: String,
+    max_allocations: u64,
+    max_frame_bytes: u64,
+    lease: Option<myownmesh_core::ResourceLease>,
+    active: bool,
+}
+
+pub(crate) struct ClosedRelayCommitError {
+    pub(crate) channel: ClosedRelayChannel,
+    pub(crate) message: &'static str,
+}
+
+impl ClosedRelayRegistry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ClosedRelayState {
+                entries: HashMap::new(),
+                reservations: HashMap::new(),
+                next_generation: 0,
+                closing: false,
+            }),
+        })
+    }
+
+    pub(crate) fn reserve(
+        self: &Arc<Self>,
+        resources: &myownmesh_core::LocalApplicationResourceScope,
+        network: &JoinedNetwork,
+    ) -> std::result::Result<ClosedRelayReservation, &'static str> {
+        let config = network.config_snapshot();
+        let network_id = network.config_id().to_owned();
+        let mut state = self.state.lock();
+        if state.closing {
+            return Err("closed relay registry is closing");
+        }
+        let active = state
+            .entries
+            .values()
+            .filter(|entry| entry.snapshot.network == network_id)
+            .count();
+        let reserved = state.reservations.get(&network_id).copied().unwrap_or(0);
+        let limit = usize::try_from(config.closed_relay.max_allocations)
+            .map_err(|_| "closed relay allocation limit is not representable")?;
+        let would_exceed = active
+            .checked_add(reserved)
+            .and_then(|count| count.checked_add(1))
+            .map_or(true, |count| count > limit);
+        if would_exceed {
+            return Err("closed relay allocation limit is full");
+        }
+        let lease = resources
+            .acquire(myownmesh_core::ResourceClaim::single(
+                myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+                1,
+            ))
+            .map_err(|_| "closed relay registry custody was refused")?;
+        *state.reservations.entry(network_id.clone()).or_default() += 1;
+        Ok(ClosedRelayReservation {
+            registry: Arc::clone(self),
+            network: network_id,
+            max_allocations: config.closed_relay.max_allocations,
+            max_frame_bytes: config.closed_relay.max_frame_ciphertext_bytes,
+            lease: Some(lease),
+            active: true,
+        })
+    }
+
+    pub(crate) async fn send(
+        &self,
+        handle: &str,
+        payload: &[u8],
+    ) -> std::result::Result<(ClosedRelaySnapshot, usize), String> {
+        let entry = self.entry(handle)?;
+        let snapshot = entry.snapshot.clone();
+        if u64::try_from(payload.len()).map_or(true, |bytes| bytes > snapshot.max_frame_bytes) {
+            return Err(format!(
+                "closed relay payload exceeds configured {} byte ceiling",
+                snapshot.max_frame_bytes
+            ));
+        }
+        let channel = entry.channel.lock().await;
+        let channel = channel
+            .as_ref()
+            .ok_or_else(|| "closed relay handle is already closed".to_string())?;
+        channel
+            .send(payload)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((snapshot, payload.len()))
+    }
+
+    pub(crate) async fn recv(
+        &self,
+        handle: &str,
+        wait_ms: u64,
+    ) -> std::result::Result<(ClosedRelaySnapshot, Vec<u8>), String> {
+        let entry = self.entry(handle)?;
+        let snapshot = entry.snapshot.clone();
+        let channel = entry.channel.lock().await;
+        let channel = channel
+            .as_ref()
+            .ok_or_else(|| "closed relay handle is already closed".to_string())?;
+        let payload =
+            tokio::time::timeout(std::time::Duration::from_millis(wait_ms), channel.recv())
+                .await
+                .map_err(|_| "closed relay receive wait expired".to_string())?
+                .map_err(|error| error.to_string())?;
+        Ok((snapshot, payload))
+    }
+
+    pub(crate) async fn close(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<ClosedRelaySnapshot, String> {
+        let entry = {
+            let mut state = self.state.lock();
+            state
+                .entries
+                .remove(handle)
+                .ok_or_else(|| "unknown or already closed relay handle".to_string())?
+        };
+        let snapshot = entry.snapshot.clone();
+        let channel = entry.channel.lock().await.take();
+        if let Some(channel) = channel {
+            channel.close().await.map_err(|error| error.to_string())?;
+        }
+        Ok(snapshot)
+    }
+
+    pub(crate) async fn state(
+        &self,
+        handle: &str,
+    ) -> std::result::Result<(ClosedRelaySnapshot, usize), String> {
+        let entry = self.entry(handle)?;
+        let network = entry.snapshot.network.clone();
+        let active = {
+            let state = self.state.lock();
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.snapshot.network == network)
+                .count()
+        };
+        Ok((entry.snapshot.clone(), active))
+    }
+
+    pub(crate) async fn shutdown_all(&self) -> std::result::Result<(), String> {
+        let entries = {
+            let mut state = self.state.lock();
+            state.closing = true;
+            state
+                .entries
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect::<Vec<_>>()
+        };
+        let mut failures = Vec::new();
+        for entry in entries {
+            if let Some(channel) = entry.channel.lock().await.take() {
+                if let Err(error) = channel.close().await {
+                    failures.push(error.to_string());
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
+    }
+
+    fn entry(&self, handle: &str) -> std::result::Result<Arc<ClosedRelayEntry>, String> {
+        self.state
+            .lock()
+            .entries
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| "unknown or already closed relay handle".to_string())
+    }
+}
+
+impl ClosedRelayReservation {
+    pub(crate) fn commit(
+        mut self,
+        channel: ClosedRelayChannel,
+    ) -> std::result::Result<ClosedRelayCapability, ClosedRelayCommitError> {
+        self.active = false;
+        let lease = self
+            .lease
+            .take()
+            .expect("a live reservation owns its registry lease");
+        let mut state = self.registry.state.lock();
+        let reservations = state
+            .reservations
+            .get_mut(&self.network)
+            .expect("a live reservation owns its registry count");
+        *reservations -= 1;
+        if *reservations == 0 {
+            state.reservations.remove(&self.network);
+        }
+        if state.closing {
+            return Err(ClosedRelayCommitError {
+                channel,
+                message: "closed relay registry is closing",
+            });
+        }
+        let mut bytes = [0u8; 32];
+        if getrandom::getrandom(&mut bytes).is_err() {
+            return Err(ClosedRelayCommitError {
+                channel,
+                message: "could not mint closed relay capability",
+            });
+        }
+        let handle = data_encoding::BASE64URL_NOPAD.encode(&bytes);
+        if state.entries.contains_key(&handle) {
+            return Err(ClosedRelayCommitError {
+                channel,
+                message: "closed relay capability collision",
+            });
+        }
+        state.next_generation = match state.next_generation.checked_add(1) {
+            Some(generation) => generation,
+            None => {
+                return Err(ClosedRelayCommitError {
+                    channel,
+                    message: "closed relay generation exhausted",
+                })
+            }
+        };
+        let snapshot = ClosedRelaySnapshot {
+            network: self.network.clone(),
+            peer: channel.peer_device_id().to_owned(),
+            relay: channel.relay_device_id().to_owned(),
+            session_id: channel.session_id(),
+            allocation_epoch: channel.allocation_epoch(),
+            generation: state.next_generation,
+            max_allocations: self.max_allocations,
+            max_frame_bytes: self.max_frame_bytes,
+        };
+        state.entries.insert(
+            handle.clone(),
+            Arc::new(ClosedRelayEntry {
+                snapshot: snapshot.clone(),
+                channel: tokio::sync::Mutex::new(Some(channel)),
+                _lease: lease,
+            }),
+        );
+        Ok(ClosedRelayCapability { handle, snapshot })
+    }
+}
+
+impl Drop for ClosedRelayReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self.registry.state.lock();
+        if let Some(reservations) = state.reservations.get_mut(&self.network) {
+            *reservations = reservations.saturating_sub(1);
+            if *reservations == 0 {
+                state.reservations.remove(&self.network);
+            }
+        }
+    }
 }
 
 pub(crate) struct StatusSource<'a> {
@@ -389,10 +703,10 @@ struct PreparedNetworksData<'a> {
 
 /// The exact owned projection serialized by the prepared Status reply.
 ///
-/// Kept separate from [`FundedStatus`] so
-/// `serialized_mailbox_item_claim_as` receives the value whose inline shape
-/// and wire shape it actually prices. The lease is the funding for this value;
-/// including that handle in the priced type would make its own claim circular.
+/// Kept separate from [`FundedStatus`] so the central serialized measurement
+/// and exact owned type layout price the value it actually retains. The lease
+/// is the funding for this value; including that handle in the priced type
+/// would make its own claim circular.
 #[derive(serde::Serialize)]
 struct OwnedStatusData {
     version: &'static str,
@@ -445,7 +759,7 @@ impl serde::Serialize for DisplayIdWidth {
 struct VisibleNetworkIds<'a>(&'a RegistryState);
 
 impl RegistryState {
-    /// Visit canonical entries in the legacy `summaries()` order without a
+    /// Visit canonical entries in the current NetworksList/`summaries()` order without a
     /// staging allocation. Each step scans for the least config id greater
     /// than the previous one, so this is O(N²) comparisons and O(1) auxiliary
     /// space. Config ids are bounded control coordinates and the registry lock
@@ -485,6 +799,44 @@ fn checked_network_bytes_add(
                 "NetworksList retention length overflowed",
             ))?;
     Ok(())
+}
+
+fn serialized_typed_claim<T>(
+    value: &impl serde::Serialize,
+) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
+    let (retained, queued, allocations) = myownmesh_core::mailbox_measure_serialized(value)?;
+    let fixed = std::mem::size_of::<T>().checked_add(retained).ok_or(
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        },
+    )?;
+    let fixed = u64::try_from(fixed).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::AccountedMemoryBytes,
+        }
+    })?;
+    let queued = u64::try_from(queued).map_err(|_| {
+        myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::QueuedBytes,
+        }
+    })?;
+    let allocations = u64::try_from(allocations)
+        .map_err(|_| myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?
+        .checked_add(1)
+        .ok_or(myownmesh_core::ResourceClaimArithmeticError::Overflow {
+            dimension: myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+        })?;
+    Ok(myownmesh_core::ResourceClaim::try_from_entries([
+        (myownmesh_core::ResourceClass::AccountedMemoryBytes, fixed),
+        (myownmesh_core::ResourceClass::QueuedBytes, queued),
+        (myownmesh_core::ResourceClass::ParsingOrCpuWork, queued),
+        (
+            myownmesh_core::ResourceClass::OpaqueDependencyResidual,
+            allocations,
+        ),
+    ])?)
 }
 
 fn checked_network_allocations_add(
@@ -1167,6 +1519,39 @@ impl NetworkRegistry {
         Arc::new(Self::default())
     }
 
+    /// Classify both aliases under the same registry fence used by `insert`.
+    ///
+    /// This is the only pre-join identity decision used by service
+    /// reconciliation.  In particular, a `B/N` request is satisfied by a
+    /// `Running A/N` owner when `B` is unbound, while `A/M` remains a
+    /// collision.  A `Closing` owner is never treated as absent or reusable.
+    pub(crate) fn classify_join(&self, config_id: &str, network_id: &str) -> JoinAdmission {
+        let state = self.state.lock();
+        let by_config = state.aliases.get(config_id).cloned();
+        let by_network = state.aliases.get(network_id).cloned();
+
+        if let Some(holder) = state.holder(config_id, network_id) {
+            let lifecycle = holder.lifecycle.state();
+            if lifecycle != RuntimeState::Running {
+                return JoinAdmission::Collision(lifecycle);
+            }
+        }
+
+        match (by_config, by_network) {
+            (None, None) => JoinAdmission::Empty,
+            (Some(config_owner), Some(network_owner))
+                if Arc::ptr_eq(&config_owner, &network_owner)
+                    && network_owner.joined.network_id() == network_id =>
+            {
+                JoinAdmission::Existing(config_owner.joined.clone())
+            }
+            (None, Some(network_owner)) if network_owner.joined.network_id() == network_id => {
+                JoinAdmission::Existing(network_owner.joined.clone())
+            }
+            _ => JoinAdmission::Collision(RuntimeState::Running),
+        }
+    }
+
     /// Insert a freshly-joined network together with its signaling
     /// driver handles. Indexed by both the config record id and the
     /// wire-level network id so callers can use either as the lookup
@@ -1231,6 +1616,79 @@ impl NetworkRegistry {
         (entry.lifecycle.state() == RuntimeState::Running).then(|| entry.joined.clone())
     }
 
+    /// Run one bounded synchronous operation against the exact currently
+    /// registered runtime.  The identity check and the closure share the
+    /// registry state lock, so removal, replacement, or a second alias update
+    /// cannot interleave after the caller captured its handle.  The closure
+    /// must not await or re-enter this registry; it is the small mutation
+    /// window used by network-update paths that need to commit against the
+    /// same [`Arc<JoinedNetwork>`] they resolved.
+    pub(crate) fn with_current<R>(
+        &self,
+        key: &str,
+        expected: &Arc<JoinedNetwork>,
+        effect: impl FnOnce(&Arc<JoinedNetwork>) -> R,
+    ) -> Option<R> {
+        let state = self.state.lock();
+        let entry = state.aliases.get(key)?;
+        if entry.lifecycle.state() != RuntimeState::Running || !Arc::ptr_eq(&entry.joined, expected)
+        {
+            return None;
+        }
+        Some(effect(&entry.joined))
+    }
+
+    /// Tear down only the exact currently registered runtime.
+    ///
+    /// This is the compare-and-claim counterpart to [`Self::with_current`].
+    /// A caller holding a handle from before a removal or replacement must not
+    /// be able to retire whatever newer runtime happens to answer to the same
+    /// key. The identity check, `Running` check, and claim all happen while
+    /// the registry state lock is held; a stale caller therefore returns
+    /// `NotFound` without changing the successor. If the exact expected owner
+    /// is already in the closing set, the caller waits for that owner and gets
+    /// `AlreadyClosing` rather than racing a same-slot rejoin. A successful
+    /// claim goes through the same owned closing set and teardown path as
+    /// [`Self::remove`], including the test pause and stopped waiter semantics.
+    pub(crate) async fn remove_if_current(
+        &self,
+        key: &str,
+        expected: &Arc<JoinedNetwork>,
+    ) -> RemoveResult {
+        let claim = {
+            let mut state = self.state.lock();
+            if let Some(entry) = state.aliases.get(key).cloned() {
+                if entry.lifecycle.state() != RuntimeState::Running
+                    || !Arc::ptr_eq(&entry.joined, expected)
+                {
+                    return RemoveResult::NotFound;
+                }
+                let won = state.claim(&entry);
+                (entry, won)
+            } else if let Some(entry) = state
+                .closing
+                .iter()
+                .find(|entry| entry.holds(key) && Arc::ptr_eq(&entry.joined, expected))
+                .cloned()
+            {
+                // The exact owner may have been claimed by another caller
+                // between its lookup and this call. Wait for that owner; do
+                // not search by key once a successor has become visible.
+                (entry, false)
+            } else {
+                return RemoveResult::NotFound;
+            }
+        };
+        match claim {
+            (entry, true) => {
+                #[cfg(test)]
+                self.pause_after_claim_for_test().await;
+                RemoveResult::Removed(self.teardown(entry).await)
+            }
+            (entry, false) => RemoveResult::AlreadyClosing(Self::await_winner(&entry).await),
+        }
+    }
+
     /// The lifecycle state of the runtime under `key`, for a caller that needs
     /// to distinguish "never existed" from "on its way out".
     pub fn state(&self, key: &str) -> Option<RuntimeState> {
@@ -1252,22 +1710,12 @@ impl NetworkRegistry {
             .is_some_and(|entry| entry.lifecycle.state() != RuntimeState::Stopped)
     }
 
-    /// Snapshot every distinct network. Each network appears once
-    /// even though the map stores aliases.
+    /// Snapshot every distinct network in canonical config-id order. Each
+    /// network appears once even though the map stores aliases.
     pub fn summaries(&self) -> Vec<NetworkSummary> {
         let state = self.state.lock();
-        let map = &state.aliases;
-        // Dedup by entry pointer — both the config-id and
-        // network-id aliases point at the same `Arc<Entry>`, so
-        // pointer identity is the cheapest dedup key.
-        let mut seen: Vec<*const Entry> = Vec::new();
         let mut out = Vec::new();
-        for entry in map.values() {
-            let ptr = Arc::as_ptr(entry);
-            if seen.contains(&ptr) {
-                continue;
-            }
-            seen.push(ptr);
+        state.for_each_canonical_in_config_order(|entry| {
             let j = &entry.joined;
             out.push(NetworkSummary {
                 config_id: j.config_id().to_string(),
@@ -1277,9 +1725,7 @@ impl NetworkRegistry {
                 topology: j.current_topology(),
                 traffic: j.traffic(),
             });
-        }
-        // Stable order across calls: alphabetical by config id.
-        out.sort_by(|a, b| a.config_id.cmp(&b.config_id));
+        });
         out
     }
 
@@ -1367,9 +1813,29 @@ impl NetworkRegistry {
     /// covers the remainder: `shutdown` returning proves the driver is retired,
     /// and not yet that this registry has recorded the fact and released the
     /// entry. A caller told `Stopped` can rely on both.
-    async fn await_winner(entry: &Arc<Entry>) -> RuntimeState {
-        let _ = entry.joined.shutdown().await;
-        entry.lifecycle.await_stopped().await
+    async fn await_winner(entry: &Arc<Entry>) -> TeardownObservation {
+        let outcome = Self::await_winner_result(entry).await;
+        TeardownObservation {
+            state: entry.lifecycle.state(),
+            outcome,
+        }
+    }
+
+    /// Await a teardown claimed by another caller while preserving its
+    /// terminal error for shutdown-all callers. The lifecycle wait remains
+    /// mandatory even when the driver reports a failure: ownership is not
+    /// released until the registry has recorded `Stopped`.
+    async fn await_winner_result(entry: &Arc<Entry>) -> Result<(), String> {
+        let outcome = entry
+            .joined
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string());
+        let state = entry.lifecycle.await_stopped().await;
+        if state != RuntimeState::Stopped {
+            return Err(format!("network teardown ended in {state:?} state"));
+        }
+        outcome
     }
 
     /// Drivers down, engine driver awaited, state advanced to `Stopped`, entry
@@ -1379,7 +1845,10 @@ impl NetworkRegistry {
         // Signaling first: their `Drop` signals every spawned task to exit, and
         // doing it before the engine wait means those tasks are not still
         // publishing on behalf of a network that is going away.
-        drop(entry.drivers.lock().take());
+        let drivers = entry.drivers.lock().take();
+        if let Some(drivers) = drivers {
+            drivers.shutdown().await;
+        }
         let outcome = entry
             .joined
             .shutdown()
@@ -1399,34 +1868,54 @@ impl NetworkRegistry {
         outcome
     }
 
-    /// Broadcast a graceful `leave` on every joined network, then wait
-    /// briefly for the publishes to reach the relays, before the caller
-    /// drains the registry on daemon shutdown. Peers drop our sessions
-    /// immediately on the `leave` instead of waiting out their ~90 s
-    /// heartbeat timeout — the same courtesy `network_remove` extends for a
-    /// single network. The read lock is held only for the synchronous emit
-    /// (dropped before the flush wait), so this never holds a `parking_lot`
-    /// guard across `.await`.
+    /// Depart every joined network before the caller drains the registry on
+    /// daemon shutdown — the same courtesy `network_remove` extends to a single
+    /// network, extended to all of them.
+    ///
+    /// **Each network's departure now travels on its authenticated sessions**
+    /// rather than on a room-wide signaling `leave` this side hoped would land.
+    /// A peer retires our session because the session itself said so, not
+    /// because an unauthenticated carrier claimed it. The carrier `leave` still
+    /// goes out behind it as reachability evidence with no teardown authority.
+    ///
+    /// The lock is taken only to snapshot the distinct entries and is dropped
+    /// before the first `.await`, so this never holds a `parking_lot` guard
+    /// across one. Networks are departed in sequence rather than raced: each is
+    /// a bounded number of sends over channels that are already open, and a
+    /// concurrent fan-out would buy nothing but interleaving on the way out.
     pub async fn announce_all_departures(&self) {
-        let mut emitted = false;
-        {
+        let departing: Vec<Arc<Entry>> = {
             let state = self.state.lock();
-            let map = &state.aliases;
             // Dedup by entry pointer — both id aliases point at the same Arc.
             let mut seen: Vec<*const Entry> = Vec::new();
-            for entry in map.values() {
+            let mut distinct = Vec::new();
+            for entry in state.aliases.values() {
                 let ptr = Arc::as_ptr(entry);
                 if seen.contains(&ptr) {
                     continue;
                 }
                 seen.push(ptr);
-                entry.joined.request_departure();
-                emitted = true;
+                distinct.push(Arc::clone(entry));
             }
+            distinct
+        };
+        for entry in departing {
+            entry.joined.announce_leave().await;
         }
-        if emitted {
-            tokio::time::sleep(DEPARTURE_FLUSH).await;
-        }
+    }
+
+    /// Supervise authenticated departures alongside registry teardown.
+    ///
+    /// A departure waits for an authenticated observation, so awaiting all
+    /// departures before requesting shutdown can deadlock on a silent peer.
+    /// Starting both futures preserves the carrier hint path while letting the
+    /// existing shutdown lifecycle cancel the departure waiter. No timeout,
+    /// grace period, retry, or alternate acknowledgement mechanism is added.
+    pub async fn shutdown_all_with_departures(&self) -> Vec<Result<(), String>> {
+        let departures = self.announce_all_departures();
+        let shutdown = self.shutdown_all();
+        let (_, outcomes) = tokio::join!(departures, shutdown);
+        outcomes
     }
 
     /// Tear down every distinct network, in the same order and through the same
@@ -1443,7 +1932,8 @@ impl NetworkRegistry {
     /// is the same live-runtime-after-removal shape one layer up. Its outcome
     /// belongs to the caller that claimed it, so it is not repeated in the
     /// returned vector — what comes back is one result per teardown this call
-    /// performed.
+    /// performed or observed. A concurrent loser observes the winner's exact
+    /// shutdown result rather than turning a failed teardown into success.
     pub async fn shutdown_all(&self) -> Vec<Result<(), String>> {
         let (winners, losers) = {
             let mut state = self.state.lock();
@@ -1471,7 +1961,7 @@ impl NetworkRegistry {
             outcomes.push(self.teardown(entry).await);
         }
         for entry in losers {
-            Self::await_winner(&entry).await;
+            outcomes.push(Self::await_winner_result(&entry).await);
         }
         outcomes
     }
@@ -1490,7 +1980,7 @@ impl StatusSource<'_> {
     pub(crate) fn typed_claim(
         &self,
     ) -> Result<myownmesh_core::ResourceClaim, myownmesh_core::ResourceMailboxItemError> {
-        myownmesh_core::serialized_mailbox_item_claim_as::<OwnedStatusData>(&self.view())
+        serialized_typed_claim::<OwnedStatusData>(&self.view())
     }
 
     pub(crate) fn line_ceiling(&self) -> Result<usize, myownmesh_core::ResourceMailboxItemError> {
@@ -1666,7 +2156,7 @@ impl MeasuredNetworksList<'_> {
 
 /// Outcome of a [`NetworkRegistry::remove`] call.
 pub enum RemoveResult {
-    /// The runtime was torn down: drivers dropped, engine driver retired,
+    /// The runtime was torn down: signaling drivers joined, engine driver retired,
     /// state `Stopped`. Carries the shutdown outcome so a failed teardown is
     /// reported rather than assumed clean.
     Removed(Result<(), String>),
@@ -1674,9 +2164,18 @@ pub enum RemoveResult {
     NotFound,
     /// A teardown for this runtime was already in progress, so this call
     /// started nothing — and **waited for it**. Carries the state observed
-    /// once that teardown finished, which is `Stopped`: the variant reports
-    /// who did the work, not that the caller gave up early.
-    AlreadyClosing(RuntimeState),
+    /// once that teardown finished, which is `Stopped`, together with the
+    /// exact success or failure observed from the winning owner. The variant
+    /// reports who did the work, not that the caller gave up early.
+    AlreadyClosing(TeardownObservation),
+}
+
+/// The terminal observation returned to a removal caller that lost the
+/// ownership claim to another concurrent remover.
+#[derive(Debug)]
+pub struct TeardownObservation {
+    pub state: RuntimeState,
+    pub outcome: Result<(), String>,
 }
 
 /// A rejected [`NetworkRegistry::insert`], handing the caller back exactly what
@@ -1766,16 +2265,50 @@ mod tests {
         myownmesh_core::NetworkConfig {
             id: config_id.to_string(),
             network_id: network_id.to_string(),
+            event_capacity: myownmesh_core::NetworkConfig::from_network_id("", "").event_capacity,
+            connection_trace_capacity: myownmesh_core::NetworkConfig::from_network_id("", "")
+                .connection_trace_capacity,
             label: config_id.to_string(),
             kind: Default::default(),
+            scheduler: myownmesh_core::config::SchedulerPolicyConfig::default(),
+            routing_policy: myownmesh_core::config::RoutingPolicyConfig::default(),
+            semantic_policy: myownmesh_core::config::SemanticPolicyConfig::default(),
             topology,
             signaling: myownmesh_core::config::SignalingConfig::default(),
+            closed_relay: Default::default(),
             stun_servers: Vec::new(),
             turn_servers: Vec::new(),
-            roster_path: None,
             pinned_peers: Vec::new(),
             auto_approve: true,
         }
+    }
+
+    #[tokio::test]
+    async fn join_admission_preserves_unbound_local_alias_for_running_wire_owner() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let incumbent = mesh
+            .join(network("admission-owner", "admission-wire"))
+            .await
+            .expect("the admission fixture joins");
+        assert!(registry.insert(incumbent, None).into_refusal().is_none());
+
+        match registry.classify_join("admission-alias", "admission-wire") {
+            JoinAdmission::Existing(owner) => {
+                assert_eq!(owner.config_id(), "admission-owner");
+                assert_eq!(owner.network_id(), "admission-wire");
+            }
+            JoinAdmission::Empty => panic!("a running wire owner must satisfy its alias"),
+            JoinAdmission::Collision(state) => {
+                panic!("unexpected {state:?} collision for a running wire owner")
+            }
+        }
+        assert!(matches!(
+            registry.classify_join("admission-owner", "other-wire"),
+            JoinAdmission::Collision(RuntimeState::Running)
+        ));
+        let _ = registry.shutdown_all().await;
     }
 
     fn widest_traffic() -> myownmesh_core::engine::traffic::TrafficSnapshot {
@@ -1942,10 +2475,6 @@ mod tests {
             .join(before_config)
             .await
             .expect("the predecessor joins");
-        let after = mesh
-            .join(after_config)
-            .await
-            .expect("the same-sized successor joins independently");
         assert!(registry.insert(before, None).into_refusal().is_none());
 
         let provider = myownmesh_core::FiniteResourceProvider::new(grant);
@@ -1978,6 +2507,10 @@ mod tests {
             registry.remove("line-config").await,
             RemoveResult::Removed(Ok(()))
         ));
+        let after = mesh
+            .join(after_config)
+            .await
+            .expect("the same-sized successor joins after its predecessor stopped");
         assert!(
             registry.insert(after, None).into_refusal().is_none(),
             "the same-sized successor installs after its predecessor stopped"
@@ -2004,7 +2537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_r3_daemon_the_prepared_network_rows_are_the_legacy_rows_on_the_wire() {
+    async fn v4_r3_daemon_prepared_rows_follow_the_canonical_config_order() {
         let _fixture = crate::exclusive_connector_fixture().await;
         let mesh = mesh().await;
         let registry = NetworkRegistry::new();
@@ -2088,18 +2621,22 @@ mod tests {
             Err((_typed, _work)) => panic!("the unchanged authoritative pass commits"),
         };
 
-        #[derive(serde::Serialize)]
-        struct LegacyNetworks<'a> {
-            networks: &'a [NetworkSummary],
-        }
-        let legacy = registry.summaries();
-        let legacy_json = serde_json::to_vec(&LegacyNetworks { networks: &legacy })
-            .expect("legacy NetworkSummary rows serialize");
         let prepared_json =
             serde_json::to_vec(&funded).expect("the funded prepared rows serialize");
+        let summary_ids: Vec<_> = registry
+            .summaries()
+            .into_iter()
+            .map(|summary| summary.config_id)
+            .collect();
         assert_eq!(
-            prepared_json, legacy_json,
-            "all topology variants, escaped labels, field order, and config-id order match"
+            summary_ids,
+            vec![
+                "01-ring".to_owned(),
+                "02-star-\n-label".to_owned(),
+                "03-hubs".to_owned(),
+                "04-full".to_owned(),
+            ],
+            "the public snapshot uses the same canonical config-id order"
         );
         assert_eq!(
             line_ceiling,
@@ -2257,10 +2794,20 @@ mod tests {
             .join(network("f13-running-config", "f13-running-wire"))
             .await
             .expect("incumbent joins");
-        let same_config = mesh
+        let same_config_error = match mesh
             .join(network("f13-running-config", "f13-other-wire"))
             .await
-            .expect("same-config newcomer joins independently");
+        {
+            Ok(_) => panic!("a concurrent same-config join must refuse its busy writer"),
+            Err(error) => error,
+        };
+        assert!(
+            same_config_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("writer is busy"),
+            "same-config join reports the typed WriterBusy refusal: {same_config_error}"
+        );
         let same_network = mesh
             .join(network("f13-other-config", "f13-running-wire"))
             .await
@@ -2270,11 +2817,6 @@ mod tests {
             "the first runtime installs"
         );
 
-        let refused_config = registry
-            .insert(same_config, None)
-            .into_refusal()
-            .expect("a Running collision must not overwrite either alias");
-        assert_eq!(refused_config.state, RuntimeState::Running);
         let refused_network = registry
             .insert(same_network, None)
             .into_refusal()
@@ -2292,10 +2834,6 @@ mod tests {
         );
         assert_eq!(by_network.network_id(), "f13-running-wire");
         assert!(
-            registry.get("f13-other-wire").is_none(),
-            "the same-config newcomer did not install its distinct network alias"
-        );
-        assert!(
             registry.get("f13-other-config").is_none(),
             "the same-network newcomer did not install its distinct config alias"
         );
@@ -2308,16 +2846,322 @@ mod tests {
         assert!(Arc::ptr_eq(&by_config_after, &by_network_after));
         assert!(Arc::ptr_eq(&by_config, &by_config_after));
 
-        refused_config
-            .joined
-            .shutdown()
-            .await
-            .expect("the refused same-config runtime is explicitly retired");
         refused_network
             .joined
             .shutdown()
             .await
             .expect("the refused same-network runtime is explicitly retired");
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn exact_current_closure_excludes_remove_until_it_returns() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("fence-closure-config", "fence-closure-wire"))
+            .await
+            .expect("the exact-current fixture joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the exact-current fixture installs"
+        );
+        let expected = registry
+            .get("fence-closure-config")
+            .expect("the exact current handle exists");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let fenced_registry = Arc::clone(&registry);
+        let fenced_expected = Arc::clone(&expected);
+        let fenced = tokio::task::spawn_blocking(move || {
+            fenced_registry.with_current("fence-closure-config", &fenced_expected, |_current| {
+                entered_tx
+                    .send(())
+                    .expect("the control observes entry into the fence");
+                release_rx
+                    .recv()
+                    .expect("the control releases the bounded synchronous closure");
+                17u8
+            })
+        });
+        entered_rx
+            .recv()
+            .expect("the exact-current closure entered before removal");
+        let removing = {
+            let registry = Arc::clone(&registry);
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                runtime.block_on(async move { registry.remove("fence-closure-config").await })
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !removing.is_finished(),
+            "removal cannot interleave while the exact-current closure holds the registry fence"
+        );
+        release_tx
+            .send(())
+            .expect("the exact-current closure is released");
+        assert_eq!(
+            fenced.await.expect("the fenced closure does not panic"),
+            Some(17),
+            "the closure committed against the exact handle"
+        );
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_current_handle_is_refused_and_successor_is_not_substituted() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("fence-stale-config", "fence-stale-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let predecessor = registry
+            .get("fence-stale-config")
+            .expect("the predecessor handle exists");
+        let pause = registry.install_claim_pause_for_test();
+        let removing = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.remove("fence-stale-config").await })
+        };
+        pause.reached.wait().await;
+        assert_eq!(
+            registry.state("fence-stale-config"),
+            Some(RuntimeState::Closing)
+        );
+        assert!(
+            registry
+                .with_current("fence-stale-config", &predecessor, |_| ())
+                .is_none(),
+            "a handle held before the claim is refused after removal starts"
+        );
+        pause.release.wait().await;
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+
+        let successor = mesh
+            .join(network("fence-stale-config", "fence-stale-wire"))
+            .await
+            .expect("the successor joins after the predecessor stopped");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs after the predecessor stopped"
+        );
+        let current = registry
+            .get("fence-stale-config")
+            .expect("the successor handle exists");
+        assert!(!Arc::ptr_eq(&predecessor, &current));
+        assert!(
+            registry
+                .with_current("fence-stale-config", &predecessor, |_| ())
+                .is_none(),
+            "the successor is never mistaken for the predecessor"
+        );
+        assert_eq!(
+            registry.with_current("fence-stale-config", &current, |joined| {
+                joined.network_id().to_string()
+            }),
+            Some("fence-stale-wire".to_string()),
+            "the successor is accepted only with its own exact handle"
+        );
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_retires_exact_owner_and_allows_replacement() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let predecessor = mesh
+            .join(network("exact-remove-config", "exact-remove-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(predecessor, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let expected = registry
+            .get("exact-remove-config")
+            .expect("the exact owner exists before retirement");
+
+        assert!(matches!(
+            registry
+                .remove_if_current("exact-remove-config", &expected)
+                .await,
+            RemoveResult::Removed(Ok(()))
+        ));
+        assert!(
+            registry.get("exact-remove-config").is_none(),
+            "exact retirement removes the predecessor alias"
+        );
+
+        let successor = mesh
+            .join(network("exact-remove-config", "exact-remove-wire"))
+            .await
+            .expect("the successor joins after exact retirement");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs after the predecessor stops"
+        );
+        let current = registry
+            .get("exact-remove-config")
+            .expect("the successor is visible");
+        assert!(
+            !Arc::ptr_eq(&expected, &current),
+            "replacement has a distinct lifecycle owner"
+        );
+        let _ = registry.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_waits_for_exact_claimed_owner() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let joined = mesh
+            .join(network("exact-closing-config", "exact-closing-wire"))
+            .await
+            .expect("the exact-closing fixture joins");
+        assert!(
+            registry.insert(joined, None).into_refusal().is_none(),
+            "the exact-closing fixture installs"
+        );
+        let expected = registry
+            .get("exact-closing-config")
+            .expect("the exact owner exists before removal");
+        let pause = registry.install_claim_pause_for_test();
+        let removing = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move { registry.remove("exact-closing-config").await })
+        };
+        pause.reached.wait().await;
+        assert_eq!(
+            registry.state("exact-closing-config"),
+            Some(RuntimeState::Closing)
+        );
+
+        let waiting = {
+            let registry = Arc::clone(&registry);
+            let expected = Arc::clone(&expected);
+            tokio::spawn(async move {
+                registry
+                    .remove_if_current("exact-closing-config", &expected)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "the exact Closing owner is awaited before teardown settles"
+        );
+        pause.release.wait().await;
+
+        assert!(matches!(
+            removing.await.expect("the removal task does not panic"),
+            RemoveResult::Removed(Ok(()))
+        ));
+        assert!(matches!(
+            waiting.await.expect("the exact waiter does not panic"),
+            RemoveResult::AlreadyClosing(TeardownObservation {
+                state: RuntimeState::Stopped,
+                outcome: Ok(()),
+            })
+        ));
+        assert!(
+            registry.get("exact-closing-config").is_none(),
+            "the exact owner is gone after the shared teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_rejects_stale_owner_before_and_after_successor() {
+        let _fixture = crate::exclusive_connector_fixture().await;
+        let mesh = mesh().await;
+        let registry = NetworkRegistry::new();
+        let predecessor = mesh
+            .join(network("stale-remove-config", "stale-remove-wire"))
+            .await
+            .expect("the predecessor joins");
+        assert!(
+            registry.insert(predecessor, None).into_refusal().is_none(),
+            "the predecessor installs"
+        );
+        let predecessor = registry
+            .get("stale-remove-config")
+            .expect("the predecessor owner exists");
+
+        let unrelated = mesh
+            .join(network(
+                "stale-remove-unrelated",
+                "stale-remove-unrelated-wire",
+            ))
+            .await
+            .expect("the unrelated owner joins");
+        assert!(
+            registry.insert(unrelated, None).into_refusal().is_none(),
+            "the unrelated owner installs"
+        );
+        let unrelated = registry
+            .get("stale-remove-unrelated")
+            .expect("the unrelated owner is visible");
+        assert!(matches!(
+            registry
+                .remove_if_current("stale-remove-config", &unrelated)
+                .await,
+            RemoveResult::NotFound
+        ));
+        assert!(
+            registry.get("stale-remove-config").is_some(),
+            "a mismatched owner cannot retire the live predecessor"
+        );
+        assert!(matches!(
+            registry.remove("stale-remove-unrelated").await,
+            RemoveResult::Removed(Ok(()))
+        ));
+
+        assert!(matches!(
+            registry.remove("stale-remove-config").await,
+            RemoveResult::Removed(Ok(()))
+        ));
+        let successor = mesh
+            .join(network("stale-remove-config", "stale-remove-wire"))
+            .await
+            .expect("the successor joins after predecessor retirement");
+        assert!(
+            registry.insert(successor, None).into_refusal().is_none(),
+            "the successor installs"
+        );
+        let current = registry
+            .get("stale-remove-config")
+            .expect("the successor owner exists");
+        assert!(matches!(
+            registry
+                .remove_if_current("stale-remove-config", &predecessor)
+                .await,
+            RemoveResult::NotFound
+        ));
+        assert!(
+            Arc::ptr_eq(
+                &current,
+                &registry
+                    .get("stale-remove-config")
+                    .expect("successor remains")
+            ),
+            "a stale predecessor cannot retire its successor"
+        );
         let _ = registry.shutdown_all().await;
     }
 
@@ -2331,7 +3175,7 @@ mod tests {
             .await
             .expect("incumbent joins");
         let replacement = mesh
-            .join(network("f13-race-config", "f13-race-wire"))
+            .join(network("f13-race-replacement", "f13-race-wire"))
             .await
             .expect("replacement joins independently");
         assert!(
@@ -2373,7 +3217,7 @@ mod tests {
             "the same replacement installs only after Stopped"
         );
         let installed = registry
-            .get("f13-race-config")
+            .get("f13-race-replacement")
             .expect("the replacement is now authoritative");
         assert_eq!(installed.network_id(), "f13-race-wire");
         let _ = registry.shutdown_all().await;

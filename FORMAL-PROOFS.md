@@ -145,13 +145,17 @@ MayPromote(c, M, A, C, u) :=
     ChannelCurrentlyWorks(c)
     and FreshMutualDeviceAuthentication(c, A, C)
     and ChannelBindsExactMesh(c, M)
-    and DurablePolicyAllows(P, M, A, C)
+    and (EphemeralOpenHandshakeAllows(c, M, A, C)
+         or DurableClosedPolicyAllows(P, M, A, C))
     and LocalPrincipalAllows(u, M, A, C)
     and PostAuthResourcesReserved(c, A, C, u)
     and FreshSessionCapabilityReserved(c, A, C, u)
 ```
 
-`DurablePolicyAllows` means Open self-participation under the Open profile or the selected Closed authorization proof under the Closed profile.
+`EphemeralOpenHandshakeAllows` means the exact-context endpoint handshake
+proved possession of the participating Device keys. It creates no durable
+fact. `DurableClosedPolicyAllows` means the selected Closed authorization proof
+is present in the accepted durable governance basis.
 
 ## 2. Assumptions
 
@@ -241,13 +245,18 @@ The domain projection rule maps an exclusive incomparable head set of cardinalit
 
 ## 5. Open and Closed authority
 
-### Theorem 5.1. Open permissionlessness
+### Theorem 5.1. Open ephemeral permissionlessness
 
-Under the Open rule, any Device key may create its own valid Open participation fact without a third-party authorization input.
+Under the Open rule, any Device key may establish ephemeral participation
+after an exact-context handshake proves key possession, without a third-party
+authorization input. Open creates zero base durable semantic facts.
 
 #### Proof
 
-The Open participation predicate requires only `CommonValid`, exact Open context, self-authorship, and the Open domain shape. No existing participant, service, application, quorum, or pair grant is an input.
+The Open predicate is an endpoint-authentication predicate, not a durable-fact
+predicate: it requires exact context and fresh Device-key possession. No
+existing participant, service, application, quorum, pair grant, or durable
+join/leave/presence record is an input.
 
 ### Theorem 5.2. Open authority confinement
 
@@ -303,7 +312,10 @@ A connected socket, successful ICE check, TURN allocation, relay allocation, or 
 
 #### Proof
 
-Each omits one or more required conjuncts of `MayPromote`, including fresh mutual Device authentication, exact mesh binding, durable Open or Closed policy, local-principal admission, post-authentication reservation, or fresh session capability.
+Each omits one or more required conjuncts of `MayPromote`, including fresh
+mutual Device authentication, exact mesh binding, the ephemeral Open
+handshake or durable Closed policy, local-principal admission,
+post-authentication reservation, or fresh session capability.
 
 ### Theorem 7.2. Channel-promotion soundness
 
@@ -311,7 +323,8 @@ If a conforming runtime exposes `AuthenticatedPeerSession(A, C, M)`, then at the
 
 1. A and C were freshly authenticated over the exact working channel;
 2. the channel was bound to `M`;
-3. the applicable Open or Closed policy allowed the peer under the local accepted durable state;
+3. the exact Open handshake or applicable Closed policy allowed the peer under
+   the local accepted view;
 4. the local principal was authorized;
 5. required post-authentication resources were reserved;
 6. the exposed handle was a fresh live capability.
@@ -414,7 +427,7 @@ A relay allocation is live bounded state naming one exact endpoint pair and one 
 
 ### Theorem 10.2. Relay non-substitution
 
-Assume A-C endpoint authentication and packet protection. A malicious TURN, generic relay, or Closed member relay cannot cause C to accept an application packet as authored by A without breaking endpoint authentication or packet integrity.
+Assume A-C endpoint authentication and packet protection. A malicious TURN or Closed member relay cannot cause C to accept an application packet as authored by A without breaking endpoint authentication or packet integrity.
 
 #### Proof sketch
 
@@ -485,7 +498,9 @@ If observation age is computed from local monotonic time recorded at successful 
 
 ### Corollary 12.3. Absence is not revocation
 
-Failure to obtain a new observation supplies no signed Open withdrawal or Closed removal and therefore cannot synthesize either durable semantic change.
+Failure to obtain a new observation supplies no runtime Open departure or
+Closed removal fact and therefore cannot synthesize either durable semantic
+change.
 
 ## 13. Durable retention and storage opening
 
@@ -493,23 +508,74 @@ Failure to obtain a new observation supplies no signed Open withdrawal or Closed
 
 A durable basis is sufficient when it preserves the current durable projection, unresolved exclusive conflicts, adopted continuation validation, and durable pending effects without requiring removed history during ordinary operation.
 
-### Theorem 13.2. Compaction equivalence
+The base ledger is durable Closed authority/governance only. Runtime join,
+leave, presence, and reconnect for Open and Closed are excluded from the
+durable fact set. The owner selects finite ceilings for retained fact count,
+canonical bytes, causal edges, per-author count/bytes, proof-verification
+work, eligible-signer quarantine, total proof history, and local-only indexed
+SQLite plus WAL/reserve bytes. The store has one semantic writer and `FULL`
+synchronous durability. A candidate whose full delta is the exact `N+1` in any
+dimension is refused before mutation, acknowledgement, identity, or
+authority change. Duplicate delivery is a semantic no-op.
+
+Quarantine is dependency-indexed and bounded by the same claims. Per-author
+retained lifetime is an explicit cleanup cap, not silent authority expiry.
+Exact proof history remains until an archive or authority-ratified checkpoint
+permits semantic deletion. The shipped compaction contract is bounded
+checkpointing only; it does not claim a full-copy `VACUUM` without separately
+funded temporary-copy, metadata, and cleanup custody. No timer deletes or
+silently prunes semantic history. These finite ceilings bound ordinary growth
+and failure spam because rejected attempts retain no new fact, while failed
+cleanup keeps its exact charged claim until terminal observation.
+
+### Theorem 13.2. Pre-mutation quota refusal
+
+Let `U` be the retained ledger usage vector and `q` the complete candidate
+delta across count, bytes, causal edges, per-author usage and lifetime, proof
+work, quarantine, and indexed database/WAL-reserve bytes. If any selected
+dimension of `U + q` exceeds its owner-selected ceiling, the candidate is
+refused before the semantic reducer mutates the graph, projection,
+acknowledgement, identity, or authority. A duplicate Fact ID is a semantic
+no-op and creates no new history.
+
+#### Proof sketch
+
+Admission computes every named component before commit. The reducer has no
+successful transition after a failed component check, so the graph and its
+projection remain unchanged. Since quarantine and proof records use the same
+vector, repeated failure cannot bypass the bound through a side structure.
+
+### Theorem 13.3. Compaction equivalence
 
 For every future durable continuation admitted by the domain's fixed continuation contract, evaluation from the verified compacted basis yields the same validation dispositions and durable projection as evaluation from the removed full history.
 
 This is a proof obligation of the compaction profile, not a property of a hash root alone.
 
-### Theorem 13.3. Store-opening non-revival
+### Theorem 13.4. Store-opening non-revival
 
 Opening a valid durable basis can reproduce its durable projection but cannot reproduce prior live transport or session state when live capabilities, keys, replay windows, connector objects, sockets, and reservations are excluded from durable restoration.
 
-### Theorem 13.4. Whole-witness rollback limit
+### Theorem 13.5. Whole-witness rollback limit
 
 If every witness of a later durable fact is lost and only an older internally valid basis remains, no algorithm using only that basis can distinguish the world in which the later fact existed from the world in which it never existed.
 
 #### Proof
 
 The local input is identical in both worlds. A deterministic or probabilistic algorithm cannot derive information absent from its input with guaranteed correctness.
+
+### Note 13.6. Durable commit outcome boundary
+
+Atomic publication proves that a successfully reopened store exposes either
+the prior valid basis or the complete new basis; it does not make every
+caller-visible SQLite error a rollback witness. A statement or preflight
+failure is old only when explicit rollback or exact reopen verification proves
+that result. A WAL write/sync failure or `COMMIT` return error is
+outcome-unknown until reopen compares context, projection commitment,
+generation, indexed rows, provisional custody, and proof records against the
+old and expected new bases. A checkpoint or truncation failure after COMMIT is
+a maintenance failure over an already committed semantic result, not evidence
+that the result was rolled back. Corrupt or mismatched reopen is a recovery
+failure, not a guessed old state.
 
 ## 14. Effects and resources
 
@@ -522,6 +588,15 @@ If every parser, candidate, socket, relay, handshake, media quarantine, session,
 The provider grants claim `q` only when component-wise checked addition proves `sum(R) + q <= G`. Owner Drop after proven cleanup removes exactly the claim held by that lease. Failed-cleanup retention replaces the live lease claim with the same exact retained claim, so it does not reduce `sum(R)`. Failed subtraction or addition cannot create capacity and instead poisons the affected accounting domain. Induction over grant, release, and failed-cleanup-retention transitions preserves `sum(R) <= G`.
 
 This theorem covers only quantities actually charged to `R`. It does not prove that allocator slack, native WebRTC allocations, OS handles, runtime internals, driver state, or external provider allocations are represented. Those require a conservative claim, an isolation boundary, or an explicit residual report.
+
+For the `StorageBytes` dimension, the process-accounted claim is one composite
+quantity, `B = M + W + S + R`, covering main database bytes, WAL bytes,
+shared-memory/sidecar bytes, and explicit reserve. Named-file containment or
+VFS accounting does not by itself prove backing disk capacity, filesystem
+metadata capacity, or ENOSPC behavior; those remain residuals unless an exact
+provider mapping proves them. This storage equation is an accounting claim and
+must not be confused with the backing quantity `B` defined in Theorem 14.5f
+without a dimension label.
 
 ### Theorem 14.2. Pre-authentication and post-authentication separation
 
@@ -986,7 +1061,8 @@ Ordinary candidate discovery, channel promotion, reachability observation, relay
 
 Under the stated assumptions, if a conforming application receives and successfully uses `AuthenticatedPeerSession(A, C, M)`, then:
 
-1. the relevant durable Open or Closed policy under the local accepted view allowed A and C;
+1. the exact Open handshake or relevant Closed policy under the local accepted
+   view allowed A and C;
 2. a connector produced a live channel that actually passed the required handshake traffic;
 3. A and C were freshly mutually authenticated over that exact channel or authenticated live-channel set;
 4. the exact mesh context was bound to the authentication;
@@ -997,7 +1073,12 @@ Under the stated assumptions, if a conforming application receives and successfu
 
 #### Proof sketch
 
-The durable policy result follows from `Project` and the Open or Closed verifier. The working channel follows from the connector transition. The endpoint, context, principal, resource, and capability properties are conjuncts of `MayPromote`. Application delivery is reachable only through the promoted capability. Signaling noninterference and relay non-substitution provide the final two properties.
+The durable Closed policy result follows from `Project`; the Open result
+follows from the exact endpoint handshake. The working channel follows from
+the connector transition. The endpoint, context, principal, resource, and
+capability properties are conjuncts of `MayPromote`. Application delivery is
+reachable only through the promoted capability. Signaling noninterference and
+relay non-substitution provide the final two properties.
 
 ## 18. Required mechanized or executable evidence
 
@@ -1010,11 +1091,20 @@ A concrete implementation must provide:
 5. bounded speculative-work tests under malformed and identity-rotating input;
 6. promotion tests that independently remove every predicate;
 7. replay tests across channels, restart, and delayed callbacks;
-8. direct, TURN, generic relay, and Closed member-relay equivalence tests;
+8. direct, TURN, and Closed member-relay equivalence tests;
 9. handoff tests with two concurrently authenticated channels and no relay-to-relay protocol;
 10. signaling and payload parser/effect reachability analysis;
 11. crash tests for reservations and effect intents;
 12. compaction equivalence tests for each adopted durable domain;
 13. eclipse controls that preserve the impossibility boundary;
 14. elastic-provider controls for grant, pressure, exact release, child-scope borrowing, pending demand under the provider's own declared selection policy, retirement requests to reclaimable owners, ignored retirement, failed-cleanup retention, slow work, and storage-backed work;
-15. resource characterization and opaque-residual reports on every supported target.
+15. resource characterization and opaque-residual reports on every supported target;
+16. deterministic durable-store controls for statement/preflight refusal, WAL
+    write and sync faults, ambiguous COMMIT return, post-COMMIT checkpoint
+    maintenance failure, crash cutpoints, and exact reopen reconciliation,
+    recording old/new/outcome-unknown without claiming rollback from an
+    unobserved transaction drop;
+17. architecture-compliance evidence that includes bounded Open/Closed scale,
+    exact `N+1` refusal, lifecycle no-op delivery, exact Closed restart, and
+    terminal provider baselines. Source inspection or unit evidence alone is
+    not a final compliance PASS.

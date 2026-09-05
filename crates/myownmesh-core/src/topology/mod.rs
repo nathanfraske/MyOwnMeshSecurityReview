@@ -68,10 +68,21 @@ pub trait Topology: Send + Sync {
     }
 
     /// Where `self_id` should send a frame destined for `dest` when
-    /// `dest` isn't directly connected: the next hop(s) to try, best
-    /// first, drawn from `connected`. Empty = no route (the caller
-    /// surfaces the delivery failure honestly rather than guessing).
-    fn next_hops(&self, _self_id: &str, _dest: &str, _connected: &[String]) -> Vec<String> {
+    /// `dest` isn't directly connected: at most `limit` next hop(s) to
+    /// try, best first, drawn from `connected`. `limit == 0` always
+    /// returns an empty list. Empty = no route (the caller surfaces the
+    /// delivery failure honestly rather than guessing).
+    ///
+    /// Implementations must retain only O(`limit`) candidate state while
+    /// scanning `connected`; they must not materialize or sort the whole
+    /// connected set merely to apply the bound.
+    fn next_hops(
+        &self,
+        _self_id: &str,
+        _dest: &str,
+        _connected: &[String],
+        _limit: usize,
+    ) -> Vec<String> {
         Vec::new()
     }
 

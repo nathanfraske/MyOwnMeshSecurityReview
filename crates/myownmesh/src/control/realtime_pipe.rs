@@ -367,6 +367,14 @@ where
 /// retired — a pump is joined and an unfinished install is answered, and both
 /// move out of the record. Everything else here is read through the record while
 /// it is still alive, so its leases outlive the buffers they fund.
+struct RouteRetirementBatch(Option<crate::ipc::LeasedList<crate::ipc::RetiredRoute>>);
+
+impl RouteRetirementBatch {
+    fn pop(&mut self) -> Option<crate::ipc::RetiredRoute> {
+        self.0.as_mut().and_then(|routes| routes.pop())
+    }
+}
+
 pub(super) async fn release_owned_registrations(
     state: &ControlState,
     removed: crate::ipc::UnregisteredClient,
@@ -405,7 +413,9 @@ pub(super) async fn release_owned_registrations(
     // `serve` counts the pumps among the tasks it will not return without. A
     // disconnect that skipped this would leave a fan-out task delivering into a
     // channel whose only subscriber is gone.
-    let mut routes = removed.routes;
+    // `RetiredRoute::retire` keeps an external bounded join owner armed across
+    // this await, so cancellation of this cleanup task cannot detach the pump.
+    let mut routes = RouteRetirementBatch(Some(removed.routes));
     while let Some(route) = routes.pop() {
         route.retire().await;
     }

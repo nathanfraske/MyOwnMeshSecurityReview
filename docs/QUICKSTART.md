@@ -10,31 +10,26 @@ instead: `cargo install --path crates/myownmesh` then
 
 ## 1. Dependencies
 
-The library crates aren't on crates.io yet. Pin them to a release
-tag via git:
+Depend on the exact `myownmesh-core` release tag selected for your deployment.
+The repository tag is the source distribution; replace `vX.Y.Z` below with the
+chosen tag:
 
 ```toml
 [dependencies]
-myownmesh-core      = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }
-myownmesh-signaling = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "v0.2.7" }  # only if you want the Nostr driver
+myownmesh-core = { git = "https://github.com/mrjeeves/MyOwnMesh", tag = "vX.Y.Z" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-`tag = "v0.2.7"` gets reproducible builds; switch to
-`branch = "main"` if you're tracking the latest work. Both crates
-resolve out of the same checkout because cargo dedupes git deps by
-URL. See [`../RELEASE.md`](../RELEASE.md) for the published-artifact
-catalogue.
+For a workspace checkout, use the corresponding path dependencies instead.
 
 ## 2. Open the mesh
 
 `Mesh::open_connector_capable` loads (or generates on first call) this device's
-long-lived ed25519 identity from
-`~/.myownmesh/.secrets/identity.json` and constructs the shared
-WebRTC API with the process owner's reviewed process and exact-Mesh connector
-policy. MyOwnMesh does not provide default policy values. Use
-`Mesh::open_infrastructure_only` only for a runtime that cannot join a network.
+long-lived ed25519 identity from `~/.myownmesh/.secrets/identity.json` and
+constructs the shared WebRTC API with the caller's explicit connector policy.
+Use `Mesh::open_infrastructure_only` only for a runtime that does not join a
+network.
 
 ```rust
 use myownmesh_core::{Mesh, MeshConfig, WebRtcConnectorCapablePolicy};
@@ -46,54 +41,9 @@ let mesh = Mesh::open_connector_capable(
 println!("device id: {}", mesh.identity().display_id());
 ```
 
-For the headless daemon, `myownmesh serve` uses the infrastructure-only form
-when node participation is disabled. A participating node requires every
-provider resource dimension below before startup:
-
-```text
-MYOWNMESH_RESOURCE_GRANT
-MYOWNMESH_CONNECTOR_REALTIME_POLICY
-```
-
-`MYOWNMESH_RESOURCE_GRANT` is the whole process grant, written as a
-comma-separated list of `dimension=value`:
-
-```text
-MYOWNMESH_RESOURCE_GRANT="accounted_memory_bytes=0,queued_bytes=0,\
-socket_or_handle=0,native_transport_object=0,worker_or_task=0,\
-callback_or_scheduled_work=0,storage_bytes=0,storage_object=0,\
-relay_or_provider_allocation=0,parsing_or_cpu_work=0,\
-opaque_dependency_residual=0"
-```
-
-All eleven dimensions are required so the process grant is explicit, including
-a deliberate zero. A grant that omits one, names one twice, names one that does
-not exist, or carries a value this daemon cannot represent is refused at
-startup with a message naming the dimension at fault.
-
-The current WebRTC connector does not yet charge `socket_or_handle` when native
-ICE sockets or handles are created, and it does not charge
-`relay_or_provider_allocation` for a native TURN allocation. Supplying either
-value does not enforce that native resource today. Those allocations remain
-dependency or provider residuals until the adapter exposes an exact claim.
-
-Set `MYOWNMESH_CONNECTOR_REALTIME_POLICY=disabled` for a data-only connector, or
-`enabled` for codec-neutral real-time resource ownership. There is no second
-connector shape and no local ceiling: what bounds the daemon is the process
-grant above, so no Mesh, peer, connector, flow, or queue-item count is
-configured beside it.
-
-`enabled` additionally requires `MYOWNMESH_REALTIME_PROFILE`, the
-application-supplied codec profile. It is governed separately from the process
-grant — see the realtime section below — and supplying it to a data-only daemon
-is a startup error rather than a harmless extra, because nothing would register
-it.
-
-MyOwnMesh supplies no numeric fallback. Missing or invalid provider values stop
-the connector-capable daemon before it joins a mesh. A provider dimension may
-be zero when the deployment intentionally grants none of that resource. Native
-close has no timeout policy. It stays in the `Closing` state until the WebRTC
-dependency returns success or an error.
+The connector-capable constructor takes an explicit provider policy. Resource
+ownership and transport admission stay inside the runtime; applications do not
+need to reproduce internal resource formulas in this guide.
 
 The returned `MeshHandle` is cheap to clone. Multiple subsystems in
 your app can hold one.
@@ -101,37 +51,46 @@ your app can hold one.
 ## 3. Join a network
 
 ```rust
-use myownmesh_core::{NetworkConfig, TopologyMode};
+use myownmesh_core::{NetworkConfig, NetworkKind, TopologyMode};
+use myownmesh_core::config::ClosedRelayPolicyConfig;
 
 let net = mesh.join(NetworkConfig {
     id: "home".into(),                          // local config record id
     network_id: "my-cool-mesh".into(),          // wire-level rendezvous handle
     label: "Home mesh".into(),
-    kind: Default::default(),                   // Open governance
+    kind: NetworkKind::Open,
     topology: TopologyMode::default(),          // FullMesh
     signaling: Default::default(),
+    closed_relay: ClosedRelayPolicyConfig::default(), // disabled by default
     stun_servers: Default::default(),
     turn_servers: Default::default(),
-    roster_path: None,
     pinned_peers: Vec::new(),
     auto_approve: false,
 }).await?;
 ```
 
-Then attach a signaling driver. For production, use Nostr:
+Then attach a signaling driver. For a configured carrier, use the joined
+network's typed attach method:
 
 ```rust
-let nostr_handle = myownmesh_core::engine::attach_nostr(&net.state());
+let _drivers = net.attach_signaling()?;
 ```
 
-For in-process testing (single-process app with multiple
-`MeshHandle`s), use the local broker:
+`LocalBroker` is a `transport-lab`-only control seam, not an advertised
+production carrier. When compiling an integration control with that feature,
+it still traverses the bounded ingress, authentication, and promotion path:
 
 ```rust
-use myownmesh_signaling::local::LocalBroker;
+use myownmesh_core::LocalBroker;
 
 let broker = LocalBroker::new();
-myownmesh_core::engine::attach_local(&net.state(), &broker);
+net.attach_local(&broker);
+```
+
+For example, run the maintained two-peer control with:
+
+```bash
+cargo test -p myownmesh-core --features transport-lab --test two_peer_handshake -- --nocapture
 ```
 
 ## 4. Subscribe to events
@@ -189,9 +148,9 @@ let delivered = chan.broadcast(&Greeting {
 println!("sent to {delivered} peers");
 
 // Receive
-let mut sub = chan.subscribe();
+let mut sub = chan.subscribe()?;
 while let Some(Ok(msg)) = sub.recv().await {
-    println!("{} says: {}", msg.from, msg.body.text);
+    println!("{} says: {}", msg.from(), msg.body().text);
 }
 ```
 
@@ -207,7 +166,7 @@ let rpc = net.rpc();
 // Server side
 rpc.serve("echo", |call| async move {
     Ok(myownmesh_core::RpcResponse::from_value(call.payload))
-});
+})?;
 
 // Client side
 let resp = rpc.call(
@@ -218,48 +177,87 @@ let resp = rpc.call(
 println!("got back: {:?}", resp.body);
 ```
 
-Streaming responses use `serve_stream` + `call_stream`:
+Streaming responses use the resource-backed `serve_stream` and `call_stream`
+APIs. Their handler returns the core crate's funded mailbox receiver, so a
+plain Tokio `mpsc::Receiver` is not a replacement.
+
+## 7. Governance
+
+Runtime authority is represented by signed semantic facts. Use the named
+proposal methods on `JoinedNetwork`; do not mutate a roster as a substitute for
+granting, revoking, or evicting a device.
 
 ```rust
-use tokio::sync::mpsc;
+use myownmesh_core::semantic::Role;
 
-rpc.serve_stream("count", |call| async move {
-    let (tx, rx) = mpsc::channel(8);
-    let n = call.payload.get("n").and_then(|v| v.as_u64()).unwrap_or(5);
-    tokio::spawn(async move {
-        for i in 0..n {
-            let _ = tx.send(serde_json::json!({ "i": i })).await;
-        }
-    });
-    Ok(rx)
-});
-
-let mut stream = rpc.call_stream(&peer_id, "count", serde_json::json!({"n": 3})).await?;
-while let Some(chunk) = stream.recv().await {
-    println!("{chunk:?}");
-}
+let grant_id = net
+    .propose_role_grant(&peer_id, Role::Member, None)
+    .await?;
+let revoke_id = net.propose_role_revoke(&peer_id, None).await?;
+let eviction_id = net.propose_evict(&peer_id, None).await?;
+println!("grant={grant_id}, revoke={revoke_id}, eviction={eviction_id}");
 ```
 
-## 7. Roster
+Each method returns the resulting semantic `FactId` after the current
+authority and exact network context have been checked. The optional MFA value
+is passed as the final argument when the deployment requires it.
 
-Per-network approved-peers list, persisted at
-`~/.myownmesh/mesh/rosters/{network_id}.json`. Approved peers
-auto-allow on reconnect without prompting.
+The base ledger is durable Closed authority/governance only. Open networks
+have zero base durable semantic facts: an exact-context handshake and Device
+key possession authenticate ephemeral participation. Join, leave, presence,
+and reconnect are runtime observations for both Open and Closed and never
+become semantic history. The owner-selected ledger limits (fact count, bytes,
+causal edges, per-author usage, proof work, and indexed database bytes) are
+checked before mutation; the exact `N+1` request is refused without changing
+the graph, projection, ACK, identity, or authority.
+
+## 8. Closed-member opaque relay
+
+Closed relaying is disabled by default. On a `NetworkKind::Closed` network,
+enable it explicitly on the `NetworkConfig` with a finite
+`ClosedRelayPolicyConfig`; the policy owns the allocation, queue, handshake,
+bandwidth, replay, and lifetime bounds.
 
 ```rust
-net.roster_approve(&peer_id, "Alice's Laptop").await?;
-let peers = net.roster_list().await?;
-for entry in peers {
-    println!("{}: {}", entry.device_id, entry.label);
-}
-net.roster_remove(&peer_id).await?;
+let policy = ClosedRelayPolicyConfig {
+    enabled: true,
+    ..ClosedRelayPolicyConfig::default()
+};
+// Set `kind: NetworkKind::Closed` and `closed_relay: policy` in NetworkConfig
+// before `mesh.join(...)`.
 ```
 
-`auto_approve = true` in `NetworkConfig` skips the user prompt for
-new peers; the engine adds every authenticating peer to the roster
-automatically. Useful for headless fleet members.
+After the endpoints have authenticated and been promoted on their direct
+links to the relay member, the requester opens a channel and the target
+accepts the next authenticated offer:
 
-## 8. Topology
+```rust
+let requester = network_a
+    .open_closed_relay(&relay_id, &target_id)
+    .await?;
+let target = network_c.accept_closed_relay().await?;
+
+requester.send(b"hello").await?;
+assert_eq!(target.recv().await?, b"hello");
+println!("relay={}, session={:?}", requester.relay_device_id(), requester.session_id());
+
+requester.close().await?;
+target.close().await?;
+```
+
+The endpoint handles expose only opaque send/receive/close operations and
+route metadata. The relay forwards ciphertext; endpoint key material remains
+at the requester and target. A direct requester-to-target connection is not
+created by this lifecycle. Every control and data message is validated against
+the complete route and bounded control profile before mutation or forwarding.
+Admission refusal preserves the pending handshake custody. Close is
+route-bound, generation-fenced, and settles the exact live allocation through
+the opposite-endpoint acknowledgement; persistent terminal tombstones make
+duplicates idempotent and prevent a delayed predecessor close from affecting
+a successor with a reused session identifier. Shutdown wakes bounded relay
+waiters and joins their owned custody before completion.
+
+## 9. Topology
 
 The selector is configured per-network and can be changed at runtime:
 
@@ -281,23 +279,21 @@ net.set_topology(TopologyMode::FullMesh).await?;
 The engine re-runs the selector synchronously and emits
 `Shelved` / `Unshelved` events for affected peers.
 
-## 9. Clean shutdown
+## 10. Clean shutdown
 
 ```rust
 net.leave().await?;
 ```
 
 `leave()` signals the driver to stop, tears down every peer session,
-and aborts the event-fanout task. Subsequent calls on the same
-`JoinedNetwork` will fail with `Error::Network`.
+and stops the event-fanout task. Use `shutdown()` when shared ownership means
+the handle cannot be consumed; it is idempotent and awaits driver retirement.
 
 The `MeshHandle` itself doesn't need explicit cleanup. Drop it.
 
 ## More
 
-- `docs/PROTOCOL.md`: wire-level frame reference.
-- `CONNECTION-ENGINE-FIELD-NOTES.md`: retained field evidence for the graduated recovery ladder, all
-  tunables, every edge case.
-- `examples/`: runnable demos.
-- `tests/two_peer_handshake.rs`: the end-to-end integration test
+- [`PROTOCOL.md`](PROTOCOL.md): wire-level frame reference.
+- `../crates/myownmesh-core/examples/`: runnable demos.
+- `../crates/myownmesh-core/tests/two_peer_handshake.rs`: the end-to-end integration test
   doubles as an executable spec for the full handshake stack.
