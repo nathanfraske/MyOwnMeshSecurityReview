@@ -161,9 +161,10 @@ impl Ticker for TopologyShapeTicker {
     }
 }
 
-/// Coalesced renegotiation — one in-place offer per peer whose track set
-/// changed since the last pass (see
-/// `engine::service_media_renegotiations`). No-op when nothing moved.
+/// Recovery backstop for coalesced renegotiation. The WebRTC
+/// `negotiationneeded` callback drives the ordinary path immediately; this
+/// pass retries debt that could not run because signaling was not stable or a
+/// prior attempt failed. No-op when nothing is pending.
 pub(crate) struct MediaRenegotiationTicker;
 
 #[async_trait]

@@ -22,6 +22,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
@@ -162,6 +163,27 @@ GRANT_DIMENSIONS = (
 
 class BenchmarkError(RuntimeError):
     """A failed benchmark contract, rather than a product qualification."""
+
+
+class SemanticExecutableError(BenchmarkError):
+    """A semantic child failed after its output streams were retained."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str,
+        stderr: str,
+        sampler: dict[str, Any] | None,
+        returncode: int | None,
+        terminal: str,
+    ) -> None:
+        super().__init__(f"{message} (child_terminal={terminal})")
+        self.stdout = stdout
+        self.stderr = stderr
+        self.sampler = sampler
+        self.returncode = returncode
+        self.terminal = terminal
 
 
 def utc_now() -> str:
@@ -519,7 +541,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semantic-max-marginal-slope-ms-per-fact",
         type=float,
-        help="required adjacent-scale marginal wall-time slope budget",
+        help="deprecated legacy slope budget; rejected in favor of matched-tail-total budget",
+    )
+    parser.add_argument(
+        "--semantic-max-matched-tail-total-ms-per-ledger-fact",
+        type=float,
+        help="required matched-tail-total wall-time slope budget",
     )
     return parser.parse_args()
 
@@ -559,11 +586,17 @@ def validate(args: argparse.Namespace) -> None:
 def _validate_semantic_budgets(args: argparse.Namespace) -> None:
     for name in (
         "semantic_max_wall_ms",
-        "semantic_max_marginal_slope_ms_per_fact",
+        "semantic_max_matched_tail_total_ms_per_ledger_fact",
     ):
         value = getattr(args, name, None)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise BenchmarkError(f"--{name.replace('_', '-')} must be a finite positive number")
+    legacy = getattr(args, "semantic_max_marginal_slope_ms_per_fact", None)
+    if legacy is not None:
+        raise BenchmarkError(
+            "--semantic-max-marginal-slope-ms-per-fact is deprecated; provide "
+            "--semantic-max-matched-tail-total-ms-per-ledger-fact"
+        )
     for name in ("semantic_max_rss_bytes", "semantic_max_disk_bytes"):
         value = getattr(args, name, None)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -609,6 +642,42 @@ def _discover_semantic_executable(build_output: str) -> Path:
     return unique[0]
 
 
+def _read_semantic_output(stdout_file: BinaryIO, stderr_file: BinaryIO) -> tuple[str, str]:
+    stdout_file.seek(0)
+    stderr_file.seek(0)
+    stdout = stdout_file.read().decode("utf-8", errors="replace")
+    stderr = stderr_file.read().decode("utf-8", errors="replace")
+    return stdout, stderr
+
+
+def _reap_semantic_process(process: subprocess.Popen[bytes]) -> str:
+    """Kill if needed and observe a child without leaving an ambiguous task."""
+    try:
+        running = process.poll() is None
+    except BaseException:
+        running = True
+    if running:
+        if os.name == "posix":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+    try:
+        process.wait(timeout=1.0)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            return "unresolved"
+    return "reaped"
+
+
 def _run_semantic_executable(
     executable: Path,
     selector: str,
@@ -617,33 +686,78 @@ def _run_semantic_executable(
 ) -> tuple[str, str, float, dict[str, Any], int]:
     command = [str(executable), "--ignored", "--exact", selector, "--nocapture", "--test-threads=1"]
     started = time.perf_counter()
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        cwd=cwd,
-        start_new_session=os.name == "posix",
-    )
-    sampler = ProcSampler({"semantic_ledger_scale": process})
-    deadline = time.monotonic() + timeout
-    while process.poll() is None:
-        sampler.sample("semantic-scale")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if os.name == "posix":
-                os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
+    # Regular files keep a verbose ignored test from filling either pipe while
+    # the parent is sampling. They also give the timeout path an explicit,
+    # bounded lifecycle: kill, wait, read, and close before reporting failure.
+    process: subprocess.Popen[bytes] | None = None
+    sampler: ProcSampler | None = None
+    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                cwd=cwd,
+                start_new_session=os.name == "posix",
+            )
+            sampler = ProcSampler({"semantic_ledger_scale": process})
+            deadline = time.monotonic() + timeout
+            while process.poll() is None:
+                sampler.sample("semantic-scale")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BenchmarkError(f"semantic case {selector} exceeded --semantic-timeout")
+                time.sleep(min(0.05, remaining))
+            sampler.sample("semantic-scale-final")
             process.wait()
-            raise BenchmarkError(f"semantic case {selector} exceeded --semantic-timeout")
-        time.sleep(min(0.05, remaining))
-    sampler.sample("semantic-scale-final")
-    stdout_bytes, stderr_bytes = process.communicate()
-    elapsed_ms = (time.perf_counter() - started) * 1_000.0
-    stdout = stdout_bytes.decode("utf-8", errors="replace")
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
-    return stdout, stderr, elapsed_ms, sampler.result(), process.returncode
+            stdout, stderr = _read_semantic_output(stdout_file, stderr_file)
+            if process.returncode != 0:
+                detail = (stderr or stdout).strip()[-4_096:]
+                raise SemanticExecutableError(
+                    f"semantic case {selector} exited {process.returncode}: {detail}",
+                    stdout=stdout,
+                    stderr=stderr,
+                    sampler=sampler.result(),
+                    returncode=process.returncode,
+                    terminal="reaped",
+                )
+            elapsed_ms = (time.perf_counter() - started) * 1_000.0
+            return stdout, stderr, elapsed_ms, sampler.result(), process.returncode
+        except SemanticExecutableError:
+            raise
+        except BaseException as error:
+            if process is None:
+                terminal = "not_started"
+            else:
+                try:
+                    terminal = _reap_semantic_process(process)
+                except BaseException:
+                    terminal = "unresolved"
+            try:
+                stdout, stderr = _read_semantic_output(stdout_file, stderr_file)
+            except BaseException as output_error:
+                stdout = f"<semantic stdout unavailable: {output_error!r}>"
+                stderr = "<semantic stderr unavailable>"
+            try:
+                sampler_result = sampler.result() if sampler is not None else None
+            except BaseException:
+                sampler_result = None
+            raise SemanticExecutableError(
+                str(error),
+                stdout=stdout,
+                stderr=stderr,
+                sampler=sampler_result,
+                returncode=process.returncode if process is not None else None,
+                terminal=terminal,
+            ) from error
+        finally:
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        _reap_semantic_process(process)
+                except BaseException:
+                    pass
 
 
 def _validate_semantic_scale_budgets(
@@ -683,15 +797,72 @@ def _validate_semantic_scale_budgets(
             "wall_ms": case["elapsed_ms"],
             "peak_rss_bytes": peak_rss,
             "sqlite_peak_bytes": disk_peak,
+            "matched_tail_work_ms": None,
+            "marginal_slope_estimator": "matched_tail_total_ms_per_ledger_fact/v1",
+            "marginal_slope_units": "ms_per_ledger_fact",
         }
+    # The scale suite intentionally seeds a large prefix for 250k/500k/1m and
+    # then times the same 2,000-admission tail. Top-level elapsed time mixes
+    # that seed cost with the measured workload, so adjacent total-time slopes
+    # are not a complexity metric. Compare only equal tail shapes, using the
+    # emitted admission_total_ms for that common tail. Unmatched transitions
+    # remain explicitly unavailable.
+    def matched_tail(metric: dict[str, Any]) -> tuple[tuple[Any, ...], float]:
+        timed = metric.get("timed_admissions")
+        window_target = metric.get("window_admission_target")
+        window_limit = metric.get("window_sample_limit")
+        total_ms = metric.get("admission_total_ms")
+        platform_name = metric.get("platform")
+        cache_state = metric.get("cache_state")
+        if (
+            isinstance(timed, bool)
+            or not isinstance(timed, int)
+            or timed <= 0
+            or isinstance(window_target, bool)
+            or not isinstance(window_target, int)
+            or window_target <= 0
+            or isinstance(window_limit, bool)
+            or not isinstance(window_limit, int)
+            or window_limit <= 0
+            or not isinstance(platform_name, str)
+            or not platform_name
+            or cache_state != SEMANTIC_CACHE_STATE
+        ):
+            raise BenchmarkError("semantic marginal slope is unavailable: matching metadata is not positive")
+        _finite_positive(total_ms, "admission_total_ms")
+        key = (
+            platform_name,
+            timed,
+            window_target,
+            window_limit,
+            cache_state,
+        )
+        return key, float(total_ms)
+
+    matched_transitions = 0
     ordered = sorted(scale_cases.items())
-    for (previous_scale, previous), (scale, current) in zip(ordered, ordered[1:]):
-        slope = max(0.0, current["elapsed_ms"] - previous["elapsed_ms"]) / (scale - previous_scale)
+    for (_, previous), (scale, current) in zip(ordered, ordered[1:]):
+        current["budget_observations"]["marginal_slope_ms_per_fact"] = None
+        current["budget_observations"]["marginal_slope_status"] = "unavailable_unmatched_workload"
+        previous_tail = matched_tail(previous["metric"])
+        current_tail = matched_tail(current["metric"])
+        if previous_tail[0] != current_tail[0]:
+            continue
+        previous_scale = previous["metric"]["scale_n"]
+        slope = (current_tail[1] - previous_tail[1]) / (scale - previous_scale)
+        previous["budget_observations"]["matched_tail_work_ms"] = previous_tail[1]
+        current["budget_observations"]["matched_tail_work_ms"] = current_tail[1]
         current["budget_observations"]["marginal_slope_ms_per_fact"] = slope
-        if slope > args.semantic_max_marginal_slope_ms_per_fact:
+        current["budget_observations"]["marginal_slope_status"] = "matched_tail_window"
+        matched_transitions += 1
+        if slope > args.semantic_max_matched_tail_total_ms_per_ledger_fact:
             raise BenchmarkError(
-                f"semantic scale transition {previous_scale}->{scale} exceeded the marginal-slope budget"
+                f"semantic matched-tail transition {previous_scale}->{scale} exceeded the marginal-slope budget"
             )
+    if matched_transitions == 0:
+        raise BenchmarkError(
+            "semantic marginal slope is unavailable: no adjacent scale cases share a comparable timed tail workload"
+        )
 
 
 def _finite_nonnegative(value: Any, label: str) -> None:
@@ -732,10 +903,30 @@ def _validate_scale_windows(metric: dict[str, Any], selector: str) -> None:
     windows = metric.get("window_evidence")
     if not isinstance(windows, list) or not windows:
         raise BenchmarkError(f"semantic metric {selector}.window_evidence must be nonempty")
+    scale = metric.get("scale_n")
+    seeded = metric.get("seeded_admissions")
+    timed = metric.get("timed_admissions")
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, int)
+        or scale <= 0
+        or isinstance(seeded, bool)
+        or not isinstance(seeded, int)
+        or seeded < 0
+        or isinstance(timed, bool)
+        or not isinstance(timed, int)
+        or timed <= 0
+    ):
+        raise BenchmarkError(f"semantic metric {selector} has invalid positive window metadata")
+    expected_start = seeded + 1
+    total_count = 0
+    total_admission_ms = 0.0
     required = {
         "start_admitted",
         "end_admitted",
+        "admission_count",
         "admission_total_ms",
+        "elapsed_ms",
         "average_admission_ms",
         "p50_ms",
         "p95_ms",
@@ -750,11 +941,34 @@ def _validate_scale_windows(metric: dict[str, Any], selector: str) -> None:
                 raise BenchmarkError(f"semantic metric {selector}.window_evidence[{index}].{field} is invalid")
         if window["end_admitted"] < window["start_admitted"]:
             raise BenchmarkError(f"semantic metric {selector}.window_evidence[{index}] is reversed")
+        count = window["admission_count"]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise BenchmarkError(f"semantic metric {selector}.window_evidence[{index}].admission_count is invalid")
+        if window["end_admitted"] - window["start_admitted"] + 1 != count:
+            raise BenchmarkError(f"semantic metric {selector}.window_evidence[{index}] has an inconsistent admission count")
+        if window["start_admitted"] != expected_start:
+            raise BenchmarkError(f"semantic metric {selector}.window_evidence does not provide contiguous admitted coverage")
+        expected_start = window["end_admitted"] + 1
+        total_count += count
         _finite_nonnegative(window["admission_total_ms"], f"{selector}.window_evidence[{index}].admission_total_ms")
+        _finite_nonnegative(window["elapsed_ms"], f"{selector}.window_evidence[{index}].elapsed_ms")
         _finite_nonnegative(window["average_admission_ms"], f"{selector}.window_evidence[{index}].average_admission_ms")
+        if not math.isclose(
+            window["average_admission_ms"],
+            window["admission_total_ms"] / count,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        ):
+            raise BenchmarkError(f"semantic metric {selector}.window_evidence[{index}] has an inconsistent average")
         _finite_nonnegative(window["p50_ms"], f"{selector}.window_evidence[{index}].p50_ms")
         _finite_nonnegative(window["p95_ms"], f"{selector}.window_evidence[{index}].p95_ms")
         _finite_positive(window["p99_ms"], f"{selector}.window_evidence[{index}].p99_ms")
+        total_admission_ms += window["admission_total_ms"]
+    if expected_start != scale + 1 or total_count != timed:
+        raise BenchmarkError(f"semantic metric {selector}.window_evidence does not cover exactly the timed admissions")
+    _finite_nonnegative(metric.get("admission_total_ms"), f"{selector}.admission_total_ms")
+    if not math.isclose(total_admission_ms, metric["admission_total_ms"], rel_tol=1e-9, abs_tol=1e-9):
+        raise BenchmarkError(f"semantic metric {selector}.window_evidence total does not match admission_total_ms")
 
 
 def _validate_provider(value: Any, label: str) -> dict[str, Any]:
@@ -1190,9 +1404,18 @@ def run_semantic_ledger(args: argparse.Namespace, artifact_dir: Path) -> dict[st
                 "--nocapture",
                 "--test-threads=1",
             ]
-            stdout, stderr, measured_elapsed_ms, process, returncode = _run_semantic_executable(
-                executable, selector, args.semantic_timeout, repo_root
-            )
+            try:
+                stdout, stderr, measured_elapsed_ms, process, returncode = _run_semantic_executable(
+                    executable, selector, args.semantic_timeout, repo_root
+                )
+            except SemanticExecutableError as error:
+                stdout_path = artifact_dir / f"case-{case_index:02d}-{selector}.stdout.log"
+                stderr_path = artifact_dir / f"case-{case_index:02d}-{selector}.stderr.log"
+                stdout_path.write_text(error.stdout, encoding="utf-8")
+                stderr_path.write_text(error.stderr, encoding="utf-8")
+                raise BenchmarkError(
+                    f"{error}; stdout_path={stdout_path.name}; stderr_path={stderr_path.name}"
+                ) from error
         else:
             command = [
                 "cargo",
@@ -1282,7 +1505,7 @@ def run_semantic_ledger(args: argparse.Namespace, artifact_dir: Path) -> dict[st
             "max_wall_ms": args.semantic_max_wall_ms,
             "max_rss_bytes": args.semantic_max_rss_bytes,
             "max_disk_bytes": args.semantic_max_disk_bytes,
-            "max_marginal_slope_ms_per_fact": args.semantic_max_marginal_slope_ms_per_fact,
+            "max_matched_tail_total_ms_per_ledger_fact": args.semantic_max_matched_tail_total_ms_per_ledger_fact,
         },
         "cases": cases,
         "claims": {

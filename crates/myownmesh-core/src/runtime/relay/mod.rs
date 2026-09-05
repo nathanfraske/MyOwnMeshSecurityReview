@@ -4,7 +4,6 @@
 //! witnesses. Endpoint key material lives in [`OpaqueRelaySession`] and never
 //! crosses into this relay-side port.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -23,7 +22,9 @@ use crate::protocol::relay::{
     ClosedRelayRoute, OpaqueRelayPacket, RelayKeyShare, OPAQUE_RELAY_NONCE_BYTES,
     OPAQUE_RELAY_VERSION,
 };
-use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
+use crate::resource::{
+    FundedArc, ResourceAuthorityClass, ResourceClaim, ResourceClass, ResourceLease,
+};
 use crate::runtime::session_broker::SessionValidityWitness;
 use crate::semantic::{DeviceId, MeshContextId};
 
@@ -179,7 +180,9 @@ impl RelayAllocationPermit {
             .ok_or(ClosedRelayRefusal::InvalidProfile)?;
         let bytes = std::mem::size_of::<Self>()
             .checked_add(std::mem::size_of::<ClosedRelayHandle>())
-            .and_then(|value| value.checked_add(std::mem::size_of::<ActiveAllocation>()))
+            // The ActiveAllocation value itself lives in the fixed,
+            // root-funded state table; only its retained member string is
+            // charged to this allocation below.
             .and_then(|value| value.checked_add(retained_endpoint_string_bytes))
             .and_then(|value| value.checked_add(retained_member_string_bytes))
             .and_then(|value| value.checked_add(queue_bytes))
@@ -236,30 +239,97 @@ impl RelayAllocationPermit {
 pub struct ClosedRelayRuntime {
     profile: ClosedRelayPolicyConfig,
     local_device_id: DeviceId,
-    state: Arc<Mutex<RelayAdmissionState>>,
+    state: FundedArc<Mutex<RelayAdmissionState>>,
 }
 
 impl ClosedRelayRuntime {
+    // One Arc value allocation, one Arc lease allocation, and the two fixed
+    // occupancy tables. The tables are allocated before this value is
+    // published, so no later admission can require an uncharged resize.
+    const ROOT_HEAP_ALLOCATIONS: u64 = 4;
+
+    /// Exact process-local custody for the runtime's shared admission root.
+    ///
+    /// The active and tombstone values are stored in fixed tables sized by the
+    /// configured ceilings. Per-handle accounting covers the handle itself;
+    /// this claim covers the shared root, table slots, handshake owners, and
+    /// the runtime's FundedArc owner.
+    pub(crate) fn runtime_claim(
+        profile: &ClosedRelayPolicyConfig,
+    ) -> Result<ResourceClaim, ClosedRelayRefusal> {
+        if !profile.enabled || !profile.validate() {
+            return Err(ClosedRelayRefusal::InvalidProfile);
+        }
+        let capacity = usize::try_from(profile.max_allocations)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        let active_bytes = capacity
+            .checked_mul(std::mem::size_of::<Option<ActiveAllocation>>())
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let tombstone_bytes = capacity
+            .checked_mul(std::mem::size_of::<Option<RelayTerminalTombstone>>())
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let handshake_bytes = usize::try_from(profile.max_pending_handshakes)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?
+            .checked_mul(std::mem::size_of::<ClosedRelayHandshakeGuard>())
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let bytes = std::mem::size_of::<Mutex<RelayAdmissionState>>()
+            .checked_add(active_bytes)
+            .and_then(|value| value.checked_add(tombstone_bytes))
+            .and_then(|value| value.checked_add(handshake_bytes))
+            .and_then(|value| {
+                value.checked_add(std::mem::size_of::<FundedArc<Mutex<RelayAdmissionState>>>())
+            })
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        ResourceClaim::try_from_entries([
+            (
+                ResourceClass::AccountedMemoryBytes,
+                u64::try_from(bytes).map_err(|_| ClosedRelayRefusal::InvalidProfile)?,
+            ),
+            (
+                ResourceClass::OpaqueDependencyResidual,
+                Self::ROOT_HEAP_ALLOCATIONS,
+            ),
+        ])
+        .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+    }
+
     pub(crate) fn new(
         profile: ClosedRelayPolicyConfig,
         local_device_id: DeviceId,
+        funding: ResourceLease,
     ) -> Result<Self, ClosedRelayRefusal> {
-        if !profile.enabled || !profile.validate() {
+        let root_claim = Self::runtime_claim(&profile)?;
+        if funding.authority() != ResourceAuthorityClass::Admitted || funding.claim() != root_claim
+        {
             return Err(ClosedRelayRefusal::InvalidProfile);
         }
         let terminal_tombstone_capacity = usize::try_from(profile.max_allocations)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
-        Ok(Self {
-            profile,
-            local_device_id,
-            state: Arc::new(Mutex::new(RelayAdmissionState {
-                active_allocations: Vec::new(),
-                terminal_tombstones: Vec::new(),
+        let active_allocations = (0..terminal_tombstone_capacity)
+            .map(|_| None)
+            .collect::<Vec<Option<ActiveAllocation>>>()
+            .into_boxed_slice();
+        let terminal_tombstones = (0..terminal_tombstone_capacity)
+            .map(|_| None)
+            .collect::<Vec<Option<RelayTerminalTombstone>>>()
+            .into_boxed_slice();
+        let state = FundedArc::new(
+            Mutex::new(RelayAdmissionState {
+                active_allocations,
+                terminal_tombstones,
                 terminal_tombstone_capacity,
+                terminal_tombstones_len: 0,
                 pending_handshakes: 0,
                 next_allocation_id: 0,
                 next_allocation_epoch: 0,
-            })),
+            }),
+            funding,
+        )
+        .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        Ok(Self {
+            profile,
+            local_device_id,
+            state,
         })
     }
 
@@ -279,7 +349,7 @@ impl ClosedRelayRuntime {
         }
         state.pending_handshakes += 1;
         Ok(ClosedRelayHandshakeGuard {
-            state: Arc::clone(&self.state),
+            state: self.state.clone(),
             expires_at,
         })
     }
@@ -345,14 +415,21 @@ impl ClosedRelayRuntime {
             if state
                 .active_allocations
                 .iter()
+                .filter_map(Option::as_ref)
                 .any(|active| active.session_id == endpoints.session_id)
             {
                 return Err(ClosedRelayRefusal::OwnerMismatch);
             }
-            if state.active_allocations.len() >= max_allocations
+            if state
+                .active_allocations
+                .iter()
+                .filter(|active| active.is_some())
+                .count()
+                >= max_allocations
                 || state
                     .active_allocations
                     .iter()
+                    .filter_map(Option::as_ref)
                     .filter(|active| active.member == member)
                     .count()
                     >= max_per_member
@@ -364,7 +441,12 @@ impl ClosedRelayRuntime {
                 .next_allocation_id
                 .checked_add(1)
                 .ok_or(ClosedRelayRefusal::InvalidProfile)?;
-            state.active_allocations.push(ActiveAllocation {
+            let active_slot = state
+                .active_allocations
+                .iter()
+                .position(Option::is_none)
+                .ok_or(ClosedRelayRefusal::QueueFull)?;
+            state.active_allocations[active_slot] = Some(ActiveAllocation {
                 id: allocation_id,
                 member: member.clone(),
                 session_id: endpoints.session_id,
@@ -372,7 +454,6 @@ impl ClosedRelayRuntime {
             let (requester_tx, requester_rx) = mpsc::channel(capacity);
             let (target_tx, target_rx) = mpsc::channel(capacity);
             Ok(ClosedRelayHandle {
-                permit: Some(permit),
                 requester,
                 target,
                 endpoints,
@@ -386,7 +467,7 @@ impl ClosedRelayRuntime {
                     self.profile.bandwidth_rate_bytes_per_second,
                     self.profile.bandwidth_burst_bytes,
                 )),
-                state: Arc::clone(&self.state),
+                state: self.state.clone(),
                 allocation_id,
                 opened_at: Instant::now(),
                 last_activity: Instant::now(),
@@ -397,6 +478,7 @@ impl ClosedRelayRuntime {
                 target_tx,
                 target_rx,
                 settled: false,
+                _permit: permit,
             })
         }
     }
@@ -405,7 +487,6 @@ impl ClosedRelayRuntime {
 /// One exact relay allocation. This is intentionally keyless: it can forward
 /// an endpoint-authenticated ciphertext but cannot decrypt or mint authority.
 pub struct ClosedRelayHandle {
-    permit: Option<RelayAllocationPermit>,
     requester: SessionValidityWitness,
     target: SessionValidityWitness,
     endpoints: ClosedRelayEndpoints,
@@ -416,7 +497,7 @@ pub struct ClosedRelayHandle {
     queue_bytes_capacity: usize,
     queue: Mutex<[QueueAccounting; 2]>,
     bandwidth: Mutex<BandwidthBucket>,
-    state: Arc<Mutex<RelayAdmissionState>>,
+    state: FundedArc<Mutex<RelayAdmissionState>>,
     allocation_id: u64,
     opened_at: Instant,
     last_activity: Instant,
@@ -427,6 +508,9 @@ pub struct ClosedRelayHandle {
     target_tx: mpsc::Sender<OpaqueRelayPacket>,
     target_rx: mpsc::Receiver<OpaqueRelayPacket>,
     settled: bool,
+    // Last so channels, queued packets, and all other handle-owned values are
+    // destroyed before their funding is released, including terminal errors.
+    _permit: RelayAllocationPermit,
 }
 
 impl ClosedRelayHandle {
@@ -674,18 +758,16 @@ impl ClosedRelayHandle {
         if self.settled {
             return;
         }
-        let permit = self.permit.take();
         let mut state = self.state.lock();
-        if let Some(index) = state
-            .active_allocations
-            .iter()
-            .position(|active| active.id == self.allocation_id)
-        {
-            state.active_allocations.swap_remove(index);
+        if let Some(index) = state.active_allocations.iter().position(|active| {
+            active
+                .as_ref()
+                .is_some_and(|active| active.id == self.allocation_id)
+        }) {
+            state.active_allocations[index] = None;
         }
         state.record_terminal_tombstone(self.endpoints.session_id, self.endpoints.allocation_epoch);
         drop(state);
-        drop(permit);
         self.settled = true;
     }
 
@@ -693,19 +775,7 @@ impl ClosedRelayHandle {
         if self.settled {
             return;
         }
-        let permit = self.permit.take();
-        let mut state = self.state.lock();
-        if let Some(index) = state
-            .active_allocations
-            .iter()
-            .position(|active| active.id == self.allocation_id)
-        {
-            state.active_allocations.swap_remove(index);
-        }
-        state.record_terminal_tombstone(self.endpoints.session_id, self.endpoints.allocation_epoch);
-        drop(state);
-        drop(permit);
-        self.settled = true;
+        self.terminate();
     }
 }
 
@@ -722,9 +792,10 @@ struct QueueAccounting {
 }
 
 struct RelayAdmissionState {
-    active_allocations: Vec<ActiveAllocation>,
-    terminal_tombstones: Vec<RelayTerminalTombstone>,
+    active_allocations: Box<[Option<ActiveAllocation>]>,
+    terminal_tombstones: Box<[Option<RelayTerminalTombstone>]>,
     terminal_tombstone_capacity: usize,
+    terminal_tombstones_len: usize,
     pending_handshakes: usize,
     next_allocation_id: u64,
     next_allocation_epoch: u64,
@@ -743,8 +814,9 @@ struct RelayTerminalTombstone {
 
 impl RelayAdmissionState {
     fn terminal_tombstone(&self, session_id: [u8; 16]) -> Option<u64> {
-        self.terminal_tombstones
+        self.terminal_tombstones[..self.terminal_tombstones_len]
             .iter()
+            .filter_map(Option::as_ref)
             .find(|tombstone| tombstone.session_id == session_id)
             .map(|tombstone| tombstone.allocation_epoch)
     }
@@ -753,29 +825,36 @@ impl RelayAdmissionState {
         if self.terminal_tombstone_capacity == 0 {
             return;
         }
-        if let Some(tombstone) = self
-            .terminal_tombstones
+        if let Some(tombstone) = self.terminal_tombstones[..self.terminal_tombstones_len]
             .iter_mut()
+            .filter_map(Option::as_mut)
             .find(|tombstone| tombstone.session_id == session_id)
         {
             tombstone.allocation_epoch = tombstone.allocation_epoch.max(allocation_epoch);
             return;
         }
-        if self.terminal_tombstones.len() >= self.terminal_tombstone_capacity {
+        if self.terminal_tombstones_len >= self.terminal_tombstone_capacity {
             // The table is bounded by the configured allocation ceiling. The
             // newest epoch is more useful than an older unrelated session,
             // while replacing an existing session above preserves its fence.
-            self.terminal_tombstones.swap_remove(0);
+            let last = self.terminal_tombstones_len - 1;
+            self.terminal_tombstones[0] = self.terminal_tombstones[last].take();
+            self.terminal_tombstones[last] = Some(RelayTerminalTombstone {
+                session_id,
+                allocation_epoch,
+            });
+            return;
         }
-        self.terminal_tombstones.push(RelayTerminalTombstone {
+        self.terminal_tombstones[self.terminal_tombstones_len] = Some(RelayTerminalTombstone {
             session_id,
             allocation_epoch,
         });
+        self.terminal_tombstones_len += 1;
     }
 }
 
 pub(crate) struct ClosedRelayHandshakeGuard {
-    state: Arc<Mutex<RelayAdmissionState>>,
+    state: FundedArc<Mutex<RelayAdmissionState>>,
     expires_at: Instant,
 }
 
@@ -1363,8 +1442,7 @@ mod tests {
             claim.amount(ResourceClass::AccountedMemoryBytes)
                 >= u64::try_from(
                     std::mem::size_of::<RelayAllocationPermit>()
-                        + std::mem::size_of::<ClosedRelayHandle>()
-                        + std::mem::size_of::<ActiveAllocation>(),
+                        + std::mem::size_of::<ClosedRelayHandle>(),
                 )
                 .expect("test platform sizes fit")
         );
@@ -1374,9 +1452,10 @@ mod tests {
     #[test]
     fn terminal_tombstones_update_latest_epoch_with_a_bounded_table() {
         let mut state = RelayAdmissionState {
-            active_allocations: Vec::new(),
-            terminal_tombstones: Vec::new(),
+            active_allocations: (0..2).map(|_| None).collect(),
+            terminal_tombstones: (0..2).map(|_| None).collect(),
             terminal_tombstone_capacity: 2,
+            terminal_tombstones_len: 0,
             pending_handshakes: 0,
             next_allocation_id: 0,
             next_allocation_epoch: 0,
@@ -1384,10 +1463,10 @@ mod tests {
         state.record_terminal_tombstone([1; 16], 1);
         state.record_terminal_tombstone([1; 16], 3);
         assert_eq!(state.terminal_tombstone([1; 16]), Some(3));
-        assert_eq!(state.terminal_tombstones.len(), 1);
+        assert_eq!(state.terminal_tombstones_len, 1);
         state.record_terminal_tombstone([2; 16], 1);
         state.record_terminal_tombstone([3; 16], 1);
-        assert_eq!(state.terminal_tombstones.len(), 2);
+        assert_eq!(state.terminal_tombstones_len, 2);
         assert_eq!(state.terminal_tombstone([3; 16]), Some(1));
     }
 }

@@ -20,6 +20,8 @@ use std::mem::size_of;
 #[cfg(any(test, feature = "transport-lab"))]
 use std::num::NonZeroUsize;
 use std::pin::Pin;
+#[cfg(feature = "transport-lab")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -2127,6 +2129,124 @@ fn callback_admission_error(context: &'static str, error: CallbackProducerOverlo
             Error::ResourceUnavailable(unavailable)
         }
         other => Error::Transport(format!("{context}: {other:?}")),
+    }
+}
+
+/// Controls-only discriminator for the production Closed-relay probe. This
+/// deliberately records neither payload bytes nor endpoint identity: the
+/// bounded leading tag is enough to tell the relay frame from every other
+/// native message without parsing peer-controlled content a second time.
+#[cfg(feature = "transport-lab")]
+fn transport_lab_message_kind(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(br#"{"kind":"closed_relay_data"#) {
+        "closed-relay-data"
+    } else {
+        "other"
+    }
+}
+
+#[cfg(feature = "transport-lab")]
+fn transport_lab_message_marker(stage: &'static str, kind: &'static str) {
+    eprintln!("closed-relay-transport-stage:{stage} kind={kind}");
+}
+
+/// Bounded transport counters for one exact native data channel.  These are
+/// intentionally lower-level observations, not delivery authority: the
+/// per-channel sent counters stop at SCTP queue admission, while the optional
+/// association/candidate counters describe aggregate network progress.
+#[cfg(feature = "transport-lab")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TransportLabChannelSnapshot {
+    pub(crate) channel_id: u16,
+    pub(crate) messages_sent: usize,
+    pub(crate) bytes_sent: usize,
+    pub(crate) messages_received: usize,
+    pub(crate) bytes_received: usize,
+    pub(crate) buffered_amount: usize,
+    pub(crate) association_bytes_sent: Option<usize>,
+    pub(crate) association_bytes_received: Option<usize>,
+    pub(crate) selected_pair_bytes_sent: Option<u64>,
+    pub(crate) selected_pair_bytes_received: Option<u64>,
+    pub(crate) selected_pair: Option<super::diag::SelectedCandidatePair>,
+    pub(crate) state: u8,
+}
+
+#[cfg(feature = "transport-lab")]
+impl PeerSession {
+    async fn transport_lab_channel_snapshot(&self) -> Option<TransportLabChannelSnapshot> {
+        let channel = self.data_channel.lock().clone()?;
+        let channel_id = channel.id();
+        let report = self.pc.get_stats().await;
+        let data_channel = report.reports.values().find_map(|report| match report {
+            webrtc::stats::StatsReportType::DataChannel(stats)
+                if stats.data_channel_identifier == channel_id =>
+            {
+                Some(stats)
+            }
+            _ => None,
+        })?;
+        let association = report.reports.values().find_map(|report| match report {
+            webrtc::stats::StatsReportType::SCTPTransport(stats) => Some(stats),
+            _ => None,
+        });
+        // Only a nominated pair is an authoritative selected-pair report.
+        // The succeeded-pair fallback used for path classification is not
+        // valid evidence for attributing this channel's traffic.
+        let selected_pair_stats = report.reports.values().find_map(|report| match report {
+            webrtc::stats::StatsReportType::CandidatePair(stats) if stats.nominated => Some(stats),
+            _ => None,
+        });
+        let selected_pair = selected_pair_stats.and_then(|stats| {
+            fn classify(
+                candidate_type: webrtc::ice::candidate::CandidateType,
+                ip: &str,
+            ) -> super::diag::IceCandidateKind {
+                use super::diag::IceCandidateKind;
+                match candidate_type {
+                    webrtc::ice::candidate::CandidateType::Relay => IceCandidateKind::Relay,
+                    _ if is_private_lan_ip(ip) => IceCandidateKind::Host,
+                    webrtc::ice::candidate::CandidateType::Host => IceCandidateKind::Host,
+                    webrtc::ice::candidate::CandidateType::ServerReflexive => {
+                        IceCandidateKind::ServerReflexive
+                    }
+                    webrtc::ice::candidate::CandidateType::PeerReflexive => {
+                        IceCandidateKind::PeerReflexive
+                    }
+                    webrtc::ice::candidate::CandidateType::Unspecified => IceCandidateKind::Unknown,
+                }
+            }
+            let local = report.reports.values().find_map(|report| match report {
+                webrtc::stats::StatsReportType::LocalCandidate(candidate)
+                    if candidate.id == stats.local_candidate_id =>
+                {
+                    Some(classify(candidate.candidate_type, &candidate.ip))
+                }
+                _ => None,
+            })?;
+            let remote = report.reports.values().find_map(|report| match report {
+                webrtc::stats::StatsReportType::RemoteCandidate(candidate)
+                    if candidate.id == stats.remote_candidate_id =>
+                {
+                    Some(classify(candidate.candidate_type, &candidate.ip))
+                }
+                _ => None,
+            })?;
+            Some(super::diag::SelectedCandidatePair { local, remote })
+        });
+        Some(TransportLabChannelSnapshot {
+            channel_id,
+            messages_sent: data_channel.messages_sent,
+            bytes_sent: data_channel.bytes_sent,
+            messages_received: data_channel.messages_received,
+            bytes_received: data_channel.bytes_received,
+            buffered_amount: channel.buffered_amount().await,
+            association_bytes_sent: association.map(|stats| stats.bytes_sent),
+            association_bytes_received: association.map(|stats| stats.bytes_received),
+            selected_pair_bytes_sent: selected_pair_stats.map(|stats| stats.bytes_sent),
+            selected_pair_bytes_received: selected_pair_stats.map(|stats| stats.bytes_received),
+            selected_pair,
+            state: channel.ready_state() as u8,
+        })
     }
 }
 
@@ -4680,6 +4800,57 @@ fn observe_inexact_item_if(
     scope.map(|scope| observe_inexact_item(scope, family, items, tasks))
 }
 
+#[cfg(feature = "transport-lab")]
+static NEXT_CALLBACK_OBSERVATION_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "transport-lab")]
+struct CallbackObservationLease {
+    id: u64,
+    site: &'static str,
+    lease: Option<ObservationLease>,
+}
+
+#[cfg(feature = "transport-lab")]
+impl Drop for CallbackObservationLease {
+    fn drop(&mut self) {
+        drop(self.lease.take());
+        eprintln!(
+            "[transport-lab] callback-observation dropped id={} site={}",
+            self.id, self.site
+        );
+    }
+}
+
+#[cfg(not(feature = "transport-lab"))]
+type CallbackObservationLease = ObservationLease;
+
+fn observe_callback_if(
+    scope: Option<&PeerConnectionResourceScope>,
+    site: &'static str,
+) -> Option<CallbackObservationLease> {
+    scope.map(|scope| {
+        let lease = observe_inexact_item(scope, PreAuthResourceFamily::Callback, 1, 0);
+        #[cfg(feature = "transport-lab")]
+        {
+            let id = NEXT_CALLBACK_OBSERVATION_ID.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[transport-lab] callback-observation constructed id={} site={}",
+                id, site
+            );
+            CallbackObservationLease {
+                id,
+                site,
+                lease: Some(lease),
+            }
+        }
+        #[cfg(not(feature = "transport-lab"))]
+        {
+            let _ = site;
+            lease
+        }
+    })
+}
+
 /// One move-only handoff from the exact connector incarnation to Endpoint
 /// Auth Task.
 pub(crate) struct EndpointAuthHandoff {
@@ -4970,6 +5141,7 @@ impl WebRtcConnectorWorker {
         // half-created transceiver.
         let _operation = self.ownership.enter_operation()?;
         self.realtime_negotiation_guard(encoding)?;
+        self.session.ensure_media_negotiation_callback();
         // Before the native call, and dropped by every `?` between here and the
         // record below — so a refused guard, a refused provider or a failed
         // `add_transceiver_from_kind` all leave this connector charged for
@@ -5145,6 +5317,7 @@ impl WebRtcConnectorWorker {
     ) -> Result<RealtimeOutboundTrack> {
         let _operation = self.ownership.enter_operation()?;
         self.realtime_negotiation_guard(encoding)?;
+        self.session.ensure_media_negotiation_callback();
         let track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type: encoding.mime().to_string(),
@@ -6005,6 +6178,19 @@ impl WebRtcConnectorWorker {
         .flatten()
     }
 
+    #[cfg(feature = "transport-lab")]
+    pub(crate) async fn transport_lab_channel_snapshot(
+        &self,
+    ) -> Option<TransportLabChannelSnapshot> {
+        let _operation = self.ownership.enter_operation().ok()?;
+        await_until_connector_retirement(
+            self.ownership.incarnation.subscribe_retirement(),
+            self.session.transport_lab_channel_snapshot(),
+        )
+        .await
+        .flatten()
+    }
+
     pub(crate) async fn ice_check_snapshot(&self) -> super::diag::IceCheckSnapshot {
         let Ok(_operation) = self.ownership.enter_operation() else {
             return super::diag::IceCheckSnapshot::default();
@@ -6325,6 +6511,13 @@ impl ConstructionTestHook {
 
     fn inject_native_close_error(&self) -> bool {
         self.pause == ConstructionPause::AfterNativeAllocationWithCloseError
+    }
+}
+
+#[cfg(test)]
+fn arc03_construction_stage(stage: &'static str) {
+    if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
+        eprintln!("arc03_construction_stage:{stage}");
     }
 }
 
@@ -6772,12 +6965,12 @@ impl Transport {
             .ok_or_else(|| {
                 Error::Transport("connector attempt retired before admission".to_string())
             })?;
+        candidate = candidate
+            .prepare_late_transport_custodian()
+            .map_err(Error::from)?;
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .map_err(|error| Error::Transport(error.to_string()))?;
-        candidate
-            .prepare_late_transport_custodian()
-            .map_err(Error::from)?;
         let late_transport_lease = candidate.take_late_transport_lease();
         let late_transport_custodian =
             LateTransportCustodian::new(late_transport_lease).map_err(|error| {
@@ -7173,6 +7366,22 @@ impl Transport {
                 realtime_tracks.bind_cleanup_owner(owner);
             }
 
+            // Register the standard callback before the offerer's initial
+            // data-channel mutation. webrtc-rs intentionally does not reset
+            // its internal negotiation-needed operation state when no handler
+            // is installed, so late registration can strand every later media
+            // notification. The gate suppresses that setup-only notification;
+            // the first RTP mutation arms ordinary event-driven negotiation.
+            let media_negotiation_callback = Arc::new(MediaNegotiationCallback {
+                armed: AtomicBool::new(false),
+                events_tx: event_sink.clone(),
+                _callback_observation: observe_callback_if(
+                    resource_scope.as_ref(),
+                    "media-negotiation",
+                ),
+            });
+            register_media_negotiation_callback(&pc, Arc::downgrade(&media_negotiation_callback));
+
             register_callbacks(
                 &pc,
                 &event_sink,
@@ -7216,6 +7425,7 @@ impl Transport {
                 realtime_profile,
                 realtime_tracks,
                 _events_tx: event_sink,
+                media_negotiation_callback,
                 operation_fence,
                 callback_gate,
                 role,
@@ -7352,12 +7562,7 @@ fn register_callbacks(
     // Local ICE candidate gathered — ship via signaling.
     {
         let tx = events_tx.clone();
-        let callback_observation = observe_inexact_item_if(
-            resource_scope.as_ref(),
-            PreAuthResourceFamily::Callback,
-            1,
-            0,
-        );
+        let callback_observation = observe_callback_if(resource_scope.as_ref(), "ice-candidate");
         pc.on_ice_candidate(Box::new(move |cand| {
             let _keep_callback_observation = &callback_observation;
             let mut callback_work =
@@ -7415,12 +7620,7 @@ fn register_callbacks(
     // ICE connection state changed.
     {
         let tx = events_tx.clone();
-        let callback_observation = observe_inexact_item_if(
-            resource_scope.as_ref(),
-            PreAuthResourceFamily::Callback,
-            1,
-            0,
-        );
+        let callback_observation = observe_callback_if(resource_scope.as_ref(), "ice-state");
         pc.on_ice_connection_state_change(Box::new(move |state| {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7447,12 +7647,7 @@ fn register_callbacks(
     // PeerConnection state changed.
     {
         let tx = events_tx.clone();
-        let callback_observation = observe_inexact_item_if(
-            resource_scope.as_ref(),
-            PreAuthResourceFamily::Callback,
-            1,
-            0,
-        );
+        let callback_observation = observe_callback_if(resource_scope.as_ref(), "peer-state");
         pc.on_peer_connection_state_change(Box::new(move |state| {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7481,12 +7676,8 @@ fn register_callbacks(
         let tx = events_tx.clone();
         let dc_slot = data_channel.clone();
         let handler_scope = resource_scope.clone();
-        let callback_observation = observe_inexact_item_if(
-            resource_scope.as_ref(),
-            PreAuthResourceFamily::Callback,
-            1,
-            0,
-        );
+        let callback_observation =
+            observe_callback_if(resource_scope.as_ref(), "data-channel-arrival");
         pc.on_data_channel(Box::new(move |dc| {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7531,12 +7722,7 @@ fn register_callbacks(
         let tx = events_tx.clone();
         let task_scope = resource_scope.clone();
         let session_tracks = Arc::clone(&realtime_tracks);
-        let callback_observation = observe_inexact_item_if(
-            resource_scope.as_ref(),
-            PreAuthResourceFamily::Callback,
-            1,
-            0,
-        );
+        let callback_observation = observe_callback_if(resource_scope.as_ref(), "track");
         pc.on_track(Box::new(move |track, _receiver, transceiver| {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7635,6 +7821,56 @@ fn register_callbacks(
     }
 }
 
+/// Install the standard WebRTC renegotiation callback during peer construction.
+///
+/// The initial data channel is negotiated explicitly by the connection setup
+/// path, so its notification is suppressed by `armed`. The first RTP mutation
+/// flips that gate. This preserves the dependency's operations-chain and
+/// stable-state coalescing without asking elapsed time to discover a change.
+fn register_media_negotiation_callback(
+    pc: &Arc<RTCPeerConnection>,
+    callback: std::sync::Weak<MediaNegotiationCallback>,
+) {
+    pc.on_negotiation_needed(Box::new(move || {
+        let Some(callback) = callback.upgrade() else {
+            return Box::pin(async {});
+        };
+        if !callback.armed.load(Ordering::Acquire) {
+            return Box::pin(async {});
+        }
+        let callback_work = match callback
+            .events_tx
+            .begin_native_callback_operation(ConnectorCallbackClass::Control)
+        {
+            Ok(work) => work,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "refusing native negotiation-needed callback under resource pressure"
+                );
+                callback.events_tx.retire_after_callback_violation();
+                return Box::pin(async {});
+            }
+        };
+        let tx = callback.events_tx.clone();
+        Box::pin(async move {
+            let _callback = callback;
+            let _callback_work = callback_work;
+            tx.emit(TransportEvent::RenegotiationNeeded).await;
+        })
+    }));
+}
+
+/// Session-owned state behind the peer connection's weak native callback.
+/// Keeping the handler weak prevents the dependency callback table from
+/// extending the lifetime of event mailboxes, resource scopes, or connector
+/// custody after the session owner is gone.
+struct MediaNegotiationCallback {
+    armed: AtomicBool,
+    events_tx: ConnectorEventSink,
+    _callback_observation: Option<CallbackObservationLease>,
+}
+
 fn install_data_channel_handlers(
     dc: Arc<RTCDataChannel>,
     tx: ConnectorEventSink,
@@ -7642,8 +7878,7 @@ fn install_data_channel_handlers(
 ) {
     {
         let tx = tx.clone();
-        let callback_observation =
-            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
+        let callback_observation = observe_callback_if(resource_scope, "data-channel-open");
         dc.on_open(Box::new(move || {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7667,8 +7902,7 @@ fn install_data_channel_handlers(
     }
     {
         let tx = tx.clone();
-        let callback_observation =
-            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
+        let callback_observation = observe_callback_if(resource_scope, "data-channel-close");
         dc.on_close(Box::new(move || {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -7693,10 +7927,13 @@ fn install_data_channel_handlers(
     }
     {
         let tx = tx.clone();
-        let callback_observation =
-            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
+        let callback_observation = observe_callback_if(resource_scope, "data-channel-message");
         dc.on_message(Box::new(move |msg: DataChannelMessage| {
             let _keep_callback_observation = &callback_observation;
+            #[cfg(feature = "transport-lab")]
+            let message_kind = transport_lab_message_kind(&msg.data);
+            #[cfg(feature = "transport-lab")]
+            transport_lab_message_marker("native-message-enter", message_kind);
             let payload_bytes = msg.data.len();
             let callback_work = match tx.begin_native_callback_operation_with_payload(
                 ConnectorCallbackClass::EndpointData,
@@ -7709,6 +7946,8 @@ fn install_data_channel_handlers(
                         ?error,
                         "refusing native endpoint-data callback under resource pressure"
                     );
+                    #[cfg(feature = "transport-lab")]
+                    transport_lab_message_marker("native-message-refused", message_kind);
                     tx.retire_after_callback_violation();
                     return Box::pin(async {});
                 }
@@ -7716,15 +7955,24 @@ fn install_data_channel_handlers(
             let tx = tx.clone();
             Box::pin(async move {
                 let _callback_work = callback_work;
-                tx.emit_data_channel(TransportEvent::Message(msg.data))
+                let accepted = tx
+                    .emit_data_channel(TransportEvent::Message(msg.data))
                     .await;
+                #[cfg(feature = "transport-lab")]
+                transport_lab_message_marker(
+                    if accepted {
+                        "native-message-mailbox-accepted"
+                    } else {
+                        "native-message-mailbox-refused"
+                    },
+                    message_kind,
+                );
             })
         }));
     }
     {
         let tx = tx.clone();
-        let callback_observation =
-            observe_inexact_item_if(resource_scope, PreAuthResourceFamily::Callback, 1, 0);
+        let callback_observation = observe_callback_if(resource_scope, "data-channel-error");
         dc.on_error(Box::new(move |err| {
             let _keep_callback_observation = &callback_observation;
             let callback_work =
@@ -8748,6 +8996,10 @@ pub struct PeerSession {
     /// that fires while its owner is being torn down must find a live sink to
     /// be refused by, not a freed one.
     _events_tx: ConnectorEventSink,
+    /// Arms delivery from the native renegotiation callback. Initial
+    /// data-channel negotiation has a separate explicit owner and must never be
+    /// mistaken for a post-promotion RTP track-set change.
+    media_negotiation_callback: Arc<MediaNegotiationCallback>,
     /// The operation fence is part of the session's close custody.  Raw
     /// sessions do not have a connector worker to retire this fence for them;
     /// retaining it here lets close drain callback admission before the native
@@ -8777,6 +9029,20 @@ pub struct PeerSession {
     /// connector reservation behind it — and it refuses native realtime
     /// negotiation rather than performing it unfunded.
     work_resource_scope: Option<ConnectorWorkResourceScope>,
+}
+
+impl PeerSession {
+    fn ensure_media_negotiation_callback(&self) {
+        self.media_negotiation_callback
+            .armed
+            .store(true, Ordering::Release);
+    }
+
+    fn retire_media_negotiation_callback(&self) {
+        self.media_negotiation_callback
+            .armed
+            .store(false, Ordering::Release);
+    }
 }
 
 impl PeerSession {
@@ -9133,6 +9399,7 @@ impl PeerSession {
     /// callback queue cannot deadlock shutdown.
     pub async fn close(&self) -> Result<()> {
         debug!("closing peer connection");
+        self.retire_media_negotiation_callback();
         self.operation_fence.begin_close();
         self.callback_gate.retire();
         self.operation_fence.wait_for_operations().await;
@@ -9740,12 +10007,12 @@ mod tests {
         let mut candidate = permit
             .reserve_connector_candidate(claim)
             .expect("fixture owner admits one candidate");
+        candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("fixture candidate reserves late terminal custodian");
         let cleanup_capability = candidate
             .issue_cleanup_capability()
             .expect("fixture candidate issues one cleanup capability");
-        candidate
-            .prepare_late_transport_custodian()
-            .expect("fixture candidate reserves late terminal custodian");
         let late_transport_lease = candidate.take_late_transport_lease();
         let late_transport_custodian = LateTransportCustodian::new(late_transport_lease)
             .expect("fixture late terminal custodian starts");
@@ -15680,34 +15947,109 @@ mod tests {
     async fn v4_arc03_cancelled_construction_closes_partial_native_peer() {
         let process = ProcessResourceRoot::isolated();
         let context = process.mesh_runtime_scope().network_instance_scope();
+        let (provider, owner) =
+            test_resource_owner_with_provider(1, 4, crate::resource::ResourceClaim::ZERO);
+        let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
         let mut transport = Transport::new()
             .expect("test transport")
-            .with_connector_resource_scope(test_resource_owner(1, 4), test_webrtc_profile(4));
+            .with_connector_resource_scope(owner.clone(), test_webrtc_profile(4));
         let hook = ConstructionTestHook::new(ConstructionPause::AfterNativeAllocation);
         transport.construction_hook = Some(Arc::clone(&hook));
         let construction_scope = context.peer_connection_scope();
-        let construction = tokio::spawn(async move {
+        arc03_construction_stage("before-construction-spawn");
+        let mut construction = tokio::spawn(async move {
             transport
                 .open_connector_peer(Role::Answerer, &[], &[], construction_scope)
                 .await
         });
 
-        let created = hook
-            .created
-            .acquire()
-            .await
-            .expect("construction hook remains open");
-        created.forget();
+        arc03_construction_stage("waiting-hook");
+        let mut completed_before_hook = None;
+        let hook_wait = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                permit = hook.created.acquire() => {
+                    permit.expect("construction hook remains open").forget();
+                    true
+                }
+                result = &mut construction => {
+                    completed_before_hook = Some(result);
+                    false
+                }
+            }
+        })
+        .await;
+        match hook_wait {
+            Ok(true) => {
+                arc03_construction_stage("hook-acquired");
+            }
+            Ok(false) => {
+                arc03_construction_stage("constructor-completed-before-hook");
+                match completed_before_hook
+                    .expect("construction completion is recorded by the race")
+                {
+                    Ok(Ok(result)) => {
+                        drop(result);
+                        panic!("connector constructor completed successfully before its hook");
+                    }
+                    Ok(Err(error)) => {
+                        panic!("connector constructor failed before its hook: {error}");
+                    }
+                    Err(error) => {
+                        panic!("connector construction task joined before its hook: {error}");
+                    }
+                }
+            }
+            Err(_) => {
+                arc03_construction_stage("hook-wait-deadline");
+                construction.abort();
+                arc03_construction_stage("abort-requested");
+                hook.resume.add_permits(1);
+                arc03_construction_stage("resume");
+                let joined = tokio::time::timeout(Duration::from_secs(10), &mut construction).await;
+                match joined {
+                    Ok(Ok(Ok(result))) => {
+                        drop(result);
+                        panic!("connector constructor completed after its hook deadline");
+                    }
+                    Ok(Ok(Err(error))) => {
+                        panic!("connector constructor returned after its hook deadline: {error}");
+                    }
+                    Ok(Err(error)) => {
+                        panic!(
+                            "connector construction task joined after its hook deadline: {error}"
+                        );
+                    }
+                    Err(_) => {
+                        panic!("connector construction did not join after abort/resume");
+                    }
+                }
+            }
+        }
         let native = hook
             .peer_connection
             .lock()
             .take()
             .expect("native peer exists at the cancellation point");
+        arc03_construction_stage("native-extracted");
 
         let close_observed_at = Instant::now();
         construction.abort();
-        assert!(construction.await.is_err());
+        arc03_construction_stage("abort-requested");
+        let cancelled = match tokio::time::timeout(Duration::from_secs(10), &mut construction).await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                arc03_construction_stage("abort-join-deadline");
+                hook.resume.add_permits(1);
+                panic!("connector construction did not join after cancellation: {error}");
+            }
+        };
+        assert!(cancelled.is_err());
+        arc03_construction_stage("join-observed");
         hook.resume.add_permits(1);
+        arc03_construction_stage("resume");
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while native.connection_state() != RTCPeerConnectionState::Closed {
@@ -15716,6 +16058,7 @@ mod tests {
         })
         .await
         .expect("owned construction closes the partial native peer");
+        arc03_construction_stage("native-closed");
         if std::env::var_os("MYOWNMESH_ARC03_OBSERVE_RAW").is_some() {
             println!(
                 "arc03_native_close_raw disposition=success close_ns={}",
@@ -15723,6 +16066,7 @@ mod tests {
             );
         }
         drop(native);
+        arc03_construction_stage("native-dropped");
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -15737,7 +16081,17 @@ mod tests {
                     .iter()
                     .find(|entry| entry.family == PreAuthResourceFamily::Task)
                     .expect("task family exists");
-                if callbacks.active == ResourceUse::ZERO && tasks.active == ResourceUse::ZERO {
+                let cleanup = owner.process_report();
+                if callbacks.active == ResourceUse::ZERO
+                    && tasks.active == ResourceUse::ZERO
+                    && cleanup.active_candidates == 0
+                    && cleanup.failed_cleanup_candidates == 0
+                    && cleanup.cleanup.queued_jobs == 0
+                    && cleanup.cleanup.active_jobs == 0
+                    && provider.in_use() == baseline
+                    && provider.active_reservations() == baseline_reservations
+                    && provider.active_scopes() == baseline_scopes
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -15745,6 +16099,20 @@ mod tests {
         })
         .await
         .expect("partial construction releases callback and task observations");
+        let report = owner.process_report();
+        assert_eq!(report.active_candidates, 0);
+        assert_eq!(report.failed_cleanup_candidates, 0);
+        assert_eq!(report.cleanup.queued_jobs, 0);
+        assert_eq!(report.cleanup.active_jobs, 0);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+        drop(owner);
+        assert_eq!(provider.in_use(), crate::resource::ResourceClaim::ZERO);
+        assert_eq!(provider.active_reservations(), 0);
+        assert_eq!(provider.active_scopes(), 0);
+        arc03_construction_stage("observation-terminal");
+        arc03_construction_stage("test-body-done");
     }
 
     #[tokio::test]
@@ -19006,6 +19374,17 @@ mod tests {
 
         assert!(off_open, "offerer never saw DataChannelOpen");
         assert!(ans_open, "answerer never saw DataChannelOpen");
+        assert!(
+            !offerer
+                .media_negotiation_callback
+                .armed
+                .load(Ordering::Acquire)
+                && !answerer
+                    .media_negotiation_callback
+                    .armed
+                    .load(Ordering::Acquire),
+            "initial data-channel setup must not arm the post-promotion media renegotiation lane"
+        );
 
         offerer
             .send(Bytes::from_static(b"hello"))
@@ -19176,6 +19555,8 @@ mod tests {
         let (provider, owner) =
             test_resource_owner_with_provider(1, 4, crate::resource::ResourceClaim::ZERO);
         let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
         let process = ProcessResourceRoot::isolated();
         let scope = process
             .mesh_runtime_scope()
@@ -19189,6 +19570,10 @@ mod tests {
             .await
             .expect("the provider-funded connector is constructed");
         let native = Arc::clone(&worker.session.pc);
+        let weak_native = Arc::downgrade(&native);
+        let weak_control = Arc::downgrade(&events.raw.control);
+        let weak_endpoint_data = Arc::downgrade(&events.raw.endpoint_data);
+        let weak_lifecycle = Arc::downgrade(&events.raw.lifecycle);
         let mut retirement = worker.ownership.incarnation.subscribe_retirement();
         let (task_started_tx, task_started_rx) = oneshot::channel();
         let task_finished = Arc::new(AtomicBool::new(false));
@@ -19228,10 +19613,79 @@ mod tests {
             task_finished.load(Ordering::Acquire),
             "the close owner sealed and joined the retained transport task"
         );
+
+        // The native peer deliberately remains alive for this first phase.
+        // Its callback closures therefore retain the four construction
+        // reservations that survive after the receiver is dropped. Derive
+        // that delta from the canonical callback claims rather than baking in
+        // allocator-dependent byte totals. The child connector scope carries
+        // its own one-record bookkeeping charge.
+        let construction_claims = callback::connector_construction_claims()
+            .expect("connector construction claims are representable");
+        let retained_delta = construction_claims
+            .iter()
+            .take(4)
+            .try_fold(crate::resource::ResourceClaim::ZERO, |total, claim| {
+                let reservation =
+                    crate::resource::FiniteResourceProvider::reservation_charge_for_test(*claim)
+                        .expect("callback reservation charge is representable");
+                total.checked_add(reservation)
+            })
+            .expect("retained callback delta is representable")
+            .checked_add(crate::resource::FiniteResourceProvider::scope_record_charge_for_test())
+            .expect("retained callback scope delta is representable");
+        let retained_in_use = baseline
+            .checked_add(retained_delta)
+            .expect("retained callback usage is representable");
+        assert_eq!(provider.in_use(), retained_in_use);
+        assert_eq!(
+            provider.active_reservations(),
+            baseline_reservations
+                .checked_add(4)
+                .expect("retained callback reservations are countable")
+        );
+        assert_eq!(
+            provider.active_scopes(),
+            baseline_scopes
+                .checked_add(1)
+                .expect("retained callback scope is countable")
+        );
+        assert!(weak_native.upgrade().is_some());
+        assert!(weak_control.upgrade().is_some());
+        assert!(weak_endpoint_data.upgrade().is_some());
+        assert!(weak_lifecycle.upgrade().is_some());
         let report = owner.report();
         assert_eq!(report.active_candidates, 0);
         assert_eq!(report.failed_cleanup_candidates, 0);
+
+        // Only the deliberately retained native owner is dropped here. The
+        // transport and resource owner stay unchanged while callback closures
+        // release their final funded owners.
+        drop(native);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if weak_native.upgrade().is_none()
+                    && weak_control.upgrade().is_none()
+                    && weak_endpoint_data.upgrade().is_none()
+                    && weak_lifecycle.upgrade().is_none()
+                    && provider.in_use() == baseline
+                    && provider.active_reservations() == baseline_reservations
+                    && provider.active_scopes() == baseline_scopes
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("hang guard: retained native owner releases callback owners");
+
         assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+        let report = owner.report();
+        assert_eq!(report.active_candidates, 0);
+        assert_eq!(report.failed_cleanup_candidates, 0);
     }
 
     #[tokio::test]

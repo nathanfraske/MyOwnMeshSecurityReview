@@ -15,6 +15,114 @@ use super::signaling_ingress::EphemeralIngress;
 use super::state::{NetworkCmd, NetworkState};
 use super::{network_watch, reliable};
 
+#[cfg(all(test, feature = "transport-lab"))]
+struct ConnectionCommandGateInner {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    entered_notify: tokio::sync::Notify,
+    released_notify: tokio::sync::Notify,
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) struct ConnectionCommandGate(Arc<ConnectionCommandGateInner>);
+
+#[cfg(all(test, feature = "transport-lab"))]
+fn connection_command_gate_slot(
+) -> &'static parking_lot::Mutex<Option<Arc<ConnectionCommandGateInner>>> {
+    static SLOT: std::sync::OnceLock<parking_lot::Mutex<Option<Arc<ConnectionCommandGateInner>>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) fn install_connection_command_gate_for_test() -> ConnectionCommandGate {
+    let gate = Arc::new(ConnectionCommandGateInner {
+        entered: std::sync::atomic::AtomicBool::new(false),
+        released: std::sync::atomic::AtomicBool::new(false),
+        entered_notify: tokio::sync::Notify::new(),
+        released_notify: tokio::sync::Notify::new(),
+    });
+    assert!(connection_command_gate_slot()
+        .lock()
+        .replace(Arc::clone(&gate))
+        .is_none());
+    ConnectionCommandGate(gate)
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) async fn wait_connection_command_gate_for_test(gate: &ConnectionCommandGate) {
+    loop {
+        let notified = gate.0.entered_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if gate.0.entered.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+pub(crate) fn release_connection_command_gate_for_test(gate: &ConnectionCommandGate) {
+    gate.0
+        .released
+        .store(true, std::sync::atomic::Ordering::Release);
+    gate.0.released_notify.notify_waiters();
+    let removed = connection_command_gate_slot().lock().take();
+    assert!(
+        removed.is_some(),
+        "connection command gate was not installed"
+    );
+}
+
+#[cfg(all(test, feature = "transport-lab"))]
+async fn hold_connection_command_gate() {
+    let Some(gate) = connection_command_gate_slot().lock().clone() else {
+        return;
+    };
+    let released = gate.released_notify.notified();
+    tokio::pin!(released);
+    released.as_mut().enable();
+    gate.entered
+        .store(true, std::sync::atomic::Ordering::Release);
+    gate.entered_notify.notify_waiters();
+    if !gate.released.load(std::sync::atomic::Ordering::Acquire) {
+        released.await;
+    }
+}
+
+async fn run_connection_commands(
+    state: Arc<NetworkState>,
+    mut receiver: crate::resource::ResourceMailboxReceiver<NetworkCmd>,
+) {
+    while let Some(delivery) = receiver.recv().await {
+        let command_state = Arc::clone(&state);
+        delivery
+            .run_terminal_effect(|command| async move {
+                match command {
+                    NetworkCmd::ConnectPeer {
+                        device_id,
+                        sticky,
+                        reply,
+                    } => {
+                        #[cfg(all(test, feature = "transport-lab"))]
+                        hold_connection_command_gate().await;
+                        connect_peer(&command_state, &device_id, sticky, reply).await;
+                    }
+                    _ => {
+                        // The sender is private to NetworkState; this is a
+                        // defensive terminal path that still settles a
+                        // delivery if an internal caller violates that seam.
+                        warn!("non-ConnectPeer command reached connection lane");
+                    }
+                }
+            })
+            .await;
+        #[cfg(test)]
+        state.notify_connect_waiter_terminal_for_test();
+    }
+}
+
 /// The engine's main loop. Owns the per-network state and the
 /// fan-in mpsc that consolidates signaling, transport, and
 /// command events.
@@ -26,6 +134,9 @@ pub(crate) async fn run_driver(
     let mut speculative_promotion_rx = state
         .take_speculative_promotion_rx()
         .expect("the network driver takes its speculative-promotion receiver once");
+    let connection_cmd_rx = state
+        .take_connection_cmd_rx()
+        .expect("the network driver takes its connection receiver once");
     state.log_diag(crate::events::DiagLevel::Info, "engine", "driver starting");
     // Settle the signed-eviction verdict from the persisted governance
     // state before anything announces or dials: a device evicted in a
@@ -120,81 +231,93 @@ pub(crate) async fn run_driver(
     // deliberate leave/`network_update`/`network_remove`, "command channel
     // closed" is the registry dropping us, "signaling channel closed" is the
     // relay/signaling feed dying.
-    let stop_reason: &str = loop {
-        tokio::select! {
-            _ = state.wait_for_shutdown() => {
-                break "shutdown requested";
-            }
+    // This is one concrete, parent-owned actor future rather than one boxed
+    // allocation per command. Its receiver and current delivery therefore
+    // remain owned by this lexical block and are dropped before state shutdown.
+    let stop_reason: &str = {
+        let connection_actor = run_connection_commands(Arc::clone(&state), connection_cmd_rx);
+        tokio::pin!(connection_actor);
+        let mut connection_actor_done = false;
+        loop {
+            tokio::select! {
+                _ = state.wait_for_shutdown() => {
+                    break "shutdown requested";
+                }
 
-            cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { break "command channel closed" };
-                // A command is handled, not read: fifteen `NetworkCmd` variants
-                // carry a `oneshot::Sender` that answering consumes, so this is
-                // the one path that cannot work from a borrow. The terminal
-                // effect releases the delivery's funding only after
-                // `handle_command` has finished, and can return nothing, so
-                // neither the command nor anything derived from it outlives
-                // the claim.
-                cmd.run_terminal_effect(|cmd| handle_command(&state, cmd)).await;
-            }
+                _ = &mut connection_actor, if !connection_actor_done => {
+                    connection_actor_done = true;
+                }
 
-            promotion = speculative_promotion_rx.recv() => {
-                let Some(promotion) = promotion else {
-                    break "speculative promotion channel closed";
-                };
-                promotion
-                    .run_terminal_effect(|promotion| {
-                        super::handle_speculative_promotion(&state, promotion)
-                    })
-                    .await;
-            }
+                cmd = cmd_rx.recv() => {
+                    let Some(cmd) = cmd else { break "command channel closed" };
+                    // A command is handled, not read: fifteen `NetworkCmd` variants
+                    // carry a `oneshot::Sender` that answering consumes, so this is
+                    // the one path that cannot work from a borrow. The terminal
+                    // effect releases the delivery's funding only after
+                    // `handle_command` has finished, and can return nothing, so
+                    // neither the command nor anything derived from it outlives
+                    // the claim.
+                    cmd.run_terminal_effect(|cmd| handle_command(&state, cmd)).await;
+                }
 
-            sig = signaling_inbound.recv() => {
-                let Some(sig) = sig else {
-                    warn!(network = %state.network_id, "signaling channel closed");
-                    break "signaling channel closed";
-                };
-                // Same shape as the command arm above, for the same reason:
-                // the delivery's payloads are consumed by
-                // value downstream — `apply_remote_sdp` takes an owned `String`
-                // and `add_remote_candidate_observed` takes an owned
-                // `LocalIceCandidate`. Handling from a borrow would mean
-                // cloning two multi-kilobyte SDP bodies and an ICE candidate
-                // outside the claim that funded them, so the whole delivery
-                // rides into the handler and its funding is released only after
-                // the handler has finished.
-                sig.run_terminal_effect(|sig| super::handle_signaling_inbound(&state, sig))
-                    .await;
-            }
+                promotion = speculative_promotion_rx.recv() => {
+                    let Some(promotion) = promotion else {
+                        break "speculative promotion channel closed";
+                    };
+                    promotion
+                        .run_terminal_effect(|promotion| {
+                            super::handle_speculative_promotion(&state, promotion)
+                        })
+                        .await;
+                }
 
-            _ = heartbeat.tick() => {
-                wake_detector.observe_with_policy(
-                    Instant::now(),
-                    scheduler_policy.heartbeat_interval_ms,
-                    &scheduler_policy,
-                );
-                super::heartbeat::tick(&state).await;
-                if wake_detector.take_wake_event() {
-                    debug!(network = %state.network_id, "wake event observed");
-                    super::wake::on_wake(&state).await;
+                sig = signaling_inbound.recv() => {
+                    let Some(sig) = sig else {
+                        warn!(network = %state.network_id, "signaling channel closed");
+                        break "signaling channel closed";
+                    };
+                    // Same shape as the command arm above, for the same reason:
+                    // the delivery's payloads are consumed by
+                    // value downstream — `apply_remote_sdp` takes an owned `String`
+                    // and `add_remote_candidate_observed` takes an owned
+                    // `LocalIceCandidate`. Handling from a borrow would mean
+                    // cloning two multi-kilobyte SDP bodies and an ICE candidate
+                    // outside the claim that funded them, so the whole delivery
+                    // rides into the handler and its funding is released only after
+                    // the handler has finished.
+                    sig.run_terminal_effect(|sig| super::handle_signaling_inbound(&state, sig))
+                        .await;
+                }
+
+                _ = heartbeat.tick() => {
+                    wake_detector.observe_with_policy(
+                        Instant::now(),
+                        scheduler_policy.heartbeat_interval_ms,
+                        &scheduler_policy,
+                    );
+                    super::heartbeat::tick(&state).await;
+                    if wake_detector.take_wake_event() {
+                        debug!(network = %state.network_id, "wake event observed");
+                        super::wake::on_wake(&state).await;
+                    }
+                }
+
+                _ = state_watch.tick() => {
+                    // Secondary safety net only — events drive recovery. Each
+                    // registered ticker confirms its slice of state and repairs
+                    // the time-based conditions no event can signal. The trace doubles
+                    // as the driver's liveness heartbeat in debug captures: when
+                    // the driver wedges, this is the line that stops.
+                    trace!(network = %state.network_id, "driver: state-watch tick");
+                    tick_registry.run(&state).await;
                 }
             }
 
-            _ = state_watch.tick() => {
-                // Secondary safety net only — events drive recovery. Each
-                // registered ticker confirms its slice of state and repairs
-                // the time-based conditions no event can signal. The trace doubles
-                // as the driver's liveness heartbeat in debug captures: when
-                // the driver wedges, this is the line that stops.
-                trace!(network = %state.network_id, "driver: state-watch tick");
-                tick_registry.run(&state).await;
-            }
+            // Observe the post-event connection state. Cheap no-op unless
+            // someone is watching; never holds a per-peer lock across an
+            // await (the handler above has already returned).
+            conn_tracer.sweep(&state);
         }
-
-        // Observe the post-event connection state. Cheap no-op unless
-        // someone is watching; never holds a per-peer lock across an
-        // await (the handler above has already returned).
-        conn_tracer.sweep(&state);
     };
 
     state.log_diag_with(
@@ -208,6 +331,9 @@ pub(crate) async fn run_driver(
     // that will never arrive; the peer-session cancellation edge is the
     // authority that settles the waiter, not a timer or a synthetic receipt.
     state.peers.cancel_pending_departures_for_shutdown();
+    // The connection actor's lexical owner has ended before this point, so
+    // its current delivery and queued mailbox entries settled before state
+    // shutdown without a detached task or a second task grant.
     state.shutdown().await;
 }
 

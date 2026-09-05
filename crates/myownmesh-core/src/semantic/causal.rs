@@ -14,6 +14,42 @@ use serde::{Deserialize, Serialize};
 thread_local! {
     static RESIDENCY_SCAN_COUNT: Cell<usize> = Cell::new(0);
     static INDEX_REBUILD_COUNT: Cell<usize> = Cell::new(0);
+    // Diagnostic-only counters for graph-work scaling probes.  These are
+    // deliberately not performance gates: they expose the work performed by
+    // the current implementation so a later optimization can be measured
+    // against fixed signed transcripts.
+    static GRAPH_WORK_COUNT: Cell<GraphWorkCounts> = Cell::new(GraphWorkCounts::default());
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GraphWorkCounts {
+    authority_fact_rows: usize,
+    authority_uses_examined: usize,
+    authority_edges_followed: usize,
+    authority_branch_nodes: usize,
+    aggregate_ready_entries: usize,
+    aggregate_waiter_edges: usize,
+    aggregate_waiter_nodes: usize,
+}
+
+#[cfg(test)]
+fn reset_graph_work() {
+    GRAPH_WORK_COUNT.with(|counter| counter.set(GraphWorkCounts::default()));
+}
+
+#[cfg(test)]
+fn graph_work() -> GraphWorkCounts {
+    GRAPH_WORK_COUNT.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_graph_work(update: impl FnOnce(&mut GraphWorkCounts)) {
+    GRAPH_WORK_COUNT.with(|counter| {
+        let mut value = counter.get();
+        update(&mut value);
+        counter.set(value);
+    });
 }
 
 use super::content::{DeviceId, ExclusiveCell, FactBody, Role};
@@ -2142,7 +2178,15 @@ impl FactGraph {
         // admission.
         let mut dependents_by_predecessor = BTreeMap::<FactId, Vec<FactId>>::new();
         for (fact_id, fact) in &self.facts {
+            #[cfg(test)]
+            record_graph_work(|work| {
+                work.authority_fact_rows = work.authority_fact_rows.saturating_add(1);
+            });
             for authority_use in &fact.content.authority_uses {
+                #[cfg(test)]
+                record_graph_work(|work| {
+                    work.authority_uses_examined = work.authority_uses_examined.saturating_add(1);
+                });
                 if authority_use.subject != *subject
                     || Self::is_payload_local_resolution(
                         &fact.content.body,
@@ -2153,6 +2197,11 @@ impl FactGraph {
                     continue;
                 }
                 for predecessor in &authority_use.predecessors {
+                    #[cfg(test)]
+                    record_graph_work(|work| {
+                        work.authority_edges_followed =
+                            work.authority_edges_followed.saturating_add(1);
+                    });
                     dependents_by_predecessor
                         .entry(*predecessor)
                         .or_default()
@@ -2171,6 +2220,10 @@ impl FactGraph {
             let Some(fact) = self.facts.get(&id) else {
                 continue;
             };
+            #[cfg(test)]
+            record_graph_work(|work| {
+                work.authority_branch_nodes = work.authority_branch_nodes.saturating_add(1);
+            });
             for cell in fact.content.body.exclusive_cells() {
                 if let ExclusiveCell::Role {
                     subject: cell_subject,
@@ -3175,6 +3228,10 @@ impl FactGraph {
             planned_subjects.extend(subjects);
         }
         for id in &self.ready_quarantine {
+            #[cfg(test)]
+            record_graph_work(|work| {
+                work.aggregate_ready_entries = work.aggregate_ready_entries.saturating_add(1);
+            });
             if let Some(fact) = self.quarantined.get(id) {
                 let (cells, subjects) = self.projection_impact_for_fact(fact);
                 planned_cells.extend(cells);
@@ -3191,7 +3248,16 @@ impl FactGraph {
             }
             if let Some(waiters) = self.waiting_by_dependency.get(&dependency) {
                 for waiter in waiters {
+                    #[cfg(test)]
+                    record_graph_work(|work| {
+                        work.aggregate_waiter_edges = work.aggregate_waiter_edges.saturating_add(1);
+                    });
                     if let Some(fact) = self.quarantined.get(waiter) {
+                        #[cfg(test)]
+                        record_graph_work(|work| {
+                            work.aggregate_waiter_nodes =
+                                work.aggregate_waiter_nodes.saturating_add(1);
+                        });
                         let (cells, subjects) = self.projection_impact_for_fact(fact);
                         planned_cells.extend(cells);
                         planned_subjects.extend(subjects);
@@ -5776,9 +5842,61 @@ mod tests {
         graph
             .admit(controller_head)
             .expect("second target head admits");
+        // Keep the signed resolution transcript fixed while growing only
+        // unrelated hot facts. The impact set must remain branch-local even
+        // though the current authority implementation still inspects every
+        // hot fact row; these counters expose that work for later tuning
+        // without treating today's O(history) scan as a performance gate.
+        let baseline = graph.clone();
+        let mut expanded = graph.clone();
+        for seed in 180..196 {
+            let unrelated = witnessed_fact(
+                &expanded,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(&key(seed)),
+                    role: Role::Member,
+                },
+            );
+            expanded
+                .admit(unrelated)
+                .expect("unrelated signed grant admits");
+        }
+        reset_graph_work();
+        let baseline_impact = baseline.projection_impact_for_fact(&resolution);
+        let baseline_work = graph_work();
+        reset_graph_work();
+        let expanded_impact = expanded.projection_impact_for_fact(&resolution);
+        let expanded_work = graph_work();
+        assert_eq!(baseline_impact, expanded_impact);
+        assert!(baseline_work.authority_fact_rows > 0);
+        assert!(baseline_work.authority_uses_examined > 0);
+        assert!(baseline_work.authority_edges_followed > 0);
+        assert!(baseline_work.authority_branch_nodes > 0);
+        assert!(expanded_work.authority_fact_rows > baseline_work.authority_fact_rows);
+        assert!(expanded_work.authority_uses_examined >= baseline_work.authority_uses_examined);
+        assert!(expanded_work.authority_edges_followed >= baseline_work.authority_edges_followed);
+        assert_eq!(
+            expanded_work.authority_branch_nodes, baseline_work.authority_branch_nodes,
+            "unrelated facts do not expand the selected authority branch"
+        );
+        let before_resolution = graph_snapshot(&graph);
+        let preflight = graph
+            .preflight_admission(&resolution)
+            .expect("fixed signed resolution preflights");
+        let journal = graph
+            .apply_preflight_journaled(resolution.clone(), preflight)
+            .expect("fixed signed resolution journals");
+        assert_eq!(
+            journal.graph().projection(),
+            Projection::from_graph(journal.graph())
+        );
+        journal.rollback();
+        assert_graph_state_eq(&graph, &before_resolution);
         graph
             .admit(resolution)
             .expect("a controller may resolve to a controller proposition");
+        assert_eq!(graph.projection(), Projection::from_graph(&graph));
     }
 
     #[test]
@@ -7927,6 +8045,8 @@ mod tests {
         assert_eq!(actual.facts, expected.facts);
         assert_eq!(actual.quarantined, expected.quarantined);
         assert_eq!(actual.policy_limits, expected.policy_limits);
+        assert_eq!(actual.admitted_fact_count, expected.admitted_fact_count);
+        assert_eq!(actual.admission_order, expected.admission_order);
         assert_eq!(actual.admitted_bytes, expected.admitted_bytes);
         assert_eq!(actual.derived_index_bytes, expected.derived_index_bytes);
         assert_eq!(actual.quarantined_bytes, expected.quarantined_bytes);
@@ -7963,6 +8083,15 @@ mod tests {
         assert_eq!(actual.facts_revision, expected.facts_revision);
         assert_eq!(actual.indexed_revision, expected.indexed_revision);
         assert_eq!(actual.generation, expected.generation);
+        assert_eq!(
+            actual.defer_projection_commitment,
+            expected.defer_projection_commitment
+        );
+        assert_eq!(
+            actual.cold_history_since_retirement,
+            expected.cold_history_since_retirement
+        );
+        assert_eq!(actual.staged_cold_pending, expected.staged_cold_pending);
         assert_eq!(
             actual.projection_cache.lock().clone(),
             expected.projection_cache.lock().clone()
@@ -8434,6 +8563,105 @@ mod tests {
             "rollback releases cold staging"
         );
         assert_eq!(live.retained_by_author, before.retained_by_author);
+    }
+
+    #[test]
+    fn aggregate_preplanning_work_tracks_ready_frontier_without_extra_promotion() {
+        fn frontier_fixture(bootstrap_seed: u8, child_count: u8) -> (FactGraph, SignedFact) {
+            let (bootstrap, root_key) = closed(bootstrap_seed);
+            let parent = fact(
+                &bootstrap,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(&key(bootstrap_seed.wrapping_add(1))),
+                    role: Role::Member,
+                },
+                Vec::new(),
+            );
+            let mut policy = SemanticAdmissionPolicy::default();
+            policy.max_ready_batch = 1;
+            let mut graph = FactGraph::from_bootstrap_with_policy(&bootstrap, policy);
+            let mut children = Vec::new();
+            for offset in 0..child_count {
+                let child = fact(
+                    &bootstrap,
+                    &root_key,
+                    FactBody::RoleGrant {
+                        target: device(&key(bootstrap_seed.wrapping_add(10 + offset))),
+                        role: Role::Member,
+                    },
+                    vec![parent.id],
+                );
+                assert!(matches!(
+                    graph.admit(child.clone()),
+                    Ok(Admission::Quarantined { .. })
+                ));
+                children.push(child);
+            }
+            for (offset, child) in children.iter().enumerate() {
+                let grandchild = fact(
+                    &bootstrap,
+                    &root_key,
+                    FactBody::RoleGrant {
+                        target: device(&key(bootstrap_seed.wrapping_add(40 + offset as u8))),
+                        role: Role::Member,
+                    },
+                    vec![child.id],
+                );
+                assert!(matches!(
+                    graph.admit(grandchild),
+                    Ok(Admission::Quarantined { .. })
+                ));
+            }
+            graph.admit(parent).expect("parent admits one ready child");
+            assert_eq!(
+                graph.ready_quarantine.len(),
+                usize::from(child_count),
+                "admit wakes the full frontier; journaled apply enforces the promotion bound"
+            );
+            let trigger = fact(
+                &bootstrap,
+                &root_key,
+                FactBody::RoleGrant {
+                    target: device(&key(bootstrap_seed.wrapping_add(100))),
+                    role: Role::Member,
+                },
+                Vec::new(),
+            );
+            (graph, trigger)
+        }
+
+        let (mut small, small_trigger) = frontier_fixture(197, 2);
+        let (mut expanded, expanded_trigger) = frontier_fixture(217, 8);
+        let small_before = graph_snapshot(&small);
+        let expanded_before = graph_snapshot(&expanded);
+
+        reset_graph_work();
+        let small_journal = small
+            .admit_journaled_batch(vec![small_trigger])
+            .expect("small frontier trigger admits");
+        let small_work = graph_work();
+        assert_eq!(small_journal.delta().promoted().len(), 1);
+        assert!(small_work.aggregate_ready_entries > 0);
+        assert!(small_work.aggregate_waiter_edges > 0);
+        assert!(small_work.aggregate_waiter_nodes > 0);
+        small_journal.rollback();
+
+        reset_graph_work();
+        let expanded_journal = expanded
+            .admit_journaled_batch(vec![expanded_trigger])
+            .expect("expanded frontier trigger admits");
+        let expanded_work = graph_work();
+        assert_eq!(expanded_journal.delta().promoted().len(), 1);
+        assert!(expanded_work.aggregate_ready_entries > small_work.aggregate_ready_entries);
+        assert!(expanded_work.aggregate_waiter_edges >= small_work.aggregate_waiter_edges);
+        assert!(expanded_work.aggregate_waiter_nodes >= small_work.aggregate_waiter_nodes);
+        expanded_journal.rollback();
+
+        assert_graph_state_eq(&small, &small_before);
+        assert_graph_state_eq(&expanded, &expanded_before);
+        assert_eq!(small.projection(), Projection::from_graph(&small));
+        assert_eq!(expanded.projection(), Projection::from_graph(&expanded));
     }
 
     #[test]

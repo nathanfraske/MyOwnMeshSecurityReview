@@ -9,7 +9,7 @@ use super::*;
 
 use crate::config::ClosedRelayPolicyConfig;
 use crate::identity::Identity;
-use crate::resource::{ResourceClaim, ResourceClass};
+use crate::resource::{ResourceAuthorityClass, ResourceClaim, ResourceClass};
 use crate::runtime::session_broker::{
     session_and_provider_for_test, session_funding_for_test, SessionCapability,
 };
@@ -26,6 +26,22 @@ fn profile() -> ClosedRelayPolicyConfig {
 
 fn permit_claim(profile: &ClosedRelayPolicyConfig) -> ResourceClaim {
     RelayAllocationPermit::allocation_claim(profile).expect("test relay claim")
+}
+
+fn relay_fixture_extra(profile: &ClosedRelayPolicyConfig, permits: u64) -> ResourceClaim {
+    let permit = permit_claim(profile)
+        .checked_scale(permits)
+        .expect("relay permit claims fit");
+    let root = ClosedRelayRuntime::runtime_claim(profile).expect("relay root claim");
+    let records =
+        crate::resource::FiniteResourceProvider::reservation_charge_for_test(ResourceClaim::ZERO)
+            .expect("the provider bookkeeping record is representable")
+            .checked_scale(permits)
+            .expect("relay permit bookkeeping records fit");
+    permit
+        .checked_add(root)
+        .and_then(|claim| claim.checked_add(records))
+        .expect("relay fixture claims fit")
 }
 
 fn endpoint_fixture() -> (Identity, Identity, MeshContextId, DeviceId, DeviceId) {
@@ -66,7 +82,20 @@ fn funded_session(
     runtime: RuntimeIncarnation,
     profile: &ClosedRelayPolicyConfig,
 ) -> SessionCapability {
-    session_funding_for_test(runtime, permit_claim(profile))
+    session_funding_for_test(runtime, relay_fixture_extra(profile, 1))
+}
+
+fn funded_relay(
+    profile: ClosedRelayPolicyConfig,
+    host_id: DeviceId,
+    owner: &SessionCapability,
+) -> ClosedRelayRuntime {
+    let claim = ClosedRelayRuntime::runtime_claim(&profile).expect("relay root claim");
+    let funding = owner
+        .validity_witness()
+        .reserve_retained(claim)
+        .expect("owner funds relay root");
+    ClosedRelayRuntime::new(profile, host_id, funding).expect("funded relay runtime")
 }
 
 fn admitted_handle(
@@ -76,7 +105,7 @@ fn admitted_handle(
     route: (MeshContextId, DeviceId, DeviceId, [u8; 16]),
     host_id: DeviceId,
 ) -> ClosedRelayHandle {
-    let relay = ClosedRelayRuntime::new(profile.clone(), host_id).expect("relay runtime");
+    let relay = funded_relay(profile.clone(), host_id, requester);
     let permit = RelayAllocationPermit::try_new(requester.validity_witness(), &profile)
         .expect("funded relay permit");
     let endpoints = ClosedRelayEndpoints::new(route.0, route.1, route.2, route.3, 1)
@@ -395,21 +424,21 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
             ..profile()
         },
     ];
-    let host_id =
-        DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id");
     for invalid in fields {
         assert!(!invalid.validate());
         assert!(matches!(
-            ClosedRelayRuntime::new(invalid, host_id.clone()),
+            ClosedRelayRuntime::runtime_claim(&invalid),
             Err(ClosedRelayRefusal::InvalidProfile)
         ));
     }
 
     let valid = profile();
     let runtime = crate::runtime::runtime_for_test();
-    let (owner, provider) = session_and_provider_for_test(runtime.clone(), permit_claim(&valid));
+    let (owner, provider) =
+        session_and_provider_for_test(runtime.clone(), relay_fixture_extra(&valid, 1));
     let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
-    let baseline = provider.in_use();
+    let before_relay = provider.in_use();
+    let before_relay_reservations = provider.active_reservations();
     let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
     let permit = RelayAllocationPermit::try_new(owner.validity_witness(), &valid)
         .expect("provider-backed permit");
@@ -424,18 +453,24 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
     ] {
         assert_eq!(
             after_permit.amount(dimension),
-            baseline
+            before_relay
                 .amount(dimension)
                 .checked_add(planned.amount(dimension))
                 .expect("planned relay claim fits"),
             "relay permit must charge the exact {dimension:?} claim",
         );
     }
-    let relay = ClosedRelayRuntime::new(
+    let relay = funded_relay(
         valid,
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
-    )
-    .expect("relay runtime");
+        &owner,
+    );
+    let root_and_permit = provider.in_use();
+    let root_only = root_and_permit
+        .checked_sub(planned)
+        .expect("root remains after permit settlement");
+    let root_reservations = provider.active_reservations();
+    assert_eq!(root_reservations, before_relay_reservations + 2);
     let handle = relay
         .admit_closed_relay(
             permit,
@@ -446,19 +481,87 @@ fn closed_relay_rejects_zero_limits_and_releases_provider_backed_settlement() {
         )
         .expect("relay admission");
     assert_eq!(handle.settle(), ClosedRelayTerminal::Settled);
-    assert_ne!(provider.in_use(), baseline);
+    assert_eq!(provider.in_use(), root_only);
+    assert_eq!(provider.active_reservations(), root_reservations - 1);
+    assert_eq!(relay.terminal_tombstone_epoch([11; 16]), Some(1));
     drop(relay);
-    assert_eq!(provider.in_use(), baseline);
+    assert_eq!(provider.active_reservations(), before_relay_reservations);
+    assert_eq!(provider.in_use(), before_relay);
+}
+
+#[test]
+fn closed_relay_root_funding_survives_runtime_drop_and_refuses_bad_leases() {
+    let profile = profile();
+    let runtime = crate::runtime::runtime_for_test();
+    let (owner, provider) =
+        session_and_provider_for_test(runtime.clone(), relay_fixture_extra(&profile, 0));
+    let host_id =
+        DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id");
+    let before = provider.active_reservations();
+    let relay = funded_relay(profile.clone(), host_id.clone(), &owner);
+    let retained = provider.active_reservations();
+    assert_eq!(retained, before + 1);
+    let handshake = relay.try_begin_handshake().expect("funded handshake guard");
+    drop(relay);
+    assert_eq!(
+        provider.active_reservations(),
+        retained,
+        "a live guard retains the funded root after runtime drop",
+    );
+    drop(handshake);
+    assert_eq!(provider.active_reservations(), before);
+
+    let root_claim = ClosedRelayRuntime::runtime_claim(&profile).expect("relay root claim");
+    let undersized = root_claim
+        .checked_sub(ResourceClaim::single(
+            ResourceClass::AccountedMemoryBytes,
+            1,
+        ))
+        .expect("root claim has accounted bytes");
+    let before_refusal = provider.in_use();
+    let lease = owner
+        .validity_witness()
+        .reserve_retained(undersized)
+        .expect("fixture can fund the undersized candidate");
+    assert!(matches!(
+        ClosedRelayRuntime::new(profile.clone(), host_id.clone(), lease),
+        Err(ClosedRelayRefusal::InvalidProfile)
+    ));
+    assert_eq!(provider.in_use(), before_refusal);
+
+    let mut lease = owner
+        .validity_witness()
+        .reserve_retained(root_claim)
+        .expect("fixture can fund the authority candidate");
+    lease
+        .transition_to(ResourceAuthorityClass::Cleanup, root_claim)
+        .expect("provider permits the explicit authority transition");
+    assert!(matches!(
+        ClosedRelayRuntime::new(profile, host_id, lease),
+        Err(ClosedRelayRefusal::InvalidProfile)
+    ));
+    assert_eq!(provider.in_use(), before_refusal);
 }
 
 #[tokio::test]
 async fn closed_relay_expiry_is_a_consumable_terminal_and_releases_exact_claim() {
     let valid = profile();
     let runtime = crate::runtime::runtime_for_test();
-    let (owner, provider) = session_and_provider_for_test(runtime.clone(), permit_claim(&valid));
+    let (owner, provider) =
+        session_and_provider_for_test(runtime.clone(), relay_fixture_extra(&valid, 1));
     let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
     let baseline = provider.in_use();
-    let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
+    let baseline_reservations = provider.active_reservations();
+    let (requester, target_identity, mesh, requester_id, target_id) = endpoint_fixture();
+    let (mut requester_session, _) = endpoint_sessions(
+        &valid,
+        mesh,
+        [16; 16],
+        &requester,
+        requester_id.clone(),
+        &target_identity,
+        target_id.clone(),
+    );
     let mut relay = admitted_handle(
         valid.clone(),
         &owner,
@@ -466,16 +569,89 @@ async fn closed_relay_expiry_is_a_consumable_terminal_and_releases_exact_claim()
         (mesh, requester_id, target_id, [16; 16]),
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
     );
+    assert_eq!(
+        provider.active_reservations(),
+        baseline_reservations + 2,
+        "root and permit remain live after runtime drops into the handle",
+    );
+    relay
+        .try_forward(
+            requester_session
+                .seal(b"queued")
+                .expect("seal queued packet"),
+        )
+        .expect("queue packet before expiry");
     relay.last_activity = Instant::now()
         .checked_sub(relay.idle_timeout)
         .expect("test clock can represent the configured idle interval");
     assert_eq!(
         relay
-            .recv_direction_checked(RelayDirection::RequesterToTarget)
+            .recv_direction_checked(RelayDirection::TargetToRequester)
             .await,
         Err(ClosedRelayRefusal::Expired)
     );
+    assert_eq!(
+        provider.active_reservations(),
+        baseline_reservations + 2,
+        "terminal error does not release queued-payload custody early",
+    );
     assert_eq!(relay.settle(), ClosedRelayTerminal::Settled);
+    assert_eq!(provider.active_reservations(), baseline_reservations);
+    assert_eq!(provider.in_use(), baseline);
+}
+
+#[tokio::test]
+async fn closed_relay_stale_terminal_retains_handle_custody_until_drop() {
+    let profile = profile();
+    let runtime = crate::runtime::runtime_for_test();
+    let (requester_owner, provider) =
+        session_and_provider_for_test(runtime.clone(), relay_fixture_extra(&profile, 1));
+    let target_owner = session_funding_for_test(runtime, ResourceClaim::ZERO);
+    let baseline = provider.in_use();
+    let baseline_reservations = provider.active_reservations();
+    let (requester, target, mesh, requester_id, target_id) = endpoint_fixture();
+    let (mut requester_session, _) = endpoint_sessions(
+        &profile,
+        mesh,
+        [18; 16],
+        &requester,
+        requester_id.clone(),
+        &target,
+        target_id.clone(),
+    );
+    let mut handle = admitted_handle(
+        profile,
+        &requester_owner,
+        &target_owner,
+        (mesh, requester_id, target_id, [18; 16]),
+        DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
+    );
+    assert_eq!(provider.active_reservations(), baseline_reservations + 2);
+    handle
+        .try_forward(
+            requester_session
+                .seal(b"queued before target retirement")
+                .expect("seal queued packet"),
+        )
+        .expect("queue packet while both endpoint owners are live");
+    let retained = provider.in_use();
+    // The target uses a separate provider. Retiring it exercises the real
+    // stale-owner gate without releasing the measured requester's own lease.
+    drop(target_owner);
+    assert_eq!(
+        handle
+            .recv_direction_checked(RelayDirection::TargetToRequester)
+            .await,
+        Err(ClosedRelayRefusal::OwnerNotLive)
+    );
+    assert_eq!(provider.in_use(), retained);
+    assert_eq!(
+        provider.active_reservations(),
+        baseline_reservations + 2,
+        "stale terminal keeps root, permit, and queued custody until drop",
+    );
+    assert_eq!(handle.settle(), ClosedRelayTerminal::Settled);
+    assert_eq!(provider.active_reservations(), baseline_reservations);
     assert_eq!(provider.in_use(), baseline);
 }
 
@@ -490,11 +666,11 @@ fn closed_relay_pending_handshake_and_allocation_limits_release_exact_slots() {
     let second_owner = funded_session(runtime.clone(), &profile);
     let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
 
-    let relay = ClosedRelayRuntime::new(
+    let relay = funded_relay(
         profile.clone(),
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
-    )
-    .expect("relay runtime");
+        &first_owner,
+    );
     let first_handshake = relay
         .try_begin_handshake()
         .expect("first pending handshake");
@@ -558,13 +734,13 @@ fn closed_relay_refuses_stale_exact_session_witness() {
     let stale = requester.validity_witness();
     let permit = RelayAllocationPermit::try_new(stale.clone(), &profile)
         .expect("live session can fund a relay permit");
-    drop(requester);
-
-    let relay = ClosedRelayRuntime::new(
+    let relay = funded_relay(
         profile.clone(),
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id"),
-    )
-    .expect("relay runtime");
+        &requester,
+    );
+    drop(requester);
+
     assert!(!stale.is_live());
     let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
     let endpoints = ClosedRelayEndpoints::new(mesh, requester_id, target_id, [15; 16], 1)
@@ -584,14 +760,16 @@ fn closed_relay_epoch_allows_bounded_reuse_after_exact_settlement() {
         ..profile()
     };
     let runtime = crate::runtime::runtime_for_test();
-    let (owner, provider) = session_and_provider_for_test(runtime.clone(), permit_claim(&profile));
+    let (owner, provider) =
+        session_and_provider_for_test(runtime.clone(), relay_fixture_extra(&profile, 2));
     let target = session_funding_for_test(runtime, ResourceClaim::ZERO);
-    let baseline = provider.in_use();
+    let before_relay = provider.in_use();
     let (_, _, mesh, requester_id, target_id) = endpoint_fixture();
     let host_id =
         DeviceId::from_canonical_str(Identity::ephemeral().public_id()).expect("relay id");
     let session_id = [17; 16];
-    let relay = ClosedRelayRuntime::new(profile.clone(), host_id).expect("relay runtime");
+    let relay = funded_relay(profile.clone(), host_id, &owner);
+    let baseline = provider.in_use();
     let permit = RelayAllocationPermit::try_new(owner.validity_witness(), &profile)
         .expect("provider-backed relay permit");
     let handle = relay
@@ -649,5 +827,5 @@ fn closed_relay_epoch_allows_bounded_reuse_after_exact_settlement() {
     assert_eq!(relay.terminal_tombstone_epoch(session_id), Some(2));
     assert_eq!(provider.in_use(), baseline);
     drop(relay);
-    assert_eq!(provider.in_use(), baseline);
+    assert_eq!(provider.in_use(), before_relay);
 }

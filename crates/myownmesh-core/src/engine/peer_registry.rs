@@ -951,6 +951,43 @@ impl PeerRegistry {
         Some(effect(&current.value().peer))
     }
 
+    /// Capture the exact currently selected worker while holding the same
+    /// mutation fence used by every owner-bound operation.  The returned
+    /// owner is stamped with that worker, so a later replacement cannot be
+    /// mistaken for the captured transport session.
+    pub(super) fn capture_current_worker_owner(
+        &self,
+        owner: &PeerOwnerToken,
+    ) -> Option<PeerOwnerToken> {
+        self.with_current(owner, |peer| {
+            let worker = peer.current_worker()?;
+            if owner
+                .worker()
+                .is_some_and(|stamped| !Arc::ptr_eq(stamped, &worker))
+            {
+                return None;
+            }
+            Some(owner.for_worker(worker))
+        })
+        .flatten()
+    }
+
+    /// Apply a synchronous witness check to the exact current worker.  No
+    /// registry lock is held across an await; callers retain the stamped
+    /// worker and re-enter this fence afterwards to validate it again.
+    pub(super) fn with_current_transport_worker<R>(
+        &self,
+        owner: &PeerOwnerToken,
+        effect: impl FnOnce(&Arc<crate::transport::WebRtcConnectorWorker>) -> R,
+    ) -> Option<R> {
+        self.with_current(owner, |peer| {
+            let stamped = owner.worker()?;
+            let current = peer.current_worker()?;
+            Arc::ptr_eq(stamped, &current).then(|| effect(stamped))
+        })
+        .flatten()
+    }
+
     /// Admit the one durable semantic frame allowed from an authenticated
     /// endpoint that is still awaiting policy approval.
     ///
@@ -1138,12 +1175,11 @@ impl PeerRegistry {
     /// channel witness. A worker belongs to a channel, not to the logical
     /// session, so requiring it again here would let a channel replacement
     /// erase a valid post-admission session commit.
-    fn with_current_logical<R>(
+    fn with_current_logical_locked<R>(
         &self,
         operation: &LogicalSessionOperation,
         effect: impl FnOnce(&Arc<PeerConnection>) -> R,
     ) -> Option<R> {
-        let _mutation = self.mutation.lock();
         let current = self.peers.get(operation.owner.device_id())?;
         if !Arc::ptr_eq(&current.value().installation, &operation.owner.installation)
             || !operation.witness.is_live()
@@ -1158,6 +1194,15 @@ impl PeerRegistry {
             return None;
         }
         Some(effect(peer))
+    }
+
+    fn with_current_logical<R>(
+        &self,
+        operation: &LogicalSessionOperation,
+        effect: impl FnOnce(&Arc<PeerConnection>) -> R,
+    ) -> Option<R> {
+        let _mutation = self.mutation.lock();
+        self.with_current_logical_locked(operation, effect)
     }
 
     /// Run one synchronous application operation, only while `owner` is the
@@ -1678,7 +1723,12 @@ impl PeerRegistry {
             mesh_context,
             |_session, _flows, _live, worker, correlation| {
                 let mut data = peer.state.write();
-                if !data.media_reneg_pending {
+                // Pending is a coalesced debt bit, while inflight is the
+                // single-flight latch.  Both must be decided under this
+                // state lock: a callback may re-arm pending after the first
+                // claim but it must not mint a second operation until the
+                // captured one has completed.
+                if !data.media_reneg_pending || data.media_reneg_inflight {
                     return None;
                 }
                 data.media_reneg_inflight = true;
@@ -3015,9 +3065,24 @@ impl AdmittedRenegotiation {
     /// A peer replaced while the offer was in flight fails `get_if_current`, so
     /// every write here becomes a no-op: the result is dropped rather than
     /// attributed to the replacement.
-    pub(super) fn complete(self, peers: &PeerRegistry, outcome: std::result::Result<(), String>) {
-        let Some(peer) = peers.with_current_logical(&self.channel.logical, Arc::clone) else {
-            return;
+    ///
+    /// Returns an exact follow-up owner only when a successor debt is still
+    /// present on this logical installation. A retired worker may therefore
+    /// hand off to a different still-authenticated worker, while a failure on
+    /// the same worker returns no follow-up and leaves the debt for its next
+    /// authenticated/stable wake.
+    pub(super) fn complete(
+        self,
+        peers: &PeerRegistry,
+        outcome: std::result::Result<(), String>,
+    ) -> Option<PeerOwnerToken> {
+        // Callback marking also enters through the registry mutation fence.
+        // Keep that fence through state settlement and worker-slot cleanup so
+        // a callback cannot install a newer debt between those two writes.
+        let _mutation = peers.mutation.lock();
+        let Some(peer) = peers.with_current_logical_locked(&self.channel.logical, Arc::clone)
+        else {
+            return None;
         };
         let mut data = peer.state.write();
         data.media_reneg_inflight = false;
@@ -3027,22 +3092,45 @@ impl AdmittedRenegotiation {
                 // after this claim was taken. Completing the older exchange
                 // must not erase that newer debt.
                 let rearmed = data.media_reneg_pending;
-                if self.channel.worker().role() == crate::transport::Role::Offerer {
+                let worker_is_owned = peer.owns_authenticated_worker(self.channel.worker());
+                if worker_is_owned
+                    && self.channel.worker().role() == crate::transport::Role::Offerer
+                {
                     data.last_offer_sent_at = Some(std::time::Instant::now());
                 }
-                drop(data);
                 if !rearmed {
                     peer.clear_media_renegotiation_worker(self.channel.worker());
                 }
-                peer.state.write().media_reneg_pending =
-                    rearmed || peer.has_pending_media_renegotiation();
+                let worker_pending = peer.has_pending_media_renegotiation();
+                // Do not overwrite a callback that re-armed the debt in the
+                // gap between the first state snapshot and worker cleanup.
+                // The mutation fence makes the worker observation and this
+                // state update one ordered operation relative to callbacks.
+                data.media_reneg_pending |= rearmed || worker_pending;
+                let follow_up = peer
+                    .media_renegotiation_worker()
+                    .filter(|worker| peer.owns_authenticated_worker(worker))
+                    .map(|worker| self.channel.owner().for_worker(worker));
+                drop(data);
+                // A successful completion may immediately hand any rearmed
+                // debt to the next operation. A failed/non-stable operation
+                // only hands off when a different authenticated worker is
+                // already pending; retrying the same worker here would spin.
+                follow_up
             }
             Err(error) => {
-                // Leave the work owed: the flag re-arms the next tick's attempt
-                // instead of losing the track-set change.
+                // Leave the work owed: a later native/authenticated wake-up or
+                // the recovery pass can retry it without losing the track-set
+                // change.
                 data.media_reneg_pending = true;
+                let follow_up = peer
+                    .media_renegotiation_worker()
+                    .filter(|worker| !Arc::ptr_eq(worker, self.channel.worker()))
+                    .filter(|worker| peer.owns_authenticated_worker(worker))
+                    .map(|worker| self.channel.owner().for_worker(worker));
                 drop(data);
                 tracing::debug!(peer = %self.channel.owner().device_id(), "renegotiation deferred: {error}");
+                follow_up
             }
         }
     }

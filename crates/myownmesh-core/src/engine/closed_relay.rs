@@ -20,7 +20,7 @@ use super::NetworkState;
 use crate::config::ClosedRelayPolicyConfig;
 use crate::protocol::relay::{ClosedRelayControl, ClosedRelayData, RelayKeyShare};
 use crate::protocol::OpaqueRelayPacket;
-use crate::resource::{ResourceClaim, ResourceClass, ResourceLease};
+use crate::resource::{FundedArc, ResourceClaim, ResourceClass, ResourceLease};
 use crate::runtime::relay::{
     ClosedRelayEndpoints, ClosedRelayHandle, ClosedRelayHandshakeGuard, ClosedRelayRuntime,
     ClosedRelayTerminal, OpaqueRelaySession, PendingEndpointKeyAgreement, RelayAllocationPermit,
@@ -30,6 +30,10 @@ use crate::runtime::session_broker::SessionValidityWitness;
 use crate::semantic::{DeviceId, MeshContextId, Role, VerifiedProjectPolicy};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
+
+mod storage;
+use storage::{FixedFifo, FixedTable};
 
 pub(crate) use crate::runtime::relay::ClosedRelayRefusal;
 
@@ -561,13 +565,12 @@ impl EndpointSession {
 }
 
 pub(crate) struct ClosedRelayEndpointRegistry {
-    sessions: Vec<EndpointSession>,
-    capacity: usize,
+    sessions: FixedTable<EndpointSession>,
 }
 
 impl Drop for ClosedRelayEndpointRegistry {
     fn drop(&mut self) {
-        for session in self.sessions.drain(..) {
+        while let Some(session) = self.sessions.take_any() {
             session.mark_closed();
         }
     }
@@ -581,22 +584,25 @@ impl ClosedRelayEndpointRegistry {
         let capacity = usize::try_from(profile.max_allocations)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         Ok(Self {
-            sessions: Vec::with_capacity(capacity),
-            capacity,
+            sessions: FixedTable::new(capacity),
         })
     }
 
     pub(crate) fn insert(&mut self, session: EndpointSession) -> Result<(), ClosedRelayRefusal> {
-        if self.sessions.len() >= self.capacity
-            || self
-                .sessions
-                .iter()
-                .any(|existing| existing.0.session_id == session.0.session_id)
+        if self
+            .sessions
+            .iter()
+            .any(|existing| existing.0.session_id == session.0.session_id)
         {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.sessions.push(session.into_registry());
-        Ok(())
+        self.sessions
+            .insert(session.into_registry())
+            .map(|_| ())
+            .map_err(|session| {
+                drop(session);
+                ClosedRelayRefusal::QueueFull
+            })
     }
 
     pub(crate) fn find(&self, session_id: [u8; 16]) -> Option<EndpointSession> {
@@ -609,32 +615,35 @@ impl ClosedRelayEndpointRegistry {
     /// Move every retained endpoint out for synchronous cancellation by the
     /// network owner. Moving the registry nodes first keeps cancellation free
     /// of a registry lock while it records the exact Close handoff.
-    pub(crate) fn take_all_for_cancel(&mut self) -> Vec<EndpointSession> {
-        std::mem::take(&mut self.sessions)
+    pub(crate) fn take_one_for_cancel(&mut self) -> Option<EndpointSession> {
+        let index = self.sessions.position(|session| {
+            session.0.consumer_state.load(Ordering::Acquire) != ENDPOINT_CONSUMER_CANCELLED
+        })?;
+        self.sessions.remove(index)
     }
 
     pub(crate) fn remove(&mut self, session: &EndpointSession) {
         if let Some(index) = self
             .sessions
-            .iter()
             .position(|existing| Arc::ptr_eq(&existing.0, &session.0))
         {
-            let removed = self.sessions.swap_remove(index);
-            removed.mark_closed();
+            if let Some(removed) = self.sessions.remove(index) {
+                removed.mark_closed();
+            }
         }
     }
 
-    pub(crate) fn take_stale(&mut self, state: &NetworkState) -> Vec<EndpointSession> {
-        let mut removed = Vec::new();
-        let mut index = 0;
-        while index < self.sessions.len() {
-            if self.sessions[index].relay_owner_is_current(state) {
-                index += 1;
-                continue;
-            }
-            removed.push(self.sessions.swap_remove(index));
+    pub(crate) fn take_one_stale(&mut self, state: &NetworkState) -> Option<EndpointSession> {
+        let index = self
+            .sessions
+            .position(|session| !session.relay_owner_is_current(state))?;
+        self.sessions.remove(index)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        while let Some(session) = self.sessions.take_any() {
+            session.mark_closed();
         }
-        removed
     }
 }
 
@@ -642,8 +651,7 @@ impl ClosedRelayEndpointRegistry {
 /// sessions enter this queue; requester pending sessions never do. The queue
 /// is fixed at the same owner-selected allocation ceiling as the relay.
 pub(crate) struct ClosedRelayTargetAcceptedRegistry {
-    ready: VecDeque<EndpointSession>,
-    capacity: usize,
+    ready: FixedFifo<EndpointSession>,
     wake: Arc<Notify>,
 }
 
@@ -653,7 +661,7 @@ impl Drop for ClosedRelayTargetAcceptedRegistry {
         // takes the registry.  Wake and close every retained endpoint before
         // the queue's last Arc is released; otherwise a dropped receiver can
         // retain its endpoint lease past engine shutdown.
-        for session in self.ready.drain(..) {
+        while let Some(session) = self.ready.pop_front() {
             session.mark_closed();
         }
         self.wake.notify_waiters();
@@ -668,22 +676,25 @@ impl ClosedRelayTargetAcceptedRegistry {
         let capacity = usize::try_from(profile.max_allocations)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         Ok(Self {
-            ready: VecDeque::with_capacity(capacity),
-            capacity,
+            ready: FixedFifo::new(capacity),
             wake: Arc::new(Notify::new()),
         })
     }
 
     pub(crate) fn publish(&mut self, session: EndpointSession) -> Result<(), ClosedRelayRefusal> {
-        if self.ready.len() >= self.capacity
-            || self
-                .ready
-                .iter()
-                .any(|existing| existing.0.session_id == session.0.session_id)
+        if self
+            .ready
+            .iter()
+            .any(|existing| existing.0.session_id == session.0.session_id)
         {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.ready.push_back(session.into_registry());
+        self.ready
+            .push_back(session.into_registry())
+            .map_err(|session| {
+                drop(session);
+                ClosedRelayRefusal::QueueFull
+            })?;
         self.wake.notify_one();
         Ok(())
     }
@@ -692,18 +703,13 @@ impl ClosedRelayTargetAcceptedRegistry {
         self.ready.pop_front().map(EndpointSession::into_public)
     }
 
-    pub(crate) fn take_all_unpulled_for_cancel(&mut self) -> Vec<EndpointSession> {
-        let mut unpulled = Vec::with_capacity(self.ready.len());
-        let mut remaining = VecDeque::with_capacity(self.ready.len());
-        while let Some(session) = self.ready.pop_front() {
-            if session.0.consumer_state.load(Ordering::Acquire) == ENDPOINT_CONSUMER_UNCLAIMED {
-                unpulled.push(session);
-            } else {
-                remaining.push_back(session);
-            }
-        }
-        self.ready = remaining;
-        unpulled
+    pub(crate) fn take_one_unpulled_for_cancel(&mut self) -> Option<EndpointSession> {
+        let index = (0..self.ready.len()).find(|index| {
+            self.ready.get(*index).is_some_and(|session| {
+                session.0.consumer_state.load(Ordering::Acquire) == ENDPOINT_CONSUMER_UNCLAIMED
+            })
+        })?;
+        self.ready.remove(index)
     }
 
     pub(crate) fn wake(&self) -> Arc<Notify> {
@@ -711,11 +717,12 @@ impl ClosedRelayTargetAcceptedRegistry {
     }
 
     pub(crate) fn remove(&mut self, session: &EndpointSession) {
-        if let Some(index) = self
-            .ready
-            .iter()
-            .position(|existing| Arc::ptr_eq(&existing.0, &session.0))
-        {
+        let index = {
+            self.ready
+                .iter()
+                .position(|existing| Arc::ptr_eq(&existing.0, &session.0))
+        };
+        if let Some(index) = index {
             if let Some(removed) = self.ready.remove(index) {
                 removed.mark_closed();
             }
@@ -723,17 +730,20 @@ impl ClosedRelayTargetAcceptedRegistry {
         }
     }
 
-    pub(crate) fn take_stale(&mut self, state: &NetworkState) -> Vec<EndpointSession> {
-        let mut removed = Vec::new();
-        let mut index = 0;
-        while index < self.ready.len() {
-            if self.ready[index].relay_owner_is_current(state) {
-                index += 1;
-                continue;
-            }
-            removed.push(self.ready.remove(index).expect("accepted index is present"));
+    pub(crate) fn take_one_stale(&mut self, state: &NetworkState) -> Option<EndpointSession> {
+        let index = (0..self.ready.len()).find(|index| {
+            self.ready
+                .get(*index)
+                .is_some_and(|session| !session.relay_owner_is_current(state))
+        })?;
+        self.ready.remove(index)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        while let Some(session) = self.ready.pop_front() {
+            session.mark_closed();
         }
-        removed
+        self.wake.notify_waiters();
     }
 }
 
@@ -911,8 +921,7 @@ impl Drop for ClosedRelayCheckout {
 /// out before `recv_direction` awaits, so this registry mutex is never held
 /// across an async boundary.
 pub(crate) struct ClosedRelayRegistry {
-    slots: Vec<ClosedRelaySlot>,
-    capacity: usize,
+    slots: FixedTable<ClosedRelaySlot>,
 }
 
 struct ClosedRelaySlot {
@@ -933,8 +942,7 @@ impl ClosedRelayRegistry {
         let capacity = usize::try_from(profile.max_allocations)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         Ok(Self {
-            slots: Vec::with_capacity(capacity),
-            capacity,
+            slots: FixedTable::new(capacity),
         })
     }
 
@@ -943,9 +951,7 @@ impl ClosedRelayRegistry {
         session_id: [u8; 16],
         admission: ClosedRelayAdmission,
     ) -> Result<ClosedRelayGeneration, ClosedRelayRefusal> {
-        if self.slots.len() >= self.capacity
-            || self.slots.iter().any(|slot| slot.session_id == session_id)
-        {
+        if self.slots.is_full() || self.slots.iter().any(|slot| slot.session_id == session_id) {
             drop(admission);
             return Err(ClosedRelayRefusal::QueueFull);
         }
@@ -955,15 +961,20 @@ impl ClosedRelayRegistry {
             lease,
         } = admission;
         let generation = Arc::new(());
-        self.slots.push(ClosedRelaySlot {
-            session_id,
-            generation: generation.clone(),
-            handle: Some(handle),
-            terminal,
-            lease: Some(lease),
-            checkout: None,
-            closing: false,
-        });
+        self.slots
+            .insert(ClosedRelaySlot {
+                session_id,
+                generation: generation.clone(),
+                handle: Some(handle),
+                terminal,
+                lease: Some(lease),
+                checkout: None,
+                closing: false,
+            })
+            .map_err(|admission| {
+                drop(admission);
+                ClosedRelayRefusal::QueueFull
+            })?;
         Ok(generation)
     }
 
@@ -972,10 +983,10 @@ impl ClosedRelayRegistry {
         state: &Arc<NetworkState>,
         session_id: [u8; 16],
     ) -> Option<ClosedRelayCheckout> {
-        let slot = self
+        let index = self
             .slots
-            .iter_mut()
-            .find(|slot| slot.session_id == session_id && slot.handle.is_some())?;
+            .position(|slot| slot.session_id == session_id && slot.handle.is_some())?;
+        let slot = self.slots.get_mut(index)?;
         let handle = slot.handle.take()?;
         let lease = slot.lease.take()?;
         let control = Arc::new(ClosedRelayCheckoutControl {
@@ -1008,11 +1019,11 @@ impl ClosedRelayRegistry {
         session_id: [u8; 16],
         generation: &ClosedRelayGeneration,
     ) -> Result<Option<Arc<ClosedRelayCheckoutControl>>, ClosedRelayRefusal> {
-        let slot = self
+        let index = self
             .slots
-            .iter_mut()
-            .find(|slot| slot.session_id == session_id)
+            .position(|slot| slot.session_id == session_id)
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+        let slot = self.slots.get_mut(index).expect("position returned a slot");
         if !Arc::ptr_eq(&slot.generation, generation) {
             return Err(ClosedRelayRefusal::OwnerNotLive);
         }
@@ -1032,7 +1043,7 @@ impl ClosedRelayRegistry {
     }
 
     pub(crate) fn request_close_all(&mut self) {
-        for slot in &mut self.slots {
+        for slot in self.slots.iter_mut() {
             slot.closing = true;
             if let Some(control) = slot.checkout.as_ref() {
                 control.request_close();
@@ -1049,7 +1060,7 @@ impl ClosedRelayRegistry {
         lease: ResourceLease,
         control: Arc<ClosedRelayCheckoutControl>,
     ) -> Option<ClosedRelayAdmission> {
-        let Some(index) = self.slots.iter().position(|slot| {
+        let Some(index) = self.slots.position(|slot| {
             slot.session_id == session_id
                 && Arc::ptr_eq(&slot.generation, &generation)
                 && slot
@@ -1063,16 +1074,26 @@ impl ClosedRelayRegistry {
                 lease,
             });
         };
-        let slot = &mut self.slots[index];
-        slot.checkout = None;
-        if slot.closing || control.closing.load(Ordering::Acquire) {
-            let _ = self.slots.swap_remove(index);
+        let closing = {
+            let slot = self
+                .slots
+                .get_mut(index)
+                .expect("checkout slot was present");
+            slot.checkout = None;
+            slot.closing || control.closing.load(Ordering::Acquire)
+        };
+        if closing {
+            let _ = self.slots.remove(index);
             Some(ClosedRelayAdmission {
                 handle,
                 terminal,
                 lease,
             })
         } else {
+            let slot = self
+                .slots
+                .get_mut(index)
+                .expect("checkout slot was present");
             slot.handle = Some(handle);
             slot.lease = Some(lease);
             None
@@ -1110,17 +1131,23 @@ impl ClosedRelayRegistry {
     ) -> Result<bool, ClosedRelayRefusal> {
         let index = self
             .slots
-            .iter()
             .position(|slot| {
                 slot.session_id == session_id && Arc::ptr_eq(&slot.generation, generation)
             })
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-        if self.slots[index].handle.is_some() {
-            let slot = self.slots.swap_remove(index);
-            settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)?;
+        if self
+            .slots
+            .get(index)
+            .is_some_and(|slot| slot.handle.is_some())
+        {
+            let slot = self.slots.remove(index).expect("live slot was present");
+            settle_registered_closed_relay(
+                slot.handle.expect("slot handle was present"),
+                slot.terminal,
+            )?;
             return Ok(true);
         }
-        let slot = &mut self.slots[index];
+        let slot = self.slots.get_mut(index).expect("live slot was present");
         slot.closing = true;
         if let Some(control) = slot.checkout.as_ref() {
             control.request_close();
@@ -1136,29 +1163,38 @@ impl ClosedRelayRegistry {
     ) -> Result<ClosedRelayTerminal, ClosedRelayRefusal> {
         let index = self
             .slots
-            .iter()
             .position(|slot| {
                 slot.session_id == session_id && Arc::ptr_eq(&slot.generation, generation)
             })
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-        let slot = self.slots.swap_remove(index);
+        let slot = self
+            .slots
+            .remove(index)
+            .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
         let handle = slot.handle.ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-        settle_closed_relay(handle, slot.terminal)
+        settle_registered_closed_relay(handle, slot.terminal)
     }
 
     pub(crate) fn settle_all(&mut self) -> usize {
         let mut settled = 0;
         let mut index = 0;
-        while index < self.slots.len() {
-            if self.slots[index].handle.is_none() {
+        while index < self.slots.capacity() {
+            let Some(slot) = self.slots.get(index) else {
+                index += 1;
+                continue;
+            };
+            if slot.handle.is_none() {
                 // A checked-out handle is finalized by its owner Drop. Keep
                 // the slot until that Drop returns the exact custody.
                 index += 1;
                 continue;
             }
-            let slot = self.slots.swap_remove(index);
-            if settle_closed_relay(slot.handle.expect("slot handle was present"), slot.terminal)
-                .is_ok()
+            let slot = self.slots.remove(index).expect("live slot was present");
+            if settle_registered_closed_relay(
+                slot.handle.expect("slot handle was present"),
+                slot.terminal,
+            )
+            .is_ok()
             {
                 settled += 1;
             }
@@ -1169,21 +1205,28 @@ impl ClosedRelayRegistry {
     pub(crate) fn retire_stale(&mut self) -> usize {
         let mut retired = 0;
         let mut index = 0;
-        while index < self.slots.len() {
-            if self.slots[index].terminal.is_current() {
+        while index < self.slots.capacity() {
+            let Some(slot) = self.slots.get(index) else {
+                index += 1;
+                continue;
+            };
+            if slot.terminal.is_current_registered() {
                 index += 1;
                 continue;
             }
-            let checkout_control = self.slots[index].checkout.as_ref().map(Arc::clone);
+            let checkout_control = slot.checkout.as_ref().map(Arc::clone);
             if let Some(control) = checkout_control {
-                self.slots[index].closing = true;
+                self.slots
+                    .get_mut(index)
+                    .expect("stale slot was present")
+                    .closing = true;
                 control.request_close();
                 index += 1;
                 continue;
             }
-            let slot = self.slots.swap_remove(index);
+            let slot = self.slots.remove(index).expect("stale slot was present");
             if let Some(handle) = slot.handle {
-                let _ = settle_closed_relay(handle, slot.terminal);
+                let _ = settle_registered_closed_relay(handle, slot.terminal);
             }
             retired += 1;
         }
@@ -1218,10 +1261,15 @@ impl ClosedRelayRegistry {
         session_id: [u8; 16],
         generation: &ClosedRelayGeneration,
     ) -> Option<(MeshContextId, DeviceId, DeviceId, DeviceId, u64)> {
+        // The caller holds the allocation registry mutex.  The exact slot
+        // session/generation and its retained epoch are therefore the
+        // allocation identity; use only the authority/session revalidation
+        // here, never the full witness checker that would look this same
+        // registry up again.
         let slot = self.slots.iter().find(|slot| {
             slot.session_id == session_id
                 && Arc::ptr_eq(&slot.generation, generation)
-                && slot.terminal.is_current()
+                && slot.terminal.is_current_registered()
         })?;
         Some((
             slot.terminal.context,
@@ -1236,8 +1284,7 @@ impl ClosedRelayRegistry {
 /// Bounded Open/Offer/Accept handshake custody. The runtime guard remains
 /// inside the pending value until Accept, refusal, or shutdown drops it.
 pub(crate) struct ClosedRelayPendingRegistry {
-    slots: Vec<ClosedRelayPending>,
-    capacity: usize,
+    slots: FixedTable<ClosedRelayPending>,
 }
 
 pub(crate) struct ClosedRelayPending {
@@ -1255,11 +1302,11 @@ pub(crate) struct ClosedRelayPending {
 /// than on `ClosedRelayPending` permits the authorization to be moved into
 /// the admitted allocation while all remaining custody still drops normally.
 pub(crate) struct ClosedRelayPendingExpiry {
-    control: Arc<ClosedRelayPendingExpiryControl>,
+    control: FundedArc<ClosedRelayPendingExpiryControl>,
 }
 
 impl ClosedRelayPendingExpiry {
-    pub(crate) fn new(control: Arc<ClosedRelayPendingExpiryControl>) -> Self {
+    pub(crate) fn new(control: FundedArc<ClosedRelayPendingExpiryControl>) -> Self {
         Self { control }
     }
 }
@@ -1271,14 +1318,14 @@ impl Drop for ClosedRelayPendingExpiry {
 }
 
 pub(crate) struct ClosedRelayPendingExpiryControl {
-    wake: Notify,
+    wake: Arc<Notify>,
     cancelled: AtomicBool,
 }
 
 impl ClosedRelayPendingExpiryControl {
     pub(crate) fn new() -> Self {
         Self {
-            wake: Notify::new(),
+            wake: Arc::new(Notify::new()),
             cancelled: AtomicBool::new(false),
         }
     }
@@ -1288,8 +1335,8 @@ impl ClosedRelayPendingExpiryControl {
         self.wake.notify_waiters();
     }
 
-    pub(crate) fn cancelled(&self) -> tokio::sync::futures::Notified<'_> {
-        self.wake.notified()
+    pub(crate) fn cancelled_owned(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.wake).notified_owned()
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -1305,13 +1352,12 @@ impl ClosedRelayPendingRegistry {
         let capacity = usize::try_from(profile.max_pending_handshakes)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         Ok(Self {
-            slots: Vec::with_capacity(capacity),
-            capacity,
+            slots: FixedTable::new(capacity),
         })
     }
 
     pub(crate) fn insert(&mut self, pending: ClosedRelayPending) -> Result<(), ClosedRelayRefusal> {
-        if self.slots.len() >= self.capacity
+        if self.slots.is_full()
             || self
                 .slots
                 .iter()
@@ -1320,16 +1366,15 @@ impl ClosedRelayPendingRegistry {
             drop(pending);
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.slots.push(pending);
-        Ok(())
+        self.slots.insert(pending).map(|_| ()).map_err(|pending| {
+            drop(pending);
+            ClosedRelayRefusal::QueueFull
+        })
     }
 
     pub(crate) fn take(&mut self, session_id: [u8; 16]) -> Option<ClosedRelayPending> {
-        let index = self
-            .slots
-            .iter()
-            .position(|slot| slot.session_id == session_id)?;
-        Some(self.slots.swap_remove(index))
+        let index = self.slots.position(|slot| slot.session_id == session_id)?;
+        self.slots.remove(index)
     }
 
     pub(crate) fn take_matching(
@@ -1339,7 +1384,10 @@ impl ClosedRelayPendingRegistry {
         target_witness: &SessionValidityWitness,
     ) -> Result<ClosedRelayPending, ClosedRelayRefusal> {
         let index = self.matching_index(session_id, route, target_witness)?;
-        Ok(self.slots.swap_remove(index))
+        Ok(self
+            .slots
+            .remove(index)
+            .expect("matching pending slot was present"))
     }
 
     pub(crate) fn matching_authorization(
@@ -1349,7 +1397,12 @@ impl ClosedRelayPendingRegistry {
         target_witness: &SessionValidityWitness,
     ) -> Result<ClosedRelayAuthorization, ClosedRelayRefusal> {
         let index = self.matching_index(session_id, route, target_witness)?;
-        Ok(self.slots[index].authorization.clone())
+        Ok(self
+            .slots
+            .get(index)
+            .expect("matching pending slot was present")
+            .authorization
+            .clone())
     }
 
     fn matching_index(
@@ -1360,10 +1413,12 @@ impl ClosedRelayPendingRegistry {
     ) -> Result<usize, ClosedRelayRefusal> {
         let index = self
             .slots
-            .iter()
             .position(|pending| pending.session_id == session_id)
             .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-        let pending = &self.slots[index];
+        let pending = self
+            .slots
+            .get(index)
+            .expect("matching pending slot was present");
         let pending_route = crate::protocol::relay::ClosedRelayRoute::new(
             pending.authorization.context,
             pending.authorization.requester.device().clone(),
@@ -1405,12 +1460,16 @@ impl ClosedRelayPendingRegistry {
     pub(crate) fn remove_stale(&mut self) -> usize {
         let mut removed = 0;
         let mut index = 0;
-        while index < self.slots.len() {
-            if self.slots[index].authorization.is_current() {
+        while index < self.slots.capacity() {
+            let Some(slot) = self.slots.get(index) else {
+                index += 1;
+                continue;
+            };
+            if slot.authorization.is_current() {
                 index += 1;
                 continue;
             }
-            self.slots.swap_remove(index);
+            let _ = self.slots.remove(index);
             removed += 1;
         }
         removed
@@ -1418,7 +1477,7 @@ impl ClosedRelayPendingRegistry {
 
     pub(crate) fn clear(&mut self) -> usize {
         let count = self.slots.len();
-        self.slots.clear();
+        while self.slots.take_any().is_some() {}
         count
     }
 }
@@ -1468,8 +1527,198 @@ impl ClosedRelayCloseRecord {
 }
 
 pub(crate) struct ClosedRelayClosingRegistry {
-    records: Vec<ClosedRelayCloseRecord>,
-    capacity: usize,
+    records: FixedTable<ClosedRelayCloseRecord>,
+}
+
+/// Provider-backed fixed storage for all Closed-relay engine custody.  The
+/// root owns only registry storage and wake state; endpoint values retain a
+/// weak state reference, so this object cannot form a resident state cycle.
+pub(crate) struct ClosedRelayEngineRoot {
+    pub(crate) allocations: Mutex<ClosedRelayRegistry>,
+    pub(crate) closing: Mutex<ClosedRelayClosingRegistry>,
+    pub(crate) pending: Mutex<ClosedRelayPendingRegistry>,
+    pub(crate) expiries: Mutex<FixedTable<ClosedRelayPendingExpiryTask>>,
+    pub(crate) endpoints: Mutex<ClosedRelayEndpointRegistry>,
+    pub(crate) accepted: Mutex<ClosedRelayTargetAcceptedRegistry>,
+    pub(crate) abandonments: Mutex<FixedTable<ClosedRelayAbandonment>>,
+}
+
+pub(crate) struct ClosedRelayPendingExpiryTask {
+    pub(crate) handle: JoinHandle<()>,
+    pub(crate) funding: FundedArc<ClosedRelayPendingExpiryControl>,
+}
+
+/// A root-pinned shutdown observation.  Awaiting through this guard keeps the
+/// exact task and its shared funding available if shutdown itself is
+/// cancelled; Drop then restores the reserved physical slot rather than
+/// silently exhausting the expiry table.
+pub(crate) struct ClosedRelayExpiryReservation {
+    root: FundedArc<ClosedRelayEngineRoot>,
+    slot: Option<usize>,
+    task: Option<ClosedRelayPendingExpiryTask>,
+}
+
+impl ClosedRelayExpiryReservation {
+    pub(crate) fn new(
+        root: FundedArc<ClosedRelayEngineRoot>,
+        slot: usize,
+        task: ClosedRelayPendingExpiryTask,
+    ) -> Self {
+        Self {
+            root,
+            slot: Some(slot),
+            task: Some(task),
+        }
+    }
+
+    pub(crate) async fn await_handle(&mut self) -> Result<(), tokio::task::JoinError> {
+        let task = self
+            .task
+            .as_mut()
+            .expect("expiry reservation retains its task");
+        (&mut task.handle).await
+    }
+
+    pub(crate) fn complete(mut self) {
+        let _ = self.task.take();
+        let slot = self.slot.take();
+        if let Some(slot) = slot {
+            let _ = self.root.expiries.lock().release_reserved(slot);
+        }
+    }
+}
+
+impl Drop for ClosedRelayExpiryReservation {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        if let Some(task) = self.task.take() {
+            self.root.expiries.lock().restore_exact(slot, task);
+        } else {
+            let _ = self.root.expiries.lock().release_reserved(slot);
+        }
+    }
+}
+
+/// A root-pinned abandonment reservation. The value remains owned here while
+/// settlement awaits, so cancellation drops the guard and restores the exact
+/// physical slot instead of losing custody or detaching a retry.
+pub(crate) struct ClosedRelayAbandonmentReservation {
+    root: FundedArc<ClosedRelayEngineRoot>,
+    slot: Option<usize>,
+    value: Option<ClosedRelayAbandonment>,
+}
+
+impl ClosedRelayAbandonmentReservation {
+    pub(crate) fn new(
+        root: FundedArc<ClosedRelayEngineRoot>,
+        slot: usize,
+        value: ClosedRelayAbandonment,
+    ) -> Self {
+        Self {
+            root,
+            slot: Some(slot),
+            value: Some(value),
+        }
+    }
+
+    pub(crate) fn value(&self) -> &ClosedRelayAbandonment {
+        self.value.as_ref().expect("reservation retains its value")
+    }
+
+    pub(crate) fn complete(mut self) {
+        let _ = self.value.take();
+        let slot = self.slot.take();
+        if let Some(slot) = slot {
+            let _ = self.root.abandonments.lock().release_reserved(slot);
+        }
+    }
+}
+
+impl Drop for ClosedRelayAbandonmentReservation {
+    fn drop(&mut self) {
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        if let Some(value) = self.value.take() {
+            self.root.abandonments.lock().restore_exact(slot, value);
+        } else {
+            let _ = self.root.abandonments.lock().release_reserved(slot);
+        }
+    }
+}
+
+impl ClosedRelayEngineRoot {
+    pub(crate) fn root_claim(
+        profile: &ClosedRelayPolicyConfig,
+    ) -> Result<ResourceClaim, ClosedRelayRefusal> {
+        if !profile.enabled || !profile.validate() {
+            return Err(ClosedRelayRefusal::InvalidProfile);
+        }
+        let allocations = usize::try_from(profile.max_allocations)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        let pending = usize::try_from(profile.max_pending_handshakes)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        let abandonment = allocations
+            .checked_mul(2)
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let mut bytes = std::mem::size_of::<Self>();
+        for allocation in [
+            FixedTable::<ClosedRelaySlot>::allocation_bytes(allocations),
+            FixedTable::<ClosedRelayCloseRecord>::allocation_bytes(allocations),
+            FixedTable::<ClosedRelayPending>::allocation_bytes(pending),
+            FixedTable::<ClosedRelayPendingExpiryTask>::allocation_bytes(pending),
+            FixedTable::<EndpointSession>::allocation_bytes(allocations),
+            FixedFifo::<EndpointSession>::allocation_bytes(allocations),
+            FixedTable::<ClosedRelayAbandonment>::allocation_bytes(abandonment),
+        ] {
+            bytes = bytes
+                .checked_add(allocation.ok_or(ClosedRelayRefusal::InvalidProfile)?)
+                .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        }
+        bytes = bytes
+            .checked_add(std::mem::size_of::<Notify>())
+            .and_then(|value| value.checked_add(std::mem::size_of::<FundedArc<Self>>()))
+            .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+        let bytes = u64::try_from(bytes).map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        ResourceClaim::try_from_entries([
+            (ResourceClass::AccountedMemoryBytes, bytes),
+            // seven Box tables, root and funding controls, accepted wake Arc.
+            (ResourceClass::OpaqueDependencyResidual, 10),
+        ])
+        .map_err(|_| ClosedRelayRefusal::InvalidProfile)
+    }
+
+    pub(crate) fn new(
+        profile: &ClosedRelayPolicyConfig,
+        funding: ResourceLease,
+    ) -> Result<FundedArc<Self>, ClosedRelayRefusal> {
+        let claim = Self::root_claim(profile)?;
+        if funding.authority() != crate::resource::ResourceAuthorityClass::Admitted
+            || funding.claim() != claim
+        {
+            return Err(ClosedRelayRefusal::InvalidProfile);
+        }
+        let allocations = usize::try_from(profile.max_allocations)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        let pending = usize::try_from(profile.max_pending_handshakes)
+            .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
+        let root = Self {
+            allocations: Mutex::new(ClosedRelayRegistry::new(profile)?),
+            closing: Mutex::new(ClosedRelayClosingRegistry::new(profile)?),
+            pending: Mutex::new(ClosedRelayPendingRegistry::new(profile)?),
+            expiries: Mutex::new(FixedTable::new(pending)),
+            endpoints: Mutex::new(ClosedRelayEndpointRegistry::new(profile)?),
+            accepted: Mutex::new(ClosedRelayTargetAcceptedRegistry::new(profile)?),
+            abandonments: Mutex::new(FixedTable::new(
+                allocations
+                    .checked_mul(2)
+                    .ok_or(ClosedRelayRefusal::InvalidProfile)?,
+            )),
+        };
+        FundedArc::new(root, funding).map_err(|_| ClosedRelayRefusal::InvalidProfile)
+    }
 }
 
 impl ClosedRelayClosingRegistry {
@@ -1480,8 +1729,7 @@ impl ClosedRelayClosingRegistry {
         let capacity = usize::try_from(profile.max_allocations)
             .map_err(|_| ClosedRelayRefusal::InvalidProfile)?;
         Ok(Self {
-            records: Vec::with_capacity(capacity),
-            capacity,
+            records: FixedTable::new(capacity),
         })
     }
 
@@ -1496,10 +1744,13 @@ impl ClosedRelayClosingRegistry {
         {
             return Ok(false);
         }
-        if self.records.len() >= self.capacity {
+        if self.records.is_full() {
             return Err(ClosedRelayRefusal::QueueFull);
         }
-        self.records.push(record);
+        self.records.insert(record).map_err(|record| {
+            drop(record);
+            ClosedRelayRefusal::QueueFull
+        })?;
         Ok(true)
     }
 
@@ -1510,32 +1761,38 @@ impl ClosedRelayClosingRegistry {
         witness: &SessionValidityWitness,
         allocation_epoch: u64,
     ) -> Option<ClosedRelayCloseRecord> {
-        let index = self.records.iter().position(|record| {
+        let index = self.records.position(|record| {
             record.session_id == session_id
                 && &record.opposite == opposite
                 && record.opposite_witness.same_validity(witness)
                 && record.allocation_epoch == allocation_epoch
         })?;
-        Some(self.records.swap_remove(index))
+        self.records.remove(index)
     }
 
     pub(crate) fn remove(&mut self, session_id: [u8; 16]) -> Option<ClosedRelayCloseRecord> {
         let index = self
             .records
-            .iter()
             .position(|record| record.session_id == session_id)?;
-        Some(self.records.swap_remove(index))
+        self.records.remove(index)
     }
 
     pub(crate) fn remove_stale(&mut self, state: &NetworkState) -> usize {
         let mut removed = 0;
         let mut index = 0;
-        while index < self.records.len() {
-            if self.records[index].is_current(state) {
+        while index < self.records.capacity() {
+            let Some(record) = self.records.get(index) else {
+                index += 1;
+                continue;
+            };
+            if record.is_current(state) {
                 index += 1;
                 continue;
             }
-            let record = self.records.swap_remove(index);
+            let record = self
+                .records
+                .remove(index)
+                .expect("stale record was present");
             if let Some(generation) = record.allocation_generation.as_ref() {
                 // Stale Close custody is terminal, not merely forgotten. The
                 // exact generation fence prevents a successor from being
@@ -1552,6 +1809,10 @@ impl ClosedRelayClosingRegistry {
         self.records
             .iter()
             .any(|record| record.session_id == session_id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        while self.records.take_any().is_some() {}
     }
 }
 
@@ -1597,10 +1858,11 @@ impl ClosedRelayAuthorization {
             })
     }
 
-    /// Re-prove the immutable policy and both exact session lineages before a
-    /// runtime terminal effect.  This is synchronous and lock-bounded; the
-    /// runtime must call it before forwarding or settlement and must not await
-    /// while any engine registry lock is held.
+    /// Re-prove the immutable policy and both exact session lineages before an
+    /// external runtime terminal effect. This is synchronous and lock-bounded;
+    /// callers holding the allocation registry mutex must use
+    /// `is_current_registered` instead because this full checker re-reads that
+    /// registry's route.
     pub(crate) fn is_current(&self) -> bool {
         if !closed_profile(&self.state) || self.state.mesh_context_id() != self.context {
             return false;
@@ -1657,6 +1919,21 @@ pub(crate) fn settle_closed_relay(
     Ok(handle.settle())
 }
 
+/// Settle a handle removed from an exact registry slot while that registry's
+/// mutex remains held. Slot session/generation/epoch identity has already been
+/// matched by the caller, so only the non-registry authorization witness check
+/// is safe here; the full external checker would recurse into the same mutex.
+fn settle_registered_closed_relay(
+    handle: ClosedRelayHandle,
+    terminal: ClosedRelayTerminalWitness,
+) -> Result<ClosedRelayTerminal, ClosedRelayRefusal> {
+    if !terminal.is_current_registered() {
+        handle.settle_stale();
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    }
+    Ok(handle.settle())
+}
+
 /// Exact owner/session data retained until `runtime::relay` settles.  This is
 /// not a terminal enum and does not settle a provider permit; it is a narrow
 /// engine callback input that lets the runtime re-prove successor safety.
@@ -1678,6 +1955,14 @@ impl ClosedRelayTerminalWitness {
                 return false;
             }
         }
+        self.is_current_registered()
+    }
+
+    /// Re-prove policy, semantic membership, and both exact endpoint sessions
+    /// without looking up the allocation registry. Registry callers already
+    /// own the exact slot/generation and retained session/epoch identity; the
+    /// external `is_current` caller performs its route/epoch check separately.
+    fn is_current_registered(&self) -> bool {
         ClosedRelayAuthorization {
             state: Arc::clone(&self.state),
             context: self.context,
@@ -2112,8 +2397,8 @@ async fn send_control_to_owner(
 /// enqueues the bounded record and never creates a detached task.
 pub(crate) async fn settle_closed_relay_abandonment(
     state: &Arc<NetworkState>,
-    abandonment: ClosedRelayAbandonment,
-) -> Result<(), ClosedRelayAbandonment> {
+    abandonment: &ClosedRelayAbandonment,
+) -> Result<(), ClosedRelayRefusal> {
     if abandonment.route.allocation_epoch == 0 {
         let _ = state.take_closed_relay_pending(abandonment.route.session_id);
         return Ok(());
@@ -2146,7 +2431,7 @@ pub(crate) async fn settle_closed_relay_abandonment(
     if settled {
         Ok(())
     } else {
-        Err(abandonment)
+        Err(ClosedRelayRefusal::OwnerNotLive)
     }
 }
 
@@ -2175,60 +2460,44 @@ fn checked_claim_bytes(value: usize) -> Result<u64, ClosedRelayRefusal> {
     u64::try_from(value).map_err(|_| ClosedRelayRefusal::InvalidProfile)
 }
 
+const CANONICAL_BASE32_BYTES: usize = (32 * 8 + 4) / 5;
+
 fn endpoint_lease_claim(
     profile: &ClosedRelayPolicyConfig,
     capacity: usize,
-    context: &MeshContextId,
-    requester: &DeviceId,
-    relay: &DeviceId,
-    target: &DeviceId,
+    _context: &MeshContextId,
+    _requester: &DeviceId,
+    _relay: &DeviceId,
+    _target: &DeviceId,
 ) -> Result<ResourceClaim, ClosedRelayRefusal> {
     let max_ciphertext =
         crate::runtime::relay::checked_ciphertext_ceiling(profile.max_frame_ciphertext_bytes)?;
     let queued_bytes = capacity
         .checked_mul(max_ciphertext)
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
-    // Measure the allocator's actual VecDeque capacity, rather than assuming
-    // the requested logical length is the backing allocation.
-    let queue_capacity = VecDeque::<OpaqueRelayPacket>::with_capacity(capacity).capacity();
-    let packet_slots = queue_capacity
+    // The endpoint constructs its queue with this exact logical capacity; the
+    // queue's allocator metadata is covered by the named opaque residual.
+    let packet_slots = capacity
         .checked_mul(std::mem::size_of::<OpaqueRelayPacket>())
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let replay_slots = usize::try_from(profile.replay_window)
         .map_err(|_| ClosedRelayRefusal::InvalidProfile)?
         .checked_mul(std::mem::size_of::<bool>())
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
-    let mesh = context.base32();
-    let requester_wire = requester.base32();
-    let relay_wire = relay.base32();
-    let target_wire = target.base32();
-    let route_bytes = requester_wire
-        .capacity()
-        .checked_add(relay_wire.capacity())
-        .and_then(|bytes| bytes.checked_add(target_wire.capacity()))
-        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
-    let key_session_bytes = requester_wire
-        .capacity()
-        .checked_add(target_wire.capacity())
-        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let packet_string_bytes = capacity
         .checked_mul(
-            mesh.capacity()
-                .checked_add(requester_wire.capacity())
-                .and_then(|bytes| bytes.checked_add(target_wire.capacity()))
+            CANONICAL_BASE32_BYTES
+                .checked_mul(3)
                 .ok_or(ClosedRelayRefusal::InvalidProfile)?,
         )
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let accounted = std::mem::size_of::<EndpointSessionInner>()
         .checked_add(packet_slots)
         .and_then(|bytes| bytes.checked_add(replay_slots))
-        .and_then(|bytes| bytes.checked_add(route_bytes))
-        .and_then(|bytes| bytes.checked_add(key_session_bytes))
         .and_then(|bytes| bytes.checked_add(packet_string_bytes))
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let retained_allocations = 1usize
-        .checked_add(3) // the endpoint's canonical requester/relay/target Strings
-        .and_then(|count| count.checked_add(1)) // endpoint inbound VecDeque
+        .checked_add(1) // endpoint inbound VecDeque
         .and_then(|count| count.checked_add(1)) // endpoint replay-window Vec
         .and_then(|count| count.checked_add(capacity.checked_mul(4)?)) // packet Strings + ciphertext
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
@@ -2269,7 +2538,6 @@ fn pending_lease_claim(
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     let retained_allocations = 3usize
         .checked_add(4) // requester-share mesh/from/to/signature Strings
-        .and_then(|count| count.checked_add(1)) // pending-expiry control Arc
         .ok_or(ClosedRelayRefusal::InvalidProfile)?;
     ResourceClaim::try_from_entries([
         (
@@ -2289,15 +2557,7 @@ fn allocation_lease_claim(
     authorization: &ClosedRelayAuthorization,
 ) -> Result<ResourceClaim, ClosedRelayRefusal> {
     let route_bytes = retained_route_bytes(authorization)?;
-    let checkout_route_bytes = authorization
-        .requester
-        .device
-        .base32()
-        .capacity()
-        .checked_add(authorization.relay.base32().capacity())
-        .and_then(|bytes| bytes.checked_add(authorization.target.device.base32().capacity()))
-        .and_then(|bytes| bytes.checked_mul(2))
-        .ok_or(ClosedRelayRefusal::InvalidProfile)?;
+    let checkout_route_bytes = 0usize;
     let accounted = std::mem::size_of::<ClosedRelaySlot>()
         .checked_add(route_bytes)
         .and_then(|bytes| bytes.checked_add(checkout_route_bytes))
@@ -2321,18 +2581,11 @@ fn allocation_lease_claim(
 }
 
 fn retained_route_bytes(
-    authorization: &ClosedRelayAuthorization,
+    _authorization: &ClosedRelayAuthorization,
 ) -> Result<usize, ClosedRelayRefusal> {
-    let context = authorization.context.base32();
-    let requester = authorization.requester.device.base32();
-    let relay = authorization.relay.base32();
-    let target = authorization.target.device.base32();
-    context
-        .capacity()
-        .checked_add(requester.capacity())
-        .and_then(|bytes| bytes.checked_add(relay.capacity()))
-        .and_then(|bytes| bytes.checked_add(target.capacity()))
-        .ok_or(ClosedRelayRefusal::InvalidProfile)
+    // MeshContextId is inline and DeviceId clones share the process interner;
+    // no route string is retained by ClosedRelayAuthorization or its clones.
+    Ok(0)
 }
 
 fn max_frame_ciphertext(state: &NetworkState) -> Result<usize, ClosedRelayRefusal> {
@@ -2535,11 +2788,21 @@ pub(crate) fn on_control(
             let runtime = state
                 .closed_relay_runtime()
                 .ok_or(ClosedRelayRefusal::InvalidProfile)?;
-            let lease = state
+            // Acquire the shared expiry reservation before constructing the
+            // control or its Notify.  All later strong handles clone this one
+            // funded owner, so completion cannot release custody before the
+            // registered JoinHandle has been observed.
+            let expiry = state.reserve_closed_relay_pending_expiry()?;
+            let lease = match state
                 .acquire_closed_relay_lease(pending_lease_claim(&authorization, &requester_share)?)
-                .map_err(|_| ClosedRelayRefusal::QueueFull)?;
+            {
+                Ok(lease) => lease,
+                Err(_) => {
+                    drop(expiry);
+                    return Err(ClosedRelayRefusal::QueueFull);
+                }
+            };
             let guard = runtime.try_begin_handshake()?;
-            let expiry = Arc::new(ClosedRelayPendingExpiryControl::new());
             let target_owner = authorization.target.owner.clone();
             state.insert_closed_relay_pending(ClosedRelayPending {
                 session_id,
@@ -2547,7 +2810,7 @@ pub(crate) fn on_control(
                 authorization,
                 _requester_share: requester_share.clone(),
                 _guard: guard,
-                _expiry: ClosedRelayPendingExpiry::new(Arc::clone(&expiry)),
+                _expiry: ClosedRelayPendingExpiry::new(expiry.clone()),
                 _lease: lease,
             })?;
             state.arm_closed_relay_pending_expiry(session_id, expiry)?;
@@ -2938,18 +3201,65 @@ pub(crate) fn on_data(
     owner: &PeerOwnerToken,
     data: ClosedRelayData,
 ) -> Result<(), ClosedRelayRefusal> {
-    let max = max_frame_ciphertext(state)?;
-    let local = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-entered");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-profile-check");
+    let max = match max_frame_ciphertext(state) {
+        Ok(max) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("on-data-profile-ok");
+            max
+        }
+        Err(error) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("on-data-profile-refused");
+            return Err(error);
+        }
+    };
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-local-identity-check");
+    let local = match DeviceId::from_canonical_str(state.identity.public_id()) {
+        Ok(local) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("on-data-local-identity-ok");
+            local
+        }
+        Err(_) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("on-data-local-identity-refused");
+            return Err(invalid("local identity is not a canonical DeviceId"));
+        }
+    };
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-local-relay-check");
     if data.context_id != state.mesh_context_id() || data.relay != local {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-local-relay-refused");
         return Err(invalid("data is not bound to this local relay"));
     }
-    let (context_id, requester, relay, target, allocation_epoch) = state
-        .closed_relay_route(data.session_id)
-        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
-    let generation = state
-        .closed_relay_generation(data.session_id)
-        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-local-relay-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-route-check");
+    let Some((context_id, requester, relay, target, allocation_epoch)) =
+        state.closed_relay_route(data.session_id)
+    else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-route-refused");
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    };
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-route-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-generation-check");
+    let Some(generation) = state.closed_relay_generation(data.session_id) else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-generation-refused");
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    };
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-generation-ok");
     let expected_route = crate::protocol::relay::ClosedRelayRoute::with_epoch(
         context_id,
         requester,
@@ -2958,17 +3268,44 @@ pub(crate) fn on_data(
         data.session_id,
         allocation_epoch,
     );
-    data.validate_against_route(&expected_route)
-        .map_err(|error| invalid(format!("closed relay data route mismatch: {error}")))?;
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-route-validation-check");
+    if let Err(error) = data.validate_against_route(&expected_route) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-route-validation-refused");
+        return Err(invalid(format!(
+            "closed relay data route mismatch: {error}"
+        )));
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-route-validation-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-direction-check");
     let direction = if owner.device_id() == data.requester.base32().as_str() {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-direction-requester-ok");
         RelayDirection::RequesterToTarget
     } else if owner.device_id() == data.target.base32().as_str() {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-direction-target-ok");
         RelayDirection::TargetToRequester
     } else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-direction-refused");
         return Err(ClosedRelayRefusal::OwnerMismatch);
     };
-    validate_data_for_direction(&data, max, direction)?;
-    let _ = current_owner_witness(
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-packet-check");
+    if let Err(error) = validate_data_for_direction(&data, max, direction) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-packet-refused");
+        return Err(error);
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-packet-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-owner-witness-check");
+    if let Err(error) = current_owner_witness(
         state,
         owner,
         if direction == RelayDirection::RequesterToTarget {
@@ -2976,7 +3313,15 @@ pub(crate) fn on_data(
         } else {
             &data.target
         },
-    )?;
+    ) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("on-data-owner-witness-refused");
+        return Err(error);
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-owner-witness-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("on-data-forward-check");
     let result = state.forward_closed_relay(
         data.session_id,
         &generation,
@@ -3005,24 +3350,91 @@ pub(crate) async fn handle_data(
     owner: &PeerOwnerToken,
     data: ClosedRelayData,
 ) -> Result<(), ClosedRelayRefusal> {
-    let local = DeviceId::from_canonical_str(state.identity.public_id())
-        .map_err(|_| invalid("local identity is not a canonical DeviceId"))?;
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-entered");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-local-identity-check");
+    let local = match DeviceId::from_canonical_str(state.identity.public_id()) {
+        Ok(local) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("handle-data-local-identity-ok");
+            local
+        }
+        Err(_) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("handle-data-local-identity-refused");
+            return Err(invalid("local identity is not a canonical DeviceId"));
+        }
+    };
     if data.relay == local {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-local-relay");
         return on_data(state, owner, data);
     }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-endpoint");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-direction-check");
     let direction = if data.target == local {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-direction-target-ok");
         RelayDirection::RequesterToTarget
     } else if data.requester == local {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-direction-requester-ok");
         RelayDirection::TargetToRequester
     } else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-direction-refused");
         return Err(ClosedRelayRefusal::OwnerMismatch);
     };
-    validate_data_for_direction(&data, max_frame_ciphertext(state)?, direction)?;
-    canonical_route_admitted(state, &data.requester, &data.relay, &data.target)?;
-    let _ = current_owner_witness(state, owner, &data.relay)?;
-    let session = state
-        .closed_relay_endpoint(data.session_id)
-        .ok_or(ClosedRelayRefusal::OwnerNotLive)?;
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-packet-check");
+    let max = match max_frame_ciphertext(state) {
+        Ok(max) => max,
+        Err(error) => {
+            #[cfg(feature = "transport-lab")]
+            relay_transport_lab_marker("handle-data-packet-profile-refused");
+            return Err(error);
+        }
+    };
+    if let Err(error) = validate_data_for_direction(&data, max, direction) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-packet-refused");
+        return Err(error);
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-packet-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-route-check");
+    if let Err(error) = canonical_route_admitted(state, &data.requester, &data.relay, &data.target)
+    {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-route-refused");
+        return Err(error);
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-route-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-owner-witness-check");
+    if let Err(error) = current_owner_witness(state, owner, &data.relay) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-owner-witness-refused");
+        return Err(error);
+    }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-owner-witness-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-endpoint-lookup-check");
+    let Some(session) = state.closed_relay_endpoint(data.session_id) else {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-endpoint-lookup-refused");
+        return Err(ClosedRelayRefusal::OwnerNotLive);
+    };
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-endpoint-lookup-ok");
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-endpoint-route-check");
     if !endpoint_matches_route(
         &session,
         &data.context_id,
@@ -3032,8 +3444,12 @@ pub(crate) async fn handle_data(
         &data.session_id,
         data.allocation_epoch,
     ) {
+        #[cfg(feature = "transport-lab")]
+        relay_transport_lab_marker("handle-data-endpoint-route-refused");
         return Err(ClosedRelayRefusal::OwnerMismatch);
     }
+    #[cfg(feature = "transport-lab")]
+    relay_transport_lab_marker("handle-data-endpoint-route-ok");
     let route = data.route();
     let result = state.deliver_closed_relay_endpoint(data.session_id, &route, data.packet);
     #[cfg(test)]
@@ -3350,5 +3766,21 @@ mod tests {
         control.request_close();
         assert!(control.closing.load(Ordering::Acquire));
         assert!(!Arc::ptr_eq(&old_generation, &successor_generation));
+    }
+
+    #[test]
+    fn pending_expiry_cancel_latch_and_registered_wake_are_both_observable() {
+        use std::future::Future;
+
+        let control = Arc::new(ClosedRelayPendingExpiryControl::new());
+        let mut registered = control.cancelled_owned();
+        let mut registered = unsafe { std::pin::Pin::new_unchecked(&mut registered) };
+        registered.as_mut().enable();
+        control.cancel();
+        assert!(control.is_cancelled());
+
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(registered.poll(&mut context).is_ready());
     }
 }

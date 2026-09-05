@@ -364,6 +364,77 @@ pub mod transport_lab {
     #[derive(Clone)]
     pub struct ProofOwner(super::peer_registry::PeerOwnerToken);
 
+    /// Opaque exact-owner/worker witness for one transport-lab snapshot.
+    /// Device ids are intentionally absent: a replacement installation must
+    /// fail the registry fence rather than being re-resolved by name.
+    #[derive(Clone)]
+    pub struct TransportChannelWitness(super::peer_registry::PeerOwnerToken);
+
+    /// Aggregate native transport counters for one exact data channel.  The
+    /// counters are observations only: SCTP and ICE values include unrelated
+    /// control/data traffic and do not prove delivery of one application
+    /// message.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ChannelSnapshot {
+        pub channel_id: u16,
+        pub messages_sent: usize,
+        pub bytes_sent: usize,
+        pub messages_received: usize,
+        pub bytes_received: usize,
+        pub buffered_amount: usize,
+        pub association_bytes_sent: Option<usize>,
+        pub association_bytes_received: Option<usize>,
+        pub selected_pair_bytes_sent: Option<u64>,
+        pub selected_pair_bytes_received: Option<u64>,
+        pub selected_pair: Option<crate::transport::diag::SelectedCandidatePair>,
+        pub state: u8,
+    }
+
+    /// Capture an exact current owner and selected worker under the registry
+    /// mutation fence.  No device-only replacement can satisfy the witness.
+    #[doc(hidden)]
+    pub fn capture_transport_channel(
+        state: &Arc<NetworkState>,
+        owner: &ProofOwner,
+    ) -> Option<TransportChannelWitness> {
+        state
+            .peers
+            .capture_current_worker_owner(&owner.0)
+            .map(TransportChannelWitness)
+    }
+
+    /// Read one native channel's aggregate counters, then revalidate the
+    /// same installation and worker after the await.  Replacement or
+    /// retirement returns `None`, distinct from valid zero counters.
+    #[doc(hidden)]
+    pub async fn transport_channel_snapshot(
+        state: &Arc<NetworkState>,
+        witness: &TransportChannelWitness,
+    ) -> Option<ChannelSnapshot> {
+        let worker = state
+            .peers
+            .with_current_transport_worker(&witness.0, Arc::clone)?;
+        let snapshot = worker.transport_lab_channel_snapshot().await?;
+        let still_current = state
+            .peers
+            .with_current_transport_worker(&witness.0, |current| Arc::ptr_eq(current, &worker))
+            .unwrap_or(false);
+        still_current.then_some(ChannelSnapshot {
+            channel_id: snapshot.channel_id,
+            messages_sent: snapshot.messages_sent,
+            bytes_sent: snapshot.bytes_sent,
+            messages_received: snapshot.messages_received,
+            bytes_received: snapshot.bytes_received,
+            buffered_amount: snapshot.buffered_amount,
+            association_bytes_sent: snapshot.association_bytes_sent,
+            association_bytes_received: snapshot.association_bytes_received,
+            selected_pair_bytes_sent: snapshot.selected_pair_bytes_sent,
+            selected_pair_bytes_received: snapshot.selected_pair_bytes_received,
+            selected_pair: snapshot.selected_pair,
+            state: snapshot.state,
+        })
+    }
+
     /// A one-shot transport-lab park at the capability replay send boundary.
     ///
     /// The proof replay runs before this boundary in the production command
@@ -2291,20 +2362,16 @@ pub(crate) async fn try_reoffer(state: &Arc<NetworkState>, device_id: &str) {
 
 /// Drive the renegotiations the transport flagged off the driver task.
 ///
-/// The tick only selects peers the connector raised `RenegotiationNeeded` for,
-/// and spawns one task per peer. The webrtc-rs excursion — transceiver changes
-/// and the ICE re-gather for the offer — runs there, so the driver and every
-/// input frame queued behind it never waits on SDP work. Glare-guarded: a peer
-/// whose signaling state isn't Stable is skipped and retried next tick rather
-/// than wedging webrtc-rs with a mid-negotiation offer. Single-flighted per
-/// peer via `media_reneg_inflight`.
+/// The WebRTC `negotiationneeded` callback invokes this immediately; the
+/// state-watch tick invokes the same function as a recovery backstop. It
+/// selects only peers whose connector raised `RenegotiationNeeded` and spawns
+/// one task per peer. The webrtc-rs excursion — transceiver changes and the ICE
+/// re-gather for the offer — runs there, so the callback pump and every input
+/// frame queued behind it never waits on SDP work. Glare-guarded: a peer whose
+/// signaling state isn't Stable is refused and left armed for the backstop
+/// rather than wedging webrtc-rs with a mid-negotiation offer. Single-flighted
+/// per peer via `media_reneg_inflight`.
 pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
-    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
-        return;
-    };
-    if state.is_offline() {
-        return;
-    }
     let candidates: Vec<String> = state.peers.collect_map(|peer| {
         let data = peer.state.read();
         (!data.media_reneg_inflight
@@ -2322,7 +2389,7 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         // Explicit finalization is the only thing that creates a pending
         // change; elapsed time never does. A superseded connector, an
         // unpromoted peer, or nothing pending each yield `None`, and each means
-        // the same thing here — there is no renegotiation this tick. Fail
+        // the same thing here — there is no renegotiation to dispatch. Fail
         // closed.
         //
         // The claim yields one move-only operation carrying the connector *and*
@@ -2333,16 +2400,43 @@ pub(crate) async fn service_media_renegotiations(state: &Arc<NetworkState>) {
         let Some(owner) = state.peers.owner(&device_id) else {
             continue;
         };
-        let Some(renegotiation) = state.peers.claim_renegotiation(
-            &owner,
-            state.session_broker.as_ref(),
-            &state.mesh_context_id().to_string(),
-        ) else {
-            continue;
-        };
-        state.register_shutdown_task(&shutdown_permit, || {
-            tokio::spawn(run_media_renegotiation(state.clone(), renegotiation))
-        });
+        dispatch_media_renegotiation(state, &owner);
+    }
+}
+
+/// Claim and dispatch one exact authenticated peer without scanning the peer
+/// registry. Native and authenticated events already carry this owner token;
+/// the periodic recovery pass is the only caller that must discover owners.
+fn dispatch_media_renegotiation(state: &Arc<NetworkState>, owner: &peer_registry::PeerOwnerToken) {
+    let Some(shutdown_permit) = state.try_admit_shutdown_mutation() else {
+        return;
+    };
+    if state.is_offline() {
+        return;
+    }
+    let Some(renegotiation) = state.peers.claim_renegotiation(
+        owner,
+        state.session_broker.as_ref(),
+        &state.mesh_context_id().to_string(),
+    ) else {
+        return;
+    };
+    state.register_shutdown_task(&shutdown_permit, || {
+        tokio::spawn(run_media_renegotiation(state.clone(), renegotiation))
+    });
+}
+
+/// Complete one exact renegotiation and, when a successor worker remains
+/// authenticated on the same logical installation, offer that exact worker
+/// one successor claim. The completion owns the currentness fence; this helper
+/// never re-resolves a device id onto a replacement.
+fn complete_media_renegotiation(
+    state: &Arc<NetworkState>,
+    renegotiation: peer_registry::AdmittedRenegotiation,
+    outcome: std::result::Result<(), String>,
+) {
+    if let Some(owner) = renegotiation.complete(&state.peers, outcome) {
+        dispatch_media_renegotiation(state, &owner);
     }
 }
 
@@ -2359,7 +2453,7 @@ async fn run_media_renegotiation(
     renegotiation: peer_registry::AdmittedRenegotiation,
 ) {
     if !renegotiation.is_live() {
-        renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+        complete_media_renegotiation(&state, renegotiation, Err("session revoked".to_string()));
         return;
     }
     if renegotiation.session().signaling_state()
@@ -2367,7 +2461,11 @@ async fn run_media_renegotiation(
     {
         // Mid-negotiation: do not stack another offer or request. Completion
         // re-arms the explicit pending work; elapsed time grants nothing.
-        renegotiation.complete(&state.peers, Err("signaling not stable".to_string()));
+        complete_media_renegotiation(
+            &state,
+            renegotiation,
+            Err("signaling not stable".to_string()),
+        );
         return;
     }
 
@@ -2376,7 +2474,11 @@ async fn run_media_renegotiation(
             let offer = tokio::select! {
                 biased;
                 () = renegotiation.revoked() => {
-                    renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+                    complete_media_renegotiation(
+                        &state,
+                        renegotiation,
+                        Err("session revoked".to_string()),
+                    );
                     return;
                 }
                 offer = renegotiation.session().create_offer() => offer,
@@ -2384,7 +2486,7 @@ async fn run_media_renegotiation(
             let offer = match offer {
                 Ok(offer) => offer,
                 Err(error) => {
-                    renegotiation.complete(&state.peers, Err(error.to_string()));
+                    complete_media_renegotiation(&state, renegotiation, Err(error.to_string()));
                     return;
                 }
             };
@@ -2424,7 +2526,7 @@ async fn run_media_renegotiation(
     if outcome.is_ok() && renegotiation.session().role() == Role::Offerer {
         record_b2_stage(&state, renegotiation.correlation(), B2Stage::MediaOfferSent);
     }
-    renegotiation.complete(&state.peers, outcome);
+    complete_media_renegotiation(&state, renegotiation, outcome);
 }
 
 /// Re-establish ICE on a *live* peer by renegotiating the SDP — the half
@@ -4092,15 +4194,22 @@ async fn handle_transport_event_from_worker(
     let owner = owner.for_worker(Arc::clone(worker));
     match event {
         TransportEvent::RenegotiationNeeded => {
-            // The connector's track set changed. Don't offer inline — a
-            // burst of changes (several flows opening together) must
-            // collapse into one offer, and glare with the remote's own
-            // changes is least likely on the paced tick.
-            state.peers.with_current(&owner, |peer| {
+            // The connector's track set changed. WebRTC has already queued and
+            // coalesced `negotiationneeded` against its operations chain. Arm
+            // the existing exact-worker/single-flight state, then invoke its
+            // asynchronous service immediately. The service only spawns the
+            // SDP work; this callback pump never awaits offer construction.
+            let armed = state.peers.with_current(&owner, |peer| {
                 if peer.mark_media_renegotiation(worker) {
                     peer.state.write().media_reneg_pending = true;
+                    true
+                } else {
+                    false
                 }
             });
+            if armed == Some(true) {
+                dispatch_media_renegotiation(state, &owner);
+            }
         }
         TransportEvent::LocalIceCandidate(Some(cand)) => {
             // Classify before moving `cand` into the signaling
@@ -4927,12 +5036,22 @@ async fn handle_inbound_frame(state: &Arc<NetworkState>, device_id: &str, bytes:
     handle_inbound_frame_from(state, &owner, bytes).await;
 }
 
+#[cfg(feature = "transport-lab")]
+#[inline]
+fn closed_relay_ingress_marker(bytes: &[u8], stage: &'static str) {
+    if bytes.starts_with(br#"{"kind":"closed_relay_data"#) {
+        eprintln!("closed-relay-ingress:{stage}");
+    }
+}
+
 async fn handle_inbound_frame_from(
     state: &Arc<NetworkState>,
     owner: &peer_registry::PeerOwnerToken,
     bytes: Bytes,
 ) {
     let device_id = owner.device_id();
+    #[cfg(feature = "transport-lab")]
+    closed_relay_ingress_marker(&bytes, "raw");
     if bytes.len() > crate::protocol::RECEIVE_FRAME_BYTES {
         warn!(
             peer = %device_id,
@@ -4945,6 +5064,8 @@ async fn handle_inbound_frame_from(
         warn!(peer = %device_id, "discarding frame without a canonical bounded kind envelope");
         return;
     };
+    #[cfg(feature = "transport-lab")]
+    closed_relay_ingress_marker(&bytes, "classified");
     // Admission gate, folded into the per-frame liveness touch below so it
     // costs no extra lookup or lock. Admission is a per-connection property
     // that flips only at the handshake/approval (and topology-shelve)
@@ -5158,7 +5279,11 @@ async fn handle_inbound_frame_from(
             witness,
             dispatch,
             frame: Some(frame),
-        }) => (frame, witness, dispatch),
+        }) => {
+            #[cfg(feature = "transport-lab")]
+            closed_relay_ingress_marker(&bytes, "funded");
+            (frame, witness, dispatch)
+        }
         Some(FundedInbound {
             witness,
             dispatch: _,
@@ -5243,6 +5368,8 @@ async fn handle_inbound_frame_from(
         }
         return;
     };
+    #[cfg(feature = "transport-lab")]
+    closed_relay_ingress_marker(&bytes, "decoded");
 
     // Committed under the exact session that funded the parse. A revocation or
     // replacement that landed while the parse ran refuses here: the work was
@@ -5398,6 +5525,8 @@ async fn handle_inbound_frame_from(
         // Nothing is owed out here, which is why this arm does nothing.
         MeshMessage::ChannelAck { .. } => {}
         MeshMessage::ClosedRelayData(data) => {
+            #[cfg(feature = "transport-lab")]
+            closed_relay_ingress_marker(&bytes, "dispatch");
             let relay_profile = state.config.read().closed_relay.clone();
             if !relay_profile.validate() {
                 trace!(peer = %device_id, "Closed relay data refused by invalid configured profile");
@@ -5766,7 +5895,7 @@ async fn on_session_control(
             if worker.role() != Role::Offerer {
                 return;
             }
-            let _ = dispatch.with_captured_peer(&state.peers, |peer| {
+            let armed = dispatch.with_captured_peer(&state.peers, |peer| {
                 // A request ordered before the answer on this reliable channel
                 // is already represented by the in-flight offer: the answerer
                 // will build its reply from its current local track set. Do not
@@ -5775,8 +5904,17 @@ async fn on_session_control(
                     worker.awaiting_answer() || peer.state.read().media_reneg_inflight;
                 if !already_covered && peer.mark_media_renegotiation(&worker) {
                     peer.state.write().media_reneg_pending = true;
+                    true
+                } else {
+                    false
                 }
             });
+            if armed == Some(true) {
+                // The authenticated request is the authoritative wake-up. The
+                // service claims the exact current worker and only spawns the
+                // SDP excursion, so no polling interval is paid on this path.
+                dispatch_media_renegotiation(state, dispatch.owner());
+            }
         }
         crate::protocol::SessionControl::RenegotiateOffer { sdp } => {
             let Some(worker) = dispatch.owner().worker().cloned() else {
@@ -5830,14 +5968,22 @@ async fn on_session_control(
                     return;
                 }
             };
-            let _ = send_to_peer_owner(
+            let answer_sent = send_to_peer_owner(
                 state,
                 dispatch.owner(),
                 &MeshMessage::SessionControl(crate::protocol::SessionControl::RenegotiateAnswer {
                     sdp: answer.sdp,
                 }),
             )
-            .await;
+            .await
+            .is_ok();
+            if answer_sent {
+                // Applying and answering the authenticated offer is the
+                // answerer's stable-event wake.  A track change that arrived
+                // while an earlier operation was inflight remains a debt bit;
+                // the normal claim gate below admits at most one successor.
+                dispatch_media_renegotiation(state, dispatch.owner());
+            }
         }
         crate::protocol::SessionControl::RenegotiateAnswer { sdp } => {
             let Some(worker) = dispatch.owner().worker().cloned() else {
@@ -5859,6 +6005,10 @@ async fn on_session_control(
                 if let Some(correlation) = correlation.as_deref() {
                     record_b2_stage(state, correlation, B2Stage::MediaAnswerApplied);
                 }
+                // The authenticated answer restores Stable on the exact
+                // captured connector.  Use that event to wake one preserved
+                // debt without waiting for the periodic recovery ticker.
+                dispatch_media_renegotiation(state, dispatch.owner());
             }
         }
     }
@@ -9442,7 +9592,7 @@ fn build_test_state_parts_metered_with_creation(
             )
             .expect("engine fixture JSON input capacity is representable");
     // The engine owns one local-application scope below the process and one
-    // network-local child below it. Its four mailboxes each own another child
+    // network-local child below it. Its five mailboxes each own another child
     // scope plus an exact root reservation. Price those from the real types;
     // otherwise they silently consume the connector callback envelope and make
     // pressure controls depend on unrelated transport slack.
@@ -9455,6 +9605,8 @@ fn build_test_state_parts_metered_with_creation(
             .expect("outbound signaling mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
             .expect("engine command mailbox root is representable"),
+        crate::resource::ResourceMailboxSender::<NetworkCmd>::root_claim()
+            .expect("connection command mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<state::SpeculativePromotionCmd>::root_claim()
             .expect("speculative promotion mailbox root is representable"),
         crate::resource::ResourceMailboxSender::<EphemeralIngress>::root_claim()
@@ -10162,24 +10314,18 @@ pub(crate) struct PromotedPeerFixture {
     _events: crate::transport::webrtc::WebRtcConnectorEventReceiver,
 }
 
-/// Test-only: an installed, policy-admitted peer holding an authenticated
-/// channel over **its own live connector**, ready to promote.
+/// Test-only authenticated-channel fixture over **its own live connector**.
+/// The legacy name does not mean that a promoted session has been installed.
 ///
-/// Every conjunct `promote_session_if_needed` evaluates is arranged here as a
-/// real value, in the order promotion reads them:
+/// This helper opens a connector, installs its authenticated channel and peer
+/// flags, and retains the connector event receiver. It neither admits policy
+/// facts nor adds provider capacity: the caller must arrange both separately.
 ///
-/// 1. a live connector worker from this Mesh's own transport, so
-///    `live_connector_incarnation` answers `Some`;
-/// 2. retained policy admitting this peer, so `is_admitted` holds;
-/// 3. an authenticated channel bound to that exact connector's handoff, this
-///    Mesh's context, and this peer's Device id, so the broker's identity,
-///    policy, and runtime conjuncts all hold;
-/// 4. session capacity, which `build_test_state_parts_with` grants one of per
-///    connector slot.
-///
-/// Nothing here promotes: the session is minted lazily by the fence, on the
-/// first admission this peer is put through, exactly as in production. So a
-/// control that arranges this and is then refused has learned something real.
+/// A control requiring a promoted session must explicitly invoke the applicable
+/// exact-owner promotion operation and assert success before taking its baseline.
+/// Merely obtaining a registry owner or calling `with_live_session` does not
+/// promote; the latter only lends an already-installed session. Controls that
+/// intentionally exercise refusal before promotion can keep this fixture as-is.
 ///
 /// Opens a native WebRTC object, so every caller carries `#[ignore]`.
 #[cfg(test)]
@@ -11725,29 +11871,17 @@ mod tests {
     #[test]
     fn cancelled_connect_wait_drops_its_exact_installed_registration() {
         let state = build_test_state("connect-wait-cancellation");
-        let (reply, _receiver) = tokio::sync::oneshot::channel();
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let id = 41;
-        state.register_connect_waiter(
-            "peer",
-            state::ConnectWaiterRegistration {
-                id,
-                reply,
-                cancelled: Arc::clone(&cancelled),
-            },
-        );
+        let (reply, _receiver) = tokio::sync::oneshot::channel();
+        let (registration, cancellation) =
+            state.connect_waiter_registration_for_test("peer", id, reply);
+        state.register_connect_waiter("peer", registration);
         assert_eq!(
             state.connect_waiter_count_for_test("peer"),
             1,
             "non-vacuity: the exact waiter is installed before cancellation"
         );
-        drop(state::ConnectWaitCancellation {
-            state: &state,
-            device_id: "peer".into(),
-            id,
-            cancelled,
-            armed: true,
-        });
+        drop(cancellation);
         assert_eq!(state.connect_waiter_count_for_test("peer"), 0);
     }
 
@@ -11981,7 +12115,8 @@ mod tests {
                 )
                 .expect("non-vacuity: the live session claims renegotiation on its own connector");
             renegotiation.session().begin_close_for_test();
-            renegotiation.complete(&closed_state.peers, Err("connector closed".to_string()));
+            let _ =
+                renegotiation.complete(&closed_state.peers, Err("connector closed".to_string()));
 
             let error = pending
                 .send_frame(
@@ -12352,7 +12487,7 @@ mod tests {
             !delayed_renegotiation.is_live(),
             "the same session edge invalidates a claimed renegotiation before it can create an offer"
         );
-        delayed_renegotiation.complete(&state.peers, Err("session revoked".to_string()));
+        let _ = delayed_renegotiation.complete(&state.peers, Err("session revoked".to_string()));
 
         let error = send_channel_frame(
             &state,
@@ -13768,29 +13903,24 @@ mod tests {
         let state = build_test_state_with_realtime_flows("arc04b-reneg-a");
         let peer_state = build_test_state_with_realtime_flows("arc04b-reneg-b");
         let device_id = peer_state.identity.public_id().to_string();
-        // Two distinct live links, held for the whole test. The replacement has
-        // to own a *different* connector and endpoint-auth task: reusing the
-        // first pair would mean claiming against a worker the replacement
-        // itself retired, which is not what a real replacement looks like. Two
-        // connectors per side is exactly the Mesh grant.
-        let first_link = crate::endpoint_auth::native_link::connect(&state, &peer_state).await;
-        let second_link = crate::endpoint_auth::native_link::connect(&state, &peer_state).await;
-
-        // The exact worker/auth-task pair must travel together: promotion
-        // proves the authenticated local principal against the connector that
-        // authenticated, so a peer carrying a session but no task never
-        // promotes and can claim nothing.
-        let install_live_peer =
-            |worker: Arc<crate::transport::WebRtcConnectorWorker>,
-             auth: Arc<crate::endpoint_auth::EndpointAuthTask>| {
-                let peer = insert_legacy_test_peer_pending_auth(&state, &device_id, worker, auth);
-                peer.install_authenticated_channel_for_test();
-                peer
-            };
+        // The helper performs the genuine open handoff and installs a
+        // promoted capability in the current Mesh context. The replacement
+        // is created later, after the first claim, so it exercises the real
+        // installation fence rather than a foreign fixture capability.
+        let first_link = insert_promoted_peer_over_real_link(&state, &peer_state, &device_id).await;
+        let first_peer = Arc::clone(&first_link.peer);
+        let first_worker = Arc::clone(&first_link.receive_ready.link.left);
 
         // Claim through the exact production sequence the tick uses. The claim
         // consumes one pending renegotiation, so each attempt arms its own.
         let claim = |peer: &Arc<PeerConnection>, owner: &peer_registry::PeerOwnerToken| {
+            let worker = owner
+                .worker()
+                .expect("the captured owner carries its live connector worker");
+            assert!(
+                peer.mark_media_renegotiation(worker),
+                "the exact live worker must arm before pending is published"
+            );
             peer.state.write().media_reneg_pending = true;
             state.peers.claim_renegotiation(
                 owner,
@@ -13799,14 +13929,11 @@ mod tests {
             )
         };
 
-        let first_peer = install_live_peer(
-            Arc::clone(&first_link.left),
-            Arc::clone(&first_link.left_auth),
-        );
         let first_owner = state
             .peers
             .owner(&device_id)
-            .expect("the first installation is current");
+            .expect("the first installation is current")
+            .for_worker(Arc::clone(&first_worker));
 
         // POSITIVE BASELINE. Without it the negative could pass merely because
         // completion never writes anything at all.
@@ -13816,37 +13943,113 @@ mod tests {
             first_peer.state.read().media_reneg_inflight,
             "claiming latches the single-flight guard"
         );
-        baseline.complete(&state.peers, Ok(()));
+        // A second native notification while the first offer is active is
+        // retained as debt, but cannot claim a second operation. This is the
+        // exact same-owner overlap the state-lock gate must close.
+        first_peer.state.write().media_reneg_pending = true;
+        assert!(
+            state
+                .peers
+                .claim_renegotiation(
+                    &first_owner,
+                    state.session_broker.as_ref(),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_none(),
+            "a rearmed same-owner notification cannot overlap the inflight operation"
+        );
+        assert!(
+            baseline.complete(&state.peers, Ok(())).is_some(),
+            "successful completion returns exactly one preserved follow-up owner"
+        );
         {
             let data = first_peer.state.read();
             assert!(!data.media_reneg_inflight, "the claimed peer is cleared");
+            assert!(
+                data.media_reneg_pending,
+                "completion preserves newer same-owner renegotiation debt"
+            );
             assert!(
                 data.last_offer_sent_at.is_some(),
                 "the claimed peer records the offer"
             );
         }
+        assert!(
+            first_peer.media_renegotiation_worker().is_some(),
+            "newer debt retains the exact worker through completion cleanup"
+        );
 
         // Claim again, then replace the installation before completing — the
         // exact window the defect lived in.
+        let follow_up = claim(&first_peer, &first_owner)
+            .expect("completion leaves exactly one successor claim available");
+        assert!(
+            first_peer.state.read().media_reneg_inflight,
+            "the successor is the only second operation admitted"
+        );
+        first_peer.state.write().media_reneg_pending = true;
+        assert!(
+            state
+                .peers
+                .claim_renegotiation(
+                    &first_owner,
+                    state.session_broker.as_ref(),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_none(),
+            "a third same-owner claim cannot overlap the successor"
+        );
+        let _ = follow_up.complete(&state.peers, Ok(()));
+
+        let failed = claim(&first_peer, &first_owner)
+            .expect("the same owner may retry after its prior successor completed");
+        assert!(
+            failed
+                .complete(&state.peers, Err("not stable".to_string()))
+                .is_none(),
+            "failed completion does not request an immediate retry"
+        );
+        {
+            let data = first_peer.state.read();
+            assert!(!data.media_reneg_inflight);
+            assert!(
+                data.media_reneg_pending,
+                "failed completion preserves debt for the stable/authenticated wake"
+            );
+        }
+        let retry_after_failure = claim(&first_peer, &first_owner)
+            .expect("the preserved debt remains claimable after the failure boundary");
+        let _ = retry_after_failure.complete(&state.peers, Ok(()));
+
         let superseded =
             claim(&first_peer, &first_owner).expect("the first installation claims again");
-        let replacement = install_live_peer(
-            Arc::clone(&second_link.left),
-            Arc::clone(&second_link.left_auth),
-        );
+        let second_link =
+            insert_promoted_peer_over_real_link(&state, &peer_state, &device_id).await;
+        let replacement = Arc::clone(&second_link.peer);
+        let replacement_worker = Arc::clone(&second_link.receive_ready.link.left);
         assert!(
             state.peers.get_if_current(&first_owner).is_none(),
             "non-vacuity: the installations must be distinct, or this proves nothing"
         );
+        let replacement_owner = state
+            .peers
+            .owner(&device_id)
+            .expect("the replacement is current")
+            .for_worker(Arc::clone(&replacement_worker));
+        // This is a real replacement claim, not a manually forged in-flight
+        // bit. The stale completion below must leave this active exchange
+        // completely untouched.
+        let own = claim(&replacement, &replacement_owner)
+            .expect("the replacement claims its own renegotiation");
         {
-            let mut data = replacement.state.write();
-            data.media_reneg_inflight = true;
-            data.media_reneg_pending = true;
-            data.last_offer_sent_at = None;
+            let data = replacement.state.read();
+            assert!(data.media_reneg_inflight);
+            assert!(!data.media_reneg_pending);
+            assert!(data.last_offer_sent_at.is_none());
         }
 
         // The superseded operation completes. It must not touch the replacement.
-        superseded.complete(&state.peers, Ok(()));
+        let _ = superseded.complete(&state.peers, Ok(()));
         {
             let data = replacement.state.read();
             assert!(
@@ -13854,7 +14057,7 @@ mod tests {
                 "a superseded renegotiation must not clear the replacement's in-flight guard"
             );
             assert!(
-                data.media_reneg_pending,
+                !data.media_reneg_pending,
                 "nor consume the replacement's pending lane change"
             );
             assert!(
@@ -13865,18 +14068,24 @@ mod tests {
 
         // The replacement's own claim still completes, so the no-op above is
         // attribution and not a dead path.
-        let replacement_owner = state
-            .peers
-            .owner(&device_id)
-            .expect("the replacement is current");
-        let own = claim(&replacement, &replacement_owner)
-            .expect("the replacement claims its own renegotiation");
-        own.complete(&state.peers, Ok(()));
+        let _ = own.complete(&state.peers, Ok(()));
         {
             let data = replacement.state.read();
             assert!(!data.media_reneg_inflight);
             assert!(data.last_offer_sent_at.is_some());
         }
+
+        let first_close = first_link.receive_ready.close_outcomes().await;
+        let second_close = second_link.receive_ready.close_outcomes().await;
+        assert!(
+            first_close
+                .into_iter()
+                .chain(second_close)
+                .all(|outcome| outcome.is_ok()),
+            "the promoted native fixture links close after the ownership control"
+        );
+        state.shutdown().await;
+        peer_state.shutdown().await;
     }
 
     /// The outbound twin of the renegotiation control above, over a real link.
@@ -17562,6 +17771,327 @@ mod tests {
         state.shutdown().await;
         peer_state.shutdown().await;
         third_peer_state.shutdown().await;
+    }
+
+    /// The renegotiation debt belongs to the logical installation, while the
+    /// native worker in flight belongs to one authenticated channel.  This
+    /// control uses genuine endpoint-authenticated promoted workers on one
+    /// logical peer to prove both handoff directions: a same-worker error
+    /// keeps debt without retrying immediately; a retired W0 hands one
+    /// successful operation to W1; and a retired W1 hands one failed
+    /// operation to W2.  No worker is re-resolved by device id.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens native WebRTC objects; run explicitly in the isolated WSL harness"]
+    async fn v4_renegotiation_same_logical_worker_handoff_preserves_debt() {
+        let state = build_test_state_with_connector_slots("renegotiation-logical-handoff", 4);
+        let remote_w0 = build_test_state("renegotiation-logical-handoff-w0");
+        let remote_key = remote_w0.identity.signing_key().clone();
+        let target = remote_w0.identity.public_id().to_string();
+        let first = insert_promoted_peer_over_real_link(&state, &remote_w0, &target).await;
+        let peer = Arc::clone(&first.peer);
+        let owner = state
+            .peers
+            .owner(&target)
+            .expect("the real promoted W0 owner is current");
+        assert!(state
+            .peers
+            .admit_application_operation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+        let w0 = peer.current_worker().expect("the promoted W0 is live");
+
+        let remote_w1 = build_test_state("renegotiation-logical-handoff-w1");
+        let mut link_w1 =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &remote_w1).await;
+        let open_w1 = link_w1.take_open_event();
+        let open_w1 = link_w1
+            .left
+            .accept_event(open_w1)
+            .expect("W1 accepts its genuine open callback");
+        let (open_w1, _open_w1_resources) = open_w1.into_parts();
+        assert!(matches!(open_w1, TransportEvent::DataChannelOpen));
+        link_w1.left_events_mut().commit_data_channel_open();
+        let w1 = Arc::clone(&link_w1.left);
+        let _task_w1 = prepare_b2_provider_speculative_channel(
+            &state,
+            &peer,
+            &w1,
+            "renegotiation-logical-w1",
+            &target,
+            &remote_key,
+        )
+        .await;
+        assert!(state
+            .peers
+            .promote_speculative_command(
+                &owner,
+                &w1,
+                "renegotiation-logical-w1",
+                state.session_broker.as_ref().expect("the broker exists"),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+
+        let arm = |worker: &Arc<crate::transport::WebRtcConnectorWorker>| {
+            assert!(peer.mark_media_renegotiation(worker));
+            peer.state.write().media_reneg_pending = true;
+        };
+        let claim = || {
+            state.peers.claim_renegotiation(
+                &owner,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+        };
+
+        // Same-worker failure preserves the debt but never immediately
+        // retries the worker that just failed.
+        arm(&w0);
+        let same_worker_error = claim().expect("W0 owns the first debt");
+        assert!(Arc::ptr_eq(same_worker_error.session(), &w0));
+        assert!(same_worker_error
+            .complete(&state.peers, Err("not stable".to_string()))
+            .is_none());
+        assert!(peer.state.read().media_reneg_pending);
+        let w0_success = claim().expect("the preserved W0 debt remains claimable");
+        assert!(Arc::ptr_eq(w0_success.session(), &w0));
+
+        // Retire W0 through the production channel-terminal seam while its
+        // operation is in flight, then arm the still-owned W1. Completion is
+        // allowed to hand off only to that exact successor worker.
+        let w0_owner = owner.for_worker(Arc::clone(&w0));
+        let terminal_dispatch = admit_logical_terminal_dispatch(&state, &w0_owner)
+            .expect("the exact logical W0 terminal witness is admitted");
+        let removed_w0 = match state.peers.remove_current_channel_for_terminal(
+            terminal_dispatch.exact_channel_operation(Arc::clone(&w0)),
+        ) {
+            peer_registry::ChannelTerminal::Channel { channel } => channel,
+            _ => panic!("retiring W0 retains the logical W1 session"),
+        };
+        let removed_w0_worker = Arc::clone(&removed_w0.worker);
+        let close_owner_started = owner.connection().start_exact_retired_worker(
+            &removed_w0.worker,
+            removed_w0.dedup,
+            removed_w0.additional_dedup.drain_tokens(),
+        );
+        assert!(
+            !owner
+                .connection()
+                .owns_authenticated_worker(&removed_w0_worker),
+            "the production terminal fence retires the exact W0 worker"
+        );
+        if close_owner_started {
+            owner
+                .connection()
+                .await_retired_workers()
+                .await
+                .expect("the funded W0 close owner reaches its native terminal");
+        } else {
+            // A close-owner entry is optional under exact provider pressure:
+            // retain_closing_worker has already started the worker directly.
+            assert!(
+                removed_w0_worker.live_connector_incarnation().is_none(),
+                "the unfunded close-owner fallback still fences W0 natively"
+            );
+            removed_w0_worker
+                .retire_and_close()
+                .await
+                .expect("the direct W0 close-owner fallback reaches its native terminal");
+        }
+        assert!(
+            state
+                .peers
+                .claim_renegotiation(
+                    &w0_owner,
+                    state.session_broker.as_ref(),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_none(),
+            "the retired W0 owner cannot claim the surviving logical session"
+        );
+        let selected_w1 = owner
+            .connection()
+            .select_unique_usable_channel()
+            .expect("the sole W1 successor is selected by the production seam");
+        assert!(
+            Arc::ptr_eq(&selected_w1, &w1),
+            "production unique-successor selection chooses exact W1"
+        );
+        arm(&w1);
+        let w1_follow_up = w0_success
+            .complete(&state.peers, Ok(()))
+            .expect("successful retired-W0 completion hands off to W1");
+        assert!(w1_follow_up
+            .worker()
+            .is_some_and(|worker| Arc::ptr_eq(worker, &w1)));
+        let w1_success = state
+            .peers
+            .claim_renegotiation(
+                &w1_follow_up,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .expect("the W1 follow-up is claimable exactly once");
+        assert!(state
+            .peers
+            .claim_renegotiation(
+                &w1_follow_up,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_none());
+        assert!(w1_success.complete(&state.peers, Ok(())).is_none());
+
+        // Add W2 only after the W0 -> W1 handoff has crossed the production
+        // unique-successor selection seam. This keeps the positive handoff
+        // independent of the test-only selector and leaves W2 available for
+        // the failed W1 -> W2 handoff below.
+        let remote_w2 = build_test_state("renegotiation-logical-handoff-w2");
+        let mut link_w2 =
+            crate::endpoint_auth::native_link::connect_before_engine_open(&state, &remote_w2).await;
+        let open_w2 = link_w2.take_open_event();
+        let open_w2 = link_w2
+            .left
+            .accept_event(open_w2)
+            .expect("W2 accepts its genuine open callback");
+        let (open_w2, _open_w2_resources) = open_w2.into_parts();
+        assert!(matches!(open_w2, TransportEvent::DataChannelOpen));
+        link_w2.left_events_mut().commit_data_channel_open();
+        let w2 = Arc::clone(&link_w2.left);
+        let _task_w2 = prepare_b2_provider_speculative_channel(
+            &state,
+            &peer,
+            &w2,
+            "renegotiation-logical-w2",
+            &target,
+            &remote_key,
+        )
+        .await;
+        assert!(state
+            .peers
+            .promote_speculative_command(
+                &owner,
+                &w2,
+                "renegotiation-logical-w2",
+                state.session_broker.as_ref().expect("the broker exists"),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_some());
+        assert_eq!(peer.promoted_channel_count(), 2);
+
+        // The error handoff has the same exact-worker rule.  W1 is retired,
+        // W2 is armed under the same logical installation, and only W2 may
+        // receive the immediate follow-up; W1 is never retried.
+        arm(&w1);
+        let w1_error = claim().expect("W1 owns the second debt");
+        let w1_owner = owner.for_worker(Arc::clone(&w1));
+        let terminal_dispatch = admit_logical_terminal_dispatch(&state, &w1_owner)
+            .expect("the exact logical W1 terminal witness is admitted");
+        let removed_w1 = match state.peers.remove_current_channel_for_terminal(
+            terminal_dispatch.exact_channel_operation(Arc::clone(&w1)),
+        ) {
+            peer_registry::ChannelTerminal::Channel { channel } => channel,
+            _ => panic!("retiring W1 retains the logical W2 session"),
+        };
+        let removed_w1_worker = Arc::clone(&removed_w1.worker);
+        let close_owner_started = owner.connection().start_exact_retired_worker(
+            &removed_w1.worker,
+            removed_w1.dedup,
+            removed_w1.additional_dedup.drain_tokens(),
+        );
+        assert!(
+            !owner
+                .connection()
+                .owns_authenticated_worker(&removed_w1_worker),
+            "the production terminal fence retires the exact W1 worker"
+        );
+        if close_owner_started {
+            owner
+                .connection()
+                .await_retired_workers()
+                .await
+                .expect("the funded W1 close owner reaches its native terminal");
+        } else {
+            // See the W0 branch: direct native close is the exact fallback
+            // when this worker's close-owner node cannot be reserved.
+            assert!(
+                removed_w1_worker.live_connector_incarnation().is_none(),
+                "the unfunded close-owner fallback still fences W1 natively"
+            );
+            removed_w1_worker
+                .retire_and_close()
+                .await
+                .expect("the direct W1 close-owner fallback reaches its native terminal");
+        }
+        assert!(
+            state
+                .peers
+                .claim_renegotiation(
+                    &w1_owner,
+                    state.session_broker.as_ref(),
+                    &state.mesh_context_id().to_string(),
+                )
+                .is_none(),
+            "the retired W1 owner cannot claim the surviving logical session"
+        );
+        let selected_w2 = owner
+            .connection()
+            .select_unique_usable_channel()
+            .expect("the sole W2 successor is selected by the production seam");
+        assert!(
+            Arc::ptr_eq(&selected_w2, &w2),
+            "production unique-successor selection chooses exact W2"
+        );
+        arm(&w2);
+        let w2_follow_up = w1_error
+            .complete(&state.peers, Err("revoked".to_string()))
+            .expect("failed retired-W1 completion hands off to W2");
+        assert!(w2_follow_up
+            .worker()
+            .is_some_and(|worker| Arc::ptr_eq(worker, &w2)));
+        let w2_success = state
+            .peers
+            .claim_renegotiation(
+                &w2_follow_up,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .expect("the W2 follow-up is claimable exactly once");
+        assert!(state
+            .peers
+            .claim_renegotiation(
+                &w2_follow_up,
+                state.session_broker.as_ref(),
+                &state.mesh_context_id().to_string(),
+            )
+            .is_none());
+        assert!(w2_success.complete(&state.peers, Ok(())).is_none());
+
+        assert_eq!(peer.promoted_channel_count(), 1);
+        assert!(link_w1
+            .close_outcomes()
+            .await
+            .into_iter()
+            .all(|outcome| outcome.is_ok()));
+        assert!(link_w2
+            .close_outcomes()
+            .await
+            .into_iter()
+            .all(|outcome| outcome.is_ok()));
+        assert!(first
+            .receive_ready
+            .close_outcomes()
+            .await
+            .into_iter()
+            .all(|outcome| outcome.is_ok()));
+        state.shutdown().await;
+        remote_w0.shutdown().await;
+        remote_w1.shutdown().await;
+        remote_w2.shutdown().await;
     }
 
     #[tokio::test]
@@ -23412,6 +23942,158 @@ mod tests {
         );
     }
 
+    /// Opening RTP on an already-authenticated link is driven entirely by the
+    /// native WebRTC negotiation-needed event. This fixture never constructs a
+    /// supervisor and never calls the state-watch ticker or the renegotiation
+    /// service directly, so reaching the final answer stage proves that the
+    /// ordinary path has no polling interval hidden underneath it.
+    #[cfg(feature = "transport-lab")]
+    #[tokio::test]
+    #[ignore = "opens a native WebRTC link; run explicitly in the isolated harness"]
+    async fn native_media_track_change_completes_without_a_scheduler_tick() {
+        let stage_probe = B2StageProbe::new();
+        install_b2_stage_probe(Arc::clone(&stage_probe));
+        let state_a = build_test_state_with_realtime_flows("native-media-event-a");
+        let state_b = build_test_state_with_realtime_flows("native-media-event-b");
+        let linked = install_promoted_session_over_real_link(&state_a, &state_b).await;
+
+        let device_a = state_a.identity.public_id().to_string();
+        let device_b = state_b.identity.public_id().to_string();
+        let owner_a = state_a
+            .peers
+            .owner(&device_b)
+            .expect("A owns the authenticated link to B");
+        let owner_b = state_b
+            .peers
+            .owner(&device_a)
+            .expect("B owns the authenticated link to A");
+        let worker_a = owner_a
+            .connection()
+            .select_unique_usable_channel()
+            .expect("A has one selected authenticated connector");
+        let worker_b = owner_b
+            .connection()
+            .select_unique_usable_channel()
+            .expect("B has one selected authenticated connector");
+        assert!(
+            settle_until(|| {
+                worker_a.signaling_state()
+                    == webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+                    && worker_b.signaling_state()
+                        == webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+            })
+            .await,
+            "the selected connectors settle before their track sets change"
+        );
+
+        let started = Instant::now();
+        let flow_a = state_a
+            .open_realtime_negotiated(
+                &device_b,
+                crate::transport::webrtc::RealtimeFlowSpec {
+                    direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                    encoding: realtime_test_encoding(),
+                    name: realtime_test_name(81),
+                },
+            )
+            .await
+            .expect("A opens one outbound RTP flow");
+        let flow_b = state_b
+            .open_realtime_negotiated(
+                &device_a,
+                crate::transport::webrtc::RealtimeFlowSpec {
+                    direction: crate::transport::webrtc::RealtimeDirection::Outbound,
+                    encoding: realtime_test_encoding(),
+                    name: realtime_test_name(82),
+                },
+            )
+            .await
+            .expect("B opens one outbound RTP flow");
+
+        let correlation_a = owner_a
+            .connection()
+            .attempt_for_worker(&worker_a)
+            .expect("A retains the selected connector correlation");
+        let correlation_b = owner_b
+            .connection()
+            .attempt_for_worker(&worker_b)
+            .expect("B retains the selected connector correlation");
+        let (offerer_device, offerer_correlation, answerer_device, answerer_correlation) =
+            if worker_a.role() == Role::Offerer {
+                (&device_a, &correlation_a, &device_b, &correlation_b)
+            } else {
+                (&device_b, &correlation_b, &device_a, &correlation_a)
+            };
+        let completed = tokio::time::timeout(
+            Duration::from_millis(SchedulerPolicyConfig::DEFAULT.data_channel_open_timeout_ms),
+            async {
+                stage_probe
+                    .wait_for(offerer_device, offerer_correlation, B2Stage::MediaOfferSent)
+                    .await;
+                stage_probe
+                    .wait_for(
+                        answerer_device,
+                        answerer_correlation,
+                        B2Stage::MediaOfferApplied,
+                    )
+                    .await;
+                stage_probe
+                    .wait_for(
+                        offerer_device,
+                        offerer_correlation,
+                        B2Stage::MediaAnswerApplied,
+                    )
+                    .await;
+            },
+        )
+        .await;
+        if completed.is_err() {
+            let a = owner_a.connection().state.read();
+            let b = owner_b.connection().state.read();
+            panic!(
+                "native media exchange stalled: A(pending={}, inflight={}, signaling={:?}) B(pending={}, inflight={}, signaling={:?})",
+                a.media_reneg_pending,
+                a.media_reneg_inflight,
+                worker_a.signaling_state(),
+                b.media_reneg_pending,
+                b.media_reneg_inflight,
+                worker_b.signaling_state(),
+            );
+        }
+        eprintln!(
+            "native event-driven media renegotiation ready in {:.3} ms",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+        assert_eq!(
+            worker_a.signaling_state(),
+            webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        );
+        assert_eq!(
+            worker_b.signaling_state(),
+            webrtc::peer_connection::signaling_state::RTCSignalingState::Stable
+        );
+
+        state_a
+            .close_realtime_negotiated(flow_a)
+            .await
+            .expect("A closes its RTP flow");
+        state_b
+            .close_realtime_negotiated(flow_b)
+            .await
+            .expect("B closes its RTP flow");
+        assert!(
+            linked
+                .close_outcomes()
+                .await
+                .into_iter()
+                .all(|outcome| outcome.is_ok()),
+            "both native connectors close cleanly"
+        );
+        clear_b2_stage_probe();
+        state_a.shutdown().await;
+        state_b.shutdown().await;
+    }
+
     /// Complete B2's real replacement boundary on two participating engines.
     ///
     /// The first replacement is held before its proof so the pre-proof refusal
@@ -26480,6 +27162,13 @@ mod tests {
         let old_frames = old_owner.connection().state.read().diag.frames_out;
         let old_proof = transport_lab::proof_owner_for_device(&state, &device_id)
             .expect("the lab witness captures the exact predecessor owner");
+        let old_transport_witness = transport_lab::capture_transport_channel(&state, &old_proof)
+            .expect("the lab witness captures the predecessor's exact current worker");
+        let initial_transport_snapshot =
+            transport_lab::transport_channel_snapshot(&state, &old_transport_witness)
+                .await
+                .expect("the captured predecessor exposes one exact native data channel");
+        eprintln!("transport-lab exact predecessor snapshot: {initial_transport_snapshot:?}");
         let park = transport_lab::install_inventory_send_park_for_lab(&state, &old_proof);
         let inventory_state = Arc::clone(&state);
         let inventory = tokio::spawn(async move {
@@ -26500,6 +27189,12 @@ mod tests {
         assert!(
             state.peers.get_if_current(&successor_owner).is_some(),
             "the replacement is the sole current owner"
+        );
+        assert!(
+            transport_lab::transport_channel_snapshot(&state, &old_transport_witness)
+                .await
+                .is_none(),
+            "a captured predecessor worker cannot snapshot a same-device successor"
         );
         assert_eq!(
             successor_owner.device_id(),

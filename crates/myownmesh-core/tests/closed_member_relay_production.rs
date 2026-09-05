@@ -31,6 +31,7 @@ fn semantic_fact_page(
     context_id: MeshContextId,
     facts: &[SignedFact],
 ) -> myownmesh_core::semantic::SemanticFactPage {
+    let facts = canonical_fact_order(facts);
     serde_json::from_value(serde_json::json!({
         "context_id": context_id,
         "facts": facts,
@@ -38,6 +39,12 @@ fn semantic_fact_page(
         "complete": true,
     }))
     .expect("strict semantic page decodes")
+}
+
+fn canonical_fact_order(facts: &[SignedFact]) -> Vec<SignedFact> {
+    let mut ordered = facts.to_vec();
+    ordered.sort_unstable_by_key(|fact| fact.id);
+    ordered
 }
 
 async fn bounded<T>(
@@ -57,6 +64,15 @@ async fn bounded<T>(
             )))
         }
     }
+}
+
+fn init_relay_trace() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "myownmesh_core::engine=trace,myownmesh_core::transport=debug",
+        ))
+        .with_test_writer()
+        .try_init();
 }
 
 fn finite_connector_policy() -> WebRtcConnectorCapablePolicy {
@@ -240,11 +256,58 @@ fn assert_baseline(label: &str, before: &ResourceReport, after: &ResourceReport)
     }
 }
 
+fn first_payload_diagnostics(
+    label: &str,
+    alice_net: &myownmesh_core::JoinedNetwork,
+    relay_net: &myownmesh_core::JoinedNetwork,
+    carol_net: &myownmesh_core::JoinedNetwork,
+    relay_id: &str,
+    alice_id: &str,
+    carol_id: &str,
+) {
+    eprintln!(
+        "production-relay first-payload {label}: peers alice->relay={:?} relay->alice={:?} relay->carol={:?} carol->relay={:?}",
+        alice_net.peer(relay_id),
+        relay_net.peer(alice_id),
+        relay_net.peer(carol_id),
+        carol_net.peer(relay_id),
+    );
+    eprintln!(
+        "production-relay first-payload {label}: resources alice={:?} relay={:?} carol={:?}",
+        alice_net.resource_report(),
+        relay_net.resource_report(),
+        carol_net.resource_report(),
+    );
+}
+
+async fn exact_transport_diagnostics(
+    label: &str,
+    alice_net: &myownmesh_core::JoinedNetwork,
+    relay_net: &myownmesh_core::JoinedNetwork,
+    sender: &myownmesh_core::engine::transport_lab::TransportChannelWitness,
+    receiver: &myownmesh_core::engine::transport_lab::TransportChannelWitness,
+) {
+    let sender_snapshot = alice_net.transport_channel_snapshot_for_lab(sender).await;
+    let receiver_snapshot = relay_net.transport_channel_snapshot_for_lab(receiver).await;
+    assert!(
+        sender_snapshot.is_some(),
+        "{label}: captured Alice-to-relay channel remains observable"
+    );
+    assert!(
+        receiver_snapshot.is_some(),
+        "{label}: captured relay-from-Alice channel remains observable"
+    );
+    eprintln!(
+        "production-relay exact-channel {label}: sender={sender_snapshot:?} receiver={receiver_snapshot:?}"
+    );
+}
+
 // Match the shipped daemon's multi-thread Tokio runtime. Native WebRTC owns
 // callbacks and worker threads that are not representative on the macro's
 // default current-thread test runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_members_relay_through_production_local_broker() -> myownmesh_core::Result<()> {
+    init_relay_trace();
     let home = tempfile::tempdir().expect("temporary mesh home");
     std::env::set_var("MYOWNMESH_HOME", home.path());
 
@@ -275,6 +338,19 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
         DeviceId::from_canonical_str(&carol_id).expect("Carol id is canonical"),
     );
     let member_facts = vec![grant_relay, grant_carol];
+    // Exercise the wire-page contract independently from causal authoring
+    // order: pages are FactId-ordered, while signed bodies retain the
+    // dependencies established by the authoring graph above.
+    let mut reverse_page_facts = canonical_fact_order(&member_facts);
+    reverse_page_facts.reverse();
+    let canonical_page_facts = canonical_fact_order(&reverse_page_facts);
+    let supplied_ids: Vec<_> = reverse_page_facts.iter().map(|fact| fact.id).collect();
+    let canonical_ids: Vec<_> = canonical_page_facts.iter().map(|fact| fact.id).collect();
+    assert_ne!(
+        supplied_ids, canonical_ids,
+        "reverse page input is discriminating"
+    );
+    assert!(canonical_ids.windows(2).all(|pair| pair[0] < pair[1]));
 
     let policy = finite_connector_policy();
     let alice_mesh = bounded(
@@ -322,7 +398,7 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     for network in [&alice_net, &relay_net, &carol_net] {
         bounded(
             "import member facts",
-            network.import_semantic_fact_page(semantic_fact_page(context_id, &member_facts)),
+            network.import_semantic_fact_page(semantic_fact_page(context_id, &reverse_page_facts)),
         )
         .await??;
     }
@@ -381,16 +457,73 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     assert_eq!(alice_channel.session_id(), carol_channel.session_id());
     assert_ne!(alice_channel.session_id(), [0; 16]);
 
+    let alice_sender_witness = alice_net
+        .capture_transport_channel_for_lab(&relay_id)
+        .expect("capture the exact Alice-to-relay worker before first payload");
+    let relay_receiver_witness = relay_net
+        .capture_transport_channel_for_lab(&alice_id)
+        .expect("capture the exact relay-from-Alice worker before first payload");
     let sentinel = b"closed-relay plaintext must not reach B".to_vec();
+    exact_transport_diagnostics(
+        "before Alice send",
+        &alice_net,
+        &relay_net,
+        &alice_sender_witness,
+        &relay_receiver_witness,
+    )
+    .await;
+    first_payload_diagnostics(
+        "before Alice send",
+        &alice_net,
+        &relay_net,
+        &carol_net,
+        &relay_id,
+        &alice_id,
+        &carol_id,
+    );
     bounded(
         "send Alice-to-Carol opaque payload",
         alice_channel.send(&sentinel),
     )
     .await??;
-    assert_eq!(
-        bounded("receive Alice-to-Carol payload", carol_channel.recv()).await??,
-        sentinel
+    exact_transport_diagnostics(
+        "after Alice send",
+        &alice_net,
+        &relay_net,
+        &alice_sender_witness,
+        &relay_receiver_witness,
+    )
+    .await;
+    first_payload_diagnostics(
+        "after Alice send",
+        &alice_net,
+        &relay_net,
+        &carol_net,
+        &relay_id,
+        &alice_id,
+        &carol_id,
     );
+    let received = bounded("receive Alice-to-Carol payload", carol_channel.recv()).await;
+    if received.as_ref().map_or(true, |result| result.is_err()) {
+        exact_transport_diagnostics(
+            "Alice receive timeout/failure",
+            &alice_net,
+            &relay_net,
+            &alice_sender_witness,
+            &relay_receiver_witness,
+        )
+        .await;
+        first_payload_diagnostics(
+            "Alice receive failure",
+            &alice_net,
+            &relay_net,
+            &carol_net,
+            &relay_id,
+            &alice_id,
+            &carol_id,
+        );
+    }
+    assert_eq!(received??, sentinel);
     let reverse = b"Carol-to-Alice opaque reply".to_vec();
     bounded(
         "send Carol-to-Alice opaque payload",
@@ -404,6 +537,9 @@ async fn closed_members_relay_through_production_local_broker() -> myownmesh_cor
     // B owns only the authenticated relay legs.  No public endpoint handle or
     // plaintext receive path exists on B; the sentinel crossed only A's/C's
     // endpoint sessions while the B leg remained a keyless forwarder.
+
+    drop(alice_sender_witness);
+    drop(relay_receiver_witness);
 
     bounded("close Carol endpoint", carol_channel.close()).await??;
     let _ = bounded("close Alice endpoint", alice_channel.close()).await;

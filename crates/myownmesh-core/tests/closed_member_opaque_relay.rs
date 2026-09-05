@@ -9,7 +9,10 @@ use myownmesh_core::config::{
     ClosedRelayPolicyConfig, NetworkConfig, NetworkKind, RoutingPolicyConfig, SemanticPolicyConfig,
     SignalingConfig, TopologyMode,
 };
-use myownmesh_core::resource::ResourceReport;
+use myownmesh_core::resource::{
+    PostAuthResourceFamily, PreAuthResourceFamily, ResourceFamilyReport, ResourceReport,
+    ResourceUse,
+};
 use myownmesh_core::semantic::VerifiedBootstrap;
 use myownmesh_core::semantic::{
     DeviceId, FactBody, FactContent, FactGraph, MeshContextId, Role, SignedFact,
@@ -26,9 +29,19 @@ fn semantic_fact_page(
     context_id: MeshContextId,
     facts: &[SignedFact],
 ) -> myownmesh_core::semantic::SemanticFactPage {
+    // The wire page is an ordered projection, while the signed facts remain
+    // byte-for-byte unchanged.  Deliberately accept the fixture's reverse
+    // order here so a successful import proves the canonical page rule rather
+    // than depending on the random order in which the two signatures hash.
+    let mut canonical = facts.to_vec();
+    canonical.sort_unstable_by_key(|fact| fact.id);
+    assert!(
+        canonical.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "membership page facts must have distinct canonical IDs"
+    );
     serde_json::from_value(serde_json::json!({
         "context_id": context_id,
-        "facts": facts,
+        "facts": canonical,
         "next_cursor": null,
         "complete": true,
     }))
@@ -69,6 +82,10 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
         .zip(after.pre_authentication.iter())
     {
         assert_eq!(
+            after.family, before.family,
+            "{label} family identity is stable"
+        );
+        assert_eq!(
             after.active, before.active,
             "{label} live custody returned to baseline"
         );
@@ -84,6 +101,10 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
         assert_eq!(
             after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
             "{label} oldest-active precision state returned to baseline"
+        );
+        assert_eq!(
+            after.measurement_inexact, before.measurement_inexact,
+            "{label} measurement precision state returned to baseline"
         );
     }
     for (before, after) in before
@@ -92,6 +113,10 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
         .zip(after.post_authentication.iter())
     {
         assert_eq!(
+            after.family, before.family,
+            "{label} family identity is stable"
+        );
+        assert_eq!(
             after.active, before.active,
             "{label} live custody returned to baseline"
         );
@@ -108,10 +133,224 @@ fn assert_live_custody_baseline(label: &str, before: &ResourceReport, after: &Re
             after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
             "{label} oldest-active precision state returned to baseline"
         );
+        assert_eq!(
+            after.measurement_inexact, before.measurement_inexact,
+            "{label} measurement precision state returned to baseline"
+        );
     }
 }
 
-fn connector_policy(session_identity: &str) -> WebRtcConnectorCapablePolicy {
+fn assert_no_activity_baseline(label: &str, before: &ResourceReport, after: &ResourceReport) {
+    for (before, after) in before
+        .pre_authentication
+        .iter()
+        .zip(after.pre_authentication.iter())
+    {
+        assert_eq!(
+            after.family, before.family,
+            "{label} family identity is stable"
+        );
+        assert_eq!(
+            after.active, before.active,
+            "{label} active use is unchanged"
+        );
+        assert_eq!(
+            after.peak_active, before.peak_active,
+            "{label} peak active use is unchanged"
+        );
+        assert_eq!(
+            after.active_lease_count, before.active_lease_count,
+            "{label} active lease count is unchanged"
+        );
+        assert_eq!(
+            after.peak_active_lease_count, before.peak_active_lease_count,
+            "{label} peak active lease count is unchanged"
+        );
+        assert_eq!(
+            after.oldest_active_lifetime.is_some(),
+            before.oldest_active_lifetime.is_some(),
+            "{label} oldest-active presence is unchanged"
+        );
+        if let (Some(before_age), Some(after_age)) =
+            (before.oldest_active_lifetime, after.oldest_active_lifetime)
+        {
+            assert!(
+                after_age >= before_age,
+                "{label} oldest-active age must not move backwards"
+            );
+        }
+        assert_eq!(
+            after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
+            "{label} oldest-active precision state is unchanged"
+        );
+        assert_eq!(
+            after.completed_lease_count, before.completed_lease_count,
+            "{label} completed lease count is unchanged"
+        );
+        assert_eq!(
+            after.completed_total_use, before.completed_total_use,
+            "{label} completed use is unchanged"
+        );
+        assert_eq!(
+            after.completed_total_lifetime, before.completed_total_lifetime,
+            "{label} completed lifetime is unchanged"
+        );
+        assert_eq!(
+            after.measurement_inexact, before.measurement_inexact,
+            "{label} measurement precision state is unchanged"
+        );
+    }
+    for (before, after) in before
+        .post_authentication
+        .iter()
+        .zip(after.post_authentication.iter())
+    {
+        assert_eq!(
+            after.family, before.family,
+            "{label} family identity is stable"
+        );
+        assert_eq!(
+            after.active, before.active,
+            "{label} active use is unchanged"
+        );
+        assert_eq!(
+            after.peak_active, before.peak_active,
+            "{label} peak active use is unchanged"
+        );
+        assert_eq!(
+            after.active_lease_count, before.active_lease_count,
+            "{label} active lease count is unchanged"
+        );
+        assert_eq!(
+            after.peak_active_lease_count, before.peak_active_lease_count,
+            "{label} peak active lease count is unchanged"
+        );
+        assert_eq!(
+            after.oldest_active_lifetime.is_some(),
+            before.oldest_active_lifetime.is_some(),
+            "{label} oldest-active presence is unchanged"
+        );
+        if let (Some(before_age), Some(after_age)) =
+            (before.oldest_active_lifetime, after.oldest_active_lifetime)
+        {
+            assert!(
+                after_age >= before_age,
+                "{label} oldest-active age must not move backwards"
+            );
+        }
+        assert_eq!(
+            after.oldest_active_lifetime_inexact, before.oldest_active_lifetime_inexact,
+            "{label} oldest-active precision state is unchanged"
+        );
+        assert_eq!(
+            after.completed_lease_count, before.completed_lease_count,
+            "{label} completed lease count is unchanged"
+        );
+        assert_eq!(
+            after.completed_total_use, before.completed_total_use,
+            "{label} completed use is unchanged"
+        );
+        assert_eq!(
+            after.completed_total_lifetime, before.completed_total_lifetime,
+            "{label} completed lifetime is unchanged"
+        );
+        assert_eq!(
+            after.measurement_inexact, before.measurement_inexact,
+            "{label} measurement precision state is unchanged"
+        );
+    }
+}
+
+fn synthetic_resource_report(oldest_active_lifetime: Duration) -> ResourceReport {
+    ResourceReport {
+        pre_authentication: PreAuthResourceFamily::ALL.map(|family| ResourceFamilyReport {
+            family,
+            active: ResourceUse::observed(1, 0, 0, 1),
+            peak_active: ResourceUse::observed(1, 0, 0, 1),
+            active_lease_count: 1,
+            peak_active_lease_count: 1,
+            oldest_active_lifetime: Some(oldest_active_lifetime),
+            oldest_active_lifetime_inexact: false,
+            completed_lease_count: 0,
+            completed_total_use: ResourceUse::ZERO,
+            completed_total_lifetime: Duration::ZERO,
+            measurement_inexact: false,
+        }),
+        post_authentication: PostAuthResourceFamily::ALL.map(|family| ResourceFamilyReport {
+            family,
+            active: ResourceUse::observed(1, 0, 0, 1),
+            peak_active: ResourceUse::observed(1, 0, 0, 1),
+            active_lease_count: 1,
+            peak_active_lease_count: 1,
+            oldest_active_lifetime: Some(oldest_active_lifetime),
+            oldest_active_lifetime_inexact: false,
+            completed_lease_count: 0,
+            completed_total_use: ResourceUse::ZERO,
+            completed_total_lifetime: Duration::ZERO,
+            measurement_inexact: false,
+        }),
+    }
+}
+
+#[test]
+fn resource_report_baseline_helpers_distinguish_live_and_history() {
+    let before = synthetic_resource_report(Duration::from_millis(5));
+    let mut after = synthetic_resource_report(Duration::from_millis(8));
+    assert_no_activity_baseline("age-only observation", &before, &after);
+    assert_live_custody_baseline("age-only observation", &before, &after);
+
+    after.pre_authentication[0].completed_lease_count = 1;
+    after.pre_authentication[0].completed_total_use = ResourceUse::observed(1, 0, 0, 1);
+    after.pre_authentication[0].completed_total_lifetime = Duration::from_millis(1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_no_activity_baseline("completed-history change", &before, &after);
+    }))
+    .is_err());
+    assert_live_custody_baseline("completed-history change", &before, &after);
+
+    for change in ["active", "lease count", "family", "measurement precision"] {
+        let mut changed = synthetic_resource_report(Duration::from_millis(8));
+        match change {
+            "active" => changed.pre_authentication[0].active = ResourceUse::observed(1, 0, 0, 0),
+            "lease count" => changed.pre_authentication[0].active_lease_count = 2,
+            "family" => changed.pre_authentication[0].family = PreAuthResourceFamily::Cleanup,
+            "measurement precision" => changed.pre_authentication[0].measurement_inexact = true,
+            _ => unreachable!(),
+        }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_live_custody_baseline(change, &before, &changed);
+        }))
+        .is_err());
+    }
+}
+
+fn resource_snapshot(
+    stage: &'static str,
+    provider: &FiniteResourceProvider,
+    meshes: &[(&'static str, &myownmesh_core::MeshHandle)],
+) {
+    let in_use = provider.in_use();
+    eprintln!(
+        "[closed-relay-resource] stage={stage} WorkerOrTask={} NativeTransportObject={} active_reservations=not-public",
+        in_use.amount(ResourceClass::WorkerOrTask),
+        in_use.amount(ResourceClass::NativeTransportObject),
+    );
+    for (name, mesh) in meshes {
+        if let Some(report) = mesh.connector_resource_report() {
+            eprintln!(
+                "[closed-relay-resource] stage={stage} mesh={name} active_candidates={} failed_cleanup_candidates={} queued_jobs={} active_jobs={}",
+                report.active_candidates,
+                report.failed_cleanup_candidates,
+                report.cleanup.queued_jobs,
+                report.cleanup.active_jobs,
+            );
+        }
+    }
+}
+
+fn connector_policy(
+    session_identity: &str,
+) -> (WebRtcConnectorCapablePolicy, FiniteResourceProvider) {
     let profile = WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only());
     let connector_count = NonZeroU64::new(4).expect("connector count is nonzero");
     let max_relay_frame_bytes = usize::try_from(
@@ -262,9 +501,11 @@ fn connector_policy(session_identity: &str) -> WebRtcConnectorCapablePolicy {
         expected_storage_bytes,
         "the three-node provider has no hidden storage slack"
     );
-    let resources = ResourceProviderPort::new(FiniteResourceProvider::new(claim))
+    let finite = FiniteResourceProvider::new(claim);
+    let meter = finite.clone();
+    let resources = ResourceProviderPort::new(finite)
         .expect("the finite provider accounts for its process scope");
-    WebRtcConnectorCapablePolicy::new(resources, profile)
+    (WebRtcConnectorCapablePolicy::new(resources, profile), meter)
 }
 
 fn network_config(id: &str, network_id: &str, relay: &str) -> NetworkConfig {
@@ -344,24 +585,44 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         &alice,
         DeviceId::from_canonical_str(&carol_id).expect("target id is canonical"),
     );
-    let signed_members = vec![grant_relay, grant_carol];
+    let mut signed_members = vec![grant_relay, grant_carol];
+    signed_members.sort_unstable_by_key(|fact| fact.id);
+    let signed_members_wire: Vec<_> = signed_members.iter().rev().cloned().collect();
+    assert_eq!(signed_members_wire.len(), 2);
+    assert!(signed_members_wire[0].id > signed_members_wire[1].id);
 
-    let policy = connector_policy(&relay_id);
+    let (policy, provider) = connector_policy(&relay_id);
+    resource_snapshot("policy", &provider, &[]);
     let alice_mesh = bounded_result(
         "open Alice mesh",
         Mesh::open_connector_capable_with_identity(MeshConfig::default(), alice, policy.clone()),
     )
     .await?;
+    resource_snapshot("mesh-open-alice", &provider, &[("alice", &alice_mesh)]);
     let relay_mesh = bounded_result(
         "open relay mesh",
         Mesh::open_connector_capable_with_identity(MeshConfig::default(), relay, policy.clone()),
     )
     .await?;
+    resource_snapshot(
+        "mesh-open-relay",
+        &provider,
+        &[("alice", &alice_mesh), ("relay", &relay_mesh)],
+    );
     let carol_mesh = bounded_result(
         "open Carol mesh",
         Mesh::open_connector_capable_with_identity(MeshConfig::default(), carol, policy),
     )
     .await?;
+    resource_snapshot(
+        "mesh-open-carol",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     let baseline_alice = alice_mesh.resource_report();
     let baseline_relay = relay_mesh.resource_report();
     let baseline_carol = carol_mesh.resource_report();
@@ -386,10 +647,10 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         refused_network,
         Err(myownmesh_core::Error::Network(_))
     ));
-    assert_eq!(
-        baseline_alice,
-        alice_mesh.resource_report(),
-        "profile refusal must preserve pre-admission custody"
+    assert_no_activity_baseline(
+        "profile refusal",
+        &baseline_alice,
+        &alice_mesh.resource_report(),
     );
 
     let alice_net = bounded_result(
@@ -397,6 +658,15 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         alice_mesh.create_network(network_config("alice", network_id, &relay_id), [0x91; 32]),
     )
     .await?;
+    resource_snapshot(
+        "network-create-alice",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     let relay_net = bounded_result(
         "import relay network",
         relay_mesh.import_network(
@@ -406,6 +676,15 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         ),
     )
     .await?;
+    resource_snapshot(
+        "network-import-relay",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     let carol_net = bounded_result(
         "import Carol network",
         carol_mesh.import_network(
@@ -415,40 +694,112 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
         ),
     )
     .await?;
+    resource_snapshot(
+        "network-import-carol",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
 
     // Membership is admitted through the public durable reducer on every
     // member. No engine/runtime/key state is used by this control.
     bounded_result(
         "import Alice membership facts",
-        alice_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
+        alice_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members_wire)),
     )
     .await?;
+    resource_snapshot(
+        "facts-import-alice",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     bounded_result(
         "import relay membership facts",
-        relay_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
+        relay_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members_wire)),
     )
     .await?;
+    resource_snapshot(
+        "facts-import-relay",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     bounded_result(
         "import Carol membership facts",
-        carol_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members)),
+        carol_net.import_semantic_fact_page(semantic_fact_page(context_id, &signed_members_wire)),
     )
     .await?;
+    resource_snapshot(
+        "facts-import-carol",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     for network in [&alice_net, &relay_net, &carol_net] {
         let roster = bounded_result("read member roster", network.roster_list()).await?;
         assert!(roster.iter().any(|peer| peer.device_id == relay_id));
         assert!(roster.iter().any(|peer| peer.device_id == carol_id));
     }
 
+    resource_snapshot(
+        "before-first-link",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     let alice_relay = bounded_value(
         "install Alice-relay link",
         alice_net.install_promoted_peer_over_real_link(&relay_net),
     )
     .await?;
+    resource_snapshot(
+        "after-first-link",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
+    resource_snapshot(
+        "before-second-link",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     let relay_carol = bounded_value(
         "install relay-Carol link",
         relay_net.install_promoted_peer_over_real_link(&carol_net),
     )
     .await?;
+    resource_snapshot(
+        "after-second-link",
+        &provider,
+        &[
+            ("alice", &alice_mesh),
+            ("relay", &relay_mesh),
+            ("carol", &carol_mesh),
+        ],
+    );
     assert_eq!(alice_relay.peer_device_id(), relay_id);
     assert_eq!(relay_carol.peer_device_id(), carol_id);
     assert!(alice_net.peer(&carol_id).is_none(), "no direct A-C session");
@@ -475,10 +826,10 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
             ))
         ));
     }
-    assert_eq!(
-        relay_before_route_refusals,
-        relay_mesh.resource_report(),
-        "route refusal must preserve relay admission custody"
+    assert_no_activity_baseline(
+        "route refusal",
+        &relay_before_route_refusals,
+        &relay_mesh.resource_report(),
     );
 
     let a_to_c = bounded_result(
@@ -704,17 +1055,5 @@ async fn closed_members_exchange_opaque_payloads_only_through_relay() -> myownme
     assert_live_custody_baseline("Alice", &baseline_alice, &live_alice);
     assert_live_custody_baseline("relay", &baseline_relay, &live_relay);
     assert_live_custody_baseline("Carol", &baseline_carol, &live_carol);
-    assert_eq!(
-        live_alice, baseline_alice,
-        "Alice shutdown must reach exact baseline"
-    );
-    assert_eq!(
-        live_relay, baseline_relay,
-        "relay shutdown must reach exact baseline"
-    );
-    assert_eq!(
-        live_carol, baseline_carol,
-        "Carol shutdown must reach exact baseline"
-    );
     Ok(())
 }

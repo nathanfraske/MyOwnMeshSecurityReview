@@ -806,6 +806,32 @@ impl JoinedNetwork {
         self.state.peer_info(device_id)
     }
 
+    /// Capture the exact current transport owner for one peer for a bounded
+    /// transport-lab observation. The device id is used only for this initial
+    /// lookup; the returned witness carries the installation and worker that
+    /// the registry proved current.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub fn capture_transport_channel_for_lab(
+        &self,
+        device_id: &str,
+    ) -> Option<crate::engine::transport_lab::TransportChannelWitness> {
+        let device_id = peer_registry_key(device_id);
+        let owner = crate::engine::transport_lab::proof_owner_for_device(&self.state, device_id)?;
+        crate::engine::transport_lab::capture_transport_channel(&self.state, &owner)
+    }
+
+    /// Snapshot one previously captured exact transport owner. Replacement or
+    /// retirement returns `None`; no device-id lookup occurs after capture.
+    #[cfg(feature = "transport-lab")]
+    #[doc(hidden)]
+    pub async fn transport_channel_snapshot_for_lab(
+        &self,
+        witness: &crate::engine::transport_lab::TransportChannelWitness,
+    ) -> Option<crate::engine::transport_lab::ChannelSnapshot> {
+        crate::engine::transport_lab::transport_channel_snapshot(&self.state, witness).await
+    }
+
     /// Open an opaque endpoint channel from this member to `target` through
     /// the exact authenticated member `relay`. The session coordinate is
     /// generated here and never accepted from a caller, while the engine
@@ -1098,12 +1124,7 @@ impl JoinedNetwork {
     pub async fn connect_peer(&self, device_id: &str) -> Result<()> {
         let device_id = peer_registry_key(device_id);
         self.state
-            .cmd_tx
-            .send(NetworkCmd::ConnectPeer {
-                device_id: device_id.to_string(),
-                sticky: false,
-                reply: None,
-            })
+            .request_connect_peer(device_id.to_string(), false, None)
             .map_err(|error| error.into_admission_error())?;
         Ok(())
     }

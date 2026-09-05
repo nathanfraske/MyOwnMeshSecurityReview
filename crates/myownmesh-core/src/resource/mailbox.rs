@@ -527,11 +527,18 @@ impl<T> ResourceMailboxDelivery<T> {
     /// outlive this claim exactly as the returned value would have.
     ///
     /// So the load-bearing rule is the census, not the type. The seam is
-    /// crate-private and has exactly five callers, all listed below; each hands
+    /// crate-private and has six counted implementation callers: the
+    /// supervisor's dedicated ConnectPeer actor, its ordered NetworkCmd,
+    /// speculative-promotion, and EphemeralIngress arms, plus the two matching
+    /// test-driver helpers. Each hands
     /// the message to a terminal handler that consumes it locally — the command
     /// handlers move only a `oneshot::Sender` out in order to answer, and the
     /// signaling handler hands its payload to a transport call that finishes
-    /// within the awaited future. **A caller that stored the message onward, or
+    /// within the awaited future. A handler may retain an intrinsically
+    /// independently funded `ConnectWaitShared` handle and a separately
+    /// leased registry entry; that retention is outside this delivery claim
+    /// and remains funded until both the registration and caller terminal
+    /// handles drop. **Any other caller that stored the message onward, or
     /// spawned it, would break this and the signature would not stop it** —
     /// which is why the caller list is part of the contract and any addition to
     /// it needs the same scrutiny the seam itself got.
@@ -544,7 +551,7 @@ impl<T> ResourceMailboxDelivery<T> {
     /// `SpeculativePromotionCmd` arms. That census is the point of the seam
     /// being `pub(crate)` and named for what it is.
     /// `the_terminal_effect_seam_has_exactly_its_documented_callers` fails if
-    /// the number moves.
+    /// the counted implementation set moves.
     pub(crate) async fn run_terminal_effect<F>(self, effect: impl FnOnce(T) -> F)
     where
         F: std::future::Future<Output = ()>,
@@ -1461,29 +1468,26 @@ mod tests {
     /// would. The doc therefore names its callers, and a claim about a caller
     /// list is worth exactly as much as something that checks it.
     ///
-    /// **Counted over the production prefix only.** The engine's own test
+    /// **Counted over the implementation sources.** The engine's own test
     /// module reaches the seam as well, and legitimately: handing
     /// `handle_command` an owned command is what the seam is for, and no other
     /// route out of a delivery is public. But a caller under `mod tests` must
     /// not be able to raise the number this census exists to hold down, so the
-    /// file is cut at its test module and five are counted before it — the
-    /// driver loop's `NetworkCmd`, `SpeculativePromotionCmd`, and
-    /// `EphemeralIngress` arms, plus matching `NetworkCmd` and
-    /// `SpeculativePromotionCmd` arms in the `#[cfg(test)]` command driver.
+    /// file is cut at its test module; the two matching engine helpers are
+    /// counted alongside the four supervisor consumers.
     /// Promotion handling consumes each owned delivery inside the same
     /// terminal effect, so these are intentional consumers rather than leaks.
     /// Test coverage of the seam is then asserted separately, as coverage
     /// rather than as census.
     ///
     /// A real check with two stated limits. It cannot see a call added in some
-    /// *other* module, so it catches the likely drift — a sixth command path
-    /// growing inside the engine — and not the unlikely one. And the cut is at
-    /// the test module, not at every `#[cfg(test)]` item, so a helper gated
-    /// outside that module still counts: that is why the production number is
-    /// five and not three.
+    /// *other* module, so it catches drift in the checked implementation set.
+    /// The cut is at the test module, not at every `#[cfg(test)]` item, so a helper gated
+    /// outside that module still counts: that is why the checked count is six.
     #[test]
     fn the_terminal_effect_seam_has_exactly_its_documented_callers() {
         const ENGINE: &str = include_str!("../engine/mod.rs");
+        const SUPERVISOR: &str = include_str!("../engine/supervisor.rs");
         const SEAM: &str = ".run_terminal_effect(";
 
         // Fail closed. A census taken over the wrong slice reads exactly like a
@@ -1514,9 +1518,14 @@ mod tests {
             .iter()
             .map(|line| line.matches(SEAM).count())
             .sum();
+        let supervisor_calls: usize = SUPERVISOR
+            .lines()
+            .map(|line| line.matches(SEAM).count())
+            .sum();
         assert_eq!(
-            production, 5,
-            "the seam's contract names five call sites ahead of the engine's \
+            production + supervisor_calls,
+            6,
+            "the seam's contract names six checked implementation call sites; \
              test module: the driver loop's `NetworkCmd`, \
              `SpeculativePromotionCmd`, and `EphemeralIngress` arms, plus the \
              matching `NetworkCmd` and `SpeculativePromotionCmd` arms in the \

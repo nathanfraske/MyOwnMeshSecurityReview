@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import subprocess
+import sys
 import tempfile
+import time
 from argparse import Namespace
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,15 +40,51 @@ def _provider_snapshot() -> dict[str, object]:
 
 
 def _scale_metric(selector: str, scale_n: int) -> dict[str, object]:
+    timed_admissions = min(scale_n, 2_000) if scale_n >= 250_000 else scale_n
+    seeded_admissions = scale_n - timed_admissions
+    window_target = (timed_admissions + 127) // 128
+    window_evidence = []
+    window_start = seeded_admissions
+    remaining = timed_admissions
+    while remaining:
+        count = min(window_target, remaining)
+        window_total_ms = float(count) / timed_admissions
+        window_evidence.append(
+            {
+                "start_admitted": window_start + 1,
+                "end_admitted": window_start + count,
+                "admission_count": count,
+                "admission_total_ms": window_total_ms,
+                "elapsed_ms": window_total_ms,
+                "average_admission_ms": window_total_ms / count,
+                "p50_ms": 0.001,
+                "p95_ms": 0.002,
+                "p99_ms": 0.003,
+            }
+        )
+        window_start += count
+        remaining -= count
     return {
         "selector": selector,
+        "platform": "windows",
         "scale_n": scale_n,
         "admitted_delta": scale_n,
+        "seeded_admissions": seeded_admissions,
+        "timed_admissions": timed_admissions,
+        "seed_total_ms": 0.0,
         "unresolved": 0,
         "admission_total_ms": 1.0,
+        "admission_end_to_end_total_ms": 1.0,
+        "admissions_per_sec": 1_000.0 * timed_admissions,
         "delta_write_total_ms": 0.5,
         "admission_p50_ms": 0.001,
         "admission_p95_ms": 0.002,
+        "admission_p99_ms": 0.003,
+        "window_evidence": window_evidence,
+        "window_admission_target": window_target,
+        "window_sample_limit": 64,
+        "cache_state": benchmark.SEMANTIC_CACHE_STATE,
+        **{field: None for field in benchmark.SEMANTIC_OPTIONAL_SCALE_COUNTERS},
         "compaction_ms": 0.25,
         "startup_plus_restore_ms": 2.0,
         "db_main_bytes_peak": 10,
@@ -138,6 +178,397 @@ def _purge_metric() -> dict[str, object]:
             "primary_shutdown_elapsed_ms": 5,
         },
     }
+
+
+def _budget_scale_cases(timed_by_scale: dict[int, int]) -> list[dict[str, object]]:
+    cases = []
+    for scale in (1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000):
+        timed = timed_by_scale[scale]
+        cases.append(
+            {
+                "elapsed_ms": 1.0,
+                "process": {"peak_rss_bytes": {"semantic_ledger_scale": 1}},
+                "metric": {
+                    "scale_n": scale,
+                    "timed_admissions": timed,
+                    "admission_total_ms": 1.0,
+                    "platform": "linux",
+                    "window_admission_target": 128,
+                    "window_sample_limit": 64,
+                    "cache_state": benchmark.SEMANTIC_CACHE_STATE,
+                    "db_main_bytes_peak": 1,
+                    "db_wal_bytes_peak": 1,
+                    "db_shm_bytes_peak": 1,
+                    "db_journal_bytes_peak": 1,
+                    "db_total_bytes_peak": 4,
+                },
+            }
+        )
+    return cases
+
+
+def test_scale_budget_rejects_unmatched_seeded_workloads() -> None:
+    args = Namespace(semantic_max_wall_ms=10.0, semantic_max_rss_bytes=10, semantic_max_disk_bytes=10,
+                     semantic_max_matched_tail_total_ms_per_ledger_fact=1.0)
+    cases = _budget_scale_cases({scale: scale for scale in (1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000)})
+    try:
+        benchmark._validate_semantic_scale_budgets(cases, args)
+    except benchmark.BenchmarkError as error:
+        assert "unavailable" in str(error)
+    else:
+        raise AssertionError("mixed seeded/unseeded scales must not silently pass a slope gate")
+
+
+def test_scale_budget_uses_only_matched_tail_workload() -> None:
+    args = Namespace(semantic_max_wall_ms=10.0, semantic_max_rss_bytes=10, semantic_max_disk_bytes=10,
+                     semantic_max_matched_tail_total_ms_per_ledger_fact=0.001)
+    cases = _budget_scale_cases({
+        1_000: 1_000,
+        10_000: 10_000,
+        100_000: 100_000,
+        250_000: 2_000,
+        500_000: 2_000,
+        1_000_000: 2_000,
+    })
+    cases[3]["metric"]["admission_total_ms"] = 1.0
+    cases[4]["metric"]["admission_total_ms"] = 1.1
+    cases[5]["metric"]["admission_total_ms"] = 1.2
+    benchmark._validate_semantic_scale_budgets(cases, args)
+    assert cases[1]["budget_observations"]["marginal_slope_status"] == "unavailable_unmatched_workload"
+    assert cases[4]["budget_observations"]["marginal_slope_status"] == "matched_tail_window"
+    assert math.isclose(cases[4]["budget_observations"]["marginal_slope_ms_per_fact"], 0.0000004)
+
+
+def test_semantic_executable_output_files_are_read_after_sampling_model() -> None:
+    class FakeProcess:
+        pid = 2_000_000_000
+        returncode = 0
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self) -> int:
+            return self.returncode
+
+    class FakeSampler:
+        def __init__(self, processes: dict[str, object]) -> None:
+            self.processes = processes
+
+        def sample(self, phase: str) -> None:
+            del phase
+
+        def result(self) -> dict[str, object]:
+            return {"available": False, "samples": []}
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        del command
+        stdout = kwargs["stdout"]
+        stderr = kwargs["stderr"]
+        assert hasattr(stdout, "write") and hasattr(stderr, "write")
+        stdout.write(b"out" * (256 * 1024))
+        stderr.write(b"err" * (256 * 1024))
+        return FakeProcess()
+
+    with patch.object(benchmark.subprocess, "Popen", fake_popen), patch.object(benchmark, "ProcSampler", FakeSampler):
+        stdout, stderr, _, _, returncode = benchmark._run_semantic_executable(
+            Path("fixture"), "selector", 1.0, Path(".")
+        )
+    assert returncode == 0
+    assert len(stdout) == 3 * 256 * 1024
+    assert len(stderr) == 3 * 256 * 1024
+
+
+def test_scale_window_coverage_and_totals_are_strict() -> None:
+    metric = _scale_metric("semantic_ledger_scale_n_10k", 10_000)
+    assert benchmark.validate_semantic_metric(metric, metric["selector"], 10_000) == metric
+    assert len(metric["window_evidence"]) > 1
+    assert metric["window_evidence"][-1]["admission_count"] < metric["window_admission_target"]
+    broken_coverage = dict(metric)
+    broken_coverage["window_evidence"] = [dict(window) for window in metric["window_evidence"]]
+    broken_coverage["window_evidence"][1]["start_admitted"] += 1
+    broken_coverage["window_evidence"][1]["end_admitted"] += 1
+    try:
+        benchmark.validate_semantic_metric(broken_coverage, metric["selector"], 10_000)
+    except benchmark.BenchmarkError as error:
+        assert "contiguous" in str(error)
+    else:
+        raise AssertionError("non-contiguous scale windows must be rejected")
+    broken_total = dict(metric)
+    # Every individual window remains valid; only the aggregate sum disagrees.
+    broken_total["admission_total_ms"] = 2.0
+    try:
+        benchmark.validate_semantic_metric(broken_total, metric["selector"], 10_000)
+    except benchmark.BenchmarkError as error:
+        assert "total does not match" in str(error)
+    else:
+        raise AssertionError("inconsistent scale window totals must be rejected")
+    broken_mean = dict(metric)
+    broken_mean["window_evidence"] = [dict(window) for window in metric["window_evidence"]]
+    broken_mean["window_evidence"][0]["average_admission_ms"] += 1.0
+    try:
+        benchmark.validate_semantic_metric(broken_mean, metric["selector"], 10_000)
+    except benchmark.BenchmarkError as error:
+        assert "inconsistent average" in str(error)
+    else:
+        raise AssertionError("inconsistent window means must be rejected")
+
+
+def test_scale_budget_preserves_signed_matched_tail_delta_and_threshold() -> None:
+    args = Namespace(semantic_max_wall_ms=10.0, semantic_max_rss_bytes=10, semantic_max_disk_bytes=10,
+                     semantic_max_matched_tail_total_ms_per_ledger_fact=0.001)
+    cases = _budget_scale_cases({
+        1_000: 1_000,
+        10_000: 10_000,
+        100_000: 100_000,
+        250_000: 2_000,
+        500_000: 2_000,
+        1_000_000: 2_000,
+    })
+    cases[3]["metric"]["admission_total_ms"] = 2.0
+    cases[4]["metric"]["admission_total_ms"] = 1.0
+    cases[5]["metric"]["admission_total_ms"] = 501.00025
+    try:
+        benchmark._validate_semantic_scale_budgets(cases, args)
+    except benchmark.BenchmarkError as error:
+        assert "500000->1000000" in str(error)
+    else:
+        raise AssertionError("positive threshold overflow must fail after preserving signed deltas")
+    assert cases[4]["budget_observations"]["marginal_slope_ms_per_fact"] == -0.000004
+
+
+def _finish_fixture_child(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.kill()
+    process.wait(timeout=2.0)
+
+
+@contextmanager
+def _real_child_popen(script: str, ready: Path, before_ready=None):
+    """Keep fixture custody even before the runner receives its Popen result."""
+    real_popen = benchmark.subprocess.Popen
+    children = []
+
+    def popen(command: list[str], **kwargs: object):
+        del command
+        process = real_popen([sys.executable, "-u", "-c", script], **kwargs)
+        children.append(process)
+        try:
+            if before_ready is not None:
+                before_ready()
+            deadline = time.monotonic() + 2.0
+            while not ready.exists():
+                if process.poll() is not None:
+                    raise AssertionError(f"child exited before readiness: {process.returncode}")
+                if time.monotonic() >= deadline:
+                    raise AssertionError("child did not publish readiness")
+                time.sleep(0.001)
+            return process
+        except BaseException:
+            _finish_fixture_child(process)
+            raise
+
+    try:
+        yield popen, children
+    finally:
+        for process in children:
+            _finish_fixture_child(process)
+
+
+CHILD_OUTPUT_BYTES = 524_289
+
+
+def _flood_child_script(ready: Path, release: Path, returncode: int = 0) -> str:
+    return (
+        "import pathlib, sys, time\n"
+        f"sys.stdout.buffer.write(b'o' * {CHILD_OUTPUT_BYTES}); sys.stdout.flush()\n"
+        f"sys.stderr.buffer.write(b'e' * {CHILD_OUTPUT_BYTES}); sys.stderr.flush()\n"
+        f"pathlib.Path({str(ready)!r}).write_text('ready')\n"
+        "watchdog = time.monotonic() + 30.0\n"
+        f"while not pathlib.Path({str(release)!r}).exists():\n"
+        "    if time.monotonic() >= watchdog: raise SystemExit(99)\n"
+        "    time.sleep(0.001)\n"
+        f"raise SystemExit({returncode})\n"
+    )
+
+
+def _real_child_released_after_sample(returncode: int) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        ready = Path(temporary) / "child.ready"
+        release = Path(temporary) / "child.release"
+        real_sampler = benchmark.ProcSampler
+
+        class ObservingSampler:
+            instances = []
+
+            def __init__(self, processes: dict[str, object]) -> None:
+                self.process = processes["semantic_ledger_scale"]
+                self.inner = real_sampler(processes)
+                self.saw_running = False
+                self.instances.append(self)
+
+            def sample(self, phase: str) -> None:
+                if self.process.poll() is None:
+                    self.saw_running = True
+                self.inner.sample(phase)
+                # The child cannot exit before this exact alive observation.
+                release.touch()
+
+            def result(self) -> dict[str, object]:
+                return self.inner.result()
+
+        with _real_child_popen(_flood_child_script(ready, release, returncode), ready) as (popen, children):
+            with patch.object(benchmark.subprocess, "Popen", popen), patch.object(
+                benchmark, "ProcSampler", ObservingSampler
+            ):
+                if returncode == 0:
+                    stdout, stderr, _, _, actual_returncode = benchmark._run_semantic_executable(
+                        Path("fixture"), "ignored", 2.0, Path(temporary)
+                    )
+                    assert actual_returncode == 0
+                else:
+                    try:
+                        benchmark._run_semantic_executable(Path("fixture"), "ignored", 2.0, Path(temporary))
+                    except benchmark.SemanticExecutableError as error:
+                        assert error.terminal == "reaped"
+                        assert error.returncode == returncode
+                        stdout, stderr = error.stdout, error.stderr
+                    else:
+                        raise AssertionError("nonzero semantic child must fail with retained output")
+            assert stdout == "o" * CHILD_OUTPUT_BYTES
+            assert stderr == "e" * CHILD_OUTPUT_BYTES
+            assert ObservingSampler.instances[0].saw_running
+            # Assert before the fixture's fallback cleanup can mask a runner defect.
+            assert len(children) == 1 and children[0].returncode == returncode
+
+
+def test_semantic_real_child_success_floods_both_streams_and_reaps() -> None:
+    _real_child_released_after_sample(0)
+
+
+def test_semantic_real_child_failure_retains_output_and_reaps() -> None:
+    _real_child_released_after_sample(17)
+
+
+def test_semantic_child_deadline_retains_output_and_reaps() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        ready = Path(temporary) / "deadline.ready"
+        release = Path(temporary) / "never.release"
+        with _real_child_popen(_flood_child_script(ready, release), ready) as (popen, children):
+            try:
+                with patch.object(benchmark.subprocess, "Popen", popen):
+                    benchmark._run_semantic_executable(Path("fixture"), "ignored", 0.1, Path(temporary))
+            except benchmark.SemanticExecutableError as error:
+                assert error.terminal == "reaped"
+                assert "exceeded --semantic-timeout" in str(error)
+                assert error.stdout == "o" * CHILD_OUTPUT_BYTES
+                assert error.stderr == "e" * CHILD_OUTPUT_BYTES
+                assert error.returncode is not None
+            else:
+                raise AssertionError("deadline must fail with retained output")
+            assert len(children) == 1 and children[0].returncode is not None
+
+
+def test_semantic_sampler_failures_reap_child_and_retain_output() -> None:
+    for sampler_error in ("constructor", "sample", "keyboard_interrupt"):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / f"{sampler_error}.ready"
+            release = Path(temporary) / "never.release"
+
+            class FailingSampler:
+                def __init__(self, processes: dict[str, object]) -> None:
+                    del processes
+                    self.samples = 0
+                    if sampler_error == "constructor":
+                        raise RuntimeError("sampler constructor failure")
+
+                def sample(self, phase: str) -> None:
+                    del phase
+                    self.samples += 1
+                    if self.samples == 1:
+                        return
+                    if sampler_error == "keyboard_interrupt":
+                        raise KeyboardInterrupt()
+                    raise RuntimeError("sampler sample failure")
+
+                def result(self) -> dict[str, object]:
+                    return {}
+
+            with _real_child_popen(_flood_child_script(ready, release), ready) as (popen, children):
+                with patch.object(benchmark.subprocess, "Popen", popen), patch.object(
+                    benchmark, "ProcSampler", FailingSampler
+                ):
+                    try:
+                        benchmark._run_semantic_executable(Path("fixture"), "selector", 2.0, Path(temporary))
+                    except benchmark.SemanticExecutableError as error:
+                        assert error.terminal == "reaped"
+                        assert error.stdout == "o" * CHILD_OUTPUT_BYTES
+                        assert error.stderr == "e" * CHILD_OUTPUT_BYTES
+                        assert error.returncode is not None
+                        expected_cause = KeyboardInterrupt if sampler_error == "keyboard_interrupt" else RuntimeError
+                        assert isinstance(error.__cause__, expected_cause)
+                    else:
+                        raise AssertionError("sampler failures must fail closed")
+                assert len(children) == 1 and children[0].returncode is not None
+
+
+def test_fixture_readiness_failure_reaps_before_handoff() -> None:
+    for error_type in (RuntimeError, KeyboardInterrupt):
+        with tempfile.TemporaryDirectory() as temporary:
+            ready = Path(temporary) / "ready"
+            release = Path(temporary) / "never.release"
+
+            def fail_before_ready():
+                raise error_type("fixture readiness failure")
+
+            with _real_child_popen(_flood_child_script(ready, release), ready, fail_before_ready) as (popen, children):
+                with patch.object(benchmark.subprocess, "Popen", popen):
+                    try:
+                        benchmark._run_semantic_executable(Path("fixture"), "selector", 2.0, Path(temporary))
+                    except benchmark.SemanticExecutableError as error:
+                        # The fixture, not the runner, still owned the unreturned handle.
+                        assert error.terminal == "not_started"
+                        assert isinstance(error.__cause__, error_type)
+                    else:
+                        raise AssertionError("readiness failure must not become a successful launch")
+                assert len(children) == 1 and children[0].returncode is not None
+
+
+def test_semantic_unresolved_reap_never_reports_success() -> None:
+    class UnreapableProcess:
+        pid = 2_000_000_000
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+        def wait(self, timeout: float | None = None) -> None:
+            del timeout
+            raise subprocess.TimeoutExpired("fixture", 1.0)
+
+        def kill(self) -> None:
+            raise OSError("fixture process cannot be killed")
+
+    def fake_popen(command, **kwargs):
+        kwargs["stdout"].write(b"unresolved stdout")
+        kwargs["stderr"].write(b"unresolved stderr")
+        return UnreapableProcess()
+
+    # A full-wrapper model, never an OS signal against an arbitrary fake PID.
+    with tempfile.TemporaryDirectory() as temporary:
+        with (
+            patch.object(benchmark.subprocess, "Popen", fake_popen),
+            patch.object(benchmark, "ProcSampler", side_effect=RuntimeError("injected sampler failure")),
+            patch.object(benchmark.os, "killpg", side_effect=PermissionError("model signal refused"), create=True),
+        ):
+            try:
+                benchmark._run_semantic_executable(Path("fixture"), "selector", 2.0, Path(temporary))
+            except benchmark.SemanticExecutableError as error:
+                assert error.terminal == "unresolved"
+                assert error.returncode is None
+                assert error.stdout == "unresolved stdout"
+                assert error.stderr == "unresolved stderr"
+            else:
+                raise AssertionError("unknown child terminal state must never return success")
 
 
 def test_percentiles_are_deterministic_and_interpolated() -> None:
@@ -266,10 +697,13 @@ def test_capacity_and_purge_metric_validation_is_fail_closed() -> None:
 
 
 def test_semantic_ledger_runs_exact_ignored_cases_and_records_identity() -> None:
+    scale_metrics = {
+        selector: _scale_metric(selector, scale)
+        for _, selector, scale, _ in benchmark.SEMANTIC_LEDGER_CASES
+        if scale is not None and scale > 0
+    }
     metrics = {
-        "semantic_ledger_scale_n_1k": _scale_metric("semantic_ledger_scale_n_1k", 1_000),
-        "semantic_ledger_scale_n_10k": _scale_metric("semantic_ledger_scale_n_10k", 10_000),
-        "semantic_ledger_scale_n_100k": _scale_metric("semantic_ledger_scale_n_100k", 100_000),
+        **scale_metrics,
         "semantic_ledger_scale_open_presence_zero": _open_metric(),
         benchmark.SEMANTIC_PROOF_SELECTOR: _proof_metric(),
         benchmark.SEMANTIC_CAPACITY_SELECTOR: _capacity_metric(),
@@ -284,37 +718,90 @@ def test_semantic_ledger_runs_exact_ignored_cases_and_records_identity() -> None
         },
     }
     calls: list[list[str]] = []
+    scale_calls: list[str] = []
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(command)
         assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["capture_output"] is True
-        selector = command[-1]
+        if "--no-run" in command:
+            artifact = {
+                "reason": "compiler-artifact",
+                "target": {"name": "semantic_ledger_scale", "kind": ["test"]},
+                "profile": {"test": True},
+                "executable": str(Path(__file__)),
+            }
+            return subprocess.CompletedProcess(command, 0, json.dumps(artifact), "")
+        selector = command[command.index("--exact") + 1]
         if selector in (benchmark.SEMANTIC_HANDSHAKE_SELECTOR, benchmark.SEMANTIC_ROUTE_SELECTOR):
-            metric_line = f"test {selector} ... ok"
+            metric_line = f"test {selector} ... ok\n"
+            metric_line += "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
         elif selector == benchmark.SEMANTIC_CAPACITY_SELECTOR:
-            metric_line = json.dumps(metrics[selector]["footprint"]) + "\n" + json.dumps(metrics[selector]["terminal"])
+            metric_line = (
+                f"test {selector} ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                + json.dumps(metrics[selector]["footprint"])
+                + "\n"
+                + json.dumps(metrics[selector]["terminal"])
+            )
         else:
-            metric_line = json.dumps(metrics[selector])
-        if selector in (benchmark.SEMANTIC_PROOF_SELECTOR, benchmark.SEMANTIC_PURGE_SELECTOR):
-            prefix = benchmark.SEMANTIC_PREFIXES[selector]
-            metric_line = prefix + " " + metric_line
+            metric_line = (
+                f"test {selector} ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                + (
+                    benchmark.SEMANTIC_PREFIXES[selector] + " "
+                    if selector in benchmark.SEMANTIC_PREFIXES
+                    else ""
+                )
+                + json.dumps(metrics[selector])
+            )
         return subprocess.CompletedProcess(command, 0, metric_line + "\n", "")
 
     args = Namespace(
         mode="semantic-ledger",
         semantic_timeout=10.0,
+        semantic_max_wall_ms=10.0,
+        semantic_max_rss_bytes=10,
+        semantic_max_disk_bytes=19,
+        semantic_max_matched_tail_total_ms_per_ledger_fact=1.0,
         repo_root=Path(__file__).parents[2],
     )
     with tempfile.TemporaryDirectory() as temporary:
         artifact_dir = Path(temporary)
-        with patch.object(benchmark.subprocess, "run", fake_run):
+        def fake_scale(*args: object, **kwargs: object) -> tuple[str, str, float, dict[str, object], int]:
+            del kwargs
+            selector = args[1]
+            scale_calls.append(selector)
+            output = (
+                f"test {selector} ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                + json.dumps(metrics[selector])
+            )
+            return output, "", 1.0, {"peak_rss_bytes": {"semantic_ledger_scale": 1}}, 0
+
+        with (
+            patch.object(benchmark.subprocess, "run", fake_run),
+            patch.object(benchmark, "_run_semantic_executable", fake_scale),
+        ):
             manifest = benchmark.run_semantic_ledger(args, artifact_dir)
         assert (artifact_dir / "semantic-ledger.json").is_file()
 
-    assert [command[-1] for command in calls] == list(metrics)
-    assert any(command[3] == "myownmesh-core" for command in calls)
-    assert any(command[3] == "myownmesh" for command in calls)
+    case_calls = [command for command in calls if "--no-run" not in command]
+    assert [command[command.index("--exact") + 1] for command in case_calls] == [
+        benchmark.SEMANTIC_PROOF_SELECTOR,
+        benchmark.SEMANTIC_CAPACITY_SELECTOR,
+        benchmark.SEMANTIC_PURGE_SELECTOR,
+        benchmark.SEMANTIC_HANDSHAKE_SELECTOR,
+        benchmark.SEMANTIC_ROUTE_SELECTOR,
+    ]
+    assert any("--no-run" in command for command in calls)
+    assert any(command[command.index("-p") + 1] == "myownmesh-core" for command in calls)
+    assert any(command[command.index("-p") + 1] == "myownmesh" for command in calls)
+    expected_executable_calls = [
+        selector for target, selector, _, _ in benchmark.SEMANTIC_LEDGER_CASES
+        if target == "semantic_ledger_scale"
+    ]
+    assert scale_calls == expected_executable_calls
     ignored_selectors = {
         "semantic_ledger_scale_n_1k",
         "semantic_ledger_scale_n_10k",
@@ -323,13 +810,15 @@ def test_semantic_ledger_runs_exact_ignored_cases_and_records_identity() -> None
         benchmark.SEMANTIC_PURGE_SELECTOR,
     }
     assert all(
-        ("--ignored" in command) == (command[-1] in ignored_selectors)
+        ("--ignored" in command) == (command[command.index("--exact") + 1] in ignored_selectors)
         and "--exact" in command
         for command in calls
+        if "--no-run" not in command
     )
     assert manifest["claims"] == {
         "capacity_or_slo": False,
-        "reported_curves_only": True,
+        "budget_gates_enforced": True,
+        "reported_curves_only": False,
         "exact_no_churn_assertions": True,
     }
     assert {entry["selector"] for entry in manifest["cases"]} == set(metrics)
@@ -351,7 +840,7 @@ def test_semantic_ledger_fails_closed_on_nonzero_case() -> None:
             try:
                 benchmark.run_semantic_ledger(args, artifact_dir)
             except benchmark.BenchmarkError as error:
-                assert "semantic_ledger_scale_n_1k" in str(error)
+                assert "semantic release build exited 17" in str(error)
             else:
                 raise AssertionError("nonzero semantic case must fail closed")
         assert not (artifact_dir / "semantic-ledger.json").exists()

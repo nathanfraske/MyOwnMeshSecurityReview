@@ -1,4 +1,5 @@
 import json
+import json
 import tempfile
 import unittest
 from argparse import Namespace
@@ -53,17 +54,28 @@ class BenchmarkRunnerTests(unittest.TestCase):
             semantic_max_wall_ms=1.0,
             semantic_max_rss_bytes=1,
             semantic_max_disk_bytes=1,
-            semantic_max_marginal_slope_ms_per_fact=1.0,
+            semantic_max_matched_tail_total_ms_per_ledger_fact=1.0,
         )
         BENCHMARK._validate_semantic_budgets(valid)
         invalid = Namespace(
             semantic_max_wall_ms=None,
             semantic_max_rss_bytes=1,
             semantic_max_disk_bytes=1,
-            semantic_max_marginal_slope_ms_per_fact=1.0,
+            semantic_max_matched_tail_total_ms_per_ledger_fact=1.0,
         )
         with self.assertRaises(BENCHMARK.BenchmarkError):
             BENCHMARK._validate_semantic_budgets(invalid)
+
+    def test_legacy_slope_budget_is_rejected_before_launch(self) -> None:
+        legacy = Namespace(
+            semantic_max_wall_ms=1.0,
+            semantic_max_rss_bytes=1,
+            semantic_max_disk_bytes=1,
+            semantic_max_marginal_slope_ms_per_fact=1.0,
+            semantic_max_matched_tail_total_ms_per_ledger_fact=1.0,
+        )
+        with self.assertRaises(BENCHMARK.BenchmarkError):
+            BENCHMARK._validate_semantic_budgets(legacy)
 
     def test_scale_schema_requires_frozen_latency_and_cache_fields(self) -> None:
         self.assertIn("admission_end_to_end_total_ms", BENCHMARK.SEMANTIC_SCALE_FIELDS)

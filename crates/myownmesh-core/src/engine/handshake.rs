@@ -2031,14 +2031,9 @@ mod tests {
         let stale_owner = state.peers.owner("peer").expect("first peer owner");
         let mut events = state.events_tx.subscribe();
         let (waiter_tx, mut waiter_rx) = tokio::sync::oneshot::channel();
-        state.register_connect_waiter(
-            "peer",
-            crate::engine::state::ConnectWaiterRegistration {
-                id: 1,
-                reply: waiter_tx,
-                cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-        );
+        let (registration, cancellation) =
+            state.connect_waiter_registration_for_test("peer", 1, waiter_tx);
+        state.register_connect_waiter("peer", registration);
         state.record_reconnect_intent("peer", false);
         {
             let peer = state
@@ -2080,6 +2075,8 @@ mod tests {
             "a peer replaced before the persistence fence must not enter the roster"
         );
         state.shutdown().await;
+        drop(waiter_rx);
+        drop(cancellation);
     }
 
     /// A Hello cannot carry application capability metadata.

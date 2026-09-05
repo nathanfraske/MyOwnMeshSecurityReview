@@ -839,6 +839,39 @@ fn durable_slot_totals(files: &BTreeMap<String, u64>) -> serde_json::Value {
     })
 }
 
+fn elapsed_micros(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).expect("operation timing fits u64")
+}
+
+fn encoded_record_bytes(records: &[ProofRecord]) -> u64 {
+    records
+        .iter()
+        .map(|record| {
+            u64::try_from(
+                serde_json::to_vec(record)
+                    .expect("proof record serializes for policy accounting")
+                    .len(),
+            )
+            .expect("proof record bytes fit u64")
+        })
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .expect("proof record bytes fit u64")
+}
+
+fn reference_facts(record: &ProofRecord, references: &[SignedFact]) -> Vec<SignedFact> {
+    record
+        .fact_ids
+        .iter()
+        .map(|fact_id| {
+            references
+                .iter()
+                .find(|fact| fact.id == *fact_id)
+                .cloned()
+                .expect("proof record fact has a reference body")
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn r3_pending_proof_is_persisted_before_send_and_replayed_after_restart() {
     let root = TempDir::new().expect("instance root");
@@ -2405,6 +2438,7 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
     // retains its exact L fact links.  This gives the mutation controls more
     // than one unrelated row while keeping the workload derived entirely
     // from the authenticated proof closure.
+    let seed_admission_started = Instant::now();
     let mut records = Vec::new();
     let mut linked_fact_ids = BTreeSet::new();
     for start in 0..facts.len() {
@@ -2421,9 +2455,15 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
             records.push(record);
         }
     }
+    let seed_admission_elapsed_us = elapsed_micros(seed_admission_started);
     assert!(
         records.len() > facts.len(),
         "the control must seed many proof rows and linked facts"
+    );
+    assert!(
+        u64::try_from(records.len()).expect("seed record count fits u64")
+            <= config.semantic_policy.max_proof_records,
+        "seed proof records remain inside the configured retained-record limit"
     );
     let seeded = durable_proof_records(&state).expect("read seeded proof rows");
     assert_eq!(seeded.len(), records.len());
@@ -2434,6 +2474,31 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
             .collect::<BTreeSet<_>>(),
         linked_fact_ids,
         "all seeded L links are retained"
+    );
+    for record in &records {
+        let delivery = materialize_durable_proof_delivery(&state, record)
+            .expect("materialize each seeded pending proof");
+        assert_eq!(
+            delivery.facts,
+            reference_facts(record, &facts),
+            "seeded proof materializes the exact signed reference bodies"
+        );
+    }
+    let mut seed_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
+    for fact in &facts {
+        seed_graph
+            .admit(fact.clone())
+            .expect("seed facts admit into reference graph");
+    }
+    assert_eq!(
+        state.semantic_fact_count(),
+        seed_graph.len(),
+        "production seed semantic count matches the reference graph"
+    );
+    assert_eq!(
+        state.semantic_unresolved_count(),
+        seed_graph.quarantined().count(),
+        "production seed unresolved count matches the reference graph"
     );
 
     let duplicate_before = durable_slot_footprint(&slot);
@@ -2507,16 +2572,283 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
         linked_fact_ids,
         "settle/rebind/supersede preserve every unrelated L fact link"
     );
+    let pending_after_seed_started = Instant::now();
+    let pending_after_seed =
+        pending_durable_proofs(&state).expect("pending records after mixed terminal mutations");
+    let pending_after_seed_us = elapsed_micros(pending_after_seed_started);
+    let expected_pending_count = expected
+        .iter()
+        .filter(|record| record.state == ProofRecordState::Pending)
+        .count();
+    let seed_pending_records = expected
+        .iter()
+        .filter(|record| record.state == ProofRecordState::Pending)
+        .cloned()
+        .collect::<Vec<_>>();
     assert_eq!(
-        pending_durable_proofs(&state)
-            .expect("pending records after mixed terminal mutations")
-            .len(),
-        expected
-            .iter()
-            .filter(|record| record.state == ProofRecordState::Pending)
-            .count(),
+        pending_after_seed.len(),
+        expected_pending_count,
         "pending N and terminal records remain exactly partitioned"
     );
+    assert_eq!(
+        pending_after_seed, seed_pending_records,
+        "the exact sorted pending record set is retained after seed mutations"
+    );
+    let seed_pending_serialized_bytes = encoded_record_bytes(&pending_after_seed);
+    let seed_total_serialized_bytes = encoded_record_bytes(&observed);
+    assert!(
+        seed_pending_serialized_bytes <= config.semantic_policy.max_pending_proof_bytes,
+        "seed pending proof bytes remain inside the configured pending limit"
+    );
+    assert!(
+        seed_total_serialized_bytes <= config.semantic_policy.max_proof_bytes,
+        "seed proof bytes remain inside the configured retained limit"
+    );
+    assert!(
+        u64::try_from(pending_after_seed.len()).expect("pending count fits u64")
+            <= config.semantic_policy.max_pending_proofs,
+        "seed pending count remains inside the configured pending limit"
+    );
+    let seed_link_count = observed
+        .iter()
+        .map(|record| u64::try_from(record.fact_ids.len()).expect("link count fits u64"))
+        .try_fold(0u64, |total, links| total.checked_add(links))
+        .expect("seed proof links fit u64");
+    assert!(
+        seed_link_count <= config.semantic_policy.max_proof_links,
+        "seed proof links remain inside the configured link limit"
+    );
+    let unrelated_rows_preserved = observed == expected;
+    assert!(
+        unrelated_rows_preserved,
+        "the seeded rows and links remain exact before history pressure"
+    );
+    let pending_linked_fact_count = linked_fact_ids.len();
+    assert_eq!(
+        pending_linked_fact_count, 5,
+        "history pressure keeps the pending proof link set fixed"
+    );
+
+    // Keep the pending proof set and its five linked facts fixed while adding
+    // a finite, mechanically-derived terminal history.  Repeated grants for
+    // one bounded roster subject produce unique causal FactIds without
+    // expanding the roster subject set; each one is persisted through the
+    // production ingress and then retired through the exact current owner.
+    let mut terminal_graph = FactGraph::from_bootstrap(state.verified_bootstrap());
+    for fact in &facts {
+        terminal_graph
+            .admit(fact.clone())
+            .expect("seed facts admit into history fixture graph");
+    }
+    let mut terminal_history = Vec::new();
+    let mut terminal_reference_facts = Vec::new();
+    let mut history_metrics = Vec::new();
+    for target_count in [10usize, 100usize] {
+        assert!(
+            u64::try_from(target_count).expect("history count fits u64")
+                <= config.semantic_policy.max_proof_records,
+            "history cases remain inside the configured proof-record capacity"
+        );
+        while terminal_history.len() < target_count {
+            let role = if terminal_history.len() % 2 == 0 {
+                myownmesh_core::semantic::Role::Member
+            } else {
+                myownmesh_core::semantic::Role::Controller
+            };
+            let fact = authored(
+                &terminal_graph,
+                identity.as_ref(),
+                FactBody::RoleGrant {
+                    target: device(&_member),
+                    role,
+                },
+            );
+            terminal_graph
+                .admit(fact.clone())
+                .expect("derived terminal-history fact admits");
+            ingest_semantic_fact(&state, fact.clone()).await;
+            let record = myownmesh_core::engine::transport_lab::new_durable_proof_record(
+                &state,
+                &owner,
+                &[fact.id],
+            )
+            .expect("derive terminal-history proof record");
+            materialize_durable_proof_delivery(&state, &record)
+                .map(|delivery| {
+                    assert_eq!(
+                        delivery.facts,
+                        vec![fact.clone()],
+                        "terminal-history proof materializes its exact signed body"
+                    );
+                })
+                .expect("materialize terminal-history proof");
+            admit_durable_proof(&state, record.clone()).expect("persist terminal-history proof");
+            assert!(
+                supersede_durable_proof(&state, &owner, &record, None)
+                    .expect("retire terminal-history proof"),
+                "each derived terminal-history proof retires once"
+            );
+            let mut terminal = record;
+            terminal.state = ProofRecordState::Superseded;
+            terminal_history.push(terminal);
+            terminal_reference_facts.push(fact);
+        }
+
+        let terminal_fact_ids = terminal_history
+            .iter()
+            .flat_map(|record| record.fact_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let terminal_delivery_ids = terminal_history
+            .iter()
+            .map(|record| record.delivery_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            terminal_fact_ids.len(),
+            terminal_history.len(),
+            "terminal history FactIds are unique"
+        );
+        assert_eq!(
+            terminal_delivery_ids.len(),
+            terminal_history.len(),
+            "terminal history delivery IDs are unique"
+        );
+        assert!(
+            terminal_fact_ids.is_disjoint(&linked_fact_ids),
+            "terminal history FactIds do not overlap the seeded link set"
+        );
+        let seed_delivery_ids = expected
+            .iter()
+            .map(|record| record.delivery_id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            terminal_delivery_ids.is_disjoint(&seed_delivery_ids),
+            "terminal history delivery IDs do not overlap seeded records"
+        );
+
+        let pending_started = Instant::now();
+        let pending = pending_durable_proofs(&state).expect("list pending history baseline");
+        let pending_us = elapsed_micros(pending_started);
+        assert_eq!(
+            pending.len(),
+            expected_pending_count,
+            "terminal history does not change the pending proof count"
+        );
+        assert_eq!(
+            pending, seed_pending_records,
+            "terminal history preserves the exact sorted pending record set"
+        );
+        let observed = durable_proof_records(&state).expect("observe terminal history baseline");
+        let mut expected_at_history = expected.clone();
+        expected_at_history.extend(terminal_history.iter().cloned());
+        expected_at_history.sort_by_key(|record| record.delivery_id);
+        assert_eq!(
+            observed, expected_at_history,
+            "terminal history preserves the exact sorted full record set"
+        );
+        let terminal_count = observed
+            .iter()
+            .filter(|record| record.state != ProofRecordState::Pending)
+            .count();
+        let expected_record_count = records
+            .len()
+            .checked_add(terminal_history.len())
+            .expect("history record count fits usize");
+        assert_eq!(
+            observed.len(),
+            expected_record_count,
+            "history retains the exact seed-plus-terminal record count"
+        );
+        assert!(
+            u64::try_from(observed.len()).expect("history record count fits u64")
+                <= config.semantic_policy.max_proof_records,
+            "history records remain inside the configured retained-record limit"
+        );
+        assert_eq!(
+            terminal_count,
+            records.len() - expected_pending_count + terminal_history.len(),
+            "terminal history count is exact"
+        );
+        let actual_fact_ids = observed
+            .iter()
+            .flat_map(|record| record.fact_ids.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let mut expected_fact_ids = linked_fact_ids.clone();
+        expected_fact_ids.extend(terminal_fact_ids.iter().copied());
+        assert_eq!(
+            actual_fact_ids, expected_fact_ids,
+            "terminal history preserves the exact union of linked FactIds"
+        );
+        assert_eq!(
+            state.semantic_fact_count(),
+            terminal_graph.len(),
+            "production history semantic count matches the reference graph"
+        );
+        assert_eq!(
+            state.semantic_unresolved_count(),
+            terminal_graph.quarantined().count(),
+            "production history unresolved count matches the reference graph"
+        );
+        let pending_serialized_bytes = encoded_record_bytes(&pending);
+        let total_serialized_bytes = encoded_record_bytes(&observed);
+        assert!(
+            pending_serialized_bytes <= config.semantic_policy.max_pending_proof_bytes,
+            "history pending proof bytes remain inside the configured pending limit"
+        );
+        assert!(
+            total_serialized_bytes <= config.semantic_policy.max_proof_bytes,
+            "history proof bytes remain inside the configured retained limit"
+        );
+        assert!(
+            u64::try_from(pending.len()).expect("pending count fits u64")
+                <= config.semantic_policy.max_pending_proofs,
+            "history pending count remains inside the configured pending limit"
+        );
+        let history_link_count = observed
+            .iter()
+            .map(|record| u64::try_from(record.fact_ids.len()).expect("link count fits u64"))
+            .try_fold(0u64, |total, links| total.checked_add(links))
+            .expect("history proof links fit u64");
+        assert!(
+            history_link_count <= config.semantic_policy.max_proof_links,
+            "history proof links remain inside the configured link limit"
+        );
+        let mut history_references = facts.clone();
+        history_references.extend(terminal_reference_facts.iter().cloned());
+        for record in &terminal_history {
+            let mut descriptive = record.clone();
+            descriptive.state = ProofRecordState::Pending;
+            let delivery = materialize_durable_proof_delivery(&state, &descriptive)
+                .expect("materialize descriptive terminal proof");
+            assert_eq!(
+                delivery.facts,
+                reference_facts(record, &history_references),
+                "terminal history retains exact signed reference bodies"
+            );
+        }
+        let history_footprint = durable_slot_footprint(&slot);
+        let history_bytes = history_footprint
+            .values()
+            .try_fold(0u64, |total, size| total.checked_add(*size))
+            .expect("history footprint fits u64");
+        assert!(
+            history_bytes <= config.semantic_policy.max_database_bytes,
+            "history pressure remains inside the configured database envelope"
+        );
+        history_metrics.push(serde_json::json!({
+            "terminal_history_count": terminal_history.len(),
+            "pending_count": pending.len(),
+            "pending_listing_elapsed_us": pending_us,
+            "pending_serialized_bytes": pending_serialized_bytes,
+            "total_serialized_bytes": total_serialized_bytes,
+            "terminal_count": terminal_count,
+            "terminal_linked_fact_count": terminal_history.len(),
+            "footprint": durable_slot_totals(&history_footprint),
+        }));
+    }
+    expected.extend(terminal_history.iter().cloned());
+    expected.sort_by_key(|record| record.delivery_id);
+    let mut all_reference_facts = facts.clone();
+    all_reference_facts.extend(terminal_reference_facts.iter().cloned());
 
     // The configured database budget is the only bound used for footprint
     // qualification; no test-local byte multiplier is smuggled in.
@@ -2546,7 +2878,7 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
     drop(state);
 
     let (reopened, reopened_driver) = spawn_network_in_instance_root(
-        config,
+        config.clone(),
         identity,
         support::test_transport(),
         root.path().to_path_buf(),
@@ -2559,9 +2891,13 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
         reopened_records, expected,
         "restart replays the exact pending set and terminal records"
     );
-    let reopened_pending_count = pending_durable_proofs(&reopened)
-        .expect("replay pending proof rows")
-        .len();
+    let reopened_pending_records =
+        pending_durable_proofs(&reopened).expect("replay pending proof rows");
+    assert_eq!(
+        reopened_pending_records, seed_pending_records,
+        "reopen preserves the exact sorted pending record set"
+    );
+    let reopened_pending_count = reopened_pending_records.len();
     let reopened_terminal_count = reopened_records
         .iter()
         .filter(|record| record.state != ProofRecordState::Pending)
@@ -2574,12 +2910,76 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
             .count(),
         "restart preserves the exact pending count"
     );
+    assert!(
+        u64::try_from(reopened_records.len()).expect("reopened record count fits u64")
+            <= config.semantic_policy.max_proof_records,
+        "reopened records remain inside the configured retained-record limit"
+    );
+    assert!(
+        u64::try_from(reopened_pending_count).expect("reopened pending count fits u64")
+            <= config.semantic_policy.max_pending_proofs,
+        "reopened pending count remains inside the configured pending limit"
+    );
+    assert_eq!(
+        reopened.semantic_fact_count(),
+        terminal_graph.len(),
+        "reopen production semantic count matches the reference graph"
+    );
+    assert_eq!(
+        reopened.semantic_unresolved_count(),
+        terminal_graph.quarantined().count(),
+        "reopen production unresolved count matches the reference graph"
+    );
+    let reopened_fact_ids = reopened_records
+        .iter()
+        .flat_map(|record| record.fact_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let expected_fact_ids = expected
+        .iter()
+        .flat_map(|record| record.fact_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        reopened_fact_ids, expected_fact_ids,
+        "reopen preserves the exact union of linked FactIds"
+    );
+    for record in &reopened_records {
+        let mut descriptive = record.clone();
+        descriptive.state = ProofRecordState::Pending;
+        let delivery = materialize_durable_proof_delivery(&reopened, &descriptive)
+            .expect("materialize descriptive reopened proof");
+        assert_eq!(
+            delivery.facts,
+            reference_facts(record, &all_reference_facts),
+            "reopen materializes the exact signed reference bodies"
+        );
+    }
+    let reopened_pending_serialized_bytes = encoded_record_bytes(&reopened_pending_records);
+    let reopened_total_serialized_bytes = encoded_record_bytes(&reopened_records);
+    assert!(
+        reopened_pending_serialized_bytes <= config.semantic_policy.max_pending_proof_bytes,
+        "reopened pending proof bytes remain inside the configured pending limit"
+    );
+    assert!(
+        reopened_total_serialized_bytes <= config.semantic_policy.max_proof_bytes,
+        "reopened proof bytes remain inside the configured retained limit"
+    );
+    let reopened_link_count = reopened_records
+        .iter()
+        .map(|record| u64::try_from(record.fact_ids.len()).expect("link count fits u64"))
+        .try_fold(0u64, |total, links| total.checked_add(links))
+        .expect("reopened proof links fit u64");
+    assert!(
+        reopened_link_count <= config.semantic_policy.max_proof_links,
+        "reopened proof links remain inside the configured link limit"
+    );
     eprintln!(
         "DURABLE_PROOF_DELIVERY_R3_METRIC {}",
         serde_json::json!({
             "selector": "r3_many_pending_deliveries_preserve_unrelated_links_and_footprints",
             "seeded_proof_count": records.len(),
             "linked_fact_count": linked_fact_ids.len(),
+            "final_record_count": reopened_records.len(),
+            "final_linked_fact_count": reopened_fact_ids.len(),
             "configured_max_database_bytes": configured_max_database_bytes,
             "operations": {
                 "duplicate_enqueue": {
@@ -2603,12 +3003,25 @@ async fn r3_many_pending_deliveries_preserve_unrelated_links_and_footprints() {
                     "after": durable_slot_totals(&duplicate_ack_after),
                 },
             },
-            "unrelated_rows_preserved": true,
+            "unrelated_rows_preserved": unrelated_rows_preserved,
             "no_op_footprints_equal": duplicate_before == duplicate_after
                 && duplicate_ack_before == duplicate_ack_after,
+            "pending_linked_fact_count": pending_linked_fact_count,
+            "seed_admission_elapsed_us": seed_admission_elapsed_us,
+            "seed_pending_listing_elapsed_us": pending_after_seed_us,
+            "seed_pending_serialized_bytes": seed_pending_serialized_bytes,
+            "seed_total_serialized_bytes": seed_total_serialized_bytes,
+            "history_pressure": history_metrics,
             "reopened_exact_equality": reopened_exact_equality,
             "reopened_pending_count": reopened_pending_count,
             "reopened_terminal_count": reopened_terminal_count,
+            "reopened_pending_serialized_bytes": reopened_pending_serialized_bytes,
+            "reopened_total_serialized_bytes": reopened_total_serialized_bytes,
+            "seed_semantic_fact_count": seed_graph.len(),
+            "final_semantic_fact_count": reopened.semantic_fact_count(),
+            "final_semantic_unresolved_count": reopened.semantic_unresolved_count(),
+            "provider_ledger_available": false,
+            "provider_evidence_ceiling": "support::test_transport hides exact provider ledger; this selector does not prove provider baseline",
         })
     );
     reopened.request_shutdown();

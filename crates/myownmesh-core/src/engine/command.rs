@@ -205,7 +205,11 @@ unsafe impl ResourceMailboxItem for NetworkCmd {
             | Self::DropPeerIfCurrent { .. }
             | Self::Reconnect { .. } => 0,
             Self::AttemptRefused { .. } | Self::AttemptOutcome { .. } => 1,
-            Self::ConnectPeer { reply, .. } => usize::from(reply.is_some()) * 2,
+            // The waiter reply and its cancellation/shared state are already
+            // funded by ConnectWaitShared. The mailbox owns only this command
+            // value and its embedded handle, so it must not charge the
+            // intrinsically-funded pointee a second time.
+            Self::ConnectPeer { .. } => 0,
             Self::SendChannelReliable { .. }
             | Self::SendChannelFrame { .. }
             | Self::BroadcastChannelFrame { .. }

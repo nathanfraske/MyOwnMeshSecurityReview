@@ -366,6 +366,64 @@ mod tests {
         (owner, scopes)
     }
 
+    fn tight_one_candidate_grant(extra_reservation_record: bool) -> ResourceClaim {
+        let record = FiniteResourceProvider::reservation_charge_for_test(ResourceClaim::ZERO)
+            .expect("the provider record charge is representable");
+        let infrastructure = resource_owner::cleanup_executor_infrastructure_claim()
+            .expect("the cleanup infrastructure claim is representable");
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let base = record
+            .checked_add(
+                FiniteResourceProvider::reservation_charge_for_test(infrastructure)
+                    .expect("the infrastructure reservation charge is representable"),
+            )
+            .and_then(|claim| claim.checked_add(record))
+            .and_then(|claim| {
+                claim.checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(floor.opening)
+                        .expect("the candidate reservation charge is representable"),
+                )
+            })
+            .and_then(|claim| claim.checked_add(record))
+            .expect("the exact process/mesh/candidate setup charge is representable");
+        if extra_reservation_record {
+            base.checked_add(record)
+                .expect("the exact extra reservation record is representable")
+        } else {
+            base
+        }
+    }
+
+    // All claims in these pre-native controls share the candidate's one child
+    // scope. Each live lease adds its own reservation record, while the last
+    // lease/capability releases the child scope. The baseline excludes both.
+    fn assert_split_live_claims(
+        provider: &FiniteResourceProvider,
+        baseline: (ResourceClaim, usize, usize),
+        claims: &[ResourceClaim],
+    ) {
+        let mut expected = baseline.0;
+        if !claims.is_empty() {
+            expected = expected
+                .checked_add(FiniteResourceProvider::scope_record_charge_for_test())
+                .expect("the candidate scope charge is representable");
+        }
+        for claim in claims {
+            expected = expected
+                .checked_add(
+                    FiniteResourceProvider::reservation_charge_for_test(*claim)
+                        .expect("the reservation charge is representable"),
+                )
+                .expect("the complete live-claim vector is representable");
+        }
+        assert_eq!(provider.in_use(), expected);
+        assert_eq!(provider.active_reservations(), baseline.1 + claims.len());
+        assert_eq!(
+            provider.active_scopes(),
+            baseline.2 + usize::from(!claims.is_empty())
+        );
+    }
+
     fn data_only_webrtc_profile() -> WebRtcConnectorProfile {
         WebRtcConnectorProfile::new(ConnectorCallbackPolicy::elastic_data_only())
     }
@@ -697,6 +755,664 @@ mod tests {
         assert_eq!(provider.in_use().amount(ResourceClass::ParsingOrCpuWork), 0);
         drop(connected);
         assert_eq!(provider.in_use(), baseline);
+    }
+
+    #[test]
+    fn v4_arc03_split_custodian_promotion_preserves_one_exact_envelope() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let child_scope_charge = FiniteResourceProvider::scope_record_charge_for_test();
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let opening = floor
+            .opening
+            .checked_add(ResourceClaim::single(ResourceClass::ParsingOrCpuWork, 1))
+            .expect("the unequal opening claim is representable");
+        let claim = ConnectorCandidateResourceClaim::checked(opening, floor.connected)
+            .expect("the unequal opening/connected claim is valid");
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let mut candidate = attempt
+            .reserve_connector_candidate(claim)
+            .expect("the unequal connector claim is admitted");
+        let before_split = provider.in_use();
+        let custodian_claim = super::resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual_opening = opening
+            .checked_sub(custodian_claim)
+            .expect("the opening claim contains the custodian claim");
+        let residual_connected = floor
+            .connected
+            .checked_sub(custodian_claim)
+            .expect("the connected claim contains the custodian claim");
+
+        candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the separate late custodian is admitted");
+        let after_split = provider.in_use();
+        assert_eq!(
+            after_split,
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(residual_opening)
+                            .expect("the residual opening charge is representable"),
+                    )
+                })
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the prepared split accounting is representable"),
+            "the second provider record and residual opening are exact"
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 2);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_ne!(after_split, before_split);
+        let reservations_after_split = provider.active_reservations();
+        candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("preparing the already-split candidate is an idempotent no-op");
+        assert_eq!(provider.in_use(), after_split);
+        assert_eq!(provider.active_reservations(), reservations_after_split);
+
+        let custodian = candidate.take_late_transport_lease();
+        let reservations_after_take = provider.active_reservations();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                candidate.take_late_transport_lease();
+            }))
+            .is_err(),
+            "taking the transferred lease twice is forbidden"
+        );
+        candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("taking the lease does not permit a second split");
+        assert_eq!(provider.in_use(), after_split);
+        assert_eq!(provider.active_reservations(), reservations_after_take);
+
+        let promoted = candidate
+            .try_promote_if_live(|candidate| candidate)
+            .ok()
+            .expect("the live candidate promotes");
+        assert_eq!(
+            provider.in_use(),
+            after_split
+                .checked_sub(ResourceClaim::single(ResourceClass::ParsingOrCpuWork, 1))
+                .expect("promotion releases the opening-only parsing claim"),
+            "promotion releases only opening work, without reacquiring the custodian"
+        );
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(residual_connected)
+                            .expect("the residual connected charge is representable"),
+                    )
+                })
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the promoted split accounting is representable")
+        );
+        drop(promoted);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian reservation charge is representable"),
+                    )
+                })
+                .expect("the retained custodian charge is representable"),
+            "the external custodian remains funded after candidate drop"
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        drop(custodian);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+    }
+
+    #[test]
+    fn v4_arc03_split_release_order_preserves_scope_and_exact_remaining_claim() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (_owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let child_scope_charge = FiniteResourceProvider::scope_record_charge_for_test();
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let custodian_claim = super::resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual_opening = floor
+            .opening
+            .checked_sub(custodian_claim)
+            .expect("the opening claim contains the custodian claim");
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the exact connector floor is admitted");
+        let mut candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the split custodian is admitted");
+        let custodian = candidate.take_late_transport_lease();
+        drop(candidate);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the candidate-first accounting is representable")
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        drop(custodian);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+
+        let candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the reverse-order candidate is admitted");
+        let mut candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the reverse-order split custodian is admitted");
+        let custodian = candidate.take_late_transport_lease();
+        drop(custodian);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(residual_opening)
+                            .expect("the residual opening charge is representable"),
+                    )
+                })
+                .expect("the external-first accounting is representable")
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        drop(candidate);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+    }
+
+    #[test]
+    fn v4_arc03_failed_custodian_split_consumes_without_partial_claim() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the exact connector floor is admitted");
+        let before_split = provider.in_use();
+        let reservations_before_split = provider.active_reservations();
+        assert_ne!(before_split, baseline);
+        assert_eq!(
+            reservations_before_split,
+            baseline_reservations + 1,
+            "the candidate contributes one child reservation"
+        );
+
+        provider.script_pressure(ResourceClass::OpaqueDependencyResidual);
+        assert!(candidate.prepare_late_transport_custodian().is_err());
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+        assert_eq!(owner.report().active_candidates, 0);
+    }
+
+    #[test]
+    fn v4_arc03_split_second_record_has_an_exact_bookkeeping_boundary() {
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let custodian_claim = super::resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let malformed_connected = floor
+            .connected
+            .checked_sub(custodian_claim)
+            .expect("the malformed guard fixture is representable");
+        let malformed_opening = floor
+            .opening
+            .checked_sub(custodian_claim)
+            .expect("the malformed guard fixture is representable");
+        assert!(
+            ConnectorCandidateResourceClaim::checked(malformed_opening, floor.connected).is_none(),
+            "the normal constructor refuses an opening claim missing C"
+        );
+        assert!(
+            ConnectorCandidateResourceClaim::checked(floor.opening, malformed_connected).is_none(),
+            "the normal constructor refuses a connected claim missing C"
+        );
+
+        let missing_provider = FiniteResourceProvider::new(tight_one_candidate_grant(false));
+        let (_missing_owner, missing_scopes) = owner_and_scopes(&missing_provider, 1);
+        let missing_baseline = missing_provider.in_use();
+        let missing_reservations = missing_provider.active_reservations();
+        let missing_scope_count = missing_provider.active_scopes();
+        let (missing_attempt, _missing_lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            missing_scopes[0].clone(),
+        );
+        let missing_candidate = missing_attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the tight grant admits the opening reservation");
+        let missing_result = missing_candidate.prepare_late_transport_custodian();
+        assert!(matches!(
+            missing_result,
+            Err(ResourceUnavailable::Pressure(pressure))
+                if pressure.dimension == ResourceClass::OpaqueDependencyResidual
+        ));
+        assert_eq!(missing_provider.in_use(), missing_baseline);
+        assert_eq!(missing_provider.active_reservations(), missing_reservations);
+        assert_eq!(missing_provider.active_scopes(), missing_scope_count);
+
+        let sufficient_provider = FiniteResourceProvider::new(tight_one_candidate_grant(true));
+        let (_sufficient_owner, sufficient_scopes) = owner_and_scopes(&sufficient_provider, 1);
+        let sufficient_baseline = sufficient_provider.in_use();
+        let sufficient_reservations = sufficient_provider.active_reservations();
+        let sufficient_scopes_count = sufficient_provider.active_scopes();
+        let (sufficient_attempt, _sufficient_lifetime) = PreAuthAttemptPermit::admitted(
+            crate::runtime::runtime_for_test(),
+            sufficient_scopes[0].clone(),
+        );
+        let sufficient_candidate = sufficient_attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the extra record charge admits the opening reservation");
+        let mut sufficient_candidate = sufficient_candidate
+            .prepare_late_transport_custodian()
+            .expect("the exact extra record charge admits the custodian");
+        let sufficient_custodian = sufficient_candidate.take_late_transport_lease();
+        drop(sufficient_candidate);
+        drop(sufficient_custodian);
+        assert_eq!(sufficient_provider.in_use(), sufficient_baseline);
+        assert_eq!(
+            sufficient_provider.active_reservations(),
+            sufficient_reservations
+        );
+        assert_eq!(sufficient_provider.active_scopes(), sufficient_scopes_count);
+    }
+
+    #[test]
+    fn v4_arc03_split_promotion_pressure_keeps_both_live_claims() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (_owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let child_scope_charge = FiniteResourceProvider::scope_record_charge_for_test();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let custodian_claim = super::resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual_opening = floor
+            .opening
+            .checked_sub(custodian_claim)
+            .expect("the opening claim contains the custodian claim");
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the exact connector floor is admitted");
+        let mut candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the split custodian is admitted");
+        let custodian = candidate.take_late_transport_lease();
+        let before_promotion = provider.in_use();
+        let reservations_before_promotion = provider.active_reservations();
+        assert_eq!(
+            before_promotion,
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(residual_opening)
+                            .expect("the residual opening charge is representable"),
+                    )
+                })
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the prepared promotion accounting is representable")
+        );
+        provider.script_pressure(ResourceClass::OpaqueDependencyResidual);
+        let mut closure_called = false;
+        let candidate = match candidate.try_promote_if_live(|candidate| {
+            closure_called = true;
+            candidate
+        }) {
+            Ok(_) => panic!("scripted promotion pressure refuses before success closure"),
+            Err(candidate) => candidate,
+        };
+        assert!(!closure_called);
+        assert_eq!(provider.in_use(), before_promotion);
+        assert_eq!(
+            provider.active_reservations(),
+            reservations_before_promotion
+        );
+        drop(candidate);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the retained split accounting is representable")
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        drop(custodian);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+    }
+
+    #[test]
+    fn v4_arc03_split_cleanup_failure_retains_the_current_residual_claim() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let child_scope_charge = FiniteResourceProvider::scope_record_charge_for_test();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let floor = ConnectorCandidateResourceClaim::exact_connector_floor();
+        let custodian_claim = super::resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual_opening = floor
+            .opening
+            .checked_sub(custodian_claim)
+            .expect("the opening claim contains the custodian claim");
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the exact connector floor is admitted");
+        let mut candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the split custodian is admitted");
+        let custodian = candidate.take_late_transport_lease();
+        let mut cleanup = candidate
+            .issue_cleanup_capability()
+            .expect("cleanup issuance follows successful preparation");
+        cleanup
+            .begin_cleanup()
+            .expect("cleanup begins against the residual candidate claim");
+        let before_failure = provider.in_use();
+        candidate.retain_after_cleanup_failure();
+        drop(candidate);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| claim.checked_add(residual_opening))
+                .and_then(|claim| {
+                    claim.checked_add(
+                        FiniteResourceProvider::reservation_charge_for_test(custodian_claim)
+                            .expect("the custodian charge is representable"),
+                    )
+                })
+                .expect("the retained residual accounting is representable")
+        );
+        assert_ne!(provider.in_use(), before_failure);
+        assert_eq!(provider.retained_after_failed_cleanup(), residual_opening);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        drop(cleanup);
+        drop(custodian);
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(residual_opening)
+                .expect("failed cleanup retains only the exact residual")
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+        assert_eq!(provider.retained_after_failed_cleanup(), residual_opening);
+        assert_eq!(owner.report().active_candidates, 1);
+        assert_eq!(owner.report().failed_cleanup_candidates, 1);
+        assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_split_contention_drops_consumed_candidate_and_allows_later_retry() {
+        let grant = explicit_test_grant(1, 1);
+        let provider = FiniteResourceProvider::new(grant);
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = provider.in_use();
+        let baseline_reservations = provider.active_reservations();
+        let baseline_scopes = provider.active_scopes();
+        let child_scope_charge = FiniteResourceProvider::scope_record_charge_for_test();
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let mut candidate = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("the first candidate is admitted");
+        let sibling_scope = candidate.work_resource_scope();
+        let worker_claim = ResourceClaim::single(ResourceClass::WorkerOrTask, 1);
+        let before_probe = provider.in_use();
+        assert!(matches!(
+            sibling_scope.acquire(ResourceAuthorityClass::Speculative, worker_claim),
+            Err(ResourceUnavailable::Pressure(pressure))
+                if pressure.dimension == ResourceClass::WorkerOrTask
+                    && pressure.authority == ResourceAuthorityClass::Speculative
+        ));
+        assert_eq!(provider.in_use(), before_probe);
+        let sibling_slot = Arc::new(Mutex::new(None));
+        let sibling_slot_for_hook = Arc::clone(&sibling_slot);
+        candidate.set_split_before_custodian_acquire_hook(move || {
+            let sibling = sibling_scope
+                .acquire(
+                    ResourceAuthorityClass::Speculative,
+                    ResourceClaim::single(ResourceClass::WorkerOrTask, 1),
+                )
+                .expect("the sibling consumes the released custodian WorkerOrTask");
+            *sibling_slot_for_hook.lock().unwrap() = Some(sibling);
+        });
+
+        let before_split = provider.in_use();
+        let reservations_before_split = provider.active_reservations();
+        assert!(matches!(
+            candidate.prepare_late_transport_custodian(),
+            Err(ResourceUnavailable::Pressure(pressure))
+                if pressure.dimension == ResourceClass::WorkerOrTask
+                    && pressure.authority == ResourceAuthorityClass::Speculative
+        ));
+        let sibling = sibling_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the contention hook admitted the one-Worker sibling");
+        let sibling_charge = FiniteResourceProvider::reservation_charge_for_test(
+            ResourceClaim::single(ResourceClass::WorkerOrTask, 1),
+        )
+        .expect("the sibling reservation charge is representable");
+        assert_eq!(
+            provider.in_use(),
+            baseline
+                .checked_add(child_scope_charge)
+                .and_then(|claim| claim.checked_add(sibling_charge))
+                .expect("the sibling accounting is representable")
+        );
+        assert_eq!(provider.active_reservations(), baseline_reservations + 1);
+        assert_eq!(provider.active_scopes(), baseline_scopes + 1);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert_ne!(provider.in_use(), before_split);
+        assert_eq!(provider.active_reservations(), reservations_before_split);
+        drop(sibling);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+
+        let retry = attempt
+            .reserve_connector_candidate(candidate_claim())
+            .expect("a fresh retry is admitted after contention clears");
+        let mut retry = retry
+            .prepare_late_transport_custodian()
+            .expect("the fresh retry prepares after capacity is available");
+        let custodian = retry.take_late_transport_lease();
+        drop(retry);
+        drop(custodian);
+        assert_eq!(provider.in_use(), baseline);
+        assert_eq!(provider.active_reservations(), baseline_reservations);
+        assert_eq!(provider.active_scopes(), baseline_scopes);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_split_drop_before_transfer_releases_both_claims_and_scope() {
+        let provider = FiniteResourceProvider::new(tight_one_candidate_grant(true));
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let floor = candidate_claim();
+        let custodian = resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual = floor.opening.checked_sub(custodian).unwrap();
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let candidate = attempt
+            .reserve_connector_candidate(floor)
+            .expect("the opening candidate is funded");
+        assert_split_live_claims(&provider, baseline, &[floor.opening]);
+        let candidate = candidate
+            .prepare_late_transport_custodian()
+            .expect("the exact second record permits preparation");
+        assert_split_live_claims(&provider, baseline, &[residual, custodian]);
+        // No take, cleanup capability, custodian thread, or native construction.
+        drop(candidate);
+        assert_split_live_claims(&provider, baseline, &[]);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_split_retirement_before_promotion_preserves_exact_custody() {
+        let provider = FiniteResourceProvider::new(tight_one_candidate_grant(true));
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let floor = candidate_claim();
+        let custodian_claim = resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual = floor.opening.checked_sub(custodian_claim).unwrap();
+        let (attempt, lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let mut candidate = attempt
+            .reserve_connector_candidate(floor)
+            .expect("the opening candidate is funded")
+            .prepare_late_transport_custodian()
+            .expect("the custodian is funded");
+        let custodian = candidate.take_late_transport_lease();
+        assert_split_live_claims(&provider, baseline, &[residual, custodian_claim]);
+        lifetime.retire();
+        let mut promoted = false;
+        let candidate = match candidate.try_promote_if_live(|candidate| {
+            promoted = true;
+            candidate
+        }) {
+            Ok(_) => panic!("a retired attempt cannot publish a prepared candidate"),
+            Err(candidate) => candidate,
+        };
+        assert!(!promoted);
+        assert!(!candidate.is_live());
+        assert!(candidate.belongs_to(&attempt));
+        assert_split_live_claims(&provider, baseline, &[residual, custodian_claim]);
+        assert_eq!(owner.report().active_candidates, 1);
+        drop(candidate);
+        assert_split_live_claims(&provider, baseline, &[custodian_claim]);
+        drop(custodian);
+        assert_split_live_claims(&provider, baseline, &[]);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert!(!owner.report().accounting_poisoned);
+    }
+
+    #[test]
+    fn v4_arc03_split_cleanup_success_waits_for_final_capability_owner() {
+        let provider = FiniteResourceProvider::new(tight_one_candidate_grant(true));
+        let (owner, scopes) = owner_and_scopes(&provider, 1);
+        let baseline = (
+            provider.in_use(),
+            provider.active_reservations(),
+            provider.active_scopes(),
+        );
+        let floor = candidate_claim();
+        let custodian_claim = resource_owner::late_transport_custodian_claim()
+            .expect("the custodian claim is representable");
+        let residual = floor.opening.checked_sub(custodian_claim).unwrap();
+        let (attempt, _lifetime) =
+            PreAuthAttemptPermit::admitted(crate::runtime::runtime_for_test(), scopes[0].clone());
+        let mut candidate = attempt
+            .reserve_connector_candidate(floor)
+            .expect("the opening candidate is funded")
+            .prepare_late_transport_custodian()
+            .expect("the custodian is funded");
+        let custodian = candidate.take_late_transport_lease();
+        let mut cleanup = candidate
+            .issue_cleanup_capability()
+            .expect("cleanup authority is issued after preparation");
+        cleanup
+            .begin_cleanup()
+            .expect("the residual enters cleanup");
+        assert_split_live_claims(&provider, baseline, &[residual, custodian_claim]);
+        candidate.release_after_cleanup_success();
+        assert!(candidate.reservation_is_active_for_test());
+        drop(candidate);
+        assert_split_live_claims(&provider, baseline, &[residual, custodian_claim]);
+        assert_eq!(owner.report().active_candidates, 1);
+        // These are lease-only controls: native close/join is a separate gate.
+        drop(custodian);
+        assert_split_live_claims(&provider, baseline, &[residual]);
+        assert_eq!(owner.report().active_candidates, 1);
+        drop(cleanup);
+        assert_split_live_claims(&provider, baseline, &[]);
+        assert_eq!(owner.report().active_candidates, 0);
+        assert!(!owner.report().accounting_poisoned);
     }
 
     #[test]
