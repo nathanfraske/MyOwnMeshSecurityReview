@@ -195,6 +195,12 @@ impl Manager {
         allocations.get(five_tuple).cloned()
     }
 
+    /// Checks the immutable creator of the captured allocation, not a later
+    /// allocation that may reuse its five-tuple while authentication awaits.
+    pub(crate) fn allocation_has_username(allocation: &Allocation, username: &Username) -> bool {
+        allocation.username.text == username.text
+    }
+
     /// Creates a new [`Allocation`] and starts relaying.
     pub async fn create_allocation(
         &self,
@@ -273,6 +279,34 @@ impl Manager {
                 log::error!("Failed to close allocation: {}", err);
             }
         }
+    }
+
+    /// Removes only the allocation whose creator the request authenticated.
+    /// A replacement at the same tuple must never be deleted by a stale request.
+    pub(crate) async fn delete_allocation_if_same(
+        &self,
+        five_tuple: &FiveTuple,
+        expected: &Arc<Allocation>,
+    ) -> bool {
+        let allocation = {
+            let mut allocations = self.allocations.lock().await;
+            if !allocations
+                .get(five_tuple)
+                .is_some_and(|current| Arc::ptr_eq(current, expected))
+            {
+                return false;
+            }
+            allocations.remove(five_tuple)
+        };
+        if let Some(a) = allocation {
+            if let Err(err) = a.close().await {
+                if !matches!(err, Error::ErrClosed) {
+                    self.cleanup.error(&err, CleanupFailure::AllocationClose);
+                }
+                log::error!("Failed to close allocation: {}", err);
+            }
+        }
+        true
     }
 
     /// Deletes the [`Allocation`]s according to the specified username `name`.

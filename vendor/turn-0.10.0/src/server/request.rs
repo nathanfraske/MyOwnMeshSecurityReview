@@ -675,10 +675,30 @@ impl Request {
         build_and_send(&self.conn, self.src_addr, msg).await
     }
 
+    async fn respond_wrong_credentials(
+        &self,
+        m: &Message,
+        method: Method,
+        message_integrity: MessageIntegrity,
+    ) -> Result<()> {
+        let msg = build_msg(
+            m.transaction_id,
+            MessageType::new(method, CLASS_ERROR_RESPONSE),
+            vec![
+                Box::new(ErrorCodeAttribute {
+                    code: CODE_WRONG_CREDENTIALS,
+                    reason: vec![],
+                }),
+                Box::new(message_integrity),
+            ],
+        )?;
+        build_and_send(&self.conn, self.src_addr, msg).await
+    }
+
     pub(crate) async fn handle_refresh_request(&mut self, m: &Message) -> Result<()> {
         log::debug!("received RefreshRequest from {}", self.src_addr);
 
-        let (_, message_integrity) =
+        let (username, message_integrity) =
             if let Some(mi) = self.authenticate_request(m, METHOD_REFRESH).await? {
                 mi
             } else {
@@ -693,9 +713,14 @@ impl Request {
             protocol: PROTO_UDP,
         };
 
-        if lifetime_duration != Duration::from_secs(0) {
-            let a = self.allocation_manager.get_allocation(&five_tuple).await;
-            if let Some(a) = a {
+        let allocation = self.allocation_manager.get_allocation(&five_tuple).await;
+        if let Some(a) = allocation {
+            if !Manager::allocation_has_username(&a, &username) {
+                return self
+                    .respond_wrong_credentials(m, METHOD_REFRESH, message_integrity)
+                    .await;
+            }
+            if lifetime_duration != Duration::from_secs(0) {
                 // If a server receives a Refresh Request with a REQUESTED-ADDRESS-FAMILY
                 // attribute, and the attribute's value doesn't match the address
                 // family of the allocation, the server MUST reply with a 443 (Peer
@@ -723,10 +748,12 @@ impl Request {
                 }
                 a.refresh(lifetime_duration).await;
             } else {
-                return Err(Error::ErrNoAllocationFound);
+                self.allocation_manager
+                    .delete_allocation_if_same(&five_tuple, &a)
+                    .await;
             }
-        } else {
-            self.allocation_manager.delete_allocation(&five_tuple).await;
+        } else if lifetime_duration != Duration::from_secs(0) {
+            return Err(Error::ErrNoAllocationFound);
         }
 
         let msg = build_msg(
@@ -754,7 +781,7 @@ impl Request {
             .await;
 
         if let Some(a) = a {
-            let (_, message_integrity) = if let Some(mi) = self
+            let (username, message_integrity) = if let Some(mi) = self
                 .authenticate_request(m, METHOD_CREATE_PERMISSION)
                 .await?
             {
@@ -763,6 +790,11 @@ impl Request {
                 log::debug!("no MessageIntegrity");
                 return Ok(());
             };
+            if !Manager::allocation_has_username(&a, &username) {
+                return self
+                    .respond_wrong_credentials(m, METHOD_CREATE_PERMISSION, message_integrity)
+                    .await;
+            }
             let mut add_count = 0;
 
             {
@@ -896,13 +928,18 @@ impl Request {
                 })],
             )?;
 
-            let (_, message_integrity) =
+            let (username, message_integrity) =
                 if let Some(mi) = self.authenticate_request(m, METHOD_CHANNEL_BIND).await? {
                     mi
                 } else {
                     log::debug!("no MessageIntegrity");
                     return Ok(());
                 };
+            if !Manager::allocation_has_username(&a, &username) {
+                return self
+                    .respond_wrong_credentials(m, METHOD_CHANNEL_BIND, message_integrity)
+                    .await;
+            }
             let mut channel = ChannelNumber::default();
             if let Err(err) = channel.get_from(m) {
                 return build_and_send_err(&self.conn, self.src_addr, bad_request_msg, err.into())
