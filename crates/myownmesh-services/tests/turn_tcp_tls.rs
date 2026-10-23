@@ -246,31 +246,13 @@ fn proxy_original_ip_quota_and_listener_class_reservation() {
         let mut cfg = config();
         cfg.tls_proxy_enabled = true;
         cfg.tls_proxy_port = proxy_port;
+        // Paired listeners reserve one direct and two proxy slots; each
+        // original IP has one slot in each class. Only 127.0.0.1 is needed.
+        cfg.tcp_max_connections = 3;
+        cfg.tcp_max_connections_per_ip = 2;
         let server = TurnServer::start_with_resource_scope(&cfg, scope, cleanup)
             .await
             .unwrap();
-        let mut direct = TcpStream::connect(server.tcp_local_addr().unwrap())
-            .await
-            .unwrap();
-        binding(&mut direct).await;
-        let second_socket = tokio::net::TcpSocket::new_v4().unwrap();
-        second_socket
-            .bind(SocketAddr::from(([127, 0, 0, 2], 0)))
-            .unwrap();
-        let mut second_direct = second_socket
-            .connect(server.tcp_local_addr().unwrap())
-            .await
-            .unwrap();
-        binding(&mut second_direct).await;
-        let third_socket = tokio::net::TcpSocket::new_v4().unwrap();
-        third_socket
-            .bind(SocketAddr::from(([127, 0, 0, 3], 0)))
-            .unwrap();
-        let mut excess_direct = third_socket
-            .connect(server.tcp_local_addr().unwrap())
-            .await
-            .unwrap();
-        closed(&mut excess_direct).await; // distinct IP: direct GLOBAL class reservation exhausted
         let addr = server.tls_proxy_local_addr().unwrap();
         assert!(addr.ip().is_loopback());
         let mut one = TcpStream::connect(addr).await.unwrap();
@@ -279,6 +261,8 @@ fn proxy_original_ip_quota_and_listener_class_reservation() {
             .unwrap();
         binding(&mut one).await;
         let admitted = provider.in_use();
+        // A proxy class slot is still free: only the original-IP quota
+        // can refuse this second connection carrying the same address.
         let mut duplicate_ip = TcpStream::connect(addr).await.unwrap();
         duplicate_ip
             .write_all(&proxy_header(Ipv4Addr::new(192, 0, 2, 1)))
@@ -293,9 +277,22 @@ fn proxy_original_ip_quota_and_listener_class_reservation() {
             .await
             .unwrap();
         binding(&mut two).await; // loopback socket peer did not collapse identities
+
+        // Two proxy clients leave one global slot free. A fresh connection
+        // with no PROXY header has no original IP to charge, so its refusal
+        // proves the listener-class cap rather than the per-IP or total cap.
+        let mut excess_proxy = TcpStream::connect(addr).await.unwrap();
+        closed(&mut excess_proxy).await;
+        // The reserved direct slot remains usable with the proxy class full;
+        // admission must not evict either of the existing proxy clients.
+        let mut direct = TcpStream::connect(server.tcp_local_addr().unwrap())
+            .await
+            .unwrap();
+        binding(&mut direct).await;
+        binding(&mut one).await;
+        binding(&mut two).await;
         server.stop().await.unwrap();
         closed(&mut direct).await;
-        closed(&mut second_direct).await;
         closed(&mut one).await;
         closed(&mut two).await;
     });
