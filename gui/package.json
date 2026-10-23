@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "packageManager": "pnpm@10.33.0",
+  "packageManager": "pnpm@10.34.7",
   "description": "MyOwnMesh — node-graph UI for the mesh daemon (Tauri + Svelte).",
   "scripts": {
     "dev": "vite",
@@ -23,6 +23,6 @@
     "svelte": "^5",
     "svelte-check": "^4",
     "typescript": "^5",
-    "vite": "^6"
+    "vite": "^6.4.5"
   }
 }

@@ -262,6 +262,51 @@ class WorkflowControls(unittest.TestCase):
     def test_release_workflow_has_exact_draft_preflight_and_publisher_dependencies(self) -> None:
         scanner.verify_workflow(self.workflow)
 
+    def test_release_workflow_rejects_tag_interpolation_in_shell(self) -> None:
+        text = self.workflow.read_text(encoding="utf-8")
+        for expression in (
+            "${{ inputs.tag || github.ref_name }}",
+            "${{ github.ref_name }}",
+            "${{ inputs['tag'] }}",
+            "${{ env.TAG }}",
+            "${{\n            github['ref_name']\n          }}",
+        ):
+            with self.subTest(expression=expression):
+                broken = text.replace(
+                    '          EXPECTED="${TAG#v}"',
+                    f'          TAG="{expression}"\n          EXPECTED="${{TAG#v}}"',
+                    1,
+                )
+                self.assertNotEqual(text, broken)
+                with tempfile.NamedTemporaryFile("w", suffix=".yml", encoding="utf-8", delete=False) as handle:
+                    handle.write(broken)
+                    path = pathlib.Path(handle.name)
+                try:
+                    with self.assertRaises(SystemExit) as error:
+                        scanner.verify_workflow(path)
+                    self.assertIn("interpolates tag data into shell source", str(error.exception))
+                finally:
+                    path.unlink()
+
+    def test_release_workflow_requires_tag_data_in_preflight_environment(self) -> None:
+        text = self.workflow.read_text(encoding="utf-8")
+        prepare_start = text.index("  prepare-release:\n")
+        prepare_end = text.index("  release-gates:\n")
+        prepare = text[prepare_start:prepare_end].replace(
+            "          TAG: ${{ inputs.tag || github.ref_name }}\n", "", 1
+        )
+        broken = text[:prepare_start] + prepare + text[prepare_end:]
+        self.assertNotEqual(text, broken)
+        with tempfile.NamedTemporaryFile("w", suffix=".yml", encoding="utf-8", delete=False) as handle:
+            handle.write(broken)
+            path = pathlib.Path(handle.name)
+        try:
+            with self.assertRaises(SystemExit) as error:
+                scanner.verify_workflow(path)
+            self.assertIn("prepare-release does not verify TAG:", str(error.exception))
+        finally:
+            path.unlink()
+
     def test_release_workflow_rejects_missing_prepare_dependency(self) -> None:
         text = self.workflow.read_text(encoding="utf-8")
         broken = text.replace("needs: [prepare-release, release-gates]", "needs: []", 1)
@@ -823,6 +868,54 @@ class ReleasePreflightControls(unittest.TestCase):
             self.returncode = returncode
             self.stderr = stderr
 
+    def test_release_tag_accepts_canonical_semver(self) -> None:
+        for tag in (
+            "v0.0.0", "v1.2.3", "v10.20.30", "v1.2.3-rc.1",
+            "v1.2.3-0", "v1.2.3-01a", "v1.2.3+build.001",
+            "v1.2.3-rc.1+build.001",
+        ):
+            with self.subTest(tag=tag):
+                scanner.validate_release_tag(tag)
+
+    def test_hostile_or_noncanonical_tag_refused_before_any_command(self) -> None:
+        # Shell-looking examples are inert data: never pass these to a shell.
+        for tag in (
+            "v1.2.3$(true)", "v1.2.3`true`", 'v1.2.3";true;#',
+            "v1.2.3;true", "v1.2.3${TAG}", "v1.2.3/other",
+            "refs/tags/v1.2.3", "--help", "1.2.3", "v1.2", "",
+            "v01.2.3", "v1.02.3", "v1.2.03", "v1.2.3-01",
+            "v1.2.3-rc..1", "v1.2.3-", "v1.2.3+", "v1.2.3+build..1",
+            "v1.2.3\n", " v1.2.3", "v1.2.3 ", "v１.2.3",
+        ):
+            with self.subTest(tag=tag), mock.patch.object(scanner.subprocess, "run") as run:
+                with self.assertRaises(SystemExit) as error:
+                    scanner.preflight_release(tag, "abc", "owner/repo")
+                self.assertIn("release tag must be", str(error.exception))
+                run.assert_not_called()
+
+    def test_missing_tag_refused_before_release_lookup_or_creation(self) -> None:
+        with mock.patch.object(scanner, "_gh_json", return_value=None) as query:
+            with mock.patch.object(scanner, "_gh_release_create") as create:
+                with self.assertRaises(SystemExit) as error:
+                    scanner.preflight_release("v1.2.3", "abc", "owner/repo")
+        self.assertIn("must already exist", str(error.exception))
+        query.assert_called_once_with("owner/repo", "git/ref/tags/v1.2.3")
+        create.assert_not_called()
+
+    def test_different_tag_commit_refused_before_release_lookup_or_creation(self) -> None:
+        for tag_ref, annotated in (
+            ({"object": {"type": "commit", "sha": "other"}}, None),
+            ({"object": {"type": "tag", "sha": "tag-object"}}, {"object": {"type": "commit", "sha": "other"}}),
+        ):
+            replies = [tag_ref] if annotated is None else [tag_ref, annotated]
+            with self.subTest(tag_ref=tag_ref), mock.patch.object(scanner, "_gh_json", side_effect=replies) as query:
+                with mock.patch.object(scanner, "_gh_release_create") as create:
+                    with self.assertRaises(SystemExit) as error:
+                        scanner.preflight_release("v1.2.3", "abc", "owner/repo")
+                self.assertIn("not the requested commit", str(error.exception))
+                self.assertEqual(query.call_count, len(replies))
+                create.assert_not_called()
+
     def test_public_requested_tag_is_refused(self) -> None:
         def run(args: list[str], **_: object) -> ReleasePreflightControls.Completed:
             endpoint = args[2]
@@ -855,7 +948,7 @@ class ReleasePreflightControls(unittest.TestCase):
             nonlocal created
             calls.append(args)
             if args[1:2] == ["api"] and "/git/ref/tags/" in args[2]:
-                return self.Completed(returncode=1, stderr="HTTP 404: Not Found")
+                return self.Completed('{"object":{"type":"commit","sha":"abc"}}')
             if args[1:2] == ["api"]:
                 if created:
                     return self.Completed('{"draft":true,"target_commitish":"abc"}')
@@ -869,6 +962,7 @@ class ReleasePreflightControls(unittest.TestCase):
             scanner.preflight_release("v1.2.3", "abc", "owner/repo")
         create = next(call for call in calls if call[1:3] == ["release", "create"])
         self.assertIn("--draft", create)
+        self.assertIn("--verify-tag", create)
         self.assertIn("--target", create)
         self.assertIn("abc", create)
 

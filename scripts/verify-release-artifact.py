@@ -53,6 +53,14 @@ MINISIGN_ARCHIVE_NAME = "minisign-0.11-linux.tar.gz"
 MINISIGN_ARCHIVE_SHA256 = (
     "F0A0954413DF8531BEFED169E447A66DA6868D79052ED7E892E50A4291AF7AE0"
 )
+# SemVer 2.0 with the release ref's required `v` prefix. Numeric version and
+# prerelease identifiers cannot have leading zeroes; build identifiers can.
+RELEASE_TAG = re.compile(
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+)
 
 
 def fail(message: str) -> None:
@@ -340,6 +348,7 @@ def _gh_release_create(repository: str, tag: str, commit: str) -> None:
             "--target",
             commit,
             "--draft",
+            "--verify-tag",
             "--title",
             tag,
         ],
@@ -373,19 +382,27 @@ def _resolve_tag_commit(repository: str, tag: str, tag_ref: dict) -> str:
     return sha
 
 
+def validate_release_tag(tag: str) -> None:
+    """Reject shell syntax, ref/path syntax and noncanonical release versions."""
+    if RELEASE_TAG.fullmatch(tag) is None:
+        fail("release tag must be vMAJOR.MINOR.PATCH with optional SemVer prerelease/build identifiers")
+
+
 def preflight_release(tag: str, commit: str, repository: str) -> None:
-    """Refuse public/repointed tags and establish one exact draft release."""
+    """Validate an existing exact release ref before reading or creating a draft."""
+    validate_release_tag(tag)
     if not tag or not commit or not repository:
         fail("release preflight requires non-empty tag, commit, and repository")
 
     tag_ref = _gh_json(repository, f"git/ref/tags/{tag}")
-    if tag_ref is not None:
-        resolved_commit = _resolve_tag_commit(repository, tag, tag_ref)
-        if resolved_commit != commit:
-            fail(
-                f"release tag {tag} targets {resolved_commit}, "
-                f"not the requested commit {commit}"
-            )
+    if tag_ref is None:
+        fail(f"release tag {tag} must already exist before release work")
+    resolved_commit = _resolve_tag_commit(repository, tag, tag_ref)
+    if resolved_commit != commit:
+        fail(
+            f"release tag {tag} targets {resolved_commit}, "
+            f"not the requested commit {commit}"
+        )
 
     release = _gh_json(repository, f"releases/tags/{tag}")
     if release is not None:
@@ -622,8 +639,32 @@ def scan_archive(path: pathlib.Path, expected_members: list[str]) -> None:
         fail(f"{path} is missing expected member(s): {', '.join(missing)}")
 
 
+def verify_tag_shell_boundary(path: pathlib.Path, text: str) -> None:
+    """Keep tag expressions in workflow data, never in generated shell source."""
+    run_indent: int | None = None
+    script_lines: list[str] = []
+    for line in text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and run_indent is not None and indent <= run_indent:
+            run_indent = None
+        run = re.match(r"^(\s*)(?:-\s+)?run:\s*(.*)$", line)
+        if run is not None:
+            run_indent = len(run.group(1)) + (2 if line.lstrip().startswith("- ") else 0)
+        if run is None and run_indent is None:
+            continue
+        script_lines.append(line)
+    for expression in re.findall(r"\$\{\{(.*?)\}\}", "\n".join(script_lines), re.DOTALL):
+        if re.search(
+            r"\binputs\b|\bgithub\s*(?:\.\s*ref(?:_name)?\b|\[\s*['\"]ref(?:_name)?['\"]\s*\])"
+            r"|\benv\s*(?:\.\s*TAG\b|\[\s*['\"]TAG['\"]\s*\])",
+            expression,
+        ):
+            fail(f"release workflow interpolates tag data into shell source: {path}")
+
+
 def verify_workflow(path: pathlib.Path) -> None:
     text = path.read_text(encoding="utf-8")
+    verify_tag_shell_boundary(path, text)
     if not re.search(r"(?ms)^concurrency:\s*\n\s+group:\s*release-", text):
         fail(f"release workflow lacks per-tag concurrency fencing: {path}")
     lines = text.splitlines()
@@ -716,6 +757,8 @@ def verify_workflow(path: pathlib.Path) -> None:
     for required in (
         "--preflight-release",
         "--tag",
+        'TAG: ${{ inputs.tag || github.ref_name }}',
+        '--tag "$TAG"',
         "--commit",
         "$GITHUB_SHA",
         "--repository",

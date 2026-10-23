@@ -145,9 +145,10 @@ jobs:
       # keeps the GUI sub-workspace files in sync.
       - name: Verify tag matches manifest versions
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          set -e
-          TAG="${{ inputs.tag || github.ref_name }}"
+          set -euo pipefail
           EXPECTED="${TAG#v}"
           fail() { echo "::error::$*"; exit 1; }
           got_workspace=$(awk '
