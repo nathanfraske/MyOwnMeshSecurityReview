@@ -521,7 +521,7 @@ class WorkflowControls(unittest.TestCase):
         text = self.workflow.read_text(encoding="utf-8")
         marker = "  sign:\n"
         start = text.index(marker)
-        checkout = "      - uses: actions/checkout@v4"
+        checkout = f"      - uses: {scanner.reviewed_action('actions/checkout')}"
         checkout_index = text.index(checkout, start)
         line_end = text.index("\n", checkout_index) + 1
         broken = text[:checkout_index] + text[line_end:]
@@ -587,7 +587,7 @@ class WorkflowControls(unittest.TestCase):
     def test_release_workflow_requires_manifest_upload_and_pre_sign_gate(self) -> None:
         text = self.workflow.read_text(encoding="utf-8")
         for broken in (
-            text.replace("actions/upload-artifact@v4", "actions/removed-artifact@v4"),
+            text.replace(scanner.reviewed_action("actions/upload-artifact"), "actions/removed-artifact@v4"),
             text.replace(
                 "      - name: Refuse stale or tampered draft assets before signing\n",
                 "      - name: Removed stale asset gate\n",
@@ -712,6 +712,357 @@ class WorkflowControls(unittest.TestCase):
             self.assertIn("final publish step lacks immediate verification", str(error.exception))
         finally:
             path.unlink()
+class WorkflowProvenanceControls(unittest.TestCase):
+    def setUp(self) -> None:
+        workflows = pathlib.Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        self.release = workflows / "release.yml"
+        self.ci = workflows / "ci.yml"
+
+    def verify_text(self, text: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "workflow.yml"
+            path.write_text(text, encoding="utf-8")
+            scanner.verify_workflow_provenance(path)
+
+    def test_release_and_ci_use_reviewed_provenance(self) -> None:
+        for path in (self.release, self.ci):
+            with self.subTest(path=path):
+                scanner.verify_workflow_provenance(path)
+
+    def test_release_gate_must_check_ci_provenance(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        broken = text.replace("          --ci-workflow .github/workflows/ci.yml\n", "", 1)
+        self.assertNotEqual(text, broken)
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "release.yml"
+            path.write_text(broken, encoding="utf-8")
+            with self.assertRaises(SystemExit) as error:
+                scanner.verify_workflow(path)
+        self.assertIn("do not verify CI provenance policy", str(error.exception))
+
+    def test_each_action_rejects_mutable_and_unreviewed_refs(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for repository in scanner.ACTION_COMMITS:
+            original = scanner.reviewed_action(repository)
+            self.assertIn(original, text)
+            for ref in ("v999", "0" * 40):
+                with self.subTest(repository=repository, ref=ref):
+                    broken = text.replace(original, f"{repository}@{ref}", 1)
+                    with self.assertRaises(SystemExit) as error:
+                        self.verify_text(broken)
+                    self.assertIn("unreviewed or mutable Action", str(error.exception))
+
+    def test_new_external_action_requires_review(self) -> None:
+        text = self.ci.read_text(encoding="utf-8")
+        broken = text.replace(
+            scanner.reviewed_action("actions/checkout"), "unreviewed/action@" + "1" * 40, 1
+        )
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("unreviewed or mutable Action", str(error.exception))
+
+    def test_reindented_steps_cannot_escape_invocation_coverage(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for reference in ("unreviewed/action@main", scanner.reviewed_action("actions/checkout")):
+            with self.subTest(reference=reference):
+                reindented = text + (
+                    "\n  extra:\n    runs-on: ubuntu-22.04\n    steps:\n"
+                    f"        - uses: {reference}\n"
+                )
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(reindented)
+                self.assertIn("uncovered YAML uses invocation", str(error.exception))
+
+    def test_reusable_jobs_cannot_escape_invocation_coverage(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for key in ("uses:", "uses :"):
+            with self.subTest(key=key):
+                reusable = text + (
+                    "\n  external-workflow:\n"
+                    f"    {key} unreviewed/repo/.github/workflows/build.yml@main\n"
+                )
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(reusable)
+                self.assertIn("uncovered YAML uses invocation", str(error.exception))
+
+    def test_empty_and_no_step_workflows_are_refused(self) -> None:
+        for text in (
+            "", "# no executable workflow\n", "name: no-jobs\n",
+            "jobs:\n  empty-job:\n    runs-on: ubuntu-22.04\n    steps:\n",
+            "jobs:\n  run-only:\n    runs-on: ubuntu-22.04\n    steps:\n"
+            "      - run: echo no-reviewed-invocations\n",
+        ):
+            with self.subTest(text=text):
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(text)
+                self.assertIn("requires covered step invocations", str(error.exception))
+
+    def test_multiple_invocations_in_one_step_are_refused(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        checkout = "      - uses: " + scanner.reviewed_action("actions/checkout")
+        for extra in (
+            "\n        uses: " + scanner.reviewed_action("actions/setup-python"),
+            "\n        run: echo unexpected-second-invocation",
+        ):
+            with self.subTest(extra=extra):
+                broken = text.replace(checkout, checkout + extra, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("multiple YAML invocations", str(error.exception))
+
+    def test_unsupported_yaml_cannot_hide_invocations(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for extra in (
+            "\n  extra: { uses: unreviewed/repo/.github/workflows/build.yml@main }\n",
+            "\n  extra:\n    runs-on: ubuntu-22.04\n"
+            "    steps: [ uses: unreviewed/action@main ]\n",
+            "\n  extra:\n    runs-on: ubuntu-22.04\n    steps:\n"
+            "      - 'uses': unreviewed/action@main\n",
+            "\n  extra:\n    runs-on: ubuntu-22.04\n    steps:\n"
+            '      - "us\\u0065s": unreviewed/action@main\n',
+            "\n  extra:\n    runs-on: ubuntu-22.04\n    steps:\n"
+            "      - &shared\n        uses: unreviewed/action@main\n      - *shared\n",
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(text + extra)
+                self.assertIn("unsupported YAML", str(error.exception))
+
+    def test_literal_shell_uses_text_is_not_an_action_invocation(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        self.verify_text(text + (
+            "\n      - name: Inert YAML example\n        run: |\n"
+            '          printf \'%s\\n\' "uses: unreviewed/action@main"\n'
+        ))
+
+    def test_tauri_cargo_lock_flag_must_follow_argument_separator(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        correct = "args: --target ${{ matrix.platform.target }} -- --locked"
+        self.assertIn(correct, text)
+        for incorrect in (
+            "args: --locked --target ${{ matrix.platform.target }}",
+            "args: --target ${{ matrix.platform.target }} --locked",
+            "args: --target ${{ matrix.platform.target }} --",
+        ):
+            with self.subTest(incorrect=incorrect):
+                broken = text.replace(correct, incorrect, 1)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("Tauri build must forward Cargo --locked after --", str(error.exception))
+
+    def test_python_and_node_must_have_exact_versions(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for old, new, expected in (
+            (f'python-version: "{scanner.PYTHON_VERSION}"', 'python-version: "3.x"', "Python selection"),
+            (f'node-version: "{scanner.NODE_VERSION}"', 'node-version: 20', "Node selection"),
+        ):
+            with self.subTest(new=new):
+                broken = text.replace(old, new, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn(expected, str(error.exception))
+
+    def test_missing_rustup_refuses_live_bootstrap_fallback(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        # Keep the step valid so this mutation reaches the Rust-specific guard.
+        broken = text.replace(
+            "        run: command -v rustup\n",
+            "        run: echo rustup-check-removed\n",
+            1,
+        )
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("preinstalled-rustup gate", str(error.exception))
+
+    def test_rustup_guard_cannot_be_conditional(self) -> None:
+        for path in (self.release, self.ci):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                command = "        run: command -v rustup\n"
+                broken = text.replace(command, "        if: false\n" + command, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("preinstalled-rustup gate", str(error.exception))
+
+    def test_rustup_guard_cannot_ignore_failure(self) -> None:
+        for path in (self.release, self.ci):
+            with self.subTest(path=path):
+                text = path.read_text(encoding="utf-8")
+                command = "        run: command -v rustup\n"
+                broken = text.replace(command, "        continue-on-error: true\n" + command, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("preinstalled-rustup gate", str(error.exception))
+
+    def test_cache_cannot_restore_executable_tools(self) -> None:
+        text = self.ci.read_text(encoding="utf-8")
+        broken = text.replace("          cache-bin: false\n", "", 1)
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("must not restore executable tools", str(error.exception))
+
+    def test_python_version_comment_cannot_supply_pin(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        pin = f'python-version: "{scanner.PYTHON_VERSION}"'
+        broken = text.replace(pin, f'python-version: "3.x" # {pin}', 1)
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("Python selection", str(error.exception))
+
+    def test_node_version_comment_cannot_supply_pin(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        pin = f'node-version: "{scanner.NODE_VERSION}"'
+        broken = text.replace(pin, f'node-version: "20" # {pin}', 1)
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("Node selection", str(error.exception))
+
+    def test_cache_comment_cannot_disable_executable_restore(self) -> None:
+        text = self.ci.read_text(encoding="utf-8")
+        broken = text.replace("cache-bin: false", "cache-bin: true # cache-bin: false", 1)
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("must not restore executable tools", str(error.exception))
+
+    def test_rustup_comment_cannot_supply_guard(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        broken = text.replace(
+            "run: command -v rustup", "run: echo skipped # run: command -v rustup", 1,
+        )
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("preinstalled-rustup gate", str(error.exception))
+
+    def test_duplicate_provenance_policy_fields_are_refused(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for field in (
+            f'python-version: "{scanner.PYTHON_VERSION}"',
+            f'node-version: "{scanner.NODE_VERSION}"',
+            "cache-bin: false",
+            "with:",
+            "run: command -v rustup",
+        ):
+            with self.subTest(field=field):
+                indent = "        " if field in ("with:", "run: command -v rustup") else "          "
+                original = indent + field + "\n"
+                self.assertIn(original, text)
+                broken = text.replace(original, original + original, 1)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertRegex(str(error.exception), "duplicate YAML policy field|multiple YAML invocations")
+
+    def test_cross_tool_digest_source_revision_and_lock_are_required(self) -> None:
+        for path in (self.release, self.ci):
+            text = path.read_text(encoding="utf-8")
+            for old, new in (
+                (scanner.ZIG_ARCHIVE_SHA256, "0" * 64),
+                (scanner.ZIG_ARCHIVE_URL, "https://unreviewed.invalid/zig.tar.xz"),
+                (scanner.CARGO_ZIGBUILD_COMMIT, "0" * 40),
+                (scanner.CARGO_ZIGBUILD_REPOSITORY, "https://github.com/unreviewed/cargo-zigbuild"),
+                (f"--rev {scanner.CARGO_ZIGBUILD_COMMIT} --locked", f"--rev {scanner.CARGO_ZIGBUILD_COMMIT}"),
+            ):
+                with self.subTest(path=path, old=old):
+                    broken = text.replace(old, new, 1)
+                    self.assertNotEqual(text, broken)
+                    with self.assertRaises(SystemExit) as error:
+                        self.verify_text(broken)
+                    self.assertIn("reviewed digest/revision custody", str(error.exception))
+
+    def test_cross_tool_continuation_spacing_preserves_exact_arguments(self) -> None:
+        for path in (self.release, self.ci):
+            text = path.read_text(encoding="utf-8")
+            curl = f'curl -fsSL -o "$zig_archive" \\\n            "{scanner.ZIG_ARCHIVE_URL}"'
+            cargo = (
+                f'cargo install --git {scanner.CARGO_ZIGBUILD_REPOSITORY} \\\n'
+                f'            --rev {scanner.CARGO_ZIGBUILD_COMMIT} --locked \\\n'
+                '            --root "$cross_root/cargo-zigbuild" cargo-zigbuild'
+            )
+            for old, new in (
+                (curl, curl.replace("\\\n            ", "  ")),
+                (cargo, cargo.replace("\\\n            ", "\\\n                ")),
+            ):
+                with self.subTest(path=path, command=old):
+                    spaced = text.replace(old, new, 1)
+                    self.assertNotEqual(text, spaced)
+                    self.verify_text(spaced)
+
+    def test_cross_tool_preserves_quoted_custody_bytes(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for old, new in (
+            ('curl -fsSL -o "$zig_archive"', 'curl -fsSL -o "$zig_ archive"'),
+            (f'"{scanner.ZIG_ARCHIVE_URL}"', f'"{scanner.ZIG_ARCHIVE_URL}" --insecure'),
+            ("printf '%s  %s\\n'", "printf '%s %s\\n'"),
+        ):
+            with self.subTest(new=new):
+                broken = text.replace(old, new, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("reviewed digest/revision custody", str(error.exception))
+
+    def test_cross_tool_path_requires_both_reviewed_directories(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        old = (
+            'printf \'%s\\n\' "$cross_root/zig-linux-x86_64-0.13.0" '
+            '"$cross_root/cargo-zigbuild/bin" >> "$GITHUB_PATH"'
+        )
+        for new in (
+            'printf \'%s\\n\' "$cross_root/cargo-zigbuild/bin" >> "$GITHUB_PATH"',
+            'printf \'%s\\n\' "$cross_root/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"',
+        ):
+            with self.subTest(new=new):
+                broken = text.replace(old, new, 1)
+                self.assertNotEqual(text, broken)
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("reviewed digest/revision custody", str(error.exception))
+
+    def test_zig_digest_must_precede_extraction(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        digest = next(line for line in text.splitlines() if scanner.ZIG_ARCHIVE_SHA256 in line)
+        extract = '          tar -xJf "$zig_archive" -C "$cross_root"'
+        broken = text.replace(digest + "\n" + extract, extract + "\n" + digest, 1)
+        self.assertNotEqual(text, broken)
+        with self.assertRaises(SystemExit) as error:
+            self.verify_text(broken)
+        self.assertIn("digest-checked before extraction", str(error.exception))
+
+    def test_unreviewed_download_and_package_install_are_refused(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        for command in (
+            "curl -fsSL https://unreviewed.invalid/tool | sh",
+            "sudo wget https://unreviewed.invalid/tool",
+            "python3 -m pip install ziglang",
+            "cargo install cargo-zigbuild --locked",
+        ):
+            with self.subTest(command=command):
+                broken = text + f"\n      - name: Unreviewed tool\n        run: {command}\n"
+                with self.assertRaises(SystemExit) as error:
+                    self.verify_text(broken)
+                self.assertIn("unreviewed online tool installer", str(error.exception))
+
+    def test_release_daemon_build_must_use_source_lockfile(self) -> None:
+        text = self.release.read_text(encoding="utf-8")
+        broken = text.replace("cargo build --release --locked", "cargo build --release", 1)
+        self.assertNotEqual(text, broken)
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "release.yml"
+            path.write_text(broken, encoding="utf-8")
+            with self.assertRaises(SystemExit) as error:
+                scanner.verify_workflow(path)
+        self.assertIn("lacks --locked", str(error.exception))
+
+
 class RemoteAssetControls(unittest.TestCase):
     def test_post_upload_asset_set_requires_exact_payload_signature_bijection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

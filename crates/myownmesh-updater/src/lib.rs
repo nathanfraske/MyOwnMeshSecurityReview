@@ -38,6 +38,8 @@
 //! sequence in one invocation — check, download, verify, apply per artifact —
 //! mirroring MyOwnLLM's single `myownllm update` command.
 
+mod archive;
+mod bounded;
 mod policy;
 
 use std::hash::{BuildHasher, Hash, Hasher, RandomState};
@@ -326,7 +328,7 @@ fn apply_pending_at(
     if !pending.exists() {
         return Ok(None);
     }
-    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&pending)?)?;
+    let doc: Value = serde_json::from_slice(&bounded::file(&pending, bounded::MARKER_BYTES)?)?;
     let target_version = doc
         .get("version")
         .and_then(Value::as_str)
@@ -486,7 +488,7 @@ fn validate_staged_artifact(
             art.kind.as_str()
         )));
     };
-    let bytes: Box<[u8]> = std::fs::read(&staged)?.into_boxed_slice();
+    let bytes = bounded::file(&staged, bounded::ARTIFACT_BYTES)?.into_boxed_slice();
     let actual = sha256_bytes(&bytes);
     if !actual.eq_ignore_ascii_case(expected) {
         return Err(Error::msg(format!(
@@ -557,6 +559,9 @@ fn materialize_verified_binary(
             "raw artifact `{archive_name}` is empty"
         )))
     } else {
+        if archive_bytes.len() > bounded::BINARY_BYTES {
+            return Err(Error::msg("updater binary byte limit exceeded"));
+        }
         Ok(archive_bytes.to_vec().into_boxed_slice())
     }
 }
@@ -569,25 +574,8 @@ fn extract_verified_binary_bytes(
     archive_name: &str,
     binary_name: &str,
 ) -> Result<Box<[u8]>> {
-    let members = tar_output(archive_bytes, archive_name, "-tf")?;
-    let details = tar_output(archive_bytes, archive_name, "-tvf")?;
-    validate_archive_listing(&members, &details, binary_name)?;
-
-    let mut cmd = std::process::Command::new("tar");
-    cmd.arg("-xOf").arg("-").arg(binary_name);
-    let output = run_tar_with_bytes(cmd, archive_bytes, archive_name)?;
-    if !output.status.success() {
-        return Err(Error::msg(format!(
-            "tar exited with {} reading {} from {}",
-            output.status, binary_name, archive_name
-        )));
-    }
-    if output.stdout.is_empty() {
-        return Err(Error::msg(format!(
-            "archive member `{binary_name}` is empty"
-        )));
-    }
-    Ok(output.stdout.into_boxed_slice())
+    archive::extract(archive_bytes, binary_name)
+        .map_err(|error| Error::msg(format!("archive {archive_name} refused: {error}")))
 }
 
 /// Installed path a staged artifact replaces: the running executable for
@@ -1070,6 +1058,12 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
+        // Account encoded bytes directly even under feature unification.
+        // Release archives have their own separately bounded decompression.
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
         .https_only(true)
         .redirect(update_redirect_policy())
         .build()?)
@@ -1077,11 +1071,39 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
 
 async fn update_get(client: &reqwest::Client, url: &reqwest::Url) -> Result<reqwest::Response> {
     require_https(url)?;
-    let response = client.get(url.clone()).send().await?;
+    let response = client
+        .get(url.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+        .send()
+        .await?;
     // Check the final target before any body is consumed, in addition to
     // rejecting every insecure hop before the client follows it.
     require_https(response.url())?;
     Ok(response)
+}
+
+async fn bounded_response_body(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    if response
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .any(|encoding| !encoding.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err(Error::msg("updater HTTP Content-Encoding is unsupported"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(Error::msg(
+            "updater response Content-Length exceeds byte limit",
+        ));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        bounded::append(&mut bytes, &chunk, limit)?;
+    }
+    Ok(bytes)
 }
 
 async fn fetch_release(au: &AutoUpdateConfig) -> Result<Value> {
@@ -1094,7 +1116,8 @@ async fn fetch_release(au: &AutoUpdateConfig) -> Result<Value> {
             resp.status()
         )));
     }
-    let body: Value = resp.json().await?;
+    let body: Value =
+        serde_json::from_slice(&bounded_response_body(resp, bounded::FEED_BYTES).await?)?;
     if au.channel == "beta" {
         // `/releases` returns an array — pick the first non-draft.
         let arr = body
@@ -1586,6 +1609,9 @@ fn stage_verified_binary(
     updates_root: &Path,
     binary_name: &str,
 ) -> Result<(PathBuf, String)> {
+    if bytes.len() > bounded::BINARY_BYTES {
+        return Err(Error::msg("updater binary byte limit exceeded"));
+    }
     validate_safe_component(binary_name, "embedded binary name")?;
     ensure_staging_parent(destination_dir, updates_root)?;
     let destination = destination_dir.join(binary_name);
@@ -1816,20 +1842,27 @@ async fn download_verify_stage(
     let archive_path = updates_dir.join(&asset_name);
     let part_path = randomized_temp_path(updates_dir, ".myownmesh-download-", ".part");
 
-    let bytes = update_get(client, &urls.artifact)
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let bytes = bounded_response_body(
+        update_get(client, &urls.artifact)
+            .await?
+            .error_for_status()?,
+        bounded::ARTIFACT_BYTES,
+    )
+    .await?;
     write_exclusive_bytes(&part_path, &bytes)?;
     let mut part_guard = TempPathGuard::new(part_path.clone());
 
     // A checksum remains mandatory, with its URL checked before download.
-    let sha_text = update_get(client, &urls.checksum)
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
+    let sha_text = String::from_utf8(
+        bounded_response_body(
+            update_get(client, &urls.checksum)
+                .await?
+                .error_for_status()?,
+            bounded::CHECKSUM_BYTES,
+        )
+        .await?,
+    )
+    .map_err(|_| Error::msg("checksum sidecar is not UTF-8"))?;
     let expected = expected_sha_for(&sha_text, &asset_name)
         .ok_or_else(|| Error::msg(format!("checksum file lists no entry for {asset_name}")))?;
     let mut hasher = Sha256::new();
@@ -1853,11 +1886,14 @@ async fn download_verify_stage(
             let sig_url = urls.signature.as_ref().ok_or_else(|| {
                 Error::msg(format!("no signature for {asset_name}; refusing to stage"))
             })?;
-            let sig_text = update_get(client, sig_url)
-                .await?
-                .error_for_status()?
-                .text()
-                .await?;
+            let sig_text = String::from_utf8(
+                bounded_response_body(
+                    update_get(client, sig_url).await?.error_for_status()?,
+                    bounded::SIGNATURE_BYTES,
+                )
+                .await?,
+            )
+            .map_err(|_| Error::msg("signature sidecar is not UTF-8"))?;
             if let Err(e) = verify_signature(pubkey, &bytes, &sig_text) {
                 let _ = std::fs::remove_file(&part_path);
                 return Err(Error::msg(format!(
@@ -1878,14 +1914,14 @@ async fn download_verify_stage(
         return Err(Error::msg(format!("raw artifact `{asset_name}` is empty")));
     }
 
-    ensure_staging_parent(updates_dir, updates_root)?;
-    replace_staged_archive(&part_path, &archive_path)?;
-    part_guard.keep();
     let binary_bytes = if is_archive {
         extract_verified_binary_bytes(&bytes, &asset_name, kind.bin_name())?
     } else {
         bytes.to_vec().into_boxed_slice()
     };
+    ensure_staging_parent(updates_dir, updates_root)?;
+    replace_staged_archive(&part_path, &archive_path)?;
+    part_guard.keep();
     let (binary, binary_sha256) =
         stage_verified_binary(&binary_bytes, updates_dir, updates_root, kind.bin_name())?;
 
@@ -2049,15 +2085,7 @@ fn recover_marker_pair(pending: &Path, backup: &Path) -> Result<()> {
     Ok(())
 }
 
-/// If `archive` is a tar.gz / tgz / zip, extract via the system `tar`
-/// and return the path to the embedded `bin_name` (e.g. `myownmesh` or
-/// `myownmesh-gui`). If it's already a raw binary, return it unchanged.
-///
-/// Archives are preflighted before any destination path is touched. The
-/// release format is deliberately exact: one flat regular-file member whose
-/// name is exactly `bin_name`. Extraction occurs in a fresh sibling directory,
-/// followed by canonical regular-file and containment checks before the one
-/// expected file is moved into place.
+/// Test seam using the same bounded, filesystem-free parser as production.
 #[cfg(test)]
 fn extract_binary_if_archived(
     archive_bytes: &[u8],
@@ -2065,100 +2093,21 @@ fn extract_binary_if_archived(
     dest_dir: &Path,
     bin_name: &str,
 ) -> Result<PathBuf> {
-    let name = archive_name;
-    // Never treat a sidecar as the binary — a stale marker could point at
-    // one, and atomic replacement would clobber the live binary with it.
-    if is_sidecar_asset(name) {
-        return Err(Error::msg(format!(
-            "refusing to install sidecar `{name}` as the {bin_name} binary"
-        )));
+    if is_sidecar_asset(archive_name) {
+        return Err(Error::msg("refusing to install an archive sidecar"));
     }
-    let is_archive = name.ends_with(".tar.gz") || name.ends_with(".tgz") || name.ends_with(".zip");
-    if !is_archive {
-        return Ok(dest_dir.join(name));
-    }
-
-    let members = tar_output(archive_bytes, archive_name, "-tf")?;
-    let details = tar_output(archive_bytes, archive_name, "-tvf")?;
-    validate_archive_listing(&members, &details, bin_name)?;
-
-    let extract_dir = dest_dir.join(format!(".myownmesh-extract-{}", std::process::id()));
-    if extract_dir.exists() {
-        return Err(Error::msg(format!(
-            "refusing archive extraction into existing {}",
-            extract_dir.display()
-        )));
-    }
-    std::fs::create_dir(&extract_dir)?;
-    let mut extraction = ExtractionDirectory {
-        path: extract_dir.clone(),
-        keep: false,
-    };
-    let mut cmd = std::process::Command::new("tar");
-    cmd.arg("-xf").arg("-").arg("-C").arg(&extract_dir);
-    // When the updater runs inside a windowless process (the GUI, or a
-    // daemon it spawned hidden), a console child like `tar` would flash
-    // up its own console window on Windows; run it without one.
-    #[cfg(windows)]
+    if !(archive_name.ends_with(".tar.gz")
+        || archive_name.ends_with(".tgz")
+        || archive_name.ends_with(".zip"))
     {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        return Ok(dest_dir.join(archive_name));
     }
-    let output = run_tar_with_bytes(cmd, archive_bytes, archive_name)?;
-    if !output.status.success() {
-        return Err(Error::msg(format!(
-            "tar exited with {} extracting {}",
-            output.status, archive_name
-        )));
-    }
-    let extracted = extract_dir.join(bin_name);
-    let extracted_root = std::fs::canonicalize(&extract_dir)?;
-    let canonical = std::fs::canonicalize(&extracted)?;
-    if !canonical.starts_with(&extracted_root) {
-        return Err(Error::msg(format!(
-            "extracted archive member `{bin_name}` escapes its extraction root"
-        )));
-    }
-    let metadata = std::fs::symlink_metadata(&extracted)?;
-    if !metadata.file_type().is_file() {
-        return Err(Error::msg(format!(
-            "extracted archive member `{bin_name}` is not a regular file"
-        )));
-    }
-    let entries: Vec<_> = std::fs::read_dir(&extract_dir)?.collect::<std::io::Result<_>>()?;
-    if entries.len() != 1 {
-        return Err(Error::msg(format!(
-            "extracted archive contains unexpected files beside `{bin_name}`"
-        )));
-    }
-
-    let bin_path = dest_dir.join(bin_name);
-    if bin_path.exists() || std::fs::symlink_metadata(&bin_path).is_ok() {
-        let existing = std::fs::symlink_metadata(&bin_path)?;
-        if existing.file_type().is_symlink() || existing.file_type().is_dir() {
-            return Err(Error::msg(format!(
-                "extraction target `{bin_name}` collides with a non-file"
-            )));
-        }
-        std::fs::remove_file(&bin_path)?;
-    }
-    if let Err(error) = std::fs::rename(&extracted, &bin_path) {
-        return Err(error.into());
-    }
-    std::fs::remove_dir(&extract_dir)?;
-    extraction.keep = true;
-    let destination_root = std::fs::canonicalize(dest_dir)?;
-    let destination = std::fs::canonicalize(&bin_path)?;
-    if !destination.starts_with(&destination_root)
-        || !std::fs::symlink_metadata(&bin_path)?.file_type().is_file()
-    {
-        return Err(Error::msg(format!(
-            "extracted archive member `{bin_name}` failed final containment check"
-        )));
-    }
-    Ok(bin_path)
+    let bytes = extract_verified_binary_bytes(archive_bytes, archive_name, bin_name)?;
+    let root = std::fs::canonicalize(dest_dir)?;
+    Ok(stage_verified_binary(&bytes, &root, &root, bin_name)?.0)
 }
 
+#[cfg(test)]
 fn validate_archive_listing(members: &str, details: &str, bin_name: &str) -> Result<()> {
     let member_names: Vec<&str> = members
         .lines()
@@ -2184,64 +2133,6 @@ fn validate_archive_listing(members: &str, details: &str, bin_name: &str) -> Res
         )));
     }
     Ok(())
-}
-
-#[cfg(test)]
-struct ExtractionDirectory {
-    path: PathBuf,
-    keep: bool,
-}
-
-#[cfg(test)]
-impl Drop for ExtractionDirectory {
-    fn drop(&mut self) {
-        if !self.keep {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-}
-
-fn tar_output(archive_bytes: &[u8], archive_name: &str, listing: &str) -> Result<String> {
-    let mut cmd = std::process::Command::new("tar");
-    cmd.arg(listing).arg("-");
-    let output = run_tar_with_bytes(cmd, archive_bytes, archive_name)?;
-    if !output.status.success() {
-        return Err(Error::msg(format!(
-            "tar exited with {} inspecting {}",
-            output.status, archive_name
-        )));
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|_| Error::msg(format!("tar produced non-UTF-8 output for {archive_name}")))
-}
-
-fn run_tar_with_bytes(
-    mut cmd: std::process::Command,
-    archive_bytes: &[u8],
-    archive_name: &str,
-) -> Result<std::process::Output> {
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| Error::msg(format!("failed to run tar for {archive_name}: {e}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        if let Err(error) = stdin.write_all(archive_bytes) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::msg(format!(
-                "failed to feed archive bytes to tar for {archive_name}: {error}"
-            )));
-        }
-    }
-    Ok(child.wait_with_output()?)
 }
 
 // ---------------------------------------------------------------------------
@@ -2555,6 +2446,124 @@ mod tests {
         assert!(!updates.join("pm-detected.flag").exists());
         assert!(!updates.join("last-check").exists());
         assert!(!updates.join("pending.json").exists());
+    }
+
+    async fn budget_response_fixture(
+        wire: Vec<u8>,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (mut stream, peer) = listener.accept().await.unwrap();
+                assert!(peer.ip().is_loopback());
+                let mut request = [0; 1024];
+                let mut used = 0;
+                while !request[..used].windows(4).any(|part| part == b"\r\n\r\n") {
+                    assert!(used < request.len());
+                    let count = stream.read(&mut request[used..]).await.unwrap();
+                    assert!(count > 0);
+                    used += count;
+                }
+                let _ = stream.write_all(&wire).await;
+            })
+            .await
+            .expect("bounded response fixture terminal");
+        });
+        // Explicit local body-reader fixture only; production transport stays
+        // HTTPS-only and this client is never passed to staging or apply.
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .timeout(Duration::from_secs(2))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/body"))
+            .send()
+            .await
+            .unwrap();
+        (response, task)
+    }
+
+    #[tokio::test]
+    async fn updater_budget_response_declared_and_actual_body_limits() {
+        for limit in [
+            bounded::FEED_BYTES,
+            bounded::CHECKSUM_BYTES,
+            bounded::SIGNATURE_BYTES,
+            bounded::ARTIFACT_BYTES,
+        ] {
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                limit + 1
+            );
+            let (response, server) = budget_response_fixture(wire.into_bytes()).await;
+            let result = bounded_response_body(response, limit).await;
+            server.await.unwrap();
+            assert!(result.unwrap_err().to_string().contains("Content-Length"));
+        }
+        for (wire, succeeds) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfourmore".to_vec(), true),
+            (b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfourmore!".to_vec(), false),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nfour\r\n5\r\nmore!\r\n0\r\n\r\n".to_vec(), false),
+        ] {
+            let (response, server) = budget_response_fixture(wire).await;
+            let result = bounded_response_body(response, 8).await;
+            server.await.unwrap();
+            if succeeds { assert_eq!(result.unwrap(), b"fourmore"); }
+            else { assert!(result.unwrap_err().to_string().contains("byte limit")); }
+        }
+    }
+
+    #[tokio::test]
+    async fn updater_budget_http_content_encoding_is_refused() {
+        let (response, server) = budget_response_fixture(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\nConnection: close\r\n\r\nraw".to_vec()
+        ).await;
+        let result = bounded_response_body(response, 8).await;
+        server.await.unwrap();
+        assert!(result.unwrap_err().to_string().contains("Content-Encoding"));
+    }
+
+    #[test]
+    fn updater_budget_archive_refusal_keeps_target_and_cleans_owned_part() {
+        let root = tempfile::tempdir().unwrap();
+        let version = root.path().join("9999.0.0");
+        std::fs::create_dir(&version).unwrap();
+        let target = root.path().join("installed-sentinel");
+        std::fs::write(&target, b"unchanged").unwrap();
+        let metadata = vec![b'x'; 64 * 1024 + 1];
+        let raw = archive::tests::tar_fixture(&[
+            ("pax", &metadata, tar::EntryType::XHeader),
+            ("myownmesh", b"fixture", tar::EntryType::Regular),
+        ]);
+        let bytes = archive::tests::gzip(&raw);
+        let path = version.join("fixture.tar.gz");
+        write_exclusive_bytes(&path, &bytes).unwrap();
+        let part = version.join(".myownmesh-download-owned.part");
+        write_exclusive_bytes(&part, &bytes).unwrap();
+        let result = {
+            let _part_guard = TempPathGuard::new(part.clone());
+            let artifact = StagedArtifact {
+                kind: ArtifactKind::Daemon,
+                staged: path.clone(),
+                sha256: Some(sha256_bytes(&bytes)),
+            };
+            apply_one_with_target(&artifact, root.path(), "9999.0.0", Some(&target), || {})
+        };
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("metadata byte limit"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert!(!part.exists());
+        assert!(!root.path().join("pending.json").exists());
+        assert_eq!(std::fs::read_dir(&version).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -3400,15 +3409,10 @@ mod tests {
         let expected = b"original verified binary";
         std::fs::write(source_dir.join("myownmesh"), expected).expect("archive source binary");
         let archive = tmp.path().join("fixture.tar.gz");
-        let status = std::process::Command::new("tar")
-            .arg("-cf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&source_dir)
-            .arg("myownmesh")
-            .status()
-            .expect("system tar is available");
-        assert!(status.success(), "tar archive creation failed: {status}");
+        let member = std::fs::read(source_dir.join("myownmesh")).unwrap();
+        let fixture =
+            archive::tests::tar_fixture(&[("myownmesh", &member, tar::EntryType::Regular)]);
+        std::fs::write(&archive, fixture).expect("write bounded archive fixture");
 
         let captured: Box<[u8]> = std::fs::read(&archive)
             .expect("capture the verified archive bytes")
@@ -3437,15 +3441,10 @@ mod tests {
         std::fs::create_dir(&source_dir).expect("archive source directory");
         std::fs::File::create(source_dir.join("myownmesh")).expect("empty archive source");
         let archive = tmp.path().join("empty.tar.gz");
-        let status = std::process::Command::new("tar")
-            .arg("-cf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&source_dir)
-            .arg("myownmesh")
-            .status()
-            .expect("system tar is available");
-        assert!(status.success(), "tar archive creation failed: {status}");
+        let member = std::fs::read(source_dir.join("myownmesh")).unwrap();
+        let fixture =
+            archive::tests::tar_fixture(&[("myownmesh", &member, tar::EntryType::Regular)]);
+        std::fs::write(&archive, fixture).expect("write bounded archive fixture");
 
         let captured = std::fs::read(&archive).expect("capture empty archive bytes");
         assert!(
@@ -3470,15 +3469,10 @@ mod tests {
         std::fs::write(outside_dir.join("myownmesh"), b"outside sentinel")
             .expect("outside sentinel");
         let archive = version_dir.join("fixture.tar.gz");
-        let status = std::process::Command::new("tar")
-            .arg("-cf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&source_dir)
-            .arg("myownmesh")
-            .status()
-            .expect("system tar is available");
-        assert!(status.success(), "tar archive creation failed: {status}");
+        let member = std::fs::read(source_dir.join("myownmesh")).unwrap();
+        let fixture =
+            archive::tests::tar_fixture(&[("myownmesh", &member, tar::EntryType::Regular)]);
+        std::fs::write(&archive, fixture).expect("write bounded archive fixture");
         let artifact = StagedArtifact {
             kind: ArtifactKind::Daemon,
             staged: archive,

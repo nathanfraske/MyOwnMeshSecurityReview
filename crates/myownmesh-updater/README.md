@@ -39,6 +39,36 @@ an unresolved staged GUI replacement remains pending for a later launch.
 Headless installs update only the daemon. Full desktop bundles remain owned
 by their installers and are not interchangeable with portable GUI archives.
 
+## Input and archive ceilings
+
+Every network body is read incrementally. Advertised oversized lengths are
+refused before the body is read; missing or dishonest lengths do not bypass
+the actual-byte limit. The fixed ceilings per request are 4 MiB for release
+JSON, 1 MiB for checksums, 64 KiB for detached signatures, and 256 MiB for an
+encoded artifact. HTTP content encoding is disabled and non-identity encoded
+responses are refused; archive decompression is a separate bounded step.
+Existing configured request deadlines cover each whole response, including
+its body. Feed, artifact, sidecar, and redirect targets must all use HTTPS.
+
+Staged-file snapshots and extracted executables are limited to 256 MiB. Tar
+streams (including concatenated gzip members and trailing padding) have a
+272 MiB total decompressed ceiling; at most 16 raw headers and 64 KiB total
+GNU long-name/local PAX metadata are allowed. ZIP central-directory metadata
+and comments are each limited to 64 KiB, with a single entry required before
+the directory parser allocates its map. ZIP64 directories, encryption, links, sparse or
+extra files, and non-flat executable names are refused. Release ZIPs support
+stored and deflated data; tar, gzip-tar, and the existing raw executable path
+remain supported. An archive must contain one nonempty regular executable.
+
+The archive reader shares one 30-second absolute deadline across inspection
+and materialization, checked before and after reads/seeks. This is a
+cooperative in-process deadline, not OS-enforced CPU/RSS isolation. Parsing
+writes no files and spawns no processes: there are no tar stdin/stdout/stderr
+pipes, output collectors, or child termination obligations. A refused archive
+does not publish its download part or replace an installed executable.
+These ceilings bound retained input/output bytes, not exact allocator or
+dependency memory use; the existing operation residual remains in force.
+
 ## CLI
 
 The daemon stages updates in the background; drive it by hand with:

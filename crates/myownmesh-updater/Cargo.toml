@@ -29,6 +29,9 @@ hex = { workspace = true }
 # verify-only — no signing in the client. Activated when a release public key
 # is baked in at build time (see `RELEASE_PUBKEY`).
 minisign-verify = "0.2"
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4.46", default-features = false }
+zip = { version = "4.6.1", default-features = false, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

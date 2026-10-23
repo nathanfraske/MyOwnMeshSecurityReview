@@ -61,6 +61,33 @@ RELEASE_TAG = re.compile(
     r"(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
+# Resolved from each official repository's existing major/version ref on
+# 2026-10-23; action.yml was inspected at these commits (including the Rust
+# installer's embedded 1.88.0 and its live-bootstrap fallback). Review updates
+# at https://github.com/<repository>/commit/<sha>; never resolve tags in CI.
+ACTION_COMMITS = {
+    "actions/checkout": "11d5960a326750d5838078e36cf38b85af677262",
+    "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
+    "dtolnay/rust-toolchain": "360a4e93673de6630fac2478bc9e35244b01a759",
+    "Swatinem/rust-cache": "d1527c8f67ef9af357290475d4af4b0fab8f12e0",
+    "pnpm/action-setup": "b906affcce14559ad1aafd4ab0e942779e9f58b1",
+    "actions/setup-node": "49933ea5288caeca8642d1e84afbd3f7d6820020",
+    "tauri-apps/tauri-action": "84b9d35b5fc46c1e45415bdb6144030364f7ebc5",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02",
+    "softprops/action-gh-release": "3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+    "actions/download-artifact": "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+}
+# These are exact selection policies, not binary digest attestations. The
+# hosted image, rustup/distribution infrastructure, Node/Python downloads,
+# pnpm bootstrap, OS packages, caches and protected signer remain trust roots.
+PYTHON_VERSION = "3.13.17"  # python/cpython v3.13.17, 64e080d38154391ff2d2caa1161c298bb7cd8f30
+NODE_VERSION = "20.20.2"  # nodejs/node v20.20.2, 3626fea570e44896ad99aaf3bf6e59def5adede5
+ZIG_ARCHIVE_URL = "https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz"
+# Official x86_64-linux digest: https://ziglang.org/download/index.json, 0.13.0.
+ZIG_ARCHIVE_SHA256 = "d45312e61ebcc48032b77bc4cf7fd6915c11fa16e4aad116b66c9468211230ea"
+CARGO_ZIGBUILD_REPOSITORY = "https://github.com/rust-cross/cargo-zigbuild"
+# Official v0.20.1 commit; Cargo.toml declares Rust 1.74 and includes Cargo.lock.
+CARGO_ZIGBUILD_COMMIT = "bbb57ac6a5eb90f53617a5c218fda03080599e4a"
 
 
 def fail(message: str) -> None:
@@ -662,6 +689,242 @@ def verify_tag_shell_boundary(path: pathlib.Path, text: str) -> None:
             fail(f"release workflow interpolates tag data into shell source: {path}")
 
 
+def reviewed_action(repository: str) -> str:
+    return f"{repository}@{ACTION_COMMITS[repository]}"
+
+
+def workflow_invocations(
+    path: pathlib.Path, text: str,
+) -> tuple[list[tuple[int, str, str]], set[int]]:
+    """Inventory executable YAML keys in the supported block-mapping syntax.
+
+    This is deliberately not a general YAML parser. Reject alternate mappings,
+    aliases and flow objects rather than silently losing invocation coverage.
+    Literal/folded scalar contents (shell scripts, upload paths) are data.
+    """
+    invocations: list[tuple[int, str, str]] = []
+    step_starts: set[int] = set()
+    scalar_indent: int | None = None
+    inside_steps = False
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        current_offset = offset
+        offset += len(line)
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent_text = line[:len(line) - len(line.lstrip())]
+        indent = len(indent_text)
+        if scalar_indent is not None and indent > scalar_indent:
+            continue
+        scalar_indent = None
+        if indent <= 4:
+            inside_steps = False
+        if "\t" in indent_text:
+            fail(f"unsupported YAML indentation in provenance policy: {path}")
+        # Expressions are scalar values; their braces are not YAML flow maps.
+        metadata = re.sub(r"\$\{\{.*?\}\}", "expression", stripped)
+        if (
+            metadata.startswith(("---", "...", "%", "? ", ": ", "<<:"))
+            or re.match(r"^(?:-\s+)?[\"']", metadata)
+            or re.search(r"(?:^|[\s:,\[{])(?:[&*][A-Za-z_]|!!|!<)", metadata)
+        ):
+            fail(f"unsupported YAML mapping/alias in provenance policy: {path}")
+        matrix_row = False
+        if "{" in metadata or "}" in metadata:
+            # The only current flow mappings are fixed platform matrix rows.
+            if re.fullmatch(
+                r"-\s*\{\s*name:\s*[A-Za-z0-9_-]+,\s*os:\s*[A-Za-z0-9_.-]+"
+                r"(?:,\s*target:\s*[A-Za-z0-9_-]+)?\s*\}\s*(?:#.*)?",
+                metadata,
+            ) is None:
+                fail(f"unsupported YAML flow mapping in provenance policy: {path}")
+            matrix_row = True
+        field = re.match(r"^( *)(- +)?([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*)$", line.rstrip())
+        if field is None:
+            if not matrix_row and re.fullmatch(r"-\s+[A-Za-z0-9_.-]+\s*(?:#.*)?", metadata) is None:
+                fail(f"unsupported YAML syntax in provenance policy: {path}")
+            continue
+        key_indent = len(field.group(1)) + len(field.group(2) or "")
+        key, value = field.group(3), field.group(4)
+        if key in ("jobs", "steps") and value and not value.startswith("#"):
+            fail(f"unsupported YAML jobs/steps value in provenance policy: {path}")
+        if key == "steps":
+            if key_indent != 4:
+                fail(f"unsupported YAML steps location in provenance policy: {path}")
+            inside_steps = True
+        if inside_steps and indent == 6 and field.group(2):
+            step_starts.add(current_offset)
+        if key in ("uses", "run"):
+            if key_indent != 8 or not inside_steps:
+                fail(f"uncovered YAML {key} invocation in provenance policy: {path}")
+            invocations.append((current_offset, key, value))
+        if re.fullmatch(r"[|>][-+]?\s*(?:#.*)?", value):
+            scalar_indent = key_indent
+    return invocations, step_starts
+
+
+def workflow_step_fields(
+    path: pathlib.Path, step: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Read active step/with fields, never comments or block-scalar contents.
+
+    Invocation coverage has already constrained the YAML syntax. Keep values
+    raw so policy checks can require complete literals, not substring decoys.
+    Duplicate mappings are ambiguous and must not select a policy value.
+    """
+    fields: dict[str, str] = {}
+    inputs: dict[str, str] = {}
+    inside_with = False
+    scalar_indent: int | None = None
+    for line in step.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if scalar_indent is not None and indent > scalar_indent:
+            continue
+        scalar_indent = None
+        field = re.match(r"^( *)(- +)?([A-Za-z_][A-Za-z0-9_-]*)[ \t]*:[ \t]*(.*)$", line)
+        if field is None:
+            continue
+        key_indent = len(field.group(1)) + len(field.group(2) or "")
+        key, value = field.group(3), field.group(4)
+        mapping: dict[str, str] | None = None
+        if key_indent == 8:
+            mapping = fields
+            inside_with = key == "with" and (not value or value.startswith("#"))
+        elif key_indent == 10 and inside_with:
+            mapping = inputs
+        if mapping is not None:
+            if key in mapping:
+                fail(f"duplicate YAML policy field {key}: {path}")
+            mapping[key] = value
+        if re.fullmatch(r"[|>][-+]?\s*(?:#.*)?", value):
+            scalar_indent = key_indent
+    return fields, inputs
+
+
+def workflow_literal_matches(value: str, expected: str) -> bool:
+    """Accept only the complete plain/quoted literal, plus a YAML comment."""
+    literal = re.escape(expected)
+    return re.fullmatch(
+        rf"(?:{literal}|'{literal}'|\"{literal}\")(?:[ \t]+#.*)?[ \t]*", value,
+    ) is not None
+
+
+def verify_workflow_provenance(path: pathlib.Path) -> None:
+    """Check reviewed source pins; this does not attest builders or isolate keys."""
+    text = path.read_text(encoding="utf-8")
+    invocations, step_starts = workflow_invocations(path, text)
+    matches = [
+        match for match in re.finditer(
+            r"(?ms)^      - .*?(?=^      - |^  [A-Za-z0-9_-]+:|\Z)", text
+        ) if match.start() in step_starts
+    ]
+    if not matches or not any(key == "uses" for _, key, _ in invocations):
+        fail(f"workflow provenance requires covered step invocations: {path}")
+    covered: set[int] = set()
+    steps = [match.group() for match in matches]
+    parsed_steps: list[tuple[dict[str, str], dict[str, str]]] = []
+    for index, (match, step) in enumerate(zip(matches, steps)):
+        declarations = [item for item in invocations if match.start() <= item[0] < match.end()]
+        if len(declarations) != 1:
+            fail(f"uncovered or multiple YAML invocations in step: {path}")
+        parsed_steps.append(workflow_step_fields(path, step))
+        position, kind, value = declarations[0]
+        covered.add(position)
+        if kind == "uses":
+            literal = re.fullmatch(r"([^\s#'\"]+)(?:\s+#.*)?", value)
+            if literal is None:
+                fail(f"unsupported YAML Action reference in provenance policy: {path}")
+            reference = literal.group(1)
+            repository, separator, commit = reference.partition("@")
+            if not separator or ACTION_COMMITS.get(repository) != commit:
+                fail(f"unreviewed or mutable Action reference {reference}: {path}")
+            _, inputs = parsed_steps[index]
+            if repository == "dtolnay/rust-toolchain":
+                guard = parsed_steps[index - 1][0] if index > 0 else {}
+                # The command must run unconditionally and its failure must
+                # stop the installer, not merely exist in the YAML.
+                if (
+                    "if" in guard or "continue-on-error" in guard
+                    or re.fullmatch(
+                        r"command -v rustup(?:[ \t]+#.*)?[ \t]*",
+                        guard.get("run", ""),
+                    ) is None
+                ):
+                    fail(f"Rust installer lacks preinstalled-rustup gate: {path}")
+            if repository == "actions/setup-python":
+                if not workflow_literal_matches(inputs.get("python-version", ""), PYTHON_VERSION):
+                    fail(f"Python selection is not pinned to {PYTHON_VERSION}: {path}")
+            if repository == "actions/setup-node":
+                if not workflow_literal_matches(inputs.get("node-version", ""), NODE_VERSION):
+                    fail(f"Node selection is not pinned to {NODE_VERSION}: {path}")
+            if repository == "Swatinem/rust-cache" and not workflow_literal_matches(
+                inputs.get("cache-bin", ""), "false",
+            ):
+                fail(f"Rust cache must not restore executable tools: {path}")
+            if repository == "tauri-apps/tauri-action":
+                if re.search(
+                    r"(?m)^          args: --target \$\{\{ matrix\.platform\.target \}\} -- --locked[ \t]*$",
+                    step,
+                ) is None:
+                    fail(f"Tauri build must forward Cargo --locked after --: {path}")
+
+        # Bash removes the escaped newline, not surrounding whitespace. Keep
+        # indentation and quoted bytes intact; command patterns below permit
+        # horizontal whitespace only between the fixed, reviewed arguments.
+        logical = step.replace("\\\n", "")
+        downloads = [
+            line for line in logical.splitlines()
+            if not line.lstrip().startswith("#")
+            and re.search(r"\b(?:curl|wget|pip\S* install|cargo install)\b", line)
+        ]
+        if not downloads:
+            continue
+        if step.startswith("      - name: Install minisign\n"):
+            # The release-specific verifier checks this archive and its order.
+            continue
+        if not step.startswith("      - name: Install Zig + cargo-zigbuild\n"):
+            fail(f"unreviewed online tool installer in workflow: {path}")
+        digest_check = (
+            f'printf \'%s  %s\\n\' "{ZIG_ARCHIVE_SHA256}" "$zig_archive" '
+            "| sha256sum --check"
+        )
+        extract = 'tar -xJf "$zig_archive" -C "$cross_root"'
+        required = (
+            'set -euo pipefail',
+            'cross_root="$(mktemp -d "$RUNNER_TEMP/myownmesh-cross-tools.XXXXXX")"',
+            digest_check,
+            extract,
+            'printf \'%s\\n\' "$cross_root/zig-linux-x86_64-0.13.0" '
+            '"$cross_root/cargo-zigbuild/bin" >> "$GITHUB_PATH"',
+        )
+        curl_command = (
+            r'(?m)^[ \t]*curl[ \t]+-fsSL[ \t]+-o[ \t]+"\$zig_archive"[ \t]+'
+            + re.escape(f'"{ZIG_ARCHIVE_URL}"') + r'[ \t]*$'
+        )
+        cargo_command = (
+            r'(?m)^[ \t]*cargo[ \t]+install[ \t]+--git[ \t]+'
+            + re.escape(CARGO_ZIGBUILD_REPOSITORY)
+            + r'[ \t]+--rev[ \t]+' + re.escape(CARGO_ZIGBUILD_COMMIT)
+            + r'[ \t]+--locked[ \t]+--root[ \t]+"\$cross_root/cargo-zigbuild"'
+            + r'[ \t]+cargo-zigbuild[ \t]*$'
+        )
+        if (
+            any(fragment not in logical for fragment in required)
+            or re.search(curl_command, logical) is None
+            or re.search(cargo_command, logical) is None
+        ):
+            fail(f"cross-tool installer lacks reviewed digest/revision custody: {path}")
+        if logical.index(digest_check) >= logical.index(extract):
+            fail(f"Zig archive must be digest-checked before extraction: {path}")
+        if len(downloads) != 2:
+            fail(f"cross-tool installer contains an unreviewed download: {path}")
+    if covered != {position for position, _, _ in invocations}:
+        fail(f"uncovered YAML invocation in provenance policy: {path}")
+
+
 def verify_workflow(path: pathlib.Path) -> None:
     text = path.read_text(encoding="utf-8")
     verify_tag_shell_boundary(path, text)
@@ -754,6 +1017,8 @@ def verify_workflow(path: pathlib.Path) -> None:
     preflight = jobs.get("prepare-release", "")
     if not preflight:
         fail(f"release workflow has no source-owned prepare-release job: {path}")
+    if "--ci-workflow .github/workflows/ci.yml" not in jobs.get("release-gates", ""):
+        fail(f"release gates do not verify CI provenance policy: {path}")
     for required in (
         "--preflight-release",
         "--tag",
@@ -792,9 +1057,9 @@ def verify_workflow(path: pathlib.Path) -> None:
         fail(f"release workflow does not re-resolve the exact tag before publish: {path}")
     if "--asset-allowlist" not in text or "--write-asset-manifest" not in text:
         fail(f"release workflow lacks source-owned release asset allowlists: {path}")
-    if "actions/download-artifact@v4" not in text:
+    if reviewed_action("actions/download-artifact") not in text:
         fail(f"release workflow does not retrieve build-owned asset allowlists: {path}")
-    if "actions/upload-artifact@v4" not in text:
+    if reviewed_action("actions/upload-artifact") not in text:
         fail(f"release workflow does not publish build-owned asset allowlists: {path}")
     if "MYOWNMESH_RELEASE_PUBKEY" not in text or "MINISIGN_PUBLIC_KEY" not in text:
         fail(f"release workflow does not bind artifacts to the publication key: {path}")
@@ -870,6 +1135,8 @@ def verify_workflow(path: pathlib.Path) -> None:
             )
             if release_build and "--no-default-features" not in line:
                 fail(f"release daemon build at {path}:{line_number} lacks --no-default-features")
+            if release_build and "--locked" not in line:
+                fail(f"release daemon build at {path}:{line_number} lacks --locked")
             if release_build and (
                 "MYOWNMESH_RELEASE_PUBKEY" not in body
                 or "--release-public-key" not in body
@@ -912,6 +1179,7 @@ def verify_workflow(path: pathlib.Path) -> None:
                 fail(f"final publish step lacks immediate verification: {required}")
     if "signing/minisign.key" in text:
         fail(f"release workflow places the minisign secret in the payload tree: {path}")
+    verify_workflow_provenance(path)
 
 
 def verify_manifest(path: pathlib.Path) -> None:
@@ -944,6 +1212,7 @@ def main() -> None:
         help="exact regular-file member required in --archive (repeatable)",
     )
     parser.add_argument("--workflow", type=pathlib.Path)
+    parser.add_argument("--ci-workflow", type=pathlib.Path)
     parser.add_argument("--manifest", type=pathlib.Path)
     parser.add_argument("--signature-tree", type=pathlib.Path)
     parser.add_argument("--public-key")
@@ -975,6 +1244,7 @@ def main() -> None:
             args.archive,
             args.tree,
             args.workflow,
+            args.ci_workflow,
             args.manifest,
             args.signature_tree,
             args.verify_release_assets,
@@ -1001,6 +1271,8 @@ def main() -> None:
         write_asset_manifest(args.tree, args.write_asset_manifest)
     if args.workflow:
         verify_workflow(args.workflow)
+    if args.ci_workflow:
+        verify_workflow_provenance(args.ci_workflow)
     if args.manifest:
         verify_manifest(args.manifest)
     if args.verify_release_assets:
