@@ -678,15 +678,41 @@ fn systemd_quote(path: &str) -> String {
     }
 }
 
-/// Render a single `Environment=` assignment, quoting the whole `KEY=value`
-/// when the value contains whitespace (otherwise systemd would treat the
-/// remainder as a second variable).
+/// Render one `Environment=` assignment. Quote and escape values that could
+/// otherwise change the directive's boundaries or syntax.
 fn systemd_env(key: &str, value: &str) -> String {
-    if value.contains(char::is_whitespace) {
-        format!("\"{key}={value}\"")
-    } else {
-        format!("{key}={value}")
+    if !value.chars().any(|character| {
+        character.is_whitespace()
+            || character.is_control()
+            || matches!(character, '\\' | '"' | '\'' | '%')
+    }) {
+        return format!("{key}={value}");
     }
+
+    let mut rendered = String::with_capacity(key.len() + value.len() + 2);
+    rendered.push('"');
+    rendered.push_str(key);
+    rendered.push('=');
+    for character in value.chars() {
+        match character {
+            '\\' => rendered.push_str("\\\\"),
+            '"' => rendered.push_str("\\\""),
+            '%' => rendered.push_str("%%"),
+            '\n' => rendered.push_str("\\n"),
+            '\r' => rendered.push_str("\\r"),
+            '\t' => rendered.push_str("\\t"),
+            character if character.is_control() => {
+                let mut encoded = [0; 4];
+                for byte in character.encode_utf8(&mut encoded).as_bytes() {
+                    use std::fmt::Write as _;
+                    write!(rendered, "\\x{byte:02x}").expect("writing to String cannot fail");
+                }
+            }
+            character => rendered.push(character),
+        }
+    }
+    rendered.push('"');
+    rendered
 }
 
 fn render_launchd_plist(exec: &Path, env: &[(String, String)], log_path: &Path) -> String {
@@ -1037,6 +1063,48 @@ mod tests {
         );
         assert!(unit.contains("ExecStart=\"/opt/My Apps/myownmesh\" serve"));
         assert!(unit.contains("Environment=\"MYOWNMESH_HOME=/home/u/My Mesh\""));
+    }
+
+    #[test]
+    fn systemd_env_escapes_directive_injection_and_controls() {
+        let malicious = "info\"'100%\n[Service]\nExecStart=/bin/sh -c evil\\tail\r\t";
+        let unit = render_systemd_unit(
+            Path::new("/usr/local/bin/myownmesh"),
+            Scope::System,
+            &env(&[("MYOWNMESH_LOG", malicious)]),
+        );
+        let environment_lines = unit
+            .lines()
+            .filter(|line| line.starts_with("Environment="))
+            .collect::<Vec<_>>();
+        assert_eq!(environment_lines.len(), 1);
+        assert_eq!(
+            environment_lines[0],
+            "Environment=\"MYOWNMESH_LOG=info\\\"'100%%\\n[Service]\\nExecStart=/bin/sh -c evil\\\\tail\\r\\t\""
+        );
+        assert_eq!(
+            unit.lines()
+                .filter(|line| line.starts_with("ExecStart="))
+                .count(),
+            1
+        );
+        assert_eq!(unit.lines().filter(|line| *line == "[Service]").count(), 1);
+    }
+
+    #[test]
+    fn systemd_env_preserves_unmatched_apostrophe() {
+        assert_eq!(
+            systemd_env("MYOWNMESH_LOG", "O'Brien"),
+            "\"MYOWNMESH_LOG=O'Brien\""
+        );
+    }
+
+    #[test]
+    fn systemd_env_preserves_balanced_apostrophes() {
+        assert_eq!(
+            systemd_env("MYOWNMESH_LOG", "before'quoted'after"),
+            "\"MYOWNMESH_LOG=before'quoted'after\""
+        );
     }
 
     // ---- launchd plist rendering ----

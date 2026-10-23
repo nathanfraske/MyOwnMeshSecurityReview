@@ -815,6 +815,14 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
             "auto_update.artifact_download_timeout_ms must be non-zero",
         ));
     }
+    for url in [stable_url.as_deref(), beta_url.as_deref()]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        update_url(url)?;
+    }
 
     MeshConfig::transaction(|cfg| {
         let au = &mut cfg.auto_update;
@@ -843,6 +851,8 @@ pub fn set_prefs(prefs: UpdatePrefs) -> Result<UpdateStatus> {
             au.beta_url = normalise_url_override(v);
         }
         au.validate()?;
+        validate_release_feed_urls(au)
+            .map_err(|error| myownmesh_core::Error::Config(error.to_string()))?;
         Ok(())
     })?;
     status()
@@ -927,10 +937,13 @@ fn load_valid_auto_update() -> Result<AutoUpdateConfig> {
     let path = myownmesh_core::dirs::config_path()?;
     if path.exists() {
         let raw = std::fs::read_to_string(&path)?;
-        let _: MeshConfig = serde_json::from_str(&raw)?;
+        let parsed: MeshConfig = serde_json::from_str(&raw)?;
+        parsed.auto_update.validate()?;
+        validate_release_feed_urls(&parsed.auto_update)?;
     }
     let au = load_auto_update()?;
     au.validate()?;
+    validate_release_feed_urls(&au)?;
     Ok(au)
 }
 
@@ -1016,17 +1029,65 @@ fn mark_pm_detected() {
 // Release fetch.
 // ---------------------------------------------------------------------------
 
+fn require_https(url: &reqwest::Url) -> Result<()> {
+    if url.scheme() != "https" || url.host_str().is_none() {
+        return Err(Error::msg("self-update URLs must use HTTPS"));
+    }
+    Ok(())
+}
+
+fn update_url(raw: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).map_err(|_| Error::msg("invalid self-update URL"))?;
+    require_https(&url)?;
+    Ok(url)
+}
+
+fn validate_release_feed_urls(au: &AutoUpdateConfig) -> Result<()> {
+    for url in [au.stable_url.as_deref(), au.beta_url.as_deref()]
+        .into_iter()
+        .flatten()
+        .filter(|url| !url.is_empty())
+    {
+        update_url(url)?;
+    }
+    // Also check the selected build-time fallback, which need not be GitHub.
+    update_url(&resolve_release_url(au))?;
+    Ok(())
+}
+
+fn update_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if require_https(attempt.url()).is_err() {
+            attempt.error("self-update redirects must use HTTPS")
+        } else {
+            // Keep reqwest's existing finite redirect-chain limit.
+            reqwest::redirect::Policy::default().redirect(attempt)
+        }
+    })
+}
+
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(timeout)
+        .https_only(true)
+        .redirect(update_redirect_policy())
         .build()?)
 }
 
+async fn update_get(client: &reqwest::Client, url: &reqwest::Url) -> Result<reqwest::Response> {
+    require_https(url)?;
+    let response = client.get(url.clone()).send().await?;
+    // Check the final target before any body is consumed, in addition to
+    // rejecting every insecure hop before the client follows it.
+    require_https(response.url())?;
+    Ok(response)
+}
+
 async fn fetch_release(au: &AutoUpdateConfig) -> Result<Value> {
-    let url = resolve_release_url(au);
+    let url = update_url(&resolve_release_url(au))?;
     let client = http_client(au.feed_request_timeout()?)?;
-    let resp = client.get(&url).send().await?;
+    let resp = update_get(&client, &url).await?;
     if !resp.status().is_success() {
         return Err(Error::msg(format!(
             "release feed {url} returned {}",
@@ -1571,18 +1632,33 @@ async fn stage_release(
         .ok_or_else(|| Error::msg("release missing assets"))?;
 
     validate_safe_component(version, "release version")?;
+    let daemon_asset = if want.contains(&ArtifactKind::Daemon) {
+        Some(pick_daemon_asset(assets).ok_or_else(|| {
+            Error::msg(format!(
+                "no daemon release asset matches this platform ({})",
+                current_platform()
+            ))
+        })?)
+    } else {
+        None
+    };
+    let gui_asset = if want.contains(&ArtifactKind::Gui) {
+        pick_gui_asset(assets)
+    } else {
+        None
+    };
+    // Transport policy applies to the entire selected bundle. An optional
+    // GUI must not reveal an insecure URL after the daemon is already staged.
+    for asset in [daemon_asset, gui_asset].into_iter().flatten() {
+        preflight_selected_asset_urls(assets, asset)?;
+    }
+
     let (updates_root, updates_dir) = prepare_staging_version_dir(version)?;
     let client = http_client(au.artifact_download_timeout()?)?;
 
     let mut staged: Vec<StagedArtifact> = Vec::new();
 
-    if want.contains(&ArtifactKind::Daemon) {
-        let daemon_asset = pick_daemon_asset(assets).ok_or_else(|| {
-            Error::msg(format!(
-                "no daemon release asset matches this platform ({})",
-                current_platform()
-            ))
-        })?;
+    if let Some(daemon_asset) = daemon_asset {
         let (daemon_bin, daemon_sha256) = download_verify_stage(
             &client,
             assets,
@@ -1600,7 +1676,7 @@ async fn stage_release(
     }
 
     if want.contains(&ArtifactKind::Gui) {
-        match pick_gui_asset(assets) {
+        match gui_asset {
             Some(gui_asset) => {
                 match download_verify_stage(
                     &client,
@@ -1645,6 +1721,79 @@ async fn stage_release(
     Ok(kinds)
 }
 
+struct UpdateDownloadUrls {
+    artifact: reqwest::Url,
+    checksum: reqwest::Url,
+    signature: Option<reqwest::Url>,
+}
+
+fn preflight_selected_asset_urls(assets: &[Value], asset: &Value) -> Result<()> {
+    let name = asset["name"]
+        .as_str()
+        .ok_or_else(|| Error::msg("asset missing name"))?;
+    for selected in [
+        Some(asset),
+        pick_sha_asset(assets, name),
+        pick_sig_asset(assets, name),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(url) = selected["browser_download_url"].as_str() {
+            update_url(url)?;
+        }
+    }
+    // Missing metadata still follows the existing per-artifact refusal path,
+    // including GUI best effort. Every present URL is a bundle-wide policy.
+    Ok(())
+}
+
+/// Preflight all selected URLs before fetching even the artifact. A secure
+/// artifact URL must not conceal a plaintext checksum or signature source.
+fn update_download_urls(
+    assets: &[Value],
+    asset: &Value,
+    require_signature: bool,
+) -> Result<UpdateDownloadUrls> {
+    let name = asset["name"]
+        .as_str()
+        .ok_or_else(|| Error::msg("asset missing name"))?;
+    let artifact = update_url(
+        asset["browser_download_url"]
+            .as_str()
+            .ok_or_else(|| Error::msg("asset missing browser_download_url"))?,
+    )?;
+    let sha_asset = pick_sha_asset(assets, name).ok_or_else(|| {
+        Error::msg(format!(
+            "no checksum sidecar for {name}; refusing to stage unverified"
+        ))
+    })?;
+    let checksum = update_url(
+        sha_asset["browser_download_url"]
+            .as_str()
+            .ok_or_else(|| Error::msg("sha asset missing url"))?,
+    )?;
+    let signature = pick_sig_asset(assets, name)
+        .map(|sig_asset| {
+            update_url(
+                sig_asset["browser_download_url"]
+                    .as_str()
+                    .ok_or_else(|| Error::msg("signature asset missing url"))?,
+            )
+        })
+        .transpose()?;
+    if require_signature && signature.is_none() {
+        return Err(Error::msg(format!(
+            "no signature for {name}; refusing to stage"
+        )));
+    }
+    Ok(UpdateDownloadUrls {
+        artifact,
+        checksum,
+        signature,
+    })
+}
+
 /// Download one release asset, SHA-256-verify it against its sidecar (or
 /// `SHA256SUMS`), and extract the embedded `kind` binary. Returns the
 /// path of the verified executable. Does NOT write `pending.json`.
@@ -1656,22 +1805,18 @@ async fn download_verify_stage(
     asset: &Value,
     kind: ArtifactKind,
 ) -> Result<(PathBuf, String)> {
-    let dl_url = asset["browser_download_url"]
-        .as_str()
-        .ok_or_else(|| Error::msg("asset missing browser_download_url"))?;
     let asset_name = asset["name"]
         .as_str()
         .ok_or_else(|| Error::msg("asset missing name"))?
         .to_string();
     validate_safe_component(&asset_name, "release asset name")?;
+    let urls = update_download_urls(assets, asset, RELEASE_PUBKEY.is_some())?;
     ensure_staging_parent(updates_dir, updates_root)?;
 
     let archive_path = updates_dir.join(&asset_name);
     let part_path = randomized_temp_path(updates_dir, ".myownmesh-download-", ".part");
 
-    let bytes = client
-        .get(dl_url)
-        .send()
+    let bytes = update_get(client, &urls.artifact)
         .await?
         .error_for_status()?
         .bytes()
@@ -1679,21 +1824,8 @@ async fn download_verify_stage(
     write_exclusive_bytes(&part_path, &bytes)?;
     let mut part_guard = TempPathGuard::new(part_path.clone());
 
-    // Integrity: a published checksum is mandatory. We never stage an
-    // unverified binary — a missing sidecar used to fall through to a warning,
-    // which let anyone able to omit it serve any payload.
-    let Some(sha_asset) = pick_sha_asset(assets, &asset_name) else {
-        let _ = std::fs::remove_file(&part_path);
-        return Err(Error::msg(format!(
-            "no checksum sidecar for {asset_name}; refusing to stage unverified"
-        )));
-    };
-    let sha_url = sha_asset["browser_download_url"]
-        .as_str()
-        .ok_or_else(|| Error::msg("sha asset missing url"))?;
-    let sha_text = client
-        .get(sha_url)
-        .send()
+    // A checksum remains mandatory, with its URL checked before download.
+    let sha_text = update_get(client, &urls.checksum)
         .await?
         .error_for_status()?
         .text()
@@ -1718,18 +1850,10 @@ async fn download_verify_stage(
     // what makes a swapped release asset detectable.
     match RELEASE_PUBKEY {
         Some(pubkey) => {
-            let Some(sig_asset) = pick_sig_asset(assets, &asset_name) else {
-                let _ = std::fs::remove_file(&part_path);
-                return Err(Error::msg(format!(
-                    "no signature for {asset_name}; refusing to stage"
-                )));
-            };
-            let sig_url = sig_asset["browser_download_url"]
-                .as_str()
-                .ok_or_else(|| Error::msg("signature asset missing url"))?;
-            let sig_text = client
-                .get(sig_url)
-                .send()
+            let sig_url = urls.signature.as_ref().ok_or_else(|| {
+                Error::msg(format!("no signature for {asset_name}; refusing to stage"))
+            })?;
+            let sig_text = update_get(client, sig_url)
                 .await?
                 .error_for_status()?
                 .text()
@@ -2431,6 +2555,259 @@ mod tests {
         assert!(!updates.join("pm-detected.flag").exists());
         assert!(!updates.join("last-check").exists());
         assert!(!updates.join("pending.json").exists());
+    }
+
+    #[tokio::test]
+    async fn updater_https_client_refuses_http_before_connect() {
+        let (url, requests, server) = request_counter_server().await;
+        let error = http_client(Duration::from_secs(5))
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("the production client refuses plaintext, including loopback");
+        assert!(error.is_builder());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn updater_https_configured_http_is_refused_before_effects() {
+        let _guard = UPDATE_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MYOWNMESH_HOME", tmp.path());
+        let (url, requests, server) = request_counter_server().await;
+        let path = myownmesh_core::dirs::config_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for channel in ["stable", "beta"] {
+            let mut config = MeshConfig::default();
+            config.auto_update.channel = channel.into();
+            config.auto_update.stable_url = Some(url.clone());
+            config.auto_update.beta_url = Some(url.clone());
+            let original = serde_json::to_vec(&config).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            assert!(fetch_release(&config.auto_update)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS"));
+            assert!(check_now(true)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS"));
+            assert!(update_now()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("HTTPS"));
+            assert_no_update_effects(&myownmesh_core::dirs::updates_dir().unwrap());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        for prefs in [
+            UpdatePrefs {
+                stable_url: Some(url.clone()),
+                ..Default::default()
+            },
+            UpdatePrefs {
+                beta_url: Some(url.clone()),
+                ..Default::default()
+            },
+        ] {
+            let original = std::fs::read(&path).unwrap();
+            assert!(set_prefs(prefs).unwrap_err().to_string().contains("HTTPS"));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        std::env::remove_var("MYOWNMESH_HOME");
+    }
+
+    #[tokio::test]
+    async fn updater_https_returned_urls_are_refused_before_download_or_staging() {
+        let (http_url, requests, server) = request_counter_server().await;
+        let client = http_client(Duration::from_secs(5)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("updates");
+        let version = root.join("fixture-version");
+        for insecure_index in 0..3 {
+            let mut assets = vec![
+                json!({"name": "fixture.bin", "browser_download_url": "https://release.example/fixture.bin"}),
+                json!({"name": "fixture.bin.sha256", "browser_download_url": "https://release.example/fixture.bin.sha256"}),
+                json!({"name": "fixture.bin.minisig", "browser_download_url": "https://release.example/fixture.bin.minisig"}),
+            ];
+            assets[insecure_index]["browser_download_url"] = json!(http_url);
+            let error = download_verify_stage(
+                &client,
+                &assets,
+                &version,
+                &root,
+                &assets[0],
+                ArtifactKind::Daemon,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("HTTPS"));
+            assert!(
+                !root.exists(),
+                "insecure URL preflight must precede staging"
+            );
+            assert_eq!(requests.load(Ordering::SeqCst), 0);
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn updater_https_stage_release_preflights_entire_selected_bundle_before_effects() {
+        let _guard = UPDATE_TEST_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("MYOWNMESH_HOME", tmp.path());
+        let (http_url, requests, server) = request_counter_server().await;
+        // The secure daemon URL also points at this observer. If a regression
+        // starts its download before inspecting the GUI, the connection is
+        // counted and closed; no artifact or external host is served.
+        let secure_url = http_url.replacen("http:", "https:", 1);
+        let daemon = format!("myownmesh-{}.{}", current_platform(), archive_ext());
+        let gui = format!("myownmesh-gui-{}.{}", current_platform(), archive_ext());
+        let assets = vec![
+            json!({"name": daemon, "browser_download_url": secure_url}),
+            json!({"name": format!("{daemon}.sha256"), "browser_download_url": secure_url}),
+            json!({"name": format!("{daemon}.minisig"), "browser_download_url": secure_url}),
+            json!({"name": gui, "browser_download_url": secure_url}),
+            json!({"name": format!("{gui}.sha256"), "browser_download_url": secure_url}),
+            json!({"name": format!("{gui}.minisig"), "browser_download_url": secure_url}),
+        ];
+        let config = AutoUpdateConfig {
+            artifact_download_timeout_ms: 200,
+            ..Default::default()
+        };
+        let updates = myownmesh_core::dirs::updates_dir().unwrap();
+        let mut outcomes = Vec::new();
+        for insecure_index in 0..assets.len() {
+            let mut candidate = assets.clone();
+            candidate[insecure_index]["browser_download_url"] = json!(http_url);
+            let result = stage_release(
+                &json!({"assets": candidate}),
+                "9999.0.0",
+                &[ArtifactKind::Daemon, ArtifactKind::Gui],
+                &config,
+            )
+            .await;
+            outcomes.push((
+                insecure_index,
+                result.err().map(|error| error.to_string()),
+                updates.exists(),
+                requests.load(Ordering::SeqCst),
+            ));
+        }
+        server.abort();
+        let terminal = server.await;
+        std::env::remove_var("MYOWNMESH_HOME");
+        assert!(terminal.unwrap_err().is_cancelled());
+        for (index, error, staging_exists, connections) in outcomes {
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("HTTPS")),
+                "selected URL {index} must fail HTTPS preflight: {error:?}"
+            );
+            assert!(
+                !staging_exists,
+                "selected URL {index} created a staging directory"
+            );
+            assert_eq!(
+                connections, 0,
+                "selected URL {index} allowed an earlier download"
+            );
+        }
+        assert_no_update_effects(&updates);
+    }
+
+    #[test]
+    fn updater_https_urls_preserve_secure_release_and_signature_selection() {
+        let assets = vec![
+            json!({"name": "fixture.bin", "browser_download_url": "https://release.example/fixture.bin?token=fixture"}),
+            json!({"name": "SHA256SUMS", "browser_download_url": "https://cdn.example/SHA256SUMS"}),
+            json!({"name": "fixture.bin.minisig", "browser_download_url": "https://cdn.example/fixture.bin.minisig"}),
+        ];
+        for require_signature in [true, false] {
+            let urls = update_download_urls(&assets, &assets[0], require_signature).unwrap();
+            assert_eq!(
+                urls.artifact.as_str(),
+                assets[0]["browser_download_url"].as_str().unwrap()
+            );
+            assert_eq!(urls.checksum.as_str(), "https://cdn.example/SHA256SUMS");
+            assert_eq!(
+                urls.signature.unwrap().as_str(),
+                "https://cdn.example/fixture.bin.minisig"
+            );
+        }
+        assert!(update_download_urls(&assets[..2], &assets[0], false).is_ok());
+        assert!(update_download_urls(&assets[..2], &assets[0], true).is_err());
+        for raw in [
+            "http://release.example/feed",
+            "http://127.0.0.1/feed",
+            "ftp://release.example/feed",
+            "file:///tmp/feed",
+            "//release.example/feed",
+        ] {
+            assert!(update_url(raw).is_err());
+        }
+        let origin = reqwest::Url::parse("https://release.example/feed").unwrap();
+        for location in [
+            "http://release.example/artifact",
+            "http://127.0.0.1/artifact",
+        ] {
+            assert!(
+                require_https(&origin.join(location).unwrap()).is_err(),
+                "HTTPS redirect downgrade must fail"
+            );
+        }
+        for location in ["/next", "https://cdn.example/next"] {
+            assert!(require_https(&origin.join(location).unwrap()).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn updater_https_redirect_policy_refuses_plaintext_destination_before_connect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (destination, requests, destination_server) = request_counter_server().await;
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let origin_server = tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let (mut stream, peer) = origin.accept().await.unwrap();
+                assert!(peer.ip().is_loopback());
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                stream.write_all(format!("HTTP/1.1 302 Found\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }).await.expect("local redirect fixture deadline");
+        });
+        // Only this local policy fixture starts at HTTP to avoid a test CA or
+        // disabling certificate checks. Production uses https_only(true).
+        // It exercises the actual callback used for every redirect target;
+        // the HTTPS-to-HTTP target matrix above exercises the same predicate.
+        let fixture_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .redirect(update_redirect_policy())
+            .build()
+            .unwrap();
+        let result = fixture_client
+            .get(format!("http://{origin_addr}/redirect"))
+            .send()
+            .await;
+        let origin_result = origin_server.await;
+        destination_server.abort();
+        assert!(destination_server.await.unwrap_err().is_cancelled());
+        origin_result.unwrap();
+        let error = result.expect_err("a plaintext redirect target must fail closed");
+        assert!(error.is_redirect());
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
     }
 
     #[test]
