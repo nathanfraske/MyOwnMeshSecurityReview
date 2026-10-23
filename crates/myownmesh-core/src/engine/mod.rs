@@ -2259,10 +2259,14 @@ async fn handle_signaling_inbound(state: &Arc<NetworkState>, delivered: Ephemera
 /// handshake / ladder / watchdog modules render peer IDs in their
 /// diag entries the same way.
 pub(crate) fn short_peer(id: &str) -> String {
-    if id.len() <= 12 {
+    // Bound both rendering and inspection even for an untrusted UTF-8 ID.
+    // Short IDs use at most 48 bytes; abbreviated IDs use at most 43.
+    if id.chars().take(13).count() <= 12 {
         return id.to_string();
     }
-    format!("{}…{}", &id[..6], &id[id.len() - 4..])
+    let prefix_bytes: usize = id.chars().take(6).map(char::len_utf8).sum();
+    let suffix_bytes: usize = id.chars().rev().take(4).map(char::len_utf8).sum();
+    format!("{}…{}", &id[..prefix_bytes], &id[id.len() - suffix_bytes..])
 }
 
 /// Emit a presence announce, but only if we haven't already emitted one
@@ -11854,6 +11858,59 @@ mod tests {
     #[cfg(feature = "transport-lab")]
     #[path = "task_lifetime.rs"]
     mod task_lifetime;
+
+    #[test]
+    fn short_peer_preserves_ascii_rendering() {
+        for (id, expected) in [
+            ("", ""),
+            ("abc", "abc"),
+            ("abcdefghijkl", "abcdefghijkl"),
+            ("abcdefghijklm", "abcdef…jklm"),
+        ] {
+            assert_eq!(short_peer(id), expected);
+        }
+
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0xa7; 32]);
+        let id = DeviceId::from_public_key_bytes(key.verifying_key().to_bytes())
+            .unwrap()
+            .to_string();
+        assert!(id.is_ascii());
+        assert!(id.len() > 12);
+        assert_eq!(
+            short_peer(&id),
+            format!("{}…{}", &id[..6], &id[id.len() - 4..])
+        );
+    }
+
+    #[test]
+    fn short_peer_handles_multibyte_boundaries_and_bounds_output() {
+        for (id, expected) in [
+            ("abcdeé0123456789", "abcdeé…6789"),
+            ("0123456789éabc", "012345…éabc"),
+            ("abcdeé0123456789éabc", "abcdeé…éabc"),
+            ("abcde🦀0123456789", "abcde🦀…6789"),
+            ("0123456789🦀abc", "012345…🦀abc"),
+            ("abcde🦀0123456789🦀abc", "abcde🦀…🦀abc"),
+        ] {
+            assert!(
+                !id.is_char_boundary(6) || !id.is_char_boundary(id.len() - 4),
+                "fixture must cross an original byte-slice boundary"
+            );
+            assert_eq!(short_peer(id), expected);
+        }
+
+        let short = "🦀".repeat(12);
+        assert_eq!(short_peer(&short), short);
+        for scalar in ["a", "é", "中", "🦀"] {
+            let id = scalar.repeat(64);
+            let rendered = short_peer(&id);
+            assert_eq!(
+                rendered,
+                format!("{}…{}", scalar.repeat(6), scalar.repeat(4))
+            );
+            assert!(rendered.len() <= 48);
+        }
+    }
 
     #[test]
     fn introduction_endpoint_policy_accepts_local_destination_without_self_connect() {

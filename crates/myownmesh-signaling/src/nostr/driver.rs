@@ -2091,7 +2091,9 @@ fn handle_inbound_frame_observed(
         }
         "NOTICE" => {
             let body = arr.get(1).and_then(|v| v.as_str()).unwrap_or("");
-            debug!(relay = %short(url), "relay notice: {body}");
+            // Debug formatting quotes and escapes relay-controlled text so a
+            // human log formatter cannot turn CR/LF into forged records.
+            debug!(relay = %short(url), notice = ?body, "relay notice");
             if body.to_ascii_lowercase().contains("too many connections") {
                 return Ok(RelayControlFrame::Rejected);
             }
@@ -3378,6 +3380,93 @@ mod tests {
             session_close_timeout: Duration::from_secs(1),
             announcer_cancel_quantum: Duration::from_secs(1),
         }
+    }
+
+    #[test]
+    fn relay_notice_log_escapes_controls_and_preserves_capacity_rejection() {
+        struct HumanLog(Arc<Mutex<Vec<String>>>);
+
+        impl tracing::Subscriber for HumanLog {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                struct Fields<'a>(&'a mut String);
+
+                impl tracing::field::Visit for Fields<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        use std::fmt::Write;
+                        // Exercise the Debug visitor used by human field
+                        // formatters, including the production message field.
+                        write!(self.0, "{}={value:?} ", field.name()).unwrap();
+                    }
+                }
+
+                let mut line = String::new();
+                event.record(&mut Fields(&mut line));
+                self.0.lock().push(line);
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let shared = fixture_shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<NostrInbound>();
+        let tx = InboundSink::from_unbounded(tx);
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let cases = [
+            (
+                "hello\r\nWARN forged\t\u{1b}[31m \"quoted\" \\path",
+                RelayControlFrame::Other,
+            ),
+            (
+                "ToO MaNy CoNnEcTiOnS\r\nWARN forged",
+                RelayControlFrame::Rejected,
+            ),
+            ("ordinary relay notice", RelayControlFrame::Other),
+        ];
+        tracing::subscriber::with_default(HumanLog(Arc::clone(&records)), || {
+            for (body, expected) in &cases {
+                let frame = serde_json::json!(["NOTICE", body]).to_string();
+                assert_eq!(
+                    handle_inbound_frame_observed(
+                        "wss://relay.test/path",
+                        &frame,
+                        &shared,
+                        &tx,
+                        RelaySessionId::fresh(),
+                    )
+                    .unwrap(),
+                    *expected,
+                );
+            }
+        });
+        let records = records.lock();
+        assert_eq!(records.len(), cases.len(), "one event per NOTICE");
+        for (record, (body, _)) in records.iter().zip(&cases) {
+            assert!(record.contains("message=relay notice"));
+            assert!(record.contains("relay=relay.test"));
+            assert!(record.contains(&format!("notice={body:?}")));
+            assert!(!record.contains('\r') && !record.contains('\n'));
+            assert!(!record.contains('\t') && !record.contains('\u{1b}'));
+        }
+        assert!(records[0].contains(r"\r\nWARN forged\t\u{1b}[31m"));
+        assert!(rx.try_recv().is_err(), "NOTICE is never peer delivery");
     }
 
     /// Build a Nostr `EVENT` frame carrying an Announce envelope
